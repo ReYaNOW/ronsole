@@ -76,9 +76,9 @@ struct TerminalPalette {
 }
 
 impl TerminalPalette {
-    fn new(accent: [f32; 4]) -> Self {
+    fn new(background: crate::config::RgbColor, accent: [f32; 4]) -> Self {
         Self {
-            bg: [0.156, 0.164, 0.211, 1.0],
+            bg: background.to_rgba(),
             fg: [0.972, 0.972, 0.949, 1.0],
             minimap_bg: [0.129, 0.133, 0.172, 1.0],
             accent,
@@ -135,10 +135,13 @@ fn terminal_accent_from_kde_content(content: Option<&str>) -> [f32; 4] {
         .unwrap_or(DEFAULT_ACCENT_COLOR)
 }
 
-fn load_terminal_palette() -> TerminalPalette {
+fn load_terminal_palette(background: crate::config::RgbColor) -> TerminalPalette {
     let kde_content = crate::platform::config_home_dir()
         .and_then(|root| std::fs::read_to_string(root.join("kdeglobals")).ok());
-    TerminalPalette::new(terminal_accent_from_kde_content(kde_content.as_deref()))
+    TerminalPalette::new(
+        background,
+        terminal_accent_from_kde_content(kde_content.as_deref()),
+    )
 }
 
 const TERMINAL_FONT: &[u8] = include_bytes!("fonts/JetBrainsMonoNerdFont-Regular.ttf");
@@ -301,6 +304,7 @@ impl Renderer {
         gl: glow::Context,
         scale_factor: f32,
         terminal_font_logical_size: f32,
+        terminal_background: crate::config::RgbColor,
     ) -> Result<Self, String> {
         let scale_factor = scale_factor.max(0.1);
         let terminal_font_logical_size =
@@ -380,7 +384,7 @@ impl Renderer {
         ui_fonts.push(FontData::new_static(TERMINAL_FONT));
         ui_fonts.extend(fonts.iter().cloned());
 
-        let palette = load_terminal_palette();
+        let palette = load_terminal_palette(terminal_background);
         let mut renderer = Self {
             gl,
             diagnostics,
@@ -485,6 +489,15 @@ impl Renderer {
         self.reset_atlases();
         self.prewarm_ascii();
         self.prewarm_search_icons();
+        true
+    }
+
+    pub(crate) fn set_terminal_background(&mut self, background: crate::config::RgbColor) -> bool {
+        let rgba = background.to_rgba();
+        if self.palette.bg == rgba {
+            return false;
+        }
+        self.palette.bg = rgba;
         true
     }
 
@@ -1647,10 +1660,11 @@ mod tests {
             DEFAULT_ACCENT_COLOR
         );
         let accent = [0.1, 0.2, 0.3, 1.0];
-        let palette = TerminalPalette::new(accent);
+        let background = crate::config::RgbColor::new(0x12, 0x34, 0x56);
+        let palette = TerminalPalette::new(background, accent);
         assert_eq!(palette.accent, accent);
         assert_eq!(palette.accent_with_alpha(0.6), [0.1, 0.2, 0.3, 0.6]);
-        assert_eq!(palette.bg, [0.156, 0.164, 0.211, 1.0]);
+        assert_eq!(palette.bg, background.to_rgba());
         assert_eq!(palette.fg, [0.972, 0.972, 0.949, 1.0]);
         assert_eq!(palette.minimap_bg, [0.129, 0.133, 0.172, 1.0]);
     }

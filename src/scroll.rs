@@ -8,6 +8,22 @@ pub struct ScrollState {
     pub drag_offset: f32,
 }
 
+pub(crate) const DRAG_AUTOSCROLL_MIN_SPEED: f32 = 360.0;
+pub(crate) const DRAG_AUTOSCROLL_MAX_SPEED: f32 = 7200.0;
+const DRAG_AUTOSCROLL_ACCEL: f32 = 0.40;
+const DRAG_AUTOSCROLL_TOP_BOOST: f32 = 1.22;
+
+pub(crate) fn drag_autoscroll_speed(delta: f32, top_edge: bool) -> f32 {
+    let amount = delta.abs();
+    let speed = (amount * amount * DRAG_AUTOSCROLL_ACCEL)
+        .clamp(DRAG_AUTOSCROLL_MIN_SPEED, DRAG_AUTOSCROLL_MAX_SPEED);
+    if top_edge {
+        (speed * DRAG_AUTOSCROLL_TOP_BOOST).min(DRAG_AUTOSCROLL_MAX_SPEED)
+    } else {
+        speed
+    }
+}
+
 impl ScrollState {
     pub fn new(anim_speed: f32) -> Self {
         Self {

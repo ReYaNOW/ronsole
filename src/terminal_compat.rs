@@ -359,7 +359,7 @@ pub(crate) fn apply_ansi_sgr(
             }
             1 => *bold = true,
             2 => *dim = true,
-            4 => *underline = true,
+            4 => *underline = param.get(1).copied() != Some(0),
             7 => *inverse = true,
             22 => {
                 *bold = false;
@@ -532,6 +532,27 @@ mod tests {
         assert!(probe.fg.is_default_foreground());
         assert!(probe.bg.is_default_background());
         assert!(!probe.bold && !probe.dim && !probe.underline && !probe.inverse);
+    }
+
+    #[test]
+    fn sgr_colon_underline_zero_cancels_underline_without_disabling_supported_styles() {
+        let mut probe = SgrProbe {
+            fg: TerminalColor::default_foreground(),
+            bg: TerminalColor::default_background(),
+            bold: false,
+            dim: false,
+            underline: false,
+            inverse: false,
+        };
+        let mut parser = Parser::new();
+        parser.advance(&mut probe, b"\x1b[4m");
+        assert!(probe.underline);
+        parser.advance(&mut probe, b"\x1b[4:0m");
+        assert!(!probe.underline);
+        parser.advance(&mut probe, b"\x1b[4:2m");
+        assert!(probe.underline);
+        parser.advance(&mut probe, b"\x1b[24m");
+        assert!(!probe.underline);
     }
 
     #[test]

@@ -192,9 +192,6 @@ pub(crate) fn tab_strip_reveal_target(
 }
 
 pub(crate) const DRAG_AUTOSCROLL_EDGE_PX: f32 = 58.0;
-const DRAG_AUTOSCROLL_MIN_SPEED: f32 = 360.0;
-const DRAG_AUTOSCROLL_MAX_SPEED: f32 = 7200.0;
-const DRAG_AUTOSCROLL_ACCEL: f32 = 0.40;
 
 pub(crate) fn drag_autoscroll_delta(pos: f32, start: f32, end: f32, edge: f32) -> f32 {
     if pos < start {
@@ -211,9 +208,7 @@ pub(crate) fn drag_autoscroll_delta(pos: f32, start: f32, end: f32, edge: f32) -
 }
 
 pub(crate) fn drag_autoscroll_speed(delta: f32) -> f32 {
-    let amount = delta.abs();
-    (amount * amount * DRAG_AUTOSCROLL_ACCEL)
-        .clamp(DRAG_AUTOSCROLL_MIN_SPEED, DRAG_AUTOSCROLL_MAX_SPEED)
+    crate::scroll::drag_autoscroll_speed(delta, false)
 }
 
 #[cfg(test)]
@@ -298,8 +293,8 @@ mod tests {
         assert_eq!(drag_autoscroll_delta(480.0, 100.0, 500.0, 40.0), 20.0);
         assert_eq!(drag_autoscroll_delta(540.0, 100.0, 500.0, 40.0), 40.0);
         assert_eq!(drag_autoscroll_delta(250.0, 100.0, 500.0, 40.0), 0.0);
-        assert!(drag_autoscroll_speed(30.0) >= DRAG_AUTOSCROLL_MIN_SPEED);
-        assert!(drag_autoscroll_speed(10_000.0) <= DRAG_AUTOSCROLL_MAX_SPEED);
+        assert!(drag_autoscroll_speed(30.0) >= crate::scroll::DRAG_AUTOSCROLL_MIN_SPEED);
+        assert!(drag_autoscroll_speed(10_000.0) <= crate::scroll::DRAG_AUTOSCROLL_MAX_SPEED);
     }
 
     #[test]

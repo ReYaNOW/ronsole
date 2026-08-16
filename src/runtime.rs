@@ -14,7 +14,7 @@ use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Window, WindowAttributes};
+use winit::window::{CursorIcon, UserAttentionType, Window, WindowAttributes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GlContextPlan {
@@ -199,6 +199,8 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub settings_tab: crate::renderer::SettingsTab,
     pub settings_font_value: &'a str,
     pub settings_scroll_value: &'a str,
+    pub settings_background_input: &'a mut crate::single_line_input::SingleLineInput,
+    pub settings_background_editing: bool,
 }
 
 pub struct WindowRuntime {
@@ -218,6 +220,7 @@ impl WindowRuntime {
         logical_width: f64,
         logical_height: f64,
         terminal_font_size: f32,
+        terminal_background: crate::config::RgbColor,
     ) -> Result<Self, String> {
         let template = ConfigTemplateBuilder::new()
             .with_transparency(false)
@@ -253,6 +256,7 @@ impl WindowRuntime {
             create_glow_context(&gl_config),
             window.scale_factor() as f32,
             terminal_font_size,
+            terminal_background,
         )
         .map_err(|error| format!("renderer initialization failed: {error}"))?;
         let mut runtime = Self {
@@ -281,12 +285,23 @@ impl WindowRuntime {
         Arc::clone(&self.window)
     }
 
+    pub fn activate_existing_window(&self) {
+        if !crate::platform::activate_primary_window(std::process::id()) {
+            self.window
+                .request_user_attention(Some(UserAttentionType::Informational));
+        }
+    }
+
     pub fn update_scale_factor(&mut self, scale_factor: f32) {
         self.renderer.update_scale_factor(scale_factor);
     }
 
     pub(crate) fn set_terminal_font_size(&mut self, logical_size: f32) -> bool {
         self.renderer.set_terminal_font_size(logical_size)
+    }
+
+    pub(crate) fn set_terminal_background(&mut self, background: crate::config::RgbColor) -> bool {
+        self.renderer.set_terminal_background(background)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -317,6 +332,8 @@ impl WindowRuntime {
             params.settings_tab,
             params.settings_font_value,
             params.settings_scroll_value,
+            params.settings_background_input,
+            params.settings_background_editing,
         );
         self.surface
             .swap_buffers(&self.context)
@@ -336,6 +353,22 @@ impl WindowRuntime {
         y: f32,
     ) -> crate::renderer::SettingsHit {
         self.renderer.settings_hit_test(progress, active_tab, x, y)
+    }
+
+    pub(crate) fn settings_background_cursor_from_x(
+        &mut self,
+        progress: f32,
+        active_tab: crate::renderer::SettingsTab,
+        text: &str,
+        x: f32,
+        scroll_x: f32,
+    ) -> Option<usize> {
+        self.renderer
+            .settings_background_cursor_from_x(progress, active_tab, text, x, scroll_x)
+    }
+
+    pub(crate) fn set_cursor_icon(&self, icon: CursorIcon) {
+        self.window.set_cursor(icon);
     }
 
     pub fn terminal_tab_strip_layout(&self) -> crate::renderer::TerminalTabStripLayout {
@@ -460,6 +493,19 @@ mod tests {
     #[test]
     fn swap_policy_is_blocking_wait_one() {
         assert_eq!(blocking_swap_interval(), SwapInterval::Wait(NonZeroU32::MIN));
+    }
+
+    #[test]
+    fn existing_window_activation_prefers_kde_raise_with_attention_fallback() {
+        let source = include_str!("runtime.rs");
+        let activation = source
+            .split("    pub fn activate_existing_window")
+            .nth(1)
+            .and_then(|tail| tail.split("    pub fn update_scale_factor").next())
+            .expect("activation method must remain present");
+        assert!(activation.contains("activate_primary_window"));
+        assert!(activation.contains("request_user_attention"));
+        assert!(!activation.contains("focus_window"));
     }
 
     #[test]

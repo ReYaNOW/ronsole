@@ -1,10 +1,12 @@
 use crate::config::{
-    AppConfig, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP, logical_window_size,
+    AppConfig, DEFAULT_SCROLL_SENSITIVITY, DEFAULT_TERMINAL_BACKGROUND, DEFAULT_TERMINAL_FONT_SIZE,
+    RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP, logical_window_size,
 };
 use crate::input::TerminalInteraction;
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
+use crate::single_line_input::SingleLineInput;
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move,
     active_index_after_remove, drag_autoscroll_delta, drag_autoscroll_speed,
@@ -18,7 +20,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::WindowId;
+use winit::window::{CursorIcon, WindowId};
 
 const TERMINAL_CLEANUP_PENDING_CAPACITY: usize = 16;
 
@@ -40,6 +42,17 @@ enum GlobalShortcut {
     NewTab,
     CloseTab,
     Search,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppEvent {
+    ExternalLaunch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalLaunchAction {
+    OpenDefaultTab,
+    ActivateExistingWindow,
 }
 
 #[inline(always)]
@@ -89,6 +102,161 @@ fn global_shortcut(key: PhysicalKey, modifiers: ModifiersState) -> Option<Global
             Some(GlobalShortcut::Search)
         }
         _ => None,
+    }
+}
+
+const SETTINGS_BACKGROUND_MAX_CHARS: usize = 7;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SettingsBackgroundKeyOutcome {
+    consumed: bool,
+    text_changed: bool,
+    visual_changed: bool,
+    copy_text: Option<String>,
+    finish: bool,
+}
+
+fn settings_hex_insert_text(input: &mut SingleLineInput, text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let mut clean = String::with_capacity(text.len().min(SETTINGS_BACKGROUND_MAX_CHARS));
+    for ch in text.chars() {
+        if ch == '\r' || ch == '\n' {
+            continue;
+        }
+        if ch == '#' {
+            clean.push(ch);
+        } else if ch.is_ascii_hexdigit() {
+            clean.push(ch.to_ascii_uppercase());
+        } else {
+            return false;
+        }
+    }
+    if clean.is_empty() {
+        return false;
+    }
+    let remaining = input
+        .char_count()
+        .saturating_sub(input.selected_char_count());
+    if remaining + clean.chars().count() > SETTINGS_BACKGROUND_MAX_CHARS {
+        return false;
+    }
+    input.insert_text(&clean)
+}
+
+fn settings_background_editor_key(
+    input: &mut SingleLineInput,
+    key: PhysicalKey,
+    text: Option<&str>,
+    ctrl: bool,
+    shift: bool,
+    text_input_allowed: bool,
+    paste_text: Option<&str>,
+) -> SettingsBackgroundKeyOutcome {
+    let before_text = input.text.clone();
+    let before_cursor = input.cursor;
+    let before_anchor = input.selection_anchor;
+    let mut outcome = SettingsBackgroundKeyOutcome::default();
+    outcome.consumed = true;
+    match key {
+        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => outcome.finish = true,
+        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+            let _ = input.move_left(shift);
+        }
+        PhysicalKey::Code(KeyCode::ArrowRight) => {
+            let _ = input.move_right(shift);
+        }
+        PhysicalKey::Code(KeyCode::Home) => {
+            let _ = input.move_home(shift);
+        }
+        PhysicalKey::Code(KeyCode::End) => {
+            let _ = input.move_end(shift);
+        }
+        PhysicalKey::Code(KeyCode::Backspace) => {
+            let _ = input.backspace();
+        }
+        PhysicalKey::Code(KeyCode::Delete) => {
+            let _ = input.delete_forward();
+        }
+        PhysicalKey::Code(KeyCode::KeyA) if ctrl => input.select_all(),
+        PhysicalKey::Code(KeyCode::KeyC) if ctrl => {
+            outcome.copy_text = input.selected_text();
+        }
+        PhysicalKey::Code(KeyCode::KeyX) if ctrl => {
+            outcome.copy_text = input.selected_text();
+            if outcome.copy_text.is_some() {
+                let _ = input.delete_selection();
+            }
+        }
+        PhysicalKey::Code(KeyCode::KeyV) if ctrl => {
+            if let Some(text) = paste_text {
+                let _ = settings_hex_insert_text(input, text);
+            }
+        }
+        _ if text_input_allowed => {
+            if let Some(text) = text {
+                let _ = settings_hex_insert_text(input, text);
+            }
+        }
+        _ => outcome.consumed = false,
+    }
+    outcome.text_changed = input.text != before_text;
+    outcome.visual_changed = outcome.text_changed
+        || input.cursor != before_cursor
+        || input.selection_anchor != before_anchor;
+    outcome
+}
+
+fn begin_settings_background_pointer_selection(input: &mut SingleLineInput, cursor: usize) -> bool {
+    let previous = (input.cursor, input.selection_anchor);
+    let _ = input.move_cursor(cursor, false);
+    input.selection_anchor = Some(input.cursor);
+    previous != (input.cursor, input.selection_anchor)
+}
+
+fn update_settings_background_pointer_selection(
+    input: &mut SingleLineInput,
+    cursor: usize,
+) -> bool {
+    input.move_cursor(cursor, true)
+}
+
+#[inline]
+fn ui_cursor_icon(
+    settings_modal_active: bool,
+    settings_hit: SettingsHit,
+    settings_text_dragging: bool,
+    tab_hit: TerminalTabHit,
+    tab_dragging: bool,
+) -> CursorIcon {
+    if settings_modal_active {
+        return if settings_text_dragging || settings_hit == SettingsHit::BackgroundField {
+            CursorIcon::Text
+        } else {
+            CursorIcon::Default
+        };
+    }
+    if tab_dragging {
+        return CursorIcon::Default;
+    }
+    match tab_hit {
+        TerminalTabHit::Close(_) | TerminalTabHit::Add => CursorIcon::Pointer,
+        TerminalTabHit::Body(_) | TerminalTabHit::None => CursorIcon::Default,
+    }
+}
+
+#[inline]
+fn cursor_icon_change(current: CursorIcon, desired: CursorIcon) -> Option<CursorIcon> {
+    (current != desired).then_some(desired)
+}
+
+#[inline]
+fn external_launch_action(focused: bool) -> ExternalLaunchAction {
+    if focused {
+        ExternalLaunchAction::OpenDefaultTab
+    } else {
+        ExternalLaunchAction::ActivateExistingWindow
     }
 }
 
@@ -159,6 +327,9 @@ pub struct App {
     config_save_attempted: bool,
     settings_font_value: String,
     settings_scroll_value: String,
+    settings_background_input: SingleLineInput,
+    settings_background_editing: bool,
+    settings_background_dragging: bool,
     terminals: Vec<Terminal>,
     active_terminal: usize,
     active_terminal_presented: bool,
@@ -172,10 +343,13 @@ pub struct App {
     modifiers: ModifiersState,
     pointer_x: f32,
     pointer_y: f32,
+    cursor_icon: CursorIcon,
     settings_open: bool,
     settings_progress: f32,
     settings_active_tab: SettingsTab,
     focused: bool,
+    unfocused_redraw_pending: bool,
+    pending_external_launches: u32,
     occluded: bool,
     zero_sized: bool,
     dirty: bool,
@@ -198,6 +372,8 @@ impl App {
         interaction.set_scroll_sensitivity(config.scroll_sensitivity);
         let settings_font_value = format!("{:.0}", config.terminal_font_size);
         let settings_scroll_value = format!("{:.2}", config.scroll_sensitivity);
+        let settings_background_input =
+            SingleLineInput::from_text(&config.terminal_background.to_hex());
         Self {
             runtime: None,
             config,
@@ -205,6 +381,9 @@ impl App {
             config_save_attempted: false,
             settings_font_value,
             settings_scroll_value,
+            settings_background_input,
+            settings_background_editing: false,
+            settings_background_dragging: false,
             terminals: Vec::new(),
             active_terminal: 0,
             active_terminal_presented: false,
@@ -218,10 +397,13 @@ impl App {
             modifiers: ModifiersState::empty(),
             pointer_x: 0.0,
             pointer_y: 0.0,
+            cursor_icon: CursorIcon::Default,
             settings_open: false,
             settings_progress: 0.0,
             settings_active_tab: SettingsTab::General,
             focused: true,
+            unfocused_redraw_pending: false,
+            pending_external_launches: 0,
             occluded: false,
             zero_sized: false,
             dirty: true,
@@ -232,7 +414,10 @@ impl App {
 
     #[inline(always)]
     fn renderable(&self) -> bool {
-        self.focused && !self.occluded && !self.zero_sized && self.runtime.is_some()
+        (self.focused || self.unfocused_redraw_pending)
+            && !self.occluded
+            && !self.zero_sized
+            && self.runtime.is_some()
     }
 
     #[inline(always)]
@@ -394,6 +579,30 @@ impl App {
         Some(index)
     }
 
+    fn handle_external_launch(&mut self) {
+        if self.runtime.is_none() {
+            self.pending_external_launches = self.pending_external_launches.saturating_add(1);
+            return;
+        }
+        match external_launch_action(self.focused) {
+            ExternalLaunchAction::OpenDefaultTab => {
+                let _ = self.add_terminal();
+            }
+            ExternalLaunchAction::ActivateExistingWindow => {
+                if let Some(runtime) = self.runtime.as_ref() {
+                    runtime.activate_existing_window();
+                }
+            }
+        }
+    }
+
+    fn flush_pending_external_launches(&mut self) {
+        let pending = std::mem::take(&mut self.pending_external_launches);
+        for _ in 0..pending {
+            self.handle_external_launch();
+        }
+    }
+
     fn close_terminal_tab_at(&mut self, index: usize) -> bool {
         if index >= self.terminals.len() {
             return false;
@@ -516,8 +725,16 @@ impl App {
         }
     }
 
+    fn clear_active_terminal_text_selection(&mut self) -> bool {
+        let active = self.active_terminal;
+        self.terminals
+            .get_mut(active)
+            .is_some_and(|terminal| self.interaction.clear_text_selection(terminal))
+    }
+
     fn handle_focus_changed(&mut self, focused: bool) {
         self.focused = focused;
+        self.unfocused_redraw_pending = !focused;
         self.modifiers = ModifiersState::empty();
         self.interaction.set_modifiers(ModifiersState::empty());
         if self.active_terminal_presented {
@@ -525,30 +742,160 @@ impl App {
         }
         if !focused {
             self.cancel_pointer_interactions();
+            self.settings_background_dragging = false;
         }
         self.suspend_frame_clock();
-        if focused {
-            self.mark_dirty();
-        }
+        self.request_redraw();
     }
 
     fn toggle_settings(&mut self) {
         let opening = !self.settings_open;
         if opening {
             self.cancel_pointer_interactions();
+            self.settings_background_input
+                .set_text(&self.config.terminal_background.to_hex());
+            self.settings_background_editing = false;
+            self.settings_background_dragging = false;
+        } else {
+            self.finish_settings_background_edit();
         }
         self.settings_open = !self.settings_open;
+        self.refresh_cursor_icon();
         self.request_redraw();
     }
 
     fn close_settings(&mut self) {
         if self.settings_open {
+            self.finish_settings_background_edit();
             self.settings_open = false;
+            self.settings_background_dragging = false;
+            self.refresh_cursor_icon();
+            self.request_redraw();
+        }
+    }
+
+    fn set_terminal_background(&mut self, color: RgbColor) -> bool {
+        if self.config.terminal_background == color {
+            return false;
+        }
+        self.config.terminal_background = color;
+        if let Some(runtime) = self.runtime.as_mut() {
+            let _ = runtime.set_terminal_background(color);
+        }
+        true
+    }
+
+    fn apply_valid_settings_background_draft(&mut self) {
+        if let Some(color) = RgbColor::parse_hex(&self.settings_background_input.text)
+            && self.set_terminal_background(color)
+        {
+            self.mark_config_dirty();
+        }
+    }
+
+    fn finish_settings_background_edit(&mut self) {
+        if !self.settings_background_editing {
+            return;
+        }
+        self.apply_valid_settings_background_draft();
+        self.settings_background_input
+            .set_text(&self.config.terminal_background.to_hex());
+        self.settings_background_editing = false;
+        self.settings_background_dragging = false;
+        self.request_redraw();
+    }
+
+    fn edit_settings_background_text(&mut self, text: &str) -> bool {
+        if !self.settings_background_editing {
+            return false;
+        }
+        if settings_hex_insert_text(&mut self.settings_background_input, text) {
+            self.apply_valid_settings_background_draft();
+            self.request_redraw();
+        }
+        true
+    }
+
+    fn handle_settings_background_key(&mut self, key: PhysicalKey, text: Option<&str>) -> bool {
+        if !self.settings_background_editing {
+            return false;
+        }
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        let paste = if ctrl && key == PhysicalKey::Code(KeyCode::KeyV) {
+            self.interaction.clipboard_text()
+        } else {
+            None
+        };
+        let outcome = settings_background_editor_key(
+            &mut self.settings_background_input,
+            key,
+            text,
+            ctrl,
+            shift,
+            !ctrl && !self.modifiers.alt_key() && !self.modifiers.super_key(),
+            paste.as_deref(),
+        );
+        if let Some(copy) = outcome.copy_text {
+            let _ = self.interaction.set_clipboard_text(copy);
+        }
+        if outcome.finish {
+            self.finish_settings_background_edit();
+            return true;
+        }
+        if outcome.text_changed {
+            self.apply_valid_settings_background_draft();
+        }
+        if outcome.visual_changed {
+            self.request_redraw();
+        }
+        outcome.consumed
+    }
+
+    fn settings_background_cursor_from_x(&mut self, x: f32) -> Option<usize> {
+        let input = &self.settings_background_input;
+        self.runtime.as_mut()?.settings_background_cursor_from_x(
+            self.settings_progress,
+            self.settings_active_tab,
+            &input.text,
+            x,
+            input.scroll_x,
+        )
+    }
+
+    fn begin_settings_background_pointer_edit(&mut self, cursor: usize) {
+        if !self.settings_background_editing {
+            self.settings_background_input
+                .set_text(&self.config.terminal_background.to_hex());
+            self.settings_background_editing = true;
+        }
+        let changed = begin_settings_background_pointer_selection(
+            &mut self.settings_background_input,
+            cursor,
+        );
+        self.settings_background_dragging = true;
+        if changed {
             self.request_redraw();
         }
     }
 
     fn apply_settings_hit(&mut self, hit: SettingsHit) {
+        if hit == SettingsHit::Outside {
+            self.close_settings();
+            return;
+        }
+        if hit != SettingsHit::BackgroundField && self.settings_background_editing {
+            self.finish_settings_background_edit();
+        }
+        if hit == SettingsHit::BackgroundField {
+            if !self.settings_background_editing {
+                self.settings_background_input
+                    .set_text(&self.config.terminal_background.to_hex());
+                self.settings_background_editing = true;
+                self.request_redraw();
+            }
+            return;
+        }
         if let SettingsHit::Tab(tab) = hit {
             if self.settings_active_tab != tab {
                 self.settings_active_tab = tab;
@@ -574,6 +921,20 @@ impl App {
                     true
                 }
             }
+            SettingsHit::FontReset => {
+                if (self.config.terminal_font_size - DEFAULT_TERMINAL_FONT_SIZE).abs()
+                    < f32::EPSILON
+                {
+                    false
+                } else {
+                    self.config.terminal_font_size = DEFAULT_TERMINAL_FONT_SIZE;
+                    if let Some(runtime) = self.runtime.as_mut() {
+                        let _ = runtime.set_terminal_font_size(DEFAULT_TERMINAL_FONT_SIZE);
+                    }
+                    self.settings_font_value = format!("{DEFAULT_TERMINAL_FONT_SIZE:.0}");
+                    true
+                }
+            }
             SettingsHit::ScrollDecrease | SettingsHit::ScrollIncrease => {
                 let delta = if hit == SettingsHit::ScrollDecrease {
                     -SCROLL_SENSITIVITY_STEP
@@ -589,7 +950,29 @@ impl App {
                     true
                 }
             }
-            SettingsHit::None | SettingsHit::Tab(_) => false,
+            SettingsHit::ScrollReset => {
+                if (self.config.scroll_sensitivity - DEFAULT_SCROLL_SENSITIVITY).abs()
+                    < f32::EPSILON
+                {
+                    false
+                } else {
+                    self.config.scroll_sensitivity = DEFAULT_SCROLL_SENSITIVITY;
+                    self.interaction
+                        .set_scroll_sensitivity(DEFAULT_SCROLL_SENSITIVITY);
+                    self.settings_scroll_value = format!("{DEFAULT_SCROLL_SENSITIVITY:.2}");
+                    true
+                }
+            }
+            SettingsHit::BackgroundReset => {
+                let changed = self.set_terminal_background(DEFAULT_TERMINAL_BACKGROUND);
+                self.settings_background_input
+                    .set_text(&DEFAULT_TERMINAL_BACKGROUND.to_hex());
+                changed
+            }
+            SettingsHit::None
+            | SettingsHit::Outside
+            | SettingsHit::Tab(_)
+            | SettingsHit::BackgroundField => false,
         };
         if changed {
             self.mark_config_dirty();
@@ -601,6 +984,42 @@ impl App {
         self.runtime.as_ref().map_or(SettingsHit::None, |runtime| {
             runtime.settings_hit_test(self.settings_progress, self.settings_active_tab, x, y)
         })
+    }
+
+    fn desired_cursor_icon(&self) -> CursorIcon {
+        let settings_modal_active = self.settings_modal_active();
+        let settings_hit = if settings_modal_active {
+            self.settings_hit_test(self.pointer_x, self.pointer_y)
+        } else {
+            SettingsHit::None
+        };
+        let tab_hit = if settings_modal_active {
+            TerminalTabHit::None
+        } else {
+            self.runtime
+                .as_ref()
+                .map_or(TerminalTabHit::None, |runtime| {
+                    runtime.terminal_tab_hit_test(self.pointer_x, self.pointer_y)
+                })
+        };
+        ui_cursor_icon(
+            settings_modal_active,
+            settings_hit,
+            self.settings_background_dragging,
+            tab_hit,
+            self.terminal_tab_drag.is_some(),
+        )
+    }
+
+    fn refresh_cursor_icon(&mut self) {
+        let desired = self.desired_cursor_icon();
+        let Some(next) = cursor_icon_change(self.cursor_icon, desired) else {
+            return;
+        };
+        self.cursor_icon = next;
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.set_cursor_icon(next);
+        }
     }
 
     fn sync_animation_state(&mut self) {
@@ -623,10 +1042,13 @@ impl App {
     }
 
     fn apply_frame_plan(&self, event_loop: &ActiveEventLoop) {
-        let plan = frame_plan(self.renderable(), self.dirty, self.animation_active);
+        let plan = frame_plan(
+            self.renderable(),
+            self.dirty,
+            self.focused && self.animation_active,
+        );
         let now = Instant::now();
-        let search_deadline = self
-            .renderable()
+        let search_deadline = (self.focused && self.renderable())
             .then(|| self.interaction.search_refresh_deadline())
             .flatten();
         let search_due = search_deadline.is_some_and(|deadline| deadline <= now);
@@ -728,7 +1150,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.runtime.is_some() {
             return;
@@ -739,6 +1161,7 @@ impl ApplicationHandler for App {
             self.config.window_width,
             self.config.window_height,
             self.config.terminal_font_size,
+            self.config.terminal_background,
         ) {
             Ok(runtime) => {
                 self.zero_sized = runtime.window().inner_size().width == 0
@@ -751,12 +1174,19 @@ impl ApplicationHandler for App {
                 self.runtime = Some(runtime);
                 self.last_frame = Instant::now();
                 let _ = self.add_terminal();
+                self.flush_pending_external_launches();
                 self.mark_dirty();
             }
             Err(error) => {
                 eprintln!("Ronsole: {error}");
                 self.request_exit(event_loop);
             }
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::ExternalLaunch => self.handle_external_launch(),
         }
     }
 
@@ -823,6 +1253,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 if self.settings_modal_active() {
+                    if self.settings_background_editing {
+                        let _ = self.edit_settings_background_text(&text);
+                    }
                     return;
                 }
                 let active = self.active_terminal;
@@ -854,6 +1287,13 @@ impl ApplicationHandler for App {
                         && key_event.physical_key == PhysicalKey::Code(KeyCode::Escape)
                     {
                         self.close_settings();
+                    } else if key_event.state == ElementState::Pressed
+                        && self.settings_background_editing
+                    {
+                        let _ = self.handle_settings_background_key(
+                            key_event.physical_key,
+                            key_event.logical_key.to_text(),
+                        );
                     }
                     return;
                 }
@@ -873,11 +1313,22 @@ impl ApplicationHandler for App {
                 if self.settings_modal_active() {
                     let previous_hit = self.settings_hit_test(previous_x, previous_y);
                     let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
-                    if previous_hit != current_hit {
+                    let mut changed = previous_hit != current_hit;
+                    if self.settings_background_dragging
+                        && let Some(cursor) = self.settings_background_cursor_from_x(self.pointer_x)
+                    {
+                        changed |= update_settings_background_pointer_selection(
+                            &mut self.settings_background_input,
+                            cursor,
+                        );
+                    }
+                    self.refresh_cursor_icon();
+                    if changed {
                         self.request_redraw();
                     }
                     return;
                 }
+                self.refresh_cursor_icon();
                 if let Some(drag) = self.terminal_tab_drag.as_mut() {
                     drag.current_x = self.pointer_x;
                     if !drag.threshold_passed {
@@ -889,12 +1340,14 @@ impl ApplicationHandler for App {
                     self.request_redraw();
                     return;
                 }
-                if self.runtime.as_ref().is_some_and(|runtime| {
-                    runtime
-                        .terminal_tab_strip_layout()
-                        .rect
-                        .contains(self.pointer_x, self.pointer_y)
-                }) {
+                if !self.interaction.terminal_selection_active()
+                    && self.runtime.as_ref().is_some_and(|runtime| {
+                        runtime
+                            .terminal_tab_strip_layout()
+                            .rect
+                            .contains(self.pointer_x, self.pointer_y)
+                    })
+                {
                     self.request_redraw();
                     return;
                 }
@@ -914,11 +1367,56 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(next) = cursor_icon_change(self.cursor_icon, CursorIcon::Default) {
+                    self.cursor_icon = next;
+                    if let Some(runtime) = self.runtime.as_ref() {
+                        runtime.set_cursor_icon(next);
+                    }
+                }
+                if self.settings_modal_active() || self.terminal_tab_drag.is_some() {
+                    return;
+                }
+                let size = self
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.window().inner_size());
+                let active = self.active_terminal;
+                if let (Some(size), Some(terminal)) = (size, self.terminals.get_mut(active))
+                    && self
+                        .interaction
+                        .cursor_left(size.width as f32, size.height as f32, terminal)
+                {
+                    self.sync_animation_state();
+                    self.request_redraw();
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.clear_active_terminal_text_selection()
+                {
+                    self.request_redraw();
+                }
                 if self.settings_modal_active() {
-                    if button == MouseButton::Left && state == ElementState::Pressed {
-                        let hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
-                        self.apply_settings_hit(hit);
+                    if button == MouseButton::Left {
+                        if state == ElementState::Pressed {
+                            let hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
+                            if hit == SettingsHit::BackgroundField {
+                                let cursor = self
+                                    .settings_background_cursor_from_x(self.pointer_x)
+                                    .unwrap_or(self.settings_background_input.cursor);
+                                self.begin_settings_background_pointer_edit(cursor);
+                            } else {
+                                self.settings_background_dragging = false;
+                                self.apply_settings_hit(hit);
+                            }
+                            self.refresh_cursor_icon();
+                        } else if self.settings_background_dragging {
+                            self.settings_background_dragging = false;
+                            self.refresh_cursor_icon();
+                            self.request_redraw();
+                        }
                     }
                     return;
                 }
@@ -1026,7 +1524,10 @@ impl ApplicationHandler for App {
                     self.terminal_tab_scroll.clamp_current(0.0, max);
                 }
                 let active = self.active_terminal;
+                let mut selection_autoscrolled = false;
                 if let Some(terminal) = self.terminals.get_mut(active) {
+                    selection_autoscrolled =
+                        self.interaction.update_selection_autoscroll(dt, terminal);
                     terminal.scroll_y.update(dt);
                     terminal
                         .scroll_y
@@ -1034,6 +1535,9 @@ impl ApplicationHandler for App {
                     terminal
                         .scroll_y
                         .clamp_current(0.0, self.interaction.layout.max_scroll);
+                }
+                if selection_autoscrolled {
+                    self.mark_dirty();
                 }
                 let (settings_progress, _) =
                     settings_animation_step(self.settings_progress, self.settings_open, dt);
@@ -1053,6 +1557,8 @@ impl ApplicationHandler for App {
                         settings_tab: self.settings_active_tab,
                         settings_font_value: &self.settings_font_value,
                         settings_scroll_value: &self.settings_scroll_value,
+                        settings_background_input: &mut self.settings_background_input,
+                        settings_background_editing: self.settings_background_editing,
                     }))
                 } else {
                     None
@@ -1078,7 +1584,11 @@ impl ApplicationHandler for App {
                                 self.terminal_tab_scroll.animate_to(target);
                             }
                         }
+                        self.refresh_cursor_icon();
                         self.sync_animation_state();
+                        if !self.focused {
+                            self.unfocused_redraw_pending = false;
+                        }
                         self.dirty = false;
                     }
                     Some(Err(error)) => {
@@ -1245,7 +1755,7 @@ mod tests {
         let renderer = include_str!("renderer/terminal_ui.rs");
 
         assert_eq!(production.matches("Terminal::spawn(").count(), 1);
-        assert_eq!(production.matches("self.add_terminal()").count(), 3);
+        assert_eq!(production.matches("self.add_terminal()").count(), 4);
         assert!(production.contains("GlobalShortcut::NewTab"));
         assert!(production.contains("TerminalTabHit::Add"));
 
@@ -1379,6 +1889,18 @@ mod tests {
     }
 
     #[test]
+    fn external_launch_action_depends_only_on_current_focus() {
+        assert_eq!(
+            external_launch_action(true),
+            ExternalLaunchAction::OpenDefaultTab
+        );
+        assert_eq!(
+            external_launch_action(false),
+            ExternalLaunchAction::ActivateExistingWindow
+        );
+    }
+
+    #[test]
     fn focus_reporting_uses_xterm_sequences_only_when_enabled() {
         assert_eq!(terminal_focus_report_sequence(false, true), None);
         assert_eq!(terminal_focus_report_sequence(false, false), None);
@@ -1436,6 +1958,420 @@ mod tests {
         app.apply_settings_hit(SettingsHit::Tab(SettingsTab::Help));
         assert!(!app.config_dirty);
         assert!(!app.dirty);
+    }
+
+    #[test]
+    fn settings_resets_change_only_their_own_config_value() {
+        let custom = AppConfig {
+            terminal_font_size: 22.0,
+            scroll_sensitivity: 2.25,
+            terminal_background: RgbColor::new(0x11, 0x22, 0x33),
+            ..AppConfig::default()
+        };
+
+        let mut font_app = App::from_config(custom.clone());
+        font_app.apply_settings_hit(SettingsHit::FontReset);
+        assert_eq!(
+            font_app.config.terminal_font_size,
+            DEFAULT_TERMINAL_FONT_SIZE
+        );
+        assert_eq!(
+            font_app.config.scroll_sensitivity,
+            custom.scroll_sensitivity
+        );
+        assert_eq!(
+            font_app.config.terminal_background,
+            custom.terminal_background
+        );
+
+        let mut scroll_app = App::from_config(custom.clone());
+        scroll_app.apply_settings_hit(SettingsHit::ScrollReset);
+        assert_eq!(
+            scroll_app.config.terminal_font_size,
+            custom.terminal_font_size
+        );
+        assert_eq!(
+            scroll_app.config.scroll_sensitivity,
+            DEFAULT_SCROLL_SENSITIVITY
+        );
+        assert_eq!(
+            scroll_app.config.terminal_background,
+            custom.terminal_background
+        );
+
+        let mut background_app = App::from_config(custom.clone());
+        background_app.apply_settings_hit(SettingsHit::BackgroundReset);
+        assert_eq!(
+            background_app.config.terminal_font_size,
+            custom.terminal_font_size
+        );
+        assert_eq!(
+            background_app.config.scroll_sensitivity,
+            custom.scroll_sensitivity
+        );
+        assert_eq!(
+            background_app.config.terminal_background,
+            DEFAULT_TERMINAL_BACKGROUND
+        );
+        assert_eq!(
+            background_app.settings_background_input.text,
+            DEFAULT_TERMINAL_BACKGROUND.to_hex()
+        );
+    }
+
+    #[test]
+    fn settings_outside_click_closes_but_empty_modal_space_and_controls_do_not() {
+        let mut app = App::new();
+        app.toggle_settings();
+        assert!(app.settings_open);
+        app.apply_settings_hit(SettingsHit::None);
+        assert!(app.settings_open);
+        app.apply_settings_hit(SettingsHit::FontReset);
+        assert!(app.settings_open);
+        app.apply_settings_hit(SettingsHit::Outside);
+        assert!(!app.settings_open);
+    }
+
+    #[test]
+    fn settings_outside_click_discards_incomplete_hex_but_keeps_last_valid_commit() {
+        let mut app = App::new();
+        app.toggle_settings();
+        app.apply_settings_hit(SettingsHit::BackgroundField);
+        app.settings_background_input.select_all();
+        assert!(app.edit_settings_background_text("#112233"));
+        assert_eq!(
+            app.config.terminal_background,
+            RgbColor::new(0x11, 0x22, 0x33)
+        );
+
+        app.settings_background_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None,));
+        assert_eq!(app.settings_background_input.text, "");
+        assert_eq!(
+            app.config.terminal_background,
+            RgbColor::new(0x11, 0x22, 0x33)
+        );
+
+        app.apply_settings_hit(SettingsHit::Outside);
+        assert!(!app.settings_open);
+        assert!(!app.settings_background_editing);
+        assert_eq!(app.settings_background_input.text, "#112233");
+        assert_eq!(
+            app.config.terminal_background,
+            RgbColor::new(0x11, 0x22, 0x33)
+        );
+    }
+
+    #[test]
+    fn settings_hex_editor_keeps_invalid_drafts_uncommitted_and_canonicalizes_valid_input() {
+        let mut app = App::new();
+        let original = app.config.terminal_background;
+        app.apply_settings_hit(SettingsHit::BackgroundField);
+        app.settings_background_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None,));
+        assert!(app.edit_settings_background_text("#12"));
+        assert_eq!(app.settings_background_input.text, "#12");
+        assert_eq!(app.config.terminal_background, original);
+
+        assert!(app.edit_settings_background_text("aBcF"));
+        assert_eq!(app.settings_background_input.text, "#12ABCF");
+        assert_eq!(
+            app.config.terminal_background,
+            RgbColor::new(0x12, 0xAB, 0xCF)
+        );
+        assert!(app.config_dirty);
+    }
+
+    #[test]
+    fn settings_hex_editor_keyboard_selection_copy_cut_paste_and_navigation_are_shared() {
+        let mut input = SingleLineInput::from_text("#12ABCF");
+        let left = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::ArrowLeft),
+            None,
+            false,
+            false,
+            true,
+            None,
+        );
+        assert!(left.visual_changed);
+        let select = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::ArrowLeft),
+            None,
+            false,
+            true,
+            true,
+            None,
+        );
+        assert!(select.visual_changed);
+        assert_eq!(input.selected_text().as_deref(), Some("C"));
+
+        let copy = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::KeyC),
+            None,
+            true,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(copy.copy_text.as_deref(), Some("C"));
+        assert!(!copy.text_changed);
+
+        let cut = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::KeyX),
+            None,
+            true,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(cut.copy_text.as_deref(), Some("C"));
+        assert!(cut.text_changed);
+        assert_eq!(input.text, "#12ABF");
+
+        let paste = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::KeyV),
+            None,
+            true,
+            false,
+            false,
+            Some("c"),
+        );
+        assert!(paste.text_changed);
+        assert_eq!(input.text, "#12ABCF");
+
+        let home = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::Home),
+            None,
+            false,
+            false,
+            true,
+            None,
+        );
+        assert!(home.visual_changed);
+        assert_eq!(input.cursor, 0);
+        let end_select = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::End),
+            None,
+            false,
+            true,
+            true,
+            None,
+        );
+        assert!(end_select.visual_changed);
+        assert_eq!(input.selection(), Some((0, 7)));
+        let select_all = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::KeyA),
+            None,
+            true,
+            false,
+            false,
+            None,
+        );
+        assert!(select_all.consumed);
+        assert_eq!(input.selection(), Some((0, 7)));
+    }
+
+    #[test]
+    fn settings_hex_editor_valid_paste_commits_canonical_background() {
+        let mut app = App::new();
+        app.apply_settings_hit(SettingsHit::BackgroundField);
+        app.settings_background_input.select_all();
+        let outcome = settings_background_editor_key(
+            &mut app.settings_background_input,
+            PhysicalKey::Code(KeyCode::KeyV),
+            None,
+            true,
+            false,
+            false,
+            Some("#a1b2c3"),
+        );
+        assert!(outcome.text_changed);
+        app.apply_valid_settings_background_draft();
+        assert_eq!(app.settings_background_input.text, "#A1B2C3");
+        assert_eq!(
+            app.config.terminal_background,
+            RgbColor::new(0xA1, 0xB2, 0xC3)
+        );
+    }
+
+    #[test]
+    fn settings_hex_editor_rejects_invalid_or_oversized_paste_and_accepts_incomplete_draft() {
+        let mut input = SingleLineInput::from_text("#282A36");
+        input.select_all();
+        let invalid = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::KeyV),
+            None,
+            true,
+            false,
+            false,
+            Some("#12GG34"),
+        );
+        assert!(!invalid.text_changed);
+        assert_eq!(input.text, "#282A36");
+        let oversized = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::KeyV),
+            None,
+            true,
+            false,
+            false,
+            Some("#1234567"),
+        );
+        assert!(!oversized.text_changed);
+        assert_eq!(input.text, "#282A36");
+
+        let incomplete = settings_background_editor_key(
+            &mut input,
+            PhysicalKey::Code(KeyCode::KeyV),
+            None,
+            true,
+            false,
+            false,
+            Some("#12"),
+        );
+        assert!(incomplete.text_changed);
+        assert_eq!(input.text, "#12");
+        assert_eq!(RgbColor::parse_hex(&input.text), None);
+    }
+
+    #[test]
+    fn settings_hex_mouse_drag_places_caret_and_selects_in_both_directions() {
+        let mut input = SingleLineInput::from_text("#123456");
+        assert!(begin_settings_background_pointer_selection(&mut input, 2));
+        assert_eq!(input.cursor, 2);
+        assert_eq!(input.selection_anchor, Some(2));
+        assert!(update_settings_background_pointer_selection(&mut input, 6));
+        assert_eq!(input.selection(), Some((2, 6)));
+        assert!(update_settings_background_pointer_selection(&mut input, 1));
+        assert_eq!(input.selection(), Some((1, 2)));
+    }
+
+    #[test]
+    fn settings_hex_backspace_delete_enter_and_reset_obey_commit_contract() {
+        let mut app = App::from_config(AppConfig {
+            terminal_background: RgbColor::new(0x11, 0x22, 0x33),
+            ..AppConfig::default()
+        });
+        app.apply_settings_hit(SettingsHit::BackgroundField);
+        app.settings_background_input.move_cursor(1, false);
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Delete), None,));
+        assert_eq!(app.settings_background_input.text, "#12233");
+        assert_eq!(
+            app.config.terminal_background,
+            RgbColor::new(0x11, 0x22, 0x33)
+        );
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None,));
+        assert_eq!(app.settings_background_input.text, "12233");
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Enter), None,));
+        assert!(!app.settings_background_editing);
+        assert_eq!(app.settings_background_input.text, "#112233");
+
+        app.apply_settings_hit(SettingsHit::BackgroundField);
+        app.settings_background_input.select_all();
+        let _ = app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None);
+        app.apply_settings_hit(SettingsHit::BackgroundReset);
+        assert_eq!(app.config.terminal_background, DEFAULT_TERMINAL_BACKGROUND);
+        assert_eq!(
+            app.settings_background_input.text,
+            DEFAULT_TERMINAL_BACKGROUND.to_hex()
+        );
+        assert_eq!(app.settings_background_input.selection(), None);
+    }
+
+    #[test]
+    fn settings_scroll_buttons_use_tenth_steps_and_stable_display() {
+        let mut app = App::new();
+        app.apply_settings_hit(SettingsHit::ScrollIncrease);
+        assert!((app.config.scroll_sensitivity - 1.1).abs() < 0.0001);
+        assert_eq!(app.settings_scroll_value, "1.10");
+        app.apply_settings_hit(SettingsHit::ScrollDecrease);
+        assert!((app.config.scroll_sensitivity - 1.0).abs() < 0.0001);
+        assert_eq!(app.settings_scroll_value, "1.00");
+    }
+
+    #[test]
+    fn settings_and_tab_cursor_policy_prioritizes_modal_and_caches_identical_icon() {
+        assert_eq!(
+            ui_cursor_icon(
+                true,
+                SettingsHit::BackgroundField,
+                false,
+                TerminalTabHit::Add,
+                false
+            ),
+            CursorIcon::Text
+        );
+        assert_eq!(
+            ui_cursor_icon(true, SettingsHit::None, false, TerminalTabHit::Add, false),
+            CursorIcon::Default
+        );
+        assert_eq!(
+            ui_cursor_icon(
+                false,
+                SettingsHit::None,
+                false,
+                TerminalTabHit::Close(0),
+                false
+            ),
+            CursorIcon::Pointer
+        );
+        assert_eq!(
+            ui_cursor_icon(false, SettingsHit::None, false, TerminalTabHit::Add, false),
+            CursorIcon::Pointer
+        );
+        assert_eq!(
+            ui_cursor_icon(
+                false,
+                SettingsHit::None,
+                false,
+                TerminalTabHit::Body(0),
+                false
+            ),
+            CursorIcon::Default
+        );
+        assert_eq!(
+            ui_cursor_icon(
+                true,
+                SettingsHit::Outside,
+                true,
+                TerminalTabHit::None,
+                false
+            ),
+            CursorIcon::Text
+        );
+        assert_eq!(
+            cursor_icon_change(CursorIcon::Pointer, CursorIcon::Pointer),
+            None
+        );
+        assert_eq!(
+            cursor_icon_change(CursorIcon::Pointer, CursorIcon::Default),
+            Some(CursorIcon::Default)
+        );
+    }
+
+    #[test]
+    fn focus_loss_marks_one_unfocused_frame_dirty_for_separator_redraw() {
+        let mut app = App::new();
+        app.dirty = false;
+        app.handle_focus_changed(false);
+        assert!(!app.focused);
+        assert!(app.unfocused_redraw_pending);
+        assert!(app.dirty);
+
+        app.dirty = false;
+        app.handle_focus_changed(true);
+        assert!(app.focused);
+        assert!(!app.unfocused_redraw_pending);
+        assert!(app.dirty);
     }
 
     #[test]
@@ -1536,6 +2472,56 @@ mod tests {
             .find("self.settings_open = !self.settings_open;")
             .expect("settings toggle must activate the modal");
         assert!(cancel < activate_modal);
+    }
+
+    #[test]
+    fn active_terminal_selection_clear_helper_removes_manual_selection() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 30, 1));
+        crate::platform::lock_recover(&app.terminals[0].grid).selection = Some((1, 2, 5, 2));
+
+        assert!(app.clear_active_terminal_text_selection());
+        assert!(
+            crate::platform::lock_recover(&app.terminals[0].grid)
+                .selection
+                .is_none()
+        );
+        assert!(!app.clear_active_terminal_text_selection());
+    }
+
+    #[test]
+    fn left_press_clear_and_cursor_leave_are_routed_before_ui_short_circuits() {
+        let source = include_str!("app.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let mouse = production
+            .split("            WindowEvent::MouseInput { state, button, .. } => {")
+            .nth(1)
+            .and_then(|tail| tail.split("            WindowEvent::MouseWheel").next())
+            .expect("mouse input routing must remain present");
+        let clear = mouse
+            .find("self.clear_active_terminal_text_selection()")
+            .expect("left press must clear stale terminal selection");
+        let settings = mouse
+            .find("if self.settings_modal_active()")
+            .expect("settings routing must remain present");
+        let tabs = mouse
+            .find("terminal_tab_hit_test")
+            .expect("tab routing must remain present");
+        assert!(clear < settings);
+        assert!(clear < tabs);
+
+        let moved = production
+            .split("            WindowEvent::CursorMoved { position, .. } => {")
+            .nth(1)
+            .and_then(|tail| tail.split("            WindowEvent::CursorLeft").next())
+            .expect("cursor moved routing must remain present");
+        assert!(moved.contains("!self.interaction.terminal_selection_active()"));
+        let left = production
+            .split("            WindowEvent::CursorLeft { .. } => {")
+            .nth(1)
+            .and_then(|tail| tail.split("            WindowEvent::MouseInput").next())
+            .expect("cursor leave routing must remain present");
+        assert!(left.contains(".cursor_left(size.width as f32, size.height as f32, terminal)"));
     }
 
     #[test]

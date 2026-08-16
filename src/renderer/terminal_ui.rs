@@ -1,5 +1,6 @@
 use super::*;
 use crate::scroll::{ScrollbarThumb, scrollbar_drag_target, scrollbar_thumb};
+use crate::single_line_input::SingleLineInput;
 use crate::search::{
     Rect, SearchRefreshCause, TerminalSearchGeometry, TerminalSearchState, terminal_search_geometry,
 };
@@ -132,6 +133,26 @@ fn terminal_focus_separator_rect(body: Rect, scale: f32) -> Option<Rect> {
         w: body.w,
         h,
     })
+}
+
+#[inline]
+fn terminal_focus_separator_color(accent: [f32; 4], focused: bool) -> [f32; 4] {
+    if focused {
+        [accent[0], accent[1], accent[2], 1.0]
+    } else {
+        [accent[0] * 0.45, accent[1] * 0.45, accent[2] * 0.45, 1.0]
+    }
+}
+
+#[inline]
+fn terminal_tab_surface_color(background: [f32; 4], active: bool, hovered: bool) -> [f32; 4] {
+    let lift = 0.026 + if active { 0.010 } else { 0.0 } + if hovered { 0.018 } else { 0.0 };
+    [
+        (background[0] + lift).clamp(0.0, 1.0),
+        (background[1] + lift).clamp(0.0, 1.0),
+        (background[2] + lift).clamp(0.0, 1.0),
+        1.0,
+    ]
 }
 
 #[inline]
@@ -324,16 +345,23 @@ const SETTINGS_HELP_ENTRIES: [SettingsHelpEntry; 5] = [
 const SETTINGS_TITLE: &str = "Настройки";
 const SETTINGS_FONT_LABEL: &str = "Размер шрифта";
 const SETTINGS_SCROLL_LABEL: &str = "Чувствительность прокрутки";
+const SETTINGS_BACKGROUND_LABEL: &str = "Цвет фона";
+const SETTINGS_RESET_LABEL: &str = "Сбросить";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SettingsHit {
     #[default]
     None,
+    Outside,
     Tab(SettingsTab),
     FontDecrease,
     FontIncrease,
+    FontReset,
     ScrollDecrease,
     ScrollIncrease,
+    ScrollReset,
+    BackgroundField,
+    BackgroundReset,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -350,6 +378,17 @@ struct SettingsRowLayout {
     value: SettingsLine,
     value_max_x: f32,
     plus: Rect,
+    reset: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsBackgroundRowLayout {
+    label: SettingsLine,
+    label_max_x: f32,
+    field: Rect,
+    value: SettingsLine,
+    value_max_x: f32,
+    reset: Rect,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -373,17 +412,22 @@ struct SettingsLayout {
     modal: Rect,
     inner: Option<Rect>,
     divider: Option<Rect>,
+    content_render_clip: Option<Rect>,
     content_clip: Option<Rect>,
     content_body: Option<Rect>,
     tabs: [Option<Rect>; SETTINGS_TABS.len()],
     title: Option<SettingsLine>,
     font: Option<SettingsRowLayout>,
     scroll: Option<SettingsRowLayout>,
+    background: Option<SettingsBackgroundRowLayout>,
     help: [Option<SettingsHelpRowLayout>; SETTINGS_HELP_ENTRIES.len()],
 }
 
 impl SettingsLayout {
     fn hit_test(self, x: f32, y: f32) -> SettingsHit {
+        if !self.modal.contains(x, y) {
+            return SettingsHit::Outside;
+        }
         for (index, spec) in SETTINGS_TABS.iter().enumerate() {
             if self.tabs[index].is_some_and(|rect| rect.contains(x, y)) {
                 return SettingsHit::Tab(spec.tab);
@@ -396,6 +440,9 @@ impl SettingsLayout {
             if row.plus.contains(x, y) {
                 return SettingsHit::FontIncrease;
             }
+            if row.reset.contains(x, y) {
+                return SettingsHit::FontReset;
+            }
         }
         if let Some(row) = self.scroll {
             if row.minus.contains(x, y) {
@@ -403,6 +450,17 @@ impl SettingsLayout {
             }
             if row.plus.contains(x, y) {
                 return SettingsHit::ScrollIncrease;
+            }
+            if row.reset.contains(x, y) {
+                return SettingsHit::ScrollReset;
+            }
+        }
+        if let Some(row) = self.background {
+            if row.field.contains(x, y) {
+                return SettingsHit::BackgroundField;
+            }
+            if row.reset.contains(x, y) {
+                return SettingsHit::BackgroundReset;
             }
         }
         SettingsHit::None
@@ -448,14 +506,21 @@ fn settings_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsRowLa
     let button = (30.0 * scale).round().max(1.0);
     let gap = (8.0 * scale).round().max(1.0);
     let value_w = (72.0 * scale).round().max(1.0);
-    let control_w = button * 2.0 + value_w + gap * 2.0;
+    let reset_w = (86.0 * scale).round().max(1.0);
+    let control_w = button * 2.0 + value_w + reset_w + gap * 3.0;
     let label_room = (64.0 * scale).round().max(1.0);
     if clip.w < control_w + label_room || top < clip.y || top + button > clip.y + clip.h {
         return None;
     }
 
+    let reset = Rect {
+        x: (clip.x + clip.w - reset_w).round(),
+        y: top.round(),
+        w: reset_w,
+        h: button,
+    };
     let plus = Rect {
-        x: (clip.x + clip.w - button).round(),
+        x: (reset.x - gap - button).round(),
         y: top.round(),
         w: button,
         h: button,
@@ -476,12 +541,77 @@ fn settings_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsRowLa
         label_max_x: (minus.x - gap).round(),
         minus,
         value: SettingsLine {
-            x: (value_x + 8.0 * scale).round(),
+            x: value_x.round(),
             baseline_y,
         },
         value_max_x: (plus.x - gap).round(),
         plus,
+        reset,
     })
+}
+
+#[inline]
+fn centered_settings_value_x(left: f32, right: f32, measured_width: f32) -> f32 {
+    let width = measured_width.max(0.0).min((right - left).max(0.0));
+    (left + ((right - left - width).max(0.0) * 0.5))
+        .round()
+        .clamp(left, (right - width).max(left))
+}
+
+fn settings_background_row_layout(
+    clip: Rect,
+    top: f32,
+    scale: f32,
+) -> Option<SettingsBackgroundRowLayout> {
+    let row_h = (30.0 * scale).round().max(1.0);
+    let gap = (8.0 * scale).round().max(1.0);
+    let field_w = (128.0 * scale).round().max(1.0);
+    let reset_w = (86.0 * scale).round().max(1.0);
+    let control_w = field_w + reset_w + gap;
+    let label_room = (64.0 * scale).round().max(1.0);
+    if clip.w < control_w + label_room || top < clip.y || top + row_h > clip.y + clip.h {
+        return None;
+    }
+
+    let reset = Rect {
+        x: (clip.x + clip.w - reset_w).round(),
+        y: top.round(),
+        w: reset_w,
+        h: row_h,
+    };
+    let field = Rect {
+        x: (reset.x - gap - field_w).round(),
+        y: top.round(),
+        w: field_w,
+        h: row_h,
+    };
+    let baseline_y = (top + row_h * 0.70).round();
+    Some(SettingsBackgroundRowLayout {
+        label: SettingsLine {
+            x: clip.x.round(),
+            baseline_y,
+        },
+        label_max_x: (field.x - gap).round(),
+        field,
+        value: SettingsLine {
+            x: (field.x + 10.0 * scale).round(),
+            baseline_y,
+        },
+        value_max_x: (field.x + field.w - 8.0 * scale).round(),
+        reset,
+    })
+}
+
+#[inline]
+fn settings_background_text_viewport(row: SettingsBackgroundRowLayout, scale: f32) -> Rect {
+    let left = (row.field.x + 10.0 * scale).round();
+    let right = (row.field.x + row.field.w - 8.0 * scale).round().max(left);
+    Rect {
+        x: left,
+        y: row.field.y,
+        w: (right - left).max(0.0),
+        h: row.field.h,
+    }
 }
 
 fn settings_help_row_layout(
@@ -604,6 +734,12 @@ fn settings_layout(
 
     let pane_left = (divider.x + divider.w).min(inner.x + inner.w);
     let pane_w = (inner.x + inner.w - pane_left).max(0.0);
+    let content_render_clip = Rect {
+        x: pane_left,
+        y: inner.y,
+        w: pane_w,
+        h: inner.h,
+    };
     let content_left_gap = (30.0 * scale).min(pane_w * 0.20).max(0.0);
     let content_right_gap = (18.0 * scale)
         .min((pane_w - content_left_gap).max(0.0) * 0.20)
@@ -621,6 +757,7 @@ fn settings_layout(
             modal,
             inner: Some(inner),
             divider: Some(divider),
+            content_render_clip: Some(content_render_clip),
             tabs,
             ..SettingsLayout::default()
         };
@@ -643,6 +780,7 @@ fn settings_layout(
 
     let mut font = None;
     let mut scroll = None;
+    let mut background = None;
     let mut help = [None; SETTINGS_HELP_ENTRIES.len()];
     match active_tab {
         SettingsTab::General => {
@@ -650,6 +788,8 @@ fn settings_layout(
             let row_gap = (54.0 * scale).round().max(1.0);
             font = settings_row_layout(content_body, first_top, scale);
             scroll = settings_row_layout(content_body, first_top + row_gap, scale);
+            background =
+                settings_background_row_layout(content_body, first_top + row_gap * 2.0, scale);
         }
         SettingsTab::Help => {
             for (index, slot) in help.iter_mut().enumerate() {
@@ -662,12 +802,14 @@ fn settings_layout(
         modal,
         inner: Some(inner),
         divider: Some(divider),
+        content_render_clip: Some(content_render_clip),
         content_clip: Some(content_clip),
         content_body: Some(content_body),
         tabs,
         title,
         font,
         scroll,
+        background,
         help,
     }
 }
@@ -747,8 +889,8 @@ pub(crate) fn visible_row_range(
     let bottom = total_lines
         .saturating_sub(1)
         .saturating_sub(scrolled_lines.min(total_lines.saturating_sub(1)));
-    let start = bottom.saturating_sub(visible_rows);
-    let end = (bottom + 1).min(total_lines);
+    let start = bottom.saturating_sub(visible_rows.saturating_add(1));
+    let end = bottom.saturating_add(2).min(total_lines);
     start..end
 }
 
@@ -804,6 +946,15 @@ pub(crate) fn terminal_scrollbar_drag_target(
     Some((offset, layout.max_scroll - scroll_from_top))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalBodyLayer {
+    Background,
+    Glyph,
+}
+
+const TERMINAL_BODY_LAYERS: [TerminalBodyLayer; 2] =
+    [TerminalBodyLayer::Background, TerminalBodyLayer::Glyph];
+
 fn terminal_glyph_anchor(
     c: char,
     glyph: GlyphInfo,
@@ -828,6 +979,26 @@ fn terminal_glyph_anchor(
     let x = cell_x + (cell_w - fitted_w) * 0.5 - glyph.offset_x * fit_scale;
     let y = cell_y + (cell_h - fitted_h) * 0.5 + glyph.offset_y * fit_scale;
     (x, y, fit_scale)
+}
+
+fn terminal_glyph_cell_geometry(
+    text_x: f32,
+    cell_index: usize,
+    cell: &Cell,
+    char_w: f32,
+) -> Option<(f32, f32)> {
+    if cell.c == ' ' || cell.is_wide_spacer() {
+        return None;
+    }
+    let (x, next_x) = terminal_cell_x_bounds(text_x, cell_index, char_w);
+    let cell_w = (next_x - x).max(1.0);
+    let glyph_cell_w = if cell.is_wide() {
+        let (_, wide_x2) = terminal_cell_span_x_bounds(text_x, cell_index, 2, char_w);
+        (wide_x2 - x).max(1.0)
+    } else {
+        cell_w
+    };
+    Some((x, glyph_cell_w))
 }
 
 #[inline]
@@ -885,26 +1056,6 @@ fn terminal_cell_render_colors(
         foreground = terminal_dim_color(foreground);
     }
     (foreground, background)
-}
-
-#[inline]
-fn terminal_underline_rect(
-    text_x: f32,
-    cell_index: usize,
-    width_cells: usize,
-    char_w: f32,
-    draw_y: f32,
-    char_h: f32,
-    scale: f32,
-) -> Rect {
-    let (x1, x2) = terminal_cell_span_x_bounds(text_x, cell_index, width_cells, char_w);
-    let height = scale.round().max(1.0);
-    Rect {
-        x: x1,
-        y: (draw_y + char_h - height).round(),
-        w: (x2 - x1).max(1.0),
-        h: height,
-    }
 }
 
 #[inline]
@@ -1087,8 +1238,25 @@ impl Renderer {
         self.ascii_advances[b'A' as usize].max(1.0) * TERMINAL_TEXT_SCALE
     }
 
-    fn search_text_advance(&mut self, c: char, text_scale: f32) -> f32 {
+    fn one_line_text_advance(&mut self, c: char, text_scale: f32) -> f32 {
         self.one_line_ui_char_layout(c, text_scale).1
+    }
+
+    fn one_line_cursor_from_input_x(
+        &mut self,
+        text: &str,
+        x: f32,
+        scroll_x: f32,
+        text_scale: f32,
+    ) -> usize {
+        let target = (x + scroll_x).max(0.0);
+        let mut chars = text.chars();
+        let advances = std::iter::from_fn(|| {
+            chars
+                .next()
+                .map(|c| self.one_line_text_advance(c, text_scale))
+        });
+        one_line_cursor_from_advances(advances, target)
     }
 
     pub(crate) fn terminal_cursor_from_input_x(
@@ -1097,36 +1265,32 @@ impl Renderer {
         x: f32,
         scroll_x: f32,
     ) -> usize {
-        let target = (x + scroll_x).max(0.0);
-        let mut chars = text.chars();
-        let advances = std::iter::from_fn(|| {
-            chars.next().map(|c| self.search_text_advance(c, 1.0))
-        });
-        one_line_cursor_from_advances(advances, target)
+        self.one_line_cursor_from_input_x(text, x, scroll_x, 1.0)
     }
 
-    fn search_text_metrics(&mut self, text: &str, cursor: usize) -> (f32, f32) {
+    fn one_line_text_metrics(&mut self, text: &str, cursor: usize, text_scale: f32) -> (f32, f32) {
         let mut chars = text.chars();
         let advances = std::iter::from_fn(|| {
-            chars.next().map(|c| self.search_text_advance(c, 1.0))
+            chars
+                .next()
+                .map(|c| self.one_line_text_advance(c, text_scale))
         });
         one_line_metrics_from_advances(advances, cursor)
     }
 
-    fn search_cursor_px(&mut self, text: &str, cursor: usize) -> f32 {
-        self.search_text_metrics(text, cursor).0
+    fn one_line_cursor_px(&mut self, text: &str, cursor: usize, text_scale: f32) -> f32 {
+        self.one_line_text_metrics(text, cursor, text_scale).0
     }
 
-    fn search_selection_px(&mut self, search: &TerminalSearchState) -> Option<(f32, f32)> {
-        let anchor = search.selection_anchor?;
-        if anchor == search.cursor {
-            return None;
-        }
-        let start = anchor.min(search.cursor);
-        let end = anchor.max(search.cursor);
+    fn one_line_selection_px(
+        &mut self,
+        input: &SingleLineInput,
+        text_scale: f32,
+    ) -> Option<(f32, f32)> {
+        let (start, end) = input.selection()?;
         Some((
-            self.search_cursor_px(&search.query, start),
-            self.search_cursor_px(&search.query, end),
+            self.one_line_cursor_px(&input.text, start, text_scale),
+            self.one_line_cursor_px(&input.text, end, text_scale),
         ))
     }
 
@@ -1190,7 +1354,7 @@ impl Renderer {
             );
 
             let (cursor_px, total_text_width) =
-                self.search_text_metrics(&search.query, search.cursor);
+                self.one_line_text_metrics(&search.text, search.cursor, 1.0);
             let horizontal_padding = (5.0 * s).round();
             search.scroll_x = one_line_scroll_for_metrics(
                 cursor_px,
@@ -1211,7 +1375,8 @@ impl Renderer {
                 geometry.text_viewport_w.round().max(0.0),
                 geometry.input.h.round().max(1.0),
             );
-            if let Some((selection_start, selection_end)) = self.search_selection_px(search) {
+            if let Some((selection_start, selection_end)) = self.one_line_selection_px(search, 1.0)
+            {
                 self.push_rounded_rect(
                     (text_x + selection_start).round(),
                     selection_y,
@@ -1221,7 +1386,7 @@ impl Renderer {
                     palette.accent,
                 );
             }
-            self.draw_ui_text(&search.query, text_x, baseline, palette.fg, 1.0);
+            self.draw_ui_text(&search.text, text_x, baseline, palette.fg, 1.0);
             if search.focused && search.selection_anchor.is_none_or(|anchor| anchor == search.cursor) {
                 self.push_rounded_rect(
                     (text_x + cursor_px).round(),
@@ -1270,7 +1435,7 @@ impl Renderer {
             );
         }
 
-        if !search.query.is_empty() || !search.results.is_empty() {
+        if !search.text.is_empty() || !search.results.is_empty() {
             let mut counter = std::mem::take(&mut self.scratch_buffer);
             counter.clear();
             if search.results.is_empty() {
@@ -1433,15 +1598,7 @@ impl Renderer {
             let visible_body = clipped_rect(raw_body, strip);
             let hovered = visible_body.is_some_and(|rect| rect.contains(pointer_x, pointer_y));
             let active = idx == active_terminal;
-            let mut bg = self.palette.bg;
-            if hovered {
-                bg = [
-                    (bg[0] + 0.02).min(1.0),
-                    (bg[1] + 0.02).min(1.0),
-                    (bg[2] + 0.02).min(1.0),
-                    bg[3],
-                ];
-            }
+            let bg = terminal_tab_surface_color(self.palette.bg, active, hovered);
             self.push_rounded_rect(tab_x, strip.y, tab_w, strip.h, 0.0, bg);
             if idx + 1 < terminals.len() {
                 self.push_rounded_rect(
@@ -1560,6 +1717,8 @@ impl Renderer {
         pointer_y: f32,
         font_value: &str,
         scroll_value: &str,
+        background_input: &mut SingleLineInput,
+        background_editing: bool,
     ) {
         let progress = progress.clamp(0.0, 1.0);
         if progress <= 0.0 {
@@ -1647,8 +1806,7 @@ impl Renderer {
         self.flush();
 
         let hovered = layout.hit_test(pointer_x, pointer_y);
-        if let Some(inner) = layout.inner {
-            self.set_clip(inner.x, inner.y, inner.w, inner.h);
+        if layout.inner.is_some() {
             for (index, spec) in SETTINGS_TABS.iter().enumerate() {
                 let Some(rect) = layout.tabs[index] else {
                     continue;
@@ -1681,17 +1839,19 @@ impl Renderer {
                 );
             }
             self.flush();
-            self.clear_clip();
         }
 
         let Some(content_clip) = layout.content_clip else {
             return;
         };
+        let Some(content_render_clip) = layout.content_render_clip else {
+            return;
+        };
         self.set_clip(
-            content_clip.x,
-            content_clip.y,
-            content_clip.w,
-            content_clip.h,
+            content_render_clip.x,
+            content_render_clip.y,
+            content_render_clip.w,
+            content_render_clip.h,
         );
 
         if let Some(title) = layout.title {
@@ -1741,6 +1901,7 @@ impl Renderer {
                         hovered,
                         SettingsHit::FontDecrease,
                         SettingsHit::FontIncrease,
+                        SettingsHit::FontReset,
                     );
                 }
                 if let Some(row) = layout.scroll {
@@ -1751,6 +1912,15 @@ impl Renderer {
                         hovered,
                         SettingsHit::ScrollDecrease,
                         SettingsHit::ScrollIncrease,
+                        SettingsHit::ScrollReset,
+                    );
+                }
+                if let Some(row) = layout.background {
+                    self.draw_settings_background_row(
+                        row,
+                        background_input,
+                        background_editing,
+                        hovered,
                     );
                 }
             }
@@ -1774,6 +1944,7 @@ impl Renderer {
         hovered: SettingsHit,
         minus_hit: SettingsHit,
         plus_hit: SettingsHit,
+        reset_hit: SettingsHit,
     ) {
         let s = self.scale_factor;
         let normal = [0.224, 0.231, 0.251, 1.0];
@@ -1795,6 +1966,14 @@ impl Renderer {
             radius,
             if hovered == plus_hit { hover } else { normal },
         );
+        self.push_rounded_rect(
+            row.reset.x,
+            row.reset.y,
+            row.reset.w,
+            row.reset.h,
+            radius,
+            if hovered == reset_hit { hover } else { normal },
+        );
         self.draw_ui_text_clipped(
             label,
             row.label.x,
@@ -1810,9 +1989,11 @@ impl Renderer {
             self.palette.fg,
             0.90,
         );
+        let value_width = self.terminal_ui_text_width(value, 0.90);
+        let value_x = centered_settings_value_x(row.value.x, row.value_max_x, value_width);
         self.draw_ui_text_clipped(
             value,
-            row.value.x,
+            value_x,
             row.value_max_x,
             row.value.baseline_y,
             self.palette.fg,
@@ -1825,6 +2006,123 @@ impl Renderer {
             self.palette.fg,
             0.90,
         );
+        self.draw_ui_text_clipped(
+            SETTINGS_RESET_LABEL,
+            (row.reset.x + 9.0 * s).round(),
+            (row.reset.x + row.reset.w - 7.0 * s).round(),
+            row.label.baseline_y,
+            self.palette.fg,
+            0.78,
+        );
+    }
+
+    fn draw_settings_background_row(
+        &mut self,
+        row: SettingsBackgroundRowLayout,
+        input: &mut SingleLineInput,
+        editing: bool,
+        hovered: SettingsHit,
+    ) {
+        let s = self.scale_factor;
+        let normal = [0.224, 0.231, 0.251, 1.0];
+        let hover = self.palette.accent_with_alpha(0.55);
+        let radius = (5.0 * s).round().max(1.0);
+        let field_border = if editing {
+            self.palette.accent
+        } else if hovered == SettingsHit::BackgroundField {
+            hover
+        } else {
+            [0.306, 0.319, 0.341, 1.0]
+        };
+        self.push_rounded_rect(
+            row.field.x - 1.0,
+            row.field.y - 1.0,
+            row.field.w + 2.0,
+            row.field.h + 2.0,
+            radius,
+            field_border,
+        );
+        self.push_rounded_rect(
+            row.field.x,
+            row.field.y,
+            row.field.w,
+            row.field.h,
+            radius,
+            [0.12, 0.13, 0.16, 1.0],
+        );
+        self.push_rounded_rect(
+            row.reset.x,
+            row.reset.y,
+            row.reset.w,
+            row.reset.h,
+            radius,
+            if hovered == SettingsHit::BackgroundReset {
+                hover
+            } else {
+                normal
+            },
+        );
+        self.draw_ui_text_clipped(
+            SETTINGS_BACKGROUND_LABEL,
+            row.label.x,
+            row.label_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        self.draw_ui_text_clipped(
+            SETTINGS_RESET_LABEL,
+            (row.reset.x + 9.0 * s).round(),
+            (row.reset.x + row.reset.w - 7.0 * s).round(),
+            row.label.baseline_y,
+            self.palette.fg,
+            0.78,
+        );
+
+        let viewport = settings_background_text_viewport(row, s);
+        let (cursor_px, total_text_width) =
+            self.one_line_text_metrics(&input.text, input.cursor, 0.90);
+        input.scroll_x = if editing {
+            one_line_scroll_for_metrics(cursor_px, total_text_width, viewport.w, input.scroll_x)
+        } else {
+            0.0
+        };
+        let text_x = (viewport.x - input.scroll_x.round()).round();
+        let selection_y = (row.field.y + 5.0 * s).round();
+        let selection_h = (row.field.h - 10.0 * s).round().max(1.0);
+
+        self.flush();
+        self.set_clip(viewport.x, viewport.y, viewport.w, viewport.h);
+        if editing
+            && let Some((selection_start, selection_end)) = self.one_line_selection_px(input, 0.90)
+        {
+            self.push_rounded_rect(
+                (text_x + selection_start).round(),
+                selection_y,
+                (selection_end - selection_start).round().max(1.0),
+                selection_h,
+                0.0,
+                self.palette.accent_with_alpha(0.75),
+            );
+        }
+        self.draw_ui_text(
+            &input.text,
+            text_x,
+            row.value.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        if editing && input.selection().is_none() {
+            self.push_rect(
+                (text_x + cursor_px).round(),
+                selection_y,
+                (1.0 * s).round().max(1.0),
+                selection_h,
+                self.palette.fg,
+            );
+        }
+        self.flush();
+        self.clear_clip();
     }
 
     fn draw_settings_help_row(&mut self, row: SettingsHelpRowLayout, entry: SettingsHelpEntry) {
@@ -1879,6 +2177,26 @@ impl Renderer {
             active_tab,
         )
         .hit_test(x, y)
+    }
+
+    pub(crate) fn settings_background_cursor_from_x(
+        &mut self,
+        progress: f32,
+        active_tab: SettingsTab,
+        text: &str,
+        x: f32,
+        scroll_x: f32,
+    ) -> Option<usize> {
+        let layout = settings_layout(
+            self.width,
+            self.height,
+            self.scale_factor,
+            progress,
+            active_tab,
+        );
+        let row = layout.background?;
+        let viewport = settings_background_text_viewport(row, self.scale_factor);
+        Some(self.one_line_cursor_from_input_x(text, x - viewport.x, scroll_x, 0.90))
     }
 
     pub(crate) fn terminal_tab_hit_test(&self, x: f32, y: f32) -> TerminalTabHit {
@@ -1960,9 +2278,16 @@ impl Renderer {
         settings_tab: SettingsTab,
         settings_font_value: &str,
         settings_scroll_value: &str,
+        settings_background_input: &mut SingleLineInput,
+        settings_background_editing: bool,
     ) -> TerminalUiLayout {
         let layout = if let Some(terminal) = terminals.get(active_terminal) {
-            self.render_terminal_body(terminal, search, focused && settings_progress <= 0.0)
+            self.render_terminal_body(
+                terminal,
+                search,
+                focused && settings_progress <= 0.0,
+                focused,
+            )
         } else {
             let palette = self.palette;
             unsafe {
@@ -1986,6 +2311,8 @@ impl Renderer {
             pointer_y,
             settings_font_value,
             settings_scroll_value,
+            settings_background_input,
+            settings_background_editing,
         );
         layout
     }
@@ -1994,7 +2321,8 @@ impl Renderer {
         &mut self,
         terminal: &Terminal,
         search: &mut TerminalSearchState,
-        focused: bool,
+        input_focused: bool,
+        window_focused: bool,
     ) -> TerminalUiLayout {
         let palette = self.palette;
         unsafe {
@@ -2034,103 +2362,158 @@ impl Renderer {
         self.flush();
         self.set_clip(body.x, body.y, body.w, body.h);
         if presentation_visible {
-            for i in visible_row_range(total_lines, visible_rows, scroll_offset, char_h) {
-                let draw_y = terminal_row_draw_y(
-                    body,
-                    bottom_pad,
-                    char_h,
-                    total_lines,
-                    i,
-                    scroll_offset,
-                );
-                if draw_y + char_h < body.y || draw_y > body.y + body.h {
-                    continue;
-                }
-                let row = if i < scrollback_len { &grid.scrollback[i] } else { &grid.lines[i - scrollback_len] };
-                let row_matches = if search.shown { search.row_matches(i) } else { &[] };
-                let active_search_match = search.active_match();
-                let mut row_match_index = 0usize;
-                for (cell_index, cell) in row.iter().take(grid.cols).enumerate() {
-                    let (x, next_x) = terminal_cell_x_bounds(text_x, cell_index, char_w);
-                    let cell_w = (next_x - x).max(1.0);
-                    let logical_cell_index = if cell.is_wide_spacer() {
-                        cell_index.saturating_sub(1)
+            let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
+            for layer in TERMINAL_BODY_LAYERS {
+                for i in visible_range.clone() {
+                    let draw_y = terminal_row_draw_y(
+                        body,
+                        bottom_pad,
+                        char_h,
+                        total_lines,
+                        i,
+                        scroll_offset,
+                    );
+                    let row = if i < scrollback_len {
+                        &grid.scrollback[i]
                     } else {
-                        cell_index
+                        &grid.lines[i - scrollback_len]
                     };
-                    let (fg, mut bg) = terminal_cell_render_colors(cell, palette);
-                    if let Some((sx, sy, ex, ey)) = grid.selection {
-                        let (start_x, start_y, end_x, end_y) = normalized_selection_bounds(sx, sy, ex, ey);
-                        let selected = if i > start_y && i < end_y { true }
-                            else if i == start_y && i == end_y { logical_cell_index >= start_x && logical_cell_index <= end_x }
-                            else if i == start_y { logical_cell_index >= start_x }
-                            else if i == end_y { logical_cell_index <= end_x }
-                            else { false };
-                        if selected { bg = Some(palette.accent); }
-                    }
-                    while row_match_index < row_matches.len()
-                        && row_matches[row_match_index].end_x < logical_cell_index
-                    {
-                        row_match_index += 1;
-                    }
-                    if let Some(item) = row_matches.get(row_match_index) {
-                        if logical_cell_index >= item.start_x && logical_cell_index <= item.end_x {
-                            let active = active_search_match.is_some_and(|active| active == *item);
-                            bg = Some(if active { SEARCH_ACTIVE } else { SEARCH_MATCH });
-                        }
-                    }
-                    if let Some(color) = bg {
-                        self.push_rect(x, draw_y, cell_w, char_h, color);
-                    }
-                    if cell.c != ' ' && !cell.is_wide_spacer() {
-                        let glyph_cell_w = if cell.is_wide() {
-                            let (_, wide_x2) =
-                                terminal_cell_span_x_bounds(text_x, cell_index, 2, char_w);
-                            (wide_x2 - x).max(1.0)
-                        } else {
-                            cell_w
-                        };
-                        if let Some(glyph) = self.terminal_glyph(cell.c, cell.presentation) {
-                            let baseline = draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
-                            let (gx, gy, gs) = terminal_glyph_anchor(cell.c, glyph, x, draw_y, glyph_cell_w, char_h, baseline, TERMINAL_TEXT_SCALE);
-                            let (qx, qy, qw, qh) = glyph_quad_rect(gx, gy, glyph, gs);
-                            self.push_quad(qx, qy, qw, qh, glyph.u, glyph.v, glyph.uw, glyph.vh, fg, glyph.mode, [0.0, 0.0, 0.0]);
-                        }
-                        for &extra in cell.zero_width() {
-                            if !terminal_should_render_zero_width(extra) {
-                                continue;
+                    match layer {
+                        TerminalBodyLayer::Background => {
+                            let row_matches = if search.shown {
+                                search.row_matches(i)
+                            } else {
+                                &[]
+                            };
+                            let active_search_match = search.active_match();
+                            let mut row_match_index = 0usize;
+                            for (cell_index, cell) in row.iter().take(grid.cols).enumerate() {
+                                let (x, next_x) =
+                                    terminal_cell_x_bounds(text_x, cell_index, char_w);
+                                let cell_w = (next_x - x).max(1.0);
+                                let logical_cell_index = if cell.is_wide_spacer() {
+                                    cell_index.saturating_sub(1)
+                                } else {
+                                    cell_index
+                                };
+                                let (_, mut bg) = terminal_cell_render_colors(cell, palette);
+                                if let Some((sx, sy, ex, ey)) = grid.selection {
+                                    let (start_x, start_y, end_x, end_y) =
+                                        normalized_selection_bounds(sx, sy, ex, ey);
+                                    let selected = if i > start_y && i < end_y {
+                                        true
+                                    } else if i == start_y && i == end_y {
+                                        logical_cell_index >= start_x && logical_cell_index <= end_x
+                                    } else if i == start_y {
+                                        logical_cell_index >= start_x
+                                    } else if i == end_y {
+                                        logical_cell_index <= end_x
+                                    } else {
+                                        false
+                                    };
+                                    if selected {
+                                        bg = Some(palette.accent);
+                                    }
+                                }
+                                while row_match_index < row_matches.len()
+                                    && row_matches[row_match_index].end_x < logical_cell_index
+                                {
+                                    row_match_index += 1;
+                                }
+                                if let Some(item) = row_matches.get(row_match_index) {
+                                    if logical_cell_index >= item.start_x
+                                        && logical_cell_index <= item.end_x
+                                    {
+                                        let active = active_search_match
+                                            .is_some_and(|active| active == *item);
+                                        bg =
+                                            Some(if active { SEARCH_ACTIVE } else { SEARCH_MATCH });
+                                    }
+                                }
+                                if let Some(color) = bg {
+                                    self.push_rect(x, draw_y, cell_w, char_h, color);
+                                }
                             }
-                            if let Some(glyph) = self.terminal_glyph(extra, cell.presentation) {
-                                let baseline = draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
-                                let (gx, gy, gs) = terminal_glyph_anchor(extra, glyph, x, draw_y, glyph_cell_w, char_h, baseline, TERMINAL_TEXT_SCALE);
-                                let (qx, qy, qw, qh) = glyph_quad_rect(gx, gy, glyph, gs);
-                                self.push_quad(qx, qy, qw, qh, glyph.u, glyph.v, glyph.uw, glyph.vh, fg, glyph.mode, [0.0, 0.0, 0.0]);
+                        }
+                        TerminalBodyLayer::Glyph => {
+                            for (cell_index, cell) in row.iter().take(grid.cols).enumerate() {
+                                let Some((x, glyph_cell_w)) =
+                                    terminal_glyph_cell_geometry(text_x, cell_index, cell, char_w)
+                                else {
+                                    continue;
+                                };
+                                let (fg, _) = terminal_cell_render_colors(cell, palette);
+                                if let Some(glyph) = self.terminal_glyph(cell.c, cell.presentation)
+                                {
+                                    let baseline =
+                                        draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
+                                    let (gx, gy, gs) = terminal_glyph_anchor(
+                                        cell.c,
+                                        glyph,
+                                        x,
+                                        draw_y,
+                                        glyph_cell_w,
+                                        char_h,
+                                        baseline,
+                                        TERMINAL_TEXT_SCALE,
+                                    );
+                                    let (qx, qy, qw, qh) = glyph_quad_rect(gx, gy, glyph, gs);
+                                    self.push_quad(
+                                        qx,
+                                        qy,
+                                        qw,
+                                        qh,
+                                        glyph.u,
+                                        glyph.v,
+                                        glyph.uw,
+                                        glyph.vh,
+                                        fg,
+                                        glyph.mode,
+                                        [0.0, 0.0, 0.0],
+                                    );
+                                }
+                                for &extra in cell.zero_width() {
+                                    if !terminal_should_render_zero_width(extra) {
+                                        continue;
+                                    }
+                                    if let Some(glyph) =
+                                        self.terminal_glyph(extra, cell.presentation)
+                                    {
+                                        let baseline =
+                                            draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
+                                        let (gx, gy, gs) = terminal_glyph_anchor(
+                                            extra,
+                                            glyph,
+                                            x,
+                                            draw_y,
+                                            glyph_cell_w,
+                                            char_h,
+                                            baseline,
+                                            TERMINAL_TEXT_SCALE,
+                                        );
+                                        let (qx, qy, qw, qh) = glyph_quad_rect(gx, gy, glyph, gs);
+                                        self.push_quad(
+                                            qx,
+                                            qy,
+                                            qw,
+                                            qh,
+                                            glyph.u,
+                                            glyph.v,
+                                            glyph.uw,
+                                            glyph.vh,
+                                            fg,
+                                            glyph.mode,
+                                            [0.0, 0.0, 0.0],
+                                        );
+                                    }
+                                }
                             }
                         }
-                    }
-                    if cell.is_underlined() && !cell.is_wide_spacer() {
-                        let underline = terminal_underline_rect(
-                            text_x,
-                            cell_index,
-                            if cell.is_wide() { 2 } else { 1 },
-                            char_w,
-                            draw_y,
-                            char_h,
-                            s,
-                        );
-                        self.push_rounded_rect(
-                            underline.x,
-                            underline.y,
-                            underline.w,
-                            underline.h,
-                            0.0,
-                            fg,
-                        );
                     }
                 }
             }
 
-            if focused && grid.cursor_visible {
+            if input_focused && grid.cursor_visible {
                 let cursor_offset = grid.lines.len().saturating_sub(1).saturating_sub(grid.cur_y);
                 let cursor_y = body.y + body.h - bottom_pad - char_h
                     - cursor_offset as f32 * char_h + scroll_offset;
@@ -2150,14 +2533,14 @@ impl Renderer {
         self.clear_clip();
         drop(grid);
 
-        if focused && let Some(separator) = terminal_focus_separator_rect(body, s) {
+        if let Some(separator) = terminal_focus_separator_rect(body, s) {
             self.push_rounded_rect(
                 separator.x,
                 separator.y,
                 separator.w,
                 separator.h,
                 0.0,
-                palette.accent,
+                terminal_focus_separator_color(palette.accent, window_focused),
             );
         }
 
@@ -2202,10 +2585,74 @@ mod tests {
     }
 
     #[test]
-    fn visible_rows_only_cover_viewport_plus_one_overscan_row() {
-        assert_eq!(visible_row_range(10_000, 30, 0.0, 20.0), 9969..10000);
-        assert_eq!(visible_row_range(10_000, 30, 40.0, 20.0), 9967..9998);
+    fn visible_rows_keep_bounded_overscan_on_both_scroll_edges() {
+        assert_eq!(visible_row_range(10_000, 30, 0.0, 20.0), 9968..10000);
+        assert_eq!(visible_row_range(10_000, 30, 40.0, 20.0), 9966..9999);
+        assert!(visible_row_range(10_000, 30, 40.0, 20.0).len() <= 33);
         assert!(visible_row_range(2, 30, 0.0, 20.0).len() <= 2);
+    }
+
+    #[test]
+    fn fractional_scroll_keeps_rows_until_their_glyph_quads_leave_the_body_clip() {
+        let total_lines = 80;
+        for scale in [1.0_f32, 1.25, 1.333_333_3, 1.5] {
+            let body = Rect {
+                x: 0.0,
+                y: (17.0 * scale).round(),
+                w: 800.0,
+                h: (173.0 * scale).round(),
+            };
+            let char_h = 26.0 * scale;
+            let visible_rows = terminal_visible_rows(body.h, char_h, scale);
+            let (_, bottom_pad) = terminal_text_padding(scale);
+            for scroll_offset in [
+                (1.0 * scale).round(),
+                (char_h - 1.0).round(),
+                (char_h + 1.0).round(),
+                (2.0 * char_h - 1.0).round(),
+            ] {
+                let range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
+                assert!(range.len() <= visible_rows.saturating_add(3));
+
+                for row in 0..total_lines {
+                    let draw_y = terminal_row_draw_y(
+                        body,
+                        bottom_pad,
+                        char_h,
+                        total_lines,
+                        row,
+                        scroll_offset,
+                    );
+                    let glyph = GlyphInfo {
+                        u: 0.0,
+                        v: 0.0,
+                        uw: 0.0,
+                        vh: 0.0,
+                        width: 8.0 * scale,
+                        height: char_h * 1.15,
+                        offset_x: 0.0,
+                        offset_y: char_h * 0.82,
+                        advance: 8.0 * scale,
+                        mode: 0.0,
+                    };
+                    let baseline = draw_y + char_h * 0.72;
+                    let (_, glyph_y, _, glyph_h) =
+                        super::super::glyph_quad_rect(0.0, baseline, glyph, 1.0);
+                    let glyph_rect = Rect {
+                        x: body.x,
+                        y: glyph_y,
+                        w: 1.0,
+                        h: glyph_h,
+                    };
+                    if clipped_rect(glyph_rect, body).is_some() {
+                        assert!(
+                            range.contains(&row),
+                            "scale={scale} scroll={scroll_offset} row={row} range={range:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2408,7 +2855,10 @@ mod tests {
 
     #[test]
     fn inverse_colors_preserve_default_background_identity_and_explicit_ansi_colors() {
-        let palette = TerminalPalette::new([0.2, 0.3, 0.4, 1.0]);
+        let palette = TerminalPalette::new(
+            crate::config::DEFAULT_TERMINAL_BACKGROUND,
+            [0.2, 0.3, 0.4, 1.0],
+        );
         let mut default_cell = Cell::default();
         default_cell.set_sgr_style(true, false, false);
         let (default_fg, default_bg) = terminal_cell_render_colors(&default_cell, palette);
@@ -2431,7 +2881,10 @@ mod tests {
 
     #[test]
     fn dim_affects_only_effective_foreground_rgb() {
-        let palette = TerminalPalette::new([0.2, 0.3, 0.4, 1.0]);
+        let palette = TerminalPalette::new(
+            crate::config::DEFAULT_TERMINAL_BACKGROUND,
+            [0.2, 0.3, 0.4, 1.0],
+        );
         let mut cell = Cell::default();
         cell.set_char(
             'X',
@@ -2450,18 +2903,90 @@ mod tests {
     }
 
     #[test]
-    fn underline_span_uses_snapped_normal_and_wide_boundaries() {
-        let normal = terminal_underline_rect(0.0, 0, 1, 7.4, 10.25, 20.0, 1.333_333_3);
-        let wide = terminal_underline_rect(0.0, 0, 2, 7.4, 10.25, 20.0, 1.333_333_3);
-        assert_eq!(normal.x, 0.0);
-        assert_eq!(normal.w, 7.0);
-        assert_eq!(wide.x, 0.0);
-        assert_eq!(wide.w, 15.0);
-        assert_eq!(normal.h, 1.0);
-        assert_eq!(normal.y, wide.y);
+    fn terminal_renderer_matches_rriter_by_not_emitting_an_underline_layer() {
+        let mut cell = Cell::default();
+        cell.set_char(
+            'x',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            false,
+        );
+        cell.set_sgr_style(false, true, false);
 
-        let adjacent = terminal_underline_rect(0.0, 2, 2, 7.4, 10.25, 20.0, 1.333_333_3);
-        assert_eq!(wide.x + wide.w, adjacent.x);
+        assert!(cell.is_underlined());
+        assert_eq!(
+            TERMINAL_BODY_LAYERS,
+            [TerminalBodyLayer::Background, TerminalBodyLayer::Glyph]
+        );
+        assert_eq!(
+            terminal_glyph_cell_geometry(0.0, 0, &cell, 8.0),
+            Some((0.0, 8.0))
+        );
+    }
+
+    #[test]
+    fn terminal_body_background_layer_precedes_overhanging_glyphs() {
+        let glyph = GlyphInfo {
+            u: 0.0,
+            v: 0.0,
+            uw: 0.0,
+            vh: 0.0,
+            width: 12.0,
+            height: 16.0,
+            offset_x: 0.0,
+            offset_y: 12.0,
+            advance: 8.0,
+            mode: 0.0,
+        };
+        let (qx, _, qw, _) = super::super::glyph_quad_rect(0.0, 16.0, glyph, 1.0);
+        let (_, neighbor_right) = terminal_cell_x_bounds(0.0, 1, 8.0);
+        let (neighbor_left, _) = terminal_cell_x_bounds(0.0, 1, 8.0);
+        assert!(qx + qw > neighbor_left);
+        assert!(qx < neighbor_right);
+
+        let background_layer = TERMINAL_BODY_LAYERS
+            .iter()
+            .position(|layer| *layer == TerminalBodyLayer::Background)
+            .unwrap();
+        let glyph_layer = TERMINAL_BODY_LAYERS
+            .iter()
+            .position(|layer| *layer == TerminalBodyLayer::Glyph)
+            .unwrap();
+        assert!(background_layer < glyph_layer);
+    }
+
+    #[test]
+    fn terminal_glyph_cell_geometry_preserves_ascii_wide_and_spacer_semantics() {
+        let mut ascii = Cell::default();
+        ascii.set_char(
+            'A',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            false,
+        );
+        assert_eq!(
+            terminal_glyph_cell_geometry(0.0, 1, &ascii, 7.4),
+            Some((7.0, 8.0))
+        );
+
+        let mut wide = Cell::default();
+        wide.set_char(
+            '界',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            true,
+        );
+        assert_eq!(
+            terminal_glyph_cell_geometry(0.0, 0, &wide, 7.4),
+            Some((0.0, 15.0))
+        );
+
+        let mut spacer = Cell::default();
+        spacer.set_wide_spacer(
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+        );
+        assert_eq!(terminal_glyph_cell_geometry(0.0, 1, &spacer, 7.4), None);
     }
 
     #[test]
@@ -2646,6 +3171,54 @@ mod tests {
     }
 
     #[test]
+    fn terminal_focus_separator_color_is_opaque_and_darker_when_unfocused() {
+        let accent = [0.60, 0.40, 0.80, 0.35];
+        let focused = terminal_focus_separator_color(accent, true);
+        let unfocused = terminal_focus_separator_color(accent, false);
+        assert_eq!(focused, [0.60, 0.40, 0.80, 1.0]);
+        assert_eq!(unfocused[3], 1.0);
+        assert_ne!(focused, unfocused);
+        assert!(unfocused[0] < focused[0]);
+        assert!(unfocused[1] < focused[1]);
+        assert!(unfocused[2] < focused[2]);
+    }
+
+    #[test]
+    fn terminal_tab_surface_is_opaque_lighter_and_clamped_for_custom_backgrounds() {
+        let background = crate::config::DEFAULT_TERMINAL_BACKGROUND.to_rgba();
+        let idle = terminal_tab_surface_color(background, false, false);
+        assert_ne!(idle, background);
+        assert_eq!(idle[3], 1.0);
+        assert!(idle[0] > background[0]);
+        assert!(idle[1] > background[1]);
+        assert!(idle[2] > background[2]);
+
+        let old_idle_lift = 0.018;
+        assert!(idle[0] - background[0] > old_idle_lift);
+        let active = terminal_tab_surface_color(background, true, false);
+        let hovered = terminal_tab_surface_color(background, false, true);
+        let active_hovered = terminal_tab_surface_color(background, true, true);
+        assert!(active[0] > idle[0]);
+        assert!(hovered[0] > active[0]);
+        assert!(active_hovered[0] > hovered[0]);
+        assert!(active_hovered[1] > idle[1]);
+        assert!(active_hovered[2] > idle[2]);
+        assert_eq!(active[3], 1.0);
+        assert_eq!(hovered[3], 1.0);
+        assert_eq!(active_hovered[3], 1.0);
+
+        for background in [[0.0, 0.0, 0.0, 0.2], [1.0, 0.99, 0.98, 0.1]] {
+            let derived = terminal_tab_surface_color(background, true, true);
+            assert_eq!(derived[3], 1.0);
+            assert!(
+                derived[..3]
+                    .iter()
+                    .all(|component| (0.0..=1.0).contains(component))
+            );
+        }
+    }
+
+    #[test]
     fn terminal_plus_glyph_is_donor_sized_centered_and_bounded() {
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
             let size = (TERMINAL_ADD_SIZE * scale).round().max(1.0);
@@ -2812,6 +3385,82 @@ mod tests {
     }
 
     #[test]
+    fn settings_hit_test_distinguishes_empty_modal_space_from_outside() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let modal = layout.modal;
+        assert_eq!(
+            layout.hit_test(modal.x + 4.0, modal.y + modal.h - 4.0),
+            SettingsHit::None
+        );
+        assert_eq!(
+            layout.hit_test(modal.x - 2.0, modal.y + 10.0),
+            SettingsHit::Outside
+        );
+        assert_eq!(
+            layout.hit_test(modal.x + modal.w + 2.0, modal.y + 10.0),
+            SettingsHit::Outside
+        );
+    }
+
+    #[test]
+    fn settings_numeric_values_center_on_measured_width_at_fractional_scale() {
+        let samples = [
+            ("8", 7.2),
+            ("14", 14.7),
+            ("14.5", 28.9),
+            ("0.5", 21.4),
+            ("1.0", 21.1),
+            ("3.0", 21.6),
+        ];
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let layout = settings_layout(
+                1100.0 * scale,
+                720.0 * scale,
+                scale,
+                1.0,
+                SettingsTab::General,
+            );
+            let row = layout.font.expect("font row should fit");
+            let region_center = (row.value.x + row.value_max_x) * 0.5;
+            for (value, base_width) in samples {
+                let measured_width = base_width * scale;
+                let x = centered_settings_value_x(row.value.x, row.value_max_x, measured_width);
+                let drawn_width = measured_width.min(row.value_max_x - row.value.x);
+                let drawn_center = x + drawn_width * 0.5;
+                assert!(
+                    (drawn_center - region_center).abs() <= 0.51,
+                    "{value} is not centered at scale {scale}: {drawn_center} vs {region_center}"
+                );
+                assert!(x >= row.value.x);
+                assert!(x + drawn_width <= row.value_max_x + 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_background_text_viewport_bounds_selection_and_caret_geometry() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let layout = settings_layout(
+                1100.0 * scale,
+                720.0 * scale,
+                scale,
+                1.0,
+                SettingsTab::General,
+            );
+            let row = layout.background.expect("background row should fit");
+            let viewport = settings_background_text_viewport(row, scale);
+            assert!(viewport.x >= row.field.x);
+            assert!(viewport.x + viewport.w <= row.field.x + row.field.w + 0.001);
+            assert!(viewport.y >= row.field.y);
+            assert!(viewport.y + viewport.h <= row.field.y + row.field.h + 0.001);
+            let scroll = one_line_scroll_for_metrics(96.0 * scale, 110.0 * scale, viewport.w, 0.0);
+            let caret_x = viewport.x + 96.0 * scale - scroll;
+            assert!(caret_x >= viewport.x - 0.001);
+            assert!(caret_x <= viewport.x + viewport.w + 0.001);
+        }
+    }
+
+    #[test]
     fn settings_controls_are_bounded_disjoint_and_hit_test_the_drawn_geometry() {
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
             let layout = settings_layout(
@@ -2826,7 +3475,17 @@ mod tests {
                 .expect("large settings modal should have content body");
             let font = layout.font.expect("font controls should fit");
             let scroll = layout.scroll.expect("scroll controls should fit");
-            for rect in [font.minus, font.plus, scroll.minus, scroll.plus] {
+            let background = layout.background.expect("background controls should fit");
+            for rect in [
+                font.minus,
+                font.plus,
+                font.reset,
+                scroll.minus,
+                scroll.plus,
+                scroll.reset,
+                background.field,
+                background.reset,
+            ] {
                 for value in [rect.x, rect.y, rect.w, rect.h] {
                     assert!(value.is_finite());
                 }
@@ -2836,17 +3495,27 @@ mod tests {
             }
             assert!(font.minus.x + font.minus.w < font.plus.x);
             assert!(font.minus.y + font.minus.h < scroll.minus.y);
+            assert!(scroll.minus.y + scroll.minus.h < background.field.y);
             assert!(font.label_max_x <= font.minus.x);
             assert!(scroll.label_max_x <= scroll.minus.x);
+            assert!(background.label_max_x <= background.field.x);
             let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
             let (x, y) = center(font.minus);
             assert_eq!(layout.hit_test(x, y), SettingsHit::FontDecrease);
             let (x, y) = center(font.plus);
             assert_eq!(layout.hit_test(x, y), SettingsHit::FontIncrease);
+            let (x, y) = center(font.reset);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::FontReset);
             let (x, y) = center(scroll.minus);
             assert_eq!(layout.hit_test(x, y), SettingsHit::ScrollDecrease);
             let (x, y) = center(scroll.plus);
             assert_eq!(layout.hit_test(x, y), SettingsHit::ScrollIncrease);
+            let (x, y) = center(scroll.reset);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::ScrollReset);
+            let (x, y) = center(background.field);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::BackgroundField);
+            let (x, y) = center(background.reset);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::BackgroundReset);
         }
     }
 
@@ -2856,6 +3525,7 @@ mod tests {
         let help = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Help);
         assert!(help.font.is_none());
         assert!(help.scroll.is_none());
+        assert!(help.background.is_none());
         let font_minus = general.font.expect("general controls should fit").minus;
         let x = font_minus.x + font_minus.w * 0.5;
         let y = font_minus.y + font_minus.h * 0.5;
@@ -2891,6 +3561,55 @@ mod tests {
     }
 
     #[test]
+    fn settings_visual_borders_stay_inside_render_bounds_at_fractional_scale() {
+        let contains = |outer: Rect, inner: Rect| {
+            inner.x >= outer.x - 0.001
+                && inner.y >= outer.y - 0.001
+                && inner.x + inner.w <= outer.x + outer.w + 0.001
+                && inner.y + inner.h <= outer.y + outer.h + 0.001
+        };
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            for tab in [SettingsTab::General, SettingsTab::Help] {
+                let layout = settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, tab);
+                let inner = layout.inner.expect("inner panel should fit");
+                for pill in layout.tabs.into_iter().flatten() {
+                    assert!(contains(inner, pill));
+                }
+
+                let content_clip = layout.content_clip.expect("content should fit");
+                let render_clip = layout
+                    .content_render_clip
+                    .expect("content render clip should fit");
+                let title = layout.title.expect("title should fit");
+                let title_outer = Rect {
+                    x: (title.x - 14.0 * scale).round() - 1.0,
+                    y: (title.baseline_y - 22.0 * scale).round() - 1.0,
+                    w: (content_clip.x + content_clip.w - (title.x - 14.0 * scale).round())
+                        .max(0.0)
+                        + 2.0,
+                    h: (30.0 * scale).round().max(1.0) + 2.0,
+                };
+                assert!(contains(render_clip, title_outer));
+
+                if tab == SettingsTab::Help {
+                    let rows = layout.help.into_iter().flatten().collect::<Vec<_>>();
+                    assert_eq!(rows.len(), SETTINGS_HELP_ENTRIES.len());
+                    for index in [0, SETTINGS_HELP_ENTRIES.len() - 1] {
+                        let keycap = rows[index].keycap;
+                        let outer = Rect {
+                            x: keycap.x - 1.0,
+                            y: keycap.y - 1.0,
+                            w: keycap.w + 2.0,
+                            h: keycap.h + 2.0,
+                        };
+                        assert!(contains(render_clip, outer));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn settings_static_labels_and_help_shortcuts_are_russian_and_app_owned() {
         assert_eq!(SETTINGS_TITLE, "Настройки");
         assert_eq!(
@@ -2908,6 +3627,8 @@ mod tests {
         );
         assert_eq!(SETTINGS_FONT_LABEL, "Размер шрифта");
         assert_eq!(SETTINGS_SCROLL_LABEL, "Чувствительность прокрутки");
+        assert_eq!(SETTINGS_BACKGROUND_LABEL, "Цвет фона");
+        assert_eq!(SETTINGS_RESET_LABEL, "Сбросить");
         assert_eq!(
             SETTINGS_HELP_ENTRIES,
             [
@@ -2951,6 +3672,7 @@ mod tests {
                 for rect in [
                     layout.inner,
                     layout.divider,
+                    layout.content_render_clip,
                     layout.content_clip,
                     layout.content_body,
                 ]
@@ -2985,7 +3707,7 @@ mod tests {
         );
         assert_eq!(
             mid.hit_test(final_center.0, final_center.1),
-            SettingsHit::None
+            SettingsHit::Outside
         );
         assert_eq!(
             final_layout.hit_test(final_center.0, final_center.1),

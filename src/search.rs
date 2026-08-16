@@ -1,3 +1,4 @@
+use crate::single_line_input::SingleLineInput;
 use crate::terminal::TermGrid;
 use std::time::{Duration, Instant};
 #[cfg(test)]
@@ -200,12 +201,9 @@ pub(crate) struct TerminalSearchState {
     pub shown: bool,
     pub focused: bool,
     pub case_sensitive: bool,
-    pub query: String,
-    pub cursor: usize,
-    pub selection_anchor: Option<usize>,
+    input: SingleLineInput,
     pub results: Vec<TerminalSearchMatch>,
     pub current: Option<usize>,
-    pub scroll_x: f32,
     query_revision: u64,
     scanned_query_revision: u64,
     scanned_grid_generation: u64,
@@ -222,12 +220,9 @@ impl Default for TerminalSearchState {
             shown: false,
             focused: false,
             case_sensitive: false,
-            query: String::with_capacity(128),
-            cursor: 0,
-            selection_anchor: None,
+            input: SingleLineInput::with_capacity(128),
             results: Vec::with_capacity(128),
             current: None,
-            scroll_x: 0.0,
             query_revision: 1,
             scanned_query_revision: 0,
             scanned_grid_generation: u64::MAX,
@@ -237,6 +232,20 @@ impl Default for TerminalSearchState {
             line_scratch: String::with_capacity(512),
             line_byte_cells: Vec::with_capacity(512),
         }
+    }
+}
+
+impl std::ops::Deref for TerminalSearchState {
+    type Target = SingleLineInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+impl std::ops::DerefMut for TerminalSearchState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.input
     }
 }
 
@@ -263,94 +272,42 @@ impl TerminalSearchState {
         self.query_revision = self.query_revision.wrapping_add(1);
     }
 
-    fn char_count(&self) -> usize {
-        self.query.chars().count()
-    }
-
-    fn byte_index(&self, char_index: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_index)
-            .map_or(self.query.len(), |(index, _)| index)
-    }
-
-    fn selection(&self) -> Option<(usize, usize)> {
-        self.selection_anchor
-            .filter(|&anchor| anchor != self.cursor)
-            .map(|anchor| (anchor.min(self.cursor), anchor.max(self.cursor)))
-    }
-
-    fn delete_selection(&mut self) -> bool {
-        let Some((start, end)) = self.selection() else {
-            return false;
-        };
-        let start_byte = self.byte_index(start);
-        let end_byte = self.byte_index(end);
-        self.query.replace_range(start_byte..end_byte, "");
-        self.cursor = start;
-        self.selection_anchor = None;
-        self.touch_query();
-        true
-    }
-
     pub(crate) fn select_all(&mut self) {
-        self.selection_anchor = Some(0);
-        self.cursor = self.char_count();
+        self.input.select_all();
     }
 
     pub(crate) fn selected_text(&self) -> Option<String> {
-        let (start, end) = self.selection()?;
-        Some(self.query[self.byte_index(start)..self.byte_index(end)].to_string())
+        self.input.selected_text()
     }
 
     pub(crate) fn insert_text(&mut self, text: &str) {
-        self.delete_selection();
-        let byte = self.byte_index(self.cursor);
-        self.query.insert_str(byte, text);
-        self.cursor += text.chars().count();
-        self.selection_anchor = None;
-        self.touch_query();
+        if self.input.insert_text(text) {
+            self.touch_query();
+        }
     }
 
     pub(crate) fn backspace(&mut self) {
-        if self.delete_selection() || self.cursor == 0 {
-            return;
+        if self.input.backspace() {
+            self.touch_query();
         }
-        let end = self.byte_index(self.cursor);
-        let start = self.byte_index(self.cursor - 1);
-        self.query.replace_range(start..end, "");
-        self.cursor -= 1;
-        self.touch_query();
     }
 
     pub(crate) fn delete_forward(&mut self) {
-        if self.delete_selection() || self.cursor >= self.char_count() {
-            return;
+        if self.input.delete_forward() {
+            self.touch_query();
         }
-        let start = self.byte_index(self.cursor);
-        let end = self.byte_index(self.cursor + 1);
-        self.query.replace_range(start..end, "");
-        self.touch_query();
     }
 
     pub(crate) fn move_cursor(&mut self, new_cursor: usize, selecting: bool) {
-        let new_cursor = new_cursor.min(self.char_count());
-        if selecting {
-            if self.selection_anchor.is_none() {
-                self.selection_anchor = Some(self.cursor);
-            }
-        } else {
-            self.selection_anchor = None;
-        }
-        self.cursor = new_cursor;
+        let _ = self.input.move_cursor(new_cursor, selecting);
     }
 
     pub(crate) fn move_left(&mut self, selecting: bool) {
-        self.move_cursor(self.cursor.saturating_sub(1), selecting);
+        let _ = self.input.move_left(selecting);
     }
 
     pub(crate) fn move_right(&mut self, selecting: bool) {
-        self.move_cursor((self.cursor + 1).min(self.char_count()), selecting);
+        let _ = self.input.move_right(selecting);
     }
 
     pub(crate) fn toggle_case(&mut self) {
@@ -375,10 +332,10 @@ impl TerminalSearchState {
         self.scanned_grid_generation = grid.content_generation;
         self.results.clear();
         self.current = None;
-        if self.query.is_empty() {
+        if self.input.text.is_empty() {
             return true;
         }
-        let escaped = regex::escape(&self.query);
+        let escaped = regex::escape(&self.input.text);
         let Ok(regex) = regex::RegexBuilder::new(&escaped)
             .case_insensitive(!self.case_sensitive)
             .build()
@@ -499,6 +456,10 @@ impl TerminalSearchState {
 
     pub(crate) fn release_grid_selection_ownership(&mut self) {
         self.grid_selection_owned = false;
+    }
+
+    pub(crate) fn owns_grid_selection(&self) -> bool {
+        self.grid_selection_owned
     }
 
     #[cfg(test)]
@@ -903,7 +864,7 @@ mod tests {
         search.move_right(true);
         assert_eq!(search.selected_text().as_deref(), Some("界"));
         search.insert_text("Z");
-        assert_eq!(search.query, "aZb");
+        assert_eq!(search.text, "aZb");
         assert_eq!(search.cursor, 2);
     }
 

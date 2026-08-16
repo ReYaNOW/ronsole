@@ -4,8 +4,11 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
+mod kde_activation;
 mod process;
+pub(crate) mod single_instance;
 
+pub(crate) use kde_activation::activate_primary_window;
 pub(crate) use process::{ProcessSnapshot, ProcessTree, foreground_process_snapshot};
 pub use process::resolve_executable;
 

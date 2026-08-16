@@ -15,6 +15,7 @@ pub(crate) struct TerminalInteraction {
     mouse_y: f32,
     pressed_mouse_buttons: u8,
     pointer_capture: PointerCapture,
+    terminal_selection_anchor: Option<(usize, usize)>,
     scroll_sensitivity: f32,
 }
 
@@ -59,6 +60,7 @@ impl Default for TerminalInteraction {
             mouse_y: 0.0,
             pressed_mouse_buttons: 0,
             pointer_capture: PointerCapture::None,
+            terminal_selection_anchor: None,
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
         }
     }
@@ -83,7 +85,7 @@ impl TerminalInteraction {
     }
 
     pub(crate) fn animation_active(&self, terminal: &Terminal) -> bool {
-        !terminal.scroll_y.is_settled()
+        !terminal.scroll_y.is_settled() || self.selection_autoscroll_active(terminal)
     }
 
     pub(crate) fn search_refresh_deadline(&self) -> Option<std::time::Instant> {
@@ -105,18 +107,149 @@ impl TerminalInteraction {
         self.layout = TerminalUiLayout::default();
         self.pressed_mouse_buttons = 0;
         self.pointer_capture = PointerCapture::None;
+        self.terminal_selection_anchor = None;
     }
 
     pub(crate) fn cancel_pointer_interaction(&mut self, terminal: &mut Terminal) {
+        self.finish_terminal_selection(terminal);
         self.cancel_pointer_interaction_state(&mut terminal.scroll_y);
     }
 
     fn cancel_pointer_interaction_state(&mut self, scroll: &mut crate::scroll::ScrollState) {
         self.pressed_mouse_buttons = 0;
         let capture = release_pointer_capture(&mut self.pointer_capture);
+        self.terminal_selection_anchor = None;
         if capture == PointerCapture::TerminalScrollbar {
             scroll.end_drag();
         }
+    }
+
+    pub(crate) fn clear_text_selection(&mut self, terminal: &mut Terminal) -> bool {
+        if self.search.owns_grid_selection() {
+            return false;
+        }
+        crate::platform::lock_recover(&terminal.grid)
+            .selection
+            .take()
+            .is_some()
+    }
+
+    pub(crate) fn terminal_selection_active(&self) -> bool {
+        self.pointer_capture == PointerCapture::TerminalSelection
+    }
+
+    pub(crate) fn cursor_left(
+        &mut self,
+        window_w: f32,
+        window_h: f32,
+        terminal: &mut Terminal,
+    ) -> bool {
+        if self.pointer_capture != PointerCapture::TerminalSelection {
+            return false;
+        }
+        let was_autoscrolling = self.selection_autoscroll_active(terminal);
+        let (x, y) =
+            project_cursor_outside_window_on_leave(self.mouse_x, self.mouse_y, window_w, window_h);
+        self.mouse_x = x;
+        self.mouse_y = y;
+        self.update_terminal_selection_endpoint(terminal, self.layout.scroll_offset)
+            || was_autoscrolling != self.selection_autoscroll_active(terminal)
+    }
+
+    pub(crate) fn update_selection_autoscroll(&mut self, dt: f32, terminal: &mut Terminal) -> bool {
+        if self.pointer_capture != PointerCapture::TerminalSelection
+            || self.terminal_selection_anchor.is_none()
+            || !dt.is_finite()
+            || dt <= 0.0
+        {
+            return false;
+        }
+        let delta = selection_drag_autoscroll_delta(
+            self.mouse_y,
+            self.layout.body.y,
+            self.layout.body.y + self.layout.body.h,
+        );
+        if delta == 0.0 || self.layout.max_scroll <= 0.0 {
+            return false;
+        }
+        let old_target = terminal.scroll_y.target.clamp(0.0, self.layout.max_scroll);
+        let speed = crate::scroll::drag_autoscroll_speed(delta, delta < 0.0);
+        let new_target =
+            (old_target - delta.signum() * speed * dt).clamp(0.0, self.layout.max_scroll);
+        if new_target == old_target {
+            return false;
+        }
+        terminal.scroll_y.target = new_target;
+        terminal.scroll_y.anim_speed = 15.0;
+        let _ = self.update_terminal_selection_endpoint(terminal, new_target.round());
+        true
+    }
+
+    fn selection_autoscroll_active(&self, terminal: &Terminal) -> bool {
+        if self.pointer_capture != PointerCapture::TerminalSelection
+            || self.terminal_selection_anchor.is_none()
+            || self.layout.max_scroll <= 0.0
+        {
+            return false;
+        }
+        let delta = selection_drag_autoscroll_delta(
+            self.mouse_y,
+            self.layout.body.y,
+            self.layout.body.y + self.layout.body.h,
+        );
+        let target = terminal.scroll_y.target;
+        target.is_finite()
+            && if delta < 0.0 {
+                target < self.layout.max_scroll
+            } else if delta > 0.0 {
+                target > 0.0
+            } else {
+                false
+            }
+    }
+
+    fn update_terminal_selection_endpoint(
+        &mut self,
+        terminal: &mut Terminal,
+        scroll_offset: f32,
+    ) -> bool {
+        let Some((anchor_x, anchor_y)) = self.terminal_selection_anchor else {
+            return false;
+        };
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        let Some((cell_x, cell_y)) = terminal_cell_from_grid(
+            self.layout,
+            &grid,
+            self.mouse_x,
+            self.mouse_y,
+            scroll_offset,
+            true,
+        ) else {
+            return false;
+        };
+        let next = (anchor_x, anchor_y, cell_x, cell_y);
+        if grid.selection.is_none() && (cell_x, cell_y) == (anchor_x, anchor_y) {
+            return false;
+        }
+        if grid.selection != Some(next) {
+            grid.selection = Some(next);
+            return true;
+        }
+        false
+    }
+
+    fn finish_terminal_selection(&mut self, terminal: &mut Terminal) {
+        if self.pointer_capture != PointerCapture::TerminalSelection {
+            return;
+        }
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        if grid
+            .selection
+            .is_some_and(|(sx, sy, ex, ey)| sx == ex && sy == ey)
+        {
+            grid.selection = None;
+        }
+        self.terminal_selection_anchor = None;
     }
 
     #[cfg(test)]
@@ -134,6 +267,16 @@ impl TerminalInteraction {
             self.clipboard = Clipboard::new().ok();
         }
         self.clipboard.as_mut()
+    }
+
+    pub(crate) fn clipboard_text(&mut self) -> Option<String> {
+        self.clipboard()
+            .and_then(|clipboard| clipboard.get_text().ok())
+    }
+
+    pub(crate) fn set_clipboard_text(&mut self, text: String) -> bool {
+        self.clipboard()
+            .is_some_and(|clipboard| clipboard.set_text(text).is_ok())
     }
 
     pub(crate) fn refresh_search(
@@ -205,7 +348,7 @@ impl TerminalInteraction {
             PhysicalKey::Code(KeyCode::ArrowRight) => self.search.move_right(shift),
             PhysicalKey::Code(KeyCode::Home) => self.search.move_cursor(0, shift),
             PhysicalKey::Code(KeyCode::End) => {
-                let end = self.search.query.chars().count();
+                let end = self.search.text.chars().count();
                 self.search.move_cursor(end, shift);
             }
             PhysicalKey::Code(KeyCode::Backspace) => { self.search.backspace(); edited = true; }
@@ -337,19 +480,17 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
     ) -> bool {
+        let was_selection_autoscrolling = self.selection_autoscroll_active(terminal);
         self.mouse_x = x;
         self.mouse_y = y;
         match self.pointer_capture {
             PointerCapture::TerminalSelection => {
-                if let Some((cell_x, cell_y)) = terminal_cell_at(self.layout, terminal, x, y) {
-                    let mut grid = crate::platform::lock_recover(&terminal.grid);
-                    if let Some((sx, sy, _, _)) = grid.selection {
-                        let next = (sx, sy, cell_x, cell_y);
-                        if grid.selection != Some(next) {
-                            grid.selection = Some(next);
-                            return true;
-                        }
-                    }
+                let changed =
+                    self.update_terminal_selection_endpoint(terminal, self.layout.scroll_offset);
+                if changed
+                    || was_selection_autoscrolling != self.selection_autoscroll_active(terminal)
+                {
+                    return true;
                 }
             }
             PointerCapture::TerminalScrollbar => {
@@ -371,7 +512,7 @@ impl TerminalInteraction {
                 if let Some(search) = self.layout.search {
                     let local_x = x - search.input.x - 5.0 * self.layout.scale;
                     let cursor =
-                        search_cursor_from_x(&self.search.query, local_x, self.search.scroll_x);
+                        search_cursor_from_x(&self.search.text, local_x, self.search.scroll_x);
                     return update_search_pointer_selection(
                         &mut self.search,
                         self.pointer_capture,
@@ -413,7 +554,9 @@ impl TerminalInteraction {
         update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, state);
 
         if state == ElementState::Released && self.pointer_capture != PointerCapture::None {
+            self.finish_terminal_selection(terminal);
             let capture = release_pointer_capture(&mut self.pointer_capture);
+            self.terminal_selection_anchor = None;
             if capture == PointerCapture::TerminalScrollbar {
                 terminal.scroll_y.end_drag();
             }
@@ -449,8 +592,7 @@ impl TerminalInteraction {
             }
             if search.input.contains(x, y) {
                 let local_x = x - search.input.x - 5.0 * self.layout.scale;
-                let cursor =
-                    search_cursor_from_x(&self.search.query, local_x, self.search.scroll_x);
+                let cursor = search_cursor_from_x(&self.search.text, local_x, self.search.scroll_x);
                 begin_search_pointer_selection(&mut self.search, cursor);
                 self.pointer_capture = PointerCapture::SearchInput;
                 return true;
@@ -480,13 +622,15 @@ impl TerminalInteraction {
             return false;
         }
         if state == ElementState::Pressed {
+            let search_owned_selection = self.search.owns_grid_selection();
             terminal_body_takes_search_focus(&mut self.search);
+            if search_owned_selection {
+                let _ = self.clear_text_selection(terminal);
+            }
         }
 
         let (tracking_mode, mouse_sgr) = {
-            let mut grid = crate::platform::lock_recover(&terminal.grid);
-            let tracking = grid.mouse_tracking_mode.enabled();
-            clear_selection_for_tracked_mouse_press(&mut grid.selection, tracking, state);
+            let grid = crate::platform::lock_recover(&terminal.grid);
             (grid.mouse_tracking_mode, grid.mouse_sgr)
         };
         let tracking = tracking_mode.enabled();
@@ -504,11 +648,12 @@ impl TerminalInteraction {
             return true;
         }
 
-        if !tracking && button == MouseButton::Left && state == ElementState::Pressed
+        if !tracking
+            && button == MouseButton::Left
+            && state == ElementState::Pressed
             && let Some((cell_x, cell_y)) = terminal_cell_at(self.layout, terminal, x, y)
         {
-            crate::platform::lock_recover(&terminal.grid).selection =
-                Some((cell_x, cell_y, cell_x, cell_y));
+            self.terminal_selection_anchor = Some((cell_x, cell_y));
             self.pointer_capture = PointerCapture::TerminalSelection;
             return true;
         }
@@ -562,16 +707,53 @@ fn terminal_cell_at(
     x: f32,
     y: f32,
 ) -> Option<(usize, usize)> {
-    if layout.char_w <= 0.0 || layout.char_h <= 0.0 || !layout.body.contains(x, y) {
+    let grid = crate::platform::lock_recover(&terminal.grid);
+    terminal_cell_from_grid(layout, &grid, x, y, layout.scroll_offset, false)
+}
+
+fn terminal_cell_from_grid(
+    layout: TerminalUiLayout,
+    grid: &crate::terminal::TermGrid,
+    x: f32,
+    y: f32,
+    scroll_offset: f32,
+    clamp_to_body: bool,
+) -> Option<(usize, usize)> {
+    if layout.char_w <= 0.0
+        || layout.char_h <= 0.0
+        || layout.body.w <= 0.0
+        || layout.body.h <= 0.0
+        || !x.is_finite()
+        || !y.is_finite()
+        || !scroll_offset.is_finite()
+        || (!clamp_to_body && !layout.body.contains(x, y))
+    {
         return None;
     }
-    let grid = crate::platform::lock_recover(&terminal.grid);
-    let total_lines = if grid.is_alt { grid.lines.len() } else { grid.scrollback.len() + grid.lines.len() };
-    if total_lines == 0 { return None; }
+    let x = if clamp_to_body {
+        x.clamp(layout.body.x, layout.body.x + layout.body.w)
+    } else {
+        x
+    };
+    let y = if clamp_to_body {
+        y.clamp(layout.body.y, layout.body.y + layout.body.h)
+    } else {
+        y
+    };
+    let total_lines = if grid.is_alt {
+        grid.lines.len()
+    } else {
+        grid.scrollback.len() + grid.lines.len()
+    };
+    if total_lines == 0 {
+        return None;
+    }
     let bottom_pad = layout.bottom_pad;
     let offset_from_bottom =
-        (layout.body.y + layout.body.h - bottom_pad - y + layout.scroll_offset) / layout.char_h;
-    let row = total_lines.saturating_sub(1).saturating_sub(offset_from_bottom.max(0.0).floor() as usize);
+        (layout.body.y + layout.body.h - bottom_pad - y + scroll_offset) / layout.char_h;
+    let row = total_lines
+        .saturating_sub(1)
+        .saturating_sub(offset_from_bottom.max(0.0).floor() as usize);
     let mut col = ((x - layout.text_x).max(0.0) / layout.char_w).floor() as usize;
     col = col.min(grid.cols.saturating_sub(1));
     let row = row.min(total_lines.saturating_sub(1));
@@ -591,6 +773,53 @@ fn terminal_cell_at(
     Some((col, row))
 }
 
+#[inline]
+fn selection_drag_autoscroll_delta(pos: f32, start: f32, end: f32) -> f32 {
+    if pos < start {
+        pos - start
+    } else if pos > end {
+        pos - end
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn project_cursor_outside_window_on_leave(
+    x: f32,
+    y: f32,
+    window_w: f32,
+    window_h: f32,
+) -> (f32, f32) {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !window_w.is_finite()
+        || !window_h.is_finite()
+        || window_w <= 0.0
+        || window_h <= 0.0
+        || x < 0.0
+        || x > window_w
+        || y < 0.0
+        || y > window_h
+    {
+        return (x, y);
+    }
+
+    let left = x;
+    let right = window_w - x;
+    let top = y;
+    let bottom = window_h - y;
+
+    if left <= right && left <= top && left <= bottom {
+        (-1.0, y)
+    } else if right <= top && right <= bottom {
+        (window_w + 1.0, y)
+    } else if top <= bottom {
+        (x, -1.0)
+    } else {
+        (x, window_h + 1.0)
+    }
+}
 
 #[inline]
 fn begin_search_pointer_selection(search: &mut TerminalSearchState, cursor: usize) {
@@ -696,17 +925,6 @@ fn terminal_mouse_protocol_cell(
     let col = (((x - layout.text_x).max(0.0) / layout.char_w).floor() as usize + 1)
         .clamp(1, layout.cols);
     Some((col, terminal_mouse_cell_y(layout, y)))
-}
-
-#[inline]
-fn clear_selection_for_tracked_mouse_press(
-    selection: &mut Option<(usize, usize, usize, usize)>,
-    tracking: bool,
-    state: ElementState,
-) {
-    if tracking && state == ElementState::Pressed {
-        *selection = None;
-    }
 }
 
 fn terminal_mouse_event_sequence(
@@ -1180,7 +1398,7 @@ mod tests {
 
         assert_eq!(interaction.pointer_capture, PointerCapture::None);
         assert!(interaction.search.shown);
-        assert_eq!(interaction.search.query, "needle");
+        assert_eq!(interaction.search.text, "needle");
     }
 
     #[test]
@@ -1334,6 +1552,278 @@ mod tests {
         }
     }
 
+    fn selection_test_terminal() -> Terminal {
+        Terminal::new_for_test(80, 30, 1)
+    }
+
+    fn begin_terminal_selection(
+        interaction: &mut TerminalInteraction,
+        terminal: &mut Terminal,
+        x: f32,
+        y: f32,
+    ) {
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = x;
+        interaction.mouse_y = y;
+        assert!(interaction.mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            terminal,
+            |_, _, _| 0,
+        ));
+        assert!(interaction.terminal_selection_active());
+    }
+
+    #[test]
+    fn terminal_selection_geometry_clamps_outside_body_to_grid_edges() {
+        let terminal = selection_test_terminal();
+        let layout = mouse_test_layout(0.0);
+        let grid = crate::platform::lock_recover(&terminal.grid);
+
+        assert_eq!(
+            terminal_cell_from_grid(layout, &grid, -50.0, 400.0, 0.0, true),
+            Some((0, 15)),
+        );
+        assert_eq!(
+            terminal_cell_from_grid(layout, &grid, 900.0, 400.0, 0.0, true),
+            Some((79, 15)),
+        );
+        assert_eq!(
+            terminal_cell_from_grid(layout, &grid, 400.0, 20.0, 0.0, true),
+            Some((39, 0)),
+        );
+        assert_eq!(
+            terminal_cell_from_grid(layout, &grid, 400.0, 760.0, 0.0, true),
+            Some((39, 29)),
+        );
+    }
+
+    #[test]
+    fn cursor_leave_projection_crosses_nearest_window_edge_only_for_active_selection() {
+        assert_eq!(
+            project_cursor_outside_window_on_leave(400.0, 599.0, 800.0, 600.0),
+            (400.0, 601.0),
+        );
+        assert_eq!(
+            project_cursor_outside_window_on_leave(400.0, 1.0, 800.0, 600.0),
+            (400.0, -1.0),
+        );
+        assert_eq!(
+            project_cursor_outside_window_on_leave(1.0, 300.0, 800.0, 600.0),
+            (-1.0, 300.0),
+        );
+        assert_eq!(
+            project_cursor_outside_window_on_leave(799.0, 300.0, 800.0, 600.0),
+            (801.0, 300.0),
+        );
+
+        let mut interaction = TerminalInteraction::default();
+        interaction.mouse_x = 400.0;
+        interaction.mouse_y = 599.0;
+        let mut terminal = selection_test_terminal();
+        assert!(!interaction.cursor_left(800.0, 600.0, &mut terminal));
+        assert_eq!((interaction.mouse_x, interaction.mouse_y), (400.0, 599.0));
+    }
+
+    #[test]
+    fn selection_autoscroll_uses_outside_distance_real_dt_and_bounded_speed() {
+        assert_eq!(selection_drag_autoscroll_delta(100.0, 100.0, 700.0), 0.0);
+        assert_eq!(selection_drag_autoscroll_delta(99.0, 100.0, 700.0), -1.0);
+        assert_eq!(selection_drag_autoscroll_delta(740.0, 100.0, 700.0), 40.0);
+        assert!(
+            crate::scroll::drag_autoscroll_speed(-30.0, true)
+                > crate::scroll::drag_autoscroll_speed(30.0, false)
+        );
+        assert!(
+            crate::scroll::drag_autoscroll_speed(3000.0, false)
+                <= crate::scroll::drag_autoscroll_speed(3000.0, true)
+        );
+
+        let run = |dt: f32| {
+            let mut interaction = TerminalInteraction::default();
+            let mut terminal = selection_test_terminal();
+            interaction.layout = mouse_test_layout(0.0);
+            interaction.layout.max_scroll = 1000.0;
+            interaction.pointer_capture = PointerCapture::TerminalSelection;
+            interaction.terminal_selection_anchor = Some((10, 15));
+            interaction.mouse_x = 100.0;
+            interaction.mouse_y = 50.0;
+            terminal.scroll_y.current = 500.0;
+            terminal.scroll_y.target = 500.0;
+            assert!(interaction.update_selection_autoscroll(dt, &mut terminal));
+            terminal.scroll_y.target - 500.0
+        };
+        let one = run(0.01);
+        let two = run(0.02);
+        assert!((two - one * 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn selection_autoscroll_clamps_at_history_bounds_without_permanent_animation() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.layout.max_scroll = 1000.0;
+        interaction.pointer_capture = PointerCapture::TerminalSelection;
+        interaction.terminal_selection_anchor = Some((10, 15));
+        interaction.mouse_x = 100.0;
+
+        interaction.mouse_y = 50.0;
+        terminal.scroll_y.current = 995.0;
+        terminal.scroll_y.target = 995.0;
+        assert!(interaction.update_selection_autoscroll(1.0, &mut terminal));
+        assert_eq!(terminal.scroll_y.target, 1000.0);
+        terminal.scroll_y.current = 1000.0;
+        assert!(!interaction.animation_active(&terminal));
+
+        interaction.mouse_y = 750.0;
+        terminal.scroll_y.current = 5.0;
+        terminal.scroll_y.target = 5.0;
+        assert!(interaction.update_selection_autoscroll(1.0, &mut terminal));
+        assert_eq!(terminal.scroll_y.target, 0.0);
+        terminal.scroll_y.current = 0.0;
+        assert!(!interaction.animation_active(&terminal));
+    }
+
+    #[test]
+    fn single_click_clears_selection_while_drag_keeps_nonempty_selection() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        crate::platform::lock_recover(&terminal.grid).selection = Some((1, 1, 4, 1));
+        assert!(interaction.clear_text_selection(&mut terminal));
+
+        begin_terminal_selection(&mut interaction, &mut terminal, 25.0, 400.0);
+        assert!(
+            crate::platform::lock_recover(&terminal.grid)
+                .selection
+                .is_none()
+        );
+        assert!(interaction.mouse_input(
+            ElementState::Released,
+            MouseButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(
+            crate::platform::lock_recover(&terminal.grid)
+                .selection
+                .is_none()
+        );
+
+        begin_terminal_selection(&mut interaction, &mut terminal, 25.0, 400.0);
+        assert!(interaction.cursor_moved(75.0, 400.0, &mut terminal, |_, _, _| 0));
+        assert!(interaction.mouse_input(
+            ElementState::Released,
+            MouseButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        let selection = crate::platform::lock_recover(&terminal.grid).selection;
+        assert!(selection.is_some_and(|(sx, sy, ex, ey)| sx != ex || sy != ey));
+    }
+
+    #[test]
+    fn cursor_left_top_and_bottom_autoscroll_continue_selection_and_return_uses_real_position() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.layout.max_scroll = 1000.0;
+        terminal.scroll_y.current = 500.0;
+        terminal.scroll_y.target = 500.0;
+
+        begin_terminal_selection(&mut interaction, &mut terminal, 100.0, 400.0);
+        interaction.layout.max_scroll = 1000.0;
+        interaction.mouse_x = 400.0;
+        interaction.mouse_y = 1.0;
+        assert!(interaction.cursor_left(800.0, 600.0, &mut terminal));
+        assert_eq!(interaction.mouse_y, -1.0);
+        assert!(interaction.update_selection_autoscroll(0.016, &mut terminal));
+        assert!(terminal.scroll_y.target > 500.0);
+        assert!(
+            crate::platform::lock_recover(&terminal.grid)
+                .selection
+                .is_some()
+        );
+
+        let _ = interaction.cursor_moved(400.0, 300.0, &mut terminal, |_, _, _| 0);
+        assert_eq!((interaction.mouse_x, interaction.mouse_y), (400.0, 300.0));
+
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.layout.max_scroll = 1000.0;
+        terminal.scroll_y.current = 500.0;
+        terminal.scroll_y.target = 500.0;
+
+        begin_terminal_selection(&mut interaction, &mut terminal, 100.0, 400.0);
+        interaction.layout.max_scroll = 1000.0;
+        interaction.mouse_x = 400.0;
+        interaction.mouse_y = 699.0;
+        assert!(interaction.cursor_left(800.0, 700.0, &mut terminal));
+        assert_eq!(interaction.mouse_y, 701.0);
+        assert!(interaction.update_selection_autoscroll(0.016, &mut terminal));
+        assert!(terminal.scroll_y.target < 500.0);
+        assert!(
+            crate::platform::lock_recover(&terminal.grid)
+                .selection
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn release_and_cancellation_stop_selection_autoscroll() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.layout.max_scroll = 1000.0;
+        terminal.scroll_y.current = 500.0;
+        terminal.scroll_y.target = 500.0;
+        interaction.pointer_capture = PointerCapture::TerminalSelection;
+        interaction.terminal_selection_anchor = Some((2, 2));
+        interaction.mouse_y = 50.0;
+        assert!(interaction.animation_active(&terminal));
+
+        assert!(interaction.mouse_input(
+            ElementState::Released,
+            MouseButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(!interaction.terminal_selection_active());
+        assert!(!interaction.animation_active(&terminal));
+
+        interaction.pointer_capture = PointerCapture::TerminalSelection;
+        interaction.terminal_selection_anchor = Some((2, 2));
+        interaction.cancel_pointer_interaction(&mut terminal);
+        assert!(!interaction.terminal_selection_active());
+        assert!(!interaction.animation_active(&terminal));
+    }
+
+    #[test]
+    fn tracked_mouse_press_still_reports_after_stale_selection_is_cleared() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 25.0;
+        interaction.mouse_y = 400.0;
+        {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            grid.selection = Some((1, 1, 4, 1));
+            grid.mouse_tracking_mode = MouseTrackingMode::Press;
+            grid.mouse_sgr = true;
+        }
+        assert!(interaction.clear_text_selection(&mut terminal));
+        assert!(interaction.mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        assert!(grid.selection.is_none());
+        assert_eq!(grid.mouse_tracking_mode, MouseTrackingMode::Press);
+    }
+
     #[test]
     fn terminal_body_click_defocuses_search_without_closing_it() {
         let mut search = TerminalSearchState::default();
@@ -1346,7 +1836,7 @@ mod tests {
         assert!(search.shown);
         assert!(!search.focused);
         assert!(!search_owns_keyboard(&search));
-        assert_eq!(search.query, "needle");
+        assert_eq!(search.text, "needle");
         assert_eq!(
             terminal_key_sequence(
                 PhysicalKey::Code(KeyCode::KeyA),
@@ -1359,7 +1849,7 @@ mod tests {
             ),
             Some(b"a".to_vec())
         );
-        assert_eq!(search.query, "needle");
+        assert_eq!(search.text, "needle");
     }
 
     #[test]
@@ -1595,31 +2085,5 @@ mod tests {
             .unwrap();
             assert_eq!(row, 13);
         }
-    }
-
-    #[test]
-    fn tracked_terminal_press_clears_stale_selection_only_on_press() {
-        let mut selection = Some((1, 2, 3, 4));
-        clear_selection_for_tracked_mouse_press(
-            &mut selection,
-            true,
-            ElementState::Pressed,
-        );
-        assert_eq!(selection, None);
-
-        selection = Some((1, 2, 3, 4));
-        clear_selection_for_tracked_mouse_press(
-            &mut selection,
-            true,
-            ElementState::Released,
-        );
-        assert!(selection.is_some());
-
-        clear_selection_for_tracked_mouse_press(
-            &mut selection,
-            false,
-            ElementState::Pressed,
-        );
-        assert!(selection.is_some());
     }
 }

@@ -132,6 +132,13 @@ struct OutputChunk {
     len: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalOutputBatchAction {
+    Collect,
+    FlushAndContinue,
+    FlushAndRedraw,
+}
+
 pub(crate) struct TerminalProcess {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master_pty: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -700,6 +707,28 @@ fn advance_terminal_output_batch(
     grid.dirty = true;
 }
 
+#[inline]
+fn terminal_output_batch_action(
+    chunk_count: usize,
+    elapsed: Duration,
+) -> TerminalOutputBatchAction {
+    if elapsed >= TERMINAL_OUTPUT_BATCH_MAX {
+        TerminalOutputBatchAction::FlushAndRedraw
+    } else if chunk_count >= TERMINAL_OUTPUT_BATCH_MAX_CHUNKS {
+        TerminalOutputBatchAction::FlushAndContinue
+    } else {
+        TerminalOutputBatchAction::Collect
+    }
+}
+
+#[inline]
+fn terminal_output_batch_receive_timeout(elapsed: Duration) -> Option<Duration> {
+    TERMINAL_OUTPUT_BATCH_MAX
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| remaining.min(TERMINAL_OUTPUT_BATCH_IDLE))
+}
+
 fn finish_terminal_output_stream(parser: &mut Parser, grid: &mut TermGrid) -> bool {
     if grid.presentation_ready {
         return false;
@@ -758,25 +787,50 @@ fn install_terminal_io_threads(
             batch.push(first_chunk);
             let started = Instant::now();
             loop {
-                match rx.recv_timeout(TERMINAL_OUTPUT_BATCH_IDLE) {
-                    Ok(next) => {
-                        batch.push(next);
-                        if batch.len() >= TERMINAL_OUTPUT_BATCH_MAX_CHUNKS
-                            || started.elapsed() >= TERMINAL_OUTPUT_BATCH_MAX
-                        {
+                let action = loop {
+                    let action = terminal_output_batch_action(batch.len(), started.elapsed());
+                    if action != TerminalOutputBatchAction::Collect {
+                        break action;
+                    }
+                    let Some(timeout) = terminal_output_batch_receive_timeout(started.elapsed())
+                    else {
+                        break TerminalOutputBatchAction::FlushAndRedraw;
+                    };
+                    match rx.recv_timeout(timeout) {
+                        Ok(next) => batch.push(next),
+                        Err(_) => break TerminalOutputBatchAction::FlushAndRedraw,
+                    }
+                };
+
+                {
+                    let mut grid = platform::lock_recover(&parser_grid);
+                    advance_terminal_output_batch(&mut parser, &mut grid, &batch);
+                }
+                recycle_output_chunks(&mut batch, &recycle_tx);
+
+                match action {
+                    TerminalOutputBatchAction::FlushAndContinue => {
+                        let Some(timeout) =
+                            terminal_output_batch_receive_timeout(started.elapsed())
+                        else {
+                            request_redraw();
                             break;
+                        };
+                        match rx.recv_timeout(timeout) {
+                            Ok(next) => batch.push(next),
+                            Err(_) => {
+                                request_redraw();
+                                break;
+                            }
                         }
                     }
-                    Err(_) => break,
+                    TerminalOutputBatchAction::Collect
+                    | TerminalOutputBatchAction::FlushAndRedraw => {
+                        request_redraw();
+                        break;
+                    }
                 }
             }
-
-            {
-                let mut grid = platform::lock_recover(&parser_grid);
-                advance_terminal_output_batch(&mut parser, &mut grid, &batch);
-            }
-            request_redraw();
-            recycle_output_chunks(&mut batch, &recycle_tx);
             first = rx.recv().ok();
         }
 
@@ -1119,6 +1173,41 @@ mod tests {
         recycle_output_chunks(&mut chunks, &tx);
         assert!(chunks.is_empty());
         assert_eq!(rx.recv().unwrap().len(), TERMINAL_READ_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn terminal_output_chunk_cap_flushes_parser_without_forcing_intermediate_redraw() {
+        assert_eq!(
+            terminal_output_batch_action(TERMINAL_OUTPUT_BATCH_MAX_CHUNKS - 1, Duration::ZERO),
+            TerminalOutputBatchAction::Collect
+        );
+        assert_eq!(
+            terminal_output_batch_action(TERMINAL_OUTPUT_BATCH_MAX_CHUNKS, Duration::ZERO),
+            TerminalOutputBatchAction::FlushAndContinue
+        );
+        assert_eq!(
+            terminal_output_batch_action(
+                TERMINAL_OUTPUT_BATCH_MAX_CHUNKS,
+                TERMINAL_OUTPUT_BATCH_MAX,
+            ),
+            TerminalOutputBatchAction::FlushAndRedraw
+        );
+    }
+
+    #[test]
+    fn terminal_output_idle_wait_is_capped_by_visual_batch_deadline() {
+        assert_eq!(
+            terminal_output_batch_receive_timeout(Duration::ZERO),
+            Some(TERMINAL_OUTPUT_BATCH_IDLE)
+        );
+        assert_eq!(
+            terminal_output_batch_receive_timeout(Duration::from_millis(30)),
+            Some(Duration::from_millis(2))
+        );
+        assert_eq!(
+            terminal_output_batch_receive_timeout(TERMINAL_OUTPUT_BATCH_MAX),
+            None
+        );
     }
 
     #[test]

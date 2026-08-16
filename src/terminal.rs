@@ -2651,6 +2651,19 @@ mod tests {
     }
 
     #[test]
+    fn sgr_colon_underline_reset_does_not_leave_a_blank_cell_decoration() {
+        let mut grid = TermGrid::new(4, 1);
+        feed(&mut grid, b"\x1b[4mA\x1b[4:0m B");
+
+        assert_eq!(grid.lines[0][0].c, 'A');
+        assert!(grid.lines[0][0].is_underlined());
+        assert_eq!(grid.lines[0][1].c, ' ');
+        assert!(!grid.lines[0][1].is_underlined());
+        assert_eq!(grid.lines[0][2].c, 'B');
+        assert!(!grid.lines[0][2].is_underlined());
+    }
+
+    #[test]
     fn column_reflow_clears_selection_and_copy_uses_reflowed_rows() {
         let mut grid = TermGrid::new(13, 1);
         let mut row = vec![Cell::default(); 13];

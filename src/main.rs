@@ -8,6 +8,7 @@ mod renderer;
 mod runtime;
 mod scroll;
 mod search;
+mod single_line_input;
 mod tabs;
 mod input;
 pub mod terminal;
@@ -115,10 +116,19 @@ fn tune_glibc_allocator() {
 }
 
 fn main() {
+    let mut primary_instance = match platform::single_instance::acquire_single_instance() {
+        Ok(platform::single_instance::SingleInstanceStatus::Primary(primary)) => primary,
+        Ok(platform::single_instance::SingleInstanceStatus::Secondary) => return,
+        Err(error) => {
+            eprintln!("Ronsole: single-instance startup failed: {error}");
+            return;
+        }
+    };
+
     prefer_egl_vendor();
     tune_glibc_allocator();
 
-    let event_loop = match EventLoop::builder().build() {
+    let event_loop = match EventLoop::<app::AppEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(error) => {
             eprintln!("Ronsole: failed to create Wayland event loop: {error}");
@@ -126,6 +136,13 @@ fn main() {
         }
     };
     event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+    if let Err(error) = primary_instance
+        .start_listener(move || proxy.send_event(app::AppEvent::ExternalLaunch).is_ok())
+    {
+        eprintln!("Ronsole: failed to start single-instance listener: {error}");
+        return;
+    }
 
     let mut app = app::App::load();
     if let Err(error) = event_loop.run_app(&mut app) {
@@ -180,5 +197,21 @@ mod tests {
             preferred_egl_vendor_path(EglVendorPreference::System, true),
             None
         );
+    }
+
+    #[test]
+    fn single_instance_gate_precedes_event_loop_and_app_creation() {
+        let source = include_str!("main.rs");
+        let gate = source
+            .find("acquire_single_instance()")
+            .expect("single-instance gate must remain present");
+        let event_loop = source
+            .find("EventLoop::<app::AppEvent>::with_user_event()")
+            .expect("typed event loop must remain present");
+        let app = source
+            .find("app::App::load()")
+            .expect("app construction must remain present");
+        assert!(gate < event_loop);
+        assert!(event_loop < app);
     }
 }
