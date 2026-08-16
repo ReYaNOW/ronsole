@@ -3,6 +3,8 @@ compile_error!("Ronsole supports Linux/Wayland only");
 
 mod app;
 mod config;
+mod input;
+mod input_types;
 mod platform;
 mod renderer;
 mod runtime;
@@ -10,14 +12,14 @@ mod scroll;
 mod search;
 mod single_line_input;
 mod tabs;
-mod input;
 pub mod terminal;
 mod terminal_compat;
 mod terminal_process;
+mod wake;
+mod wayland_input;
 
 use std::env;
 use std::path::Path;
-use winit::event_loop::{ControlFlow, EventLoop};
 
 const EGL_VENDOR_ENV: &str = "__EGL_VENDOR_LIBRARY_FILENAMES";
 const RONSOLE_EGL_VENDOR_ENV: &str = "RONSOLE_EGL_VENDOR";
@@ -128,25 +130,9 @@ fn main() {
     prefer_egl_vendor();
     tune_glibc_allocator();
 
-    let event_loop = match EventLoop::<app::AppEvent>::with_user_event().build() {
-        Ok(event_loop) => event_loop,
-        Err(error) => {
-            eprintln!("Ronsole: failed to create Wayland event loop: {error}");
-            return;
-        }
-    };
-    event_loop.set_control_flow(ControlFlow::Wait);
-    let proxy = event_loop.create_proxy();
-    if let Err(error) = primary_instance
-        .start_listener(move || proxy.send_event(app::AppEvent::ExternalLaunch).is_ok())
-    {
-        eprintln!("Ronsole: failed to start single-instance listener: {error}");
-        return;
-    }
-
     let mut app = app::App::load();
-    if let Err(error) = event_loop.run_app(&mut app) {
-        eprintln!("Ronsole: event loop failed: {error}");
+    if let Err(error) = app.run_direct_wayland(&mut primary_instance) {
+        eprintln!("Ronsole: Wayland runtime failed: {error}");
     }
 }
 
@@ -200,18 +186,18 @@ mod tests {
     }
 
     #[test]
-    fn single_instance_gate_precedes_event_loop_and_app_creation() {
+    fn single_instance_gate_precedes_direct_wayland_app_loop() {
         let source = include_str!("main.rs");
         let gate = source
             .find("acquire_single_instance()")
             .expect("single-instance gate must remain present");
-        let event_loop = source
-            .find("EventLoop::<app::AppEvent>::with_user_event()")
-            .expect("typed event loop must remain present");
         let app = source
             .find("app::App::load()")
             .expect("app construction must remain present");
-        assert!(gate < event_loop);
-        assert!(event_loop < app);
+        let direct_loop = source
+            .find("app.run_direct_wayland(&mut primary_instance)")
+            .expect("direct Wayland app loop must remain present");
+        assert!(gate < app);
+        assert!(app < direct_loop);
     }
 }

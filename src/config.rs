@@ -168,24 +168,6 @@ pub(crate) fn normalize_scroll_sensitivity(value: f32) -> f32 {
     }
 }
 
-pub(crate) fn logical_window_size(
-    physical_width: u32,
-    physical_height: u32,
-    scale_factor: f32,
-) -> Option<(f64, f64)> {
-    if physical_width == 0
-        || physical_height == 0
-        || !scale_factor.is_finite()
-        || scale_factor <= 0.0
-    {
-        return None;
-    }
-    let scale = f64::from(scale_factor);
-    let width = (f64::from(physical_width) / scale).round();
-    let height = (f64::from(physical_height) / scale).round();
-    (valid_window_dimension(width) && valid_window_dimension(height)).then_some((width, height))
-}
-
 fn valid_window_dimension(value: f64) -> bool {
     value.is_finite() && value > 0.0
 }
@@ -329,16 +311,6 @@ mod tests {
         assert_eq!(config.scroll_sensitivity, MAX_SCROLL_SENSITIVITY);
         assert!(!config.adjust_scroll_sensitivity(SCROLL_SENSITIVITY_STEP));
         assert!(format_config_content(&config).contains("scroll_sensitivity=3.00\n"));
-    }
-
-    #[test]
-    fn logical_window_size_converts_physical_pixels_without_persisting_zero() {
-        assert_eq!(logical_window_size(1650, 1080, 1.5), Some((1100.0, 720.0)));
-        assert_eq!(logical_window_size(1375, 900, 1.25), Some((1100.0, 720.0)));
-        assert_eq!(logical_window_size(0, 720, 1.0), None);
-        assert_eq!(logical_window_size(1100, 0, 1.0), None);
-        assert_eq!(logical_window_size(1100, 720, 0.0), None);
-        assert_eq!(logical_window_size(1100, 720, f32::NAN), None);
     }
 
     #[test]

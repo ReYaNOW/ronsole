@@ -11,9 +11,30 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 const SOCKET_FILE_NAME: &str = "instance.sock";
-const EXTERNAL_LAUNCH_COMMAND: u8 = 1;
+const XDG_ACTIVATION_TOKEN_ENV: &str = "XDG_ACTIVATION_TOKEN";
+const PROTOCOL_VERSION: u8 = 1;
+const EXTERNAL_LAUNCH_MESSAGE: u8 = 1;
+const REQUEST_HEADER_LEN: usize = 4;
+const MAX_ACTIVATION_TOKEN_BYTES: usize = 4096;
 const CLAIM_RETRIES: usize = 8;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExternalLaunchRequest {
+    pub(crate) activation_token: Option<String>,
+}
+
+impl std::fmt::Debug for ExternalLaunchRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalLaunchRequest")
+            .field(
+                "activation_token",
+                &self.activation_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum SingleInstanceStatus {
@@ -66,7 +87,7 @@ pub(crate) struct PrimaryInstance {
 impl PrimaryInstance {
     pub(crate) fn start_listener<F>(&mut self, mut external_launch: F) -> io::Result<()>
     where
-        F: FnMut() -> bool + Send + 'static,
+        F: FnMut(ExternalLaunchRequest) -> bool + Send + 'static,
     {
         if self.worker.is_some() {
             return Err(io::Error::new(
@@ -96,10 +117,8 @@ impl PrimaryInstance {
                 }
 
                 let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
-                let mut command = [0_u8; 1];
-                if stream.read_exact(&mut command).is_ok()
-                    && command[0] == EXTERNAL_LAUNCH_COMMAND
-                    && !external_launch()
+                if let Ok(request) = read_external_launch_request(&mut stream)
+                    && !external_launch(request)
                 {
                     break;
                 }
@@ -186,9 +205,19 @@ fn prepare_private_runtime_dir(path: &Path, uid: u32) -> io::Result<()> {
 }
 
 fn claim_at(socket_path: PathBuf, uid: u32) -> io::Result<SingleInstanceStatus> {
+    claim_at_with_request(socket_path, uid, || ExternalLaunchRequest {
+        activation_token: take_activation_token(),
+    })
+}
+
+fn claim_at_with_request(
+    socket_path: PathBuf,
+    uid: u32,
+    mut request: impl FnMut() -> ExternalLaunchRequest,
+) -> io::Result<SingleInstanceStatus> {
     let _startup_lock = StartupLock::acquire(&startup_lock_path(&socket_path))?;
     for _ in 0..CLAIM_RETRIES {
-        match notify_existing(&socket_path) {
+        match notify_existing(&socket_path, &mut request) {
             Ok(()) => return Ok(SingleInstanceStatus::Secondary),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
@@ -236,10 +265,112 @@ fn startup_lock_path(socket_path: &Path) -> PathBuf {
     socket_path.with_file_name("instance.lock")
 }
 
-fn notify_existing(socket_path: &Path) -> io::Result<()> {
+fn notify_existing(
+    socket_path: &Path,
+    request: &mut impl FnMut() -> ExternalLaunchRequest,
+) -> io::Result<()> {
     let mut stream = UnixStream::connect(socket_path)?;
     stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
-    stream.write_all(&[EXTERNAL_LAUNCH_COMMAND])
+    let request = request();
+    write_external_launch_request(&mut stream, &request)
+}
+
+fn take_activation_token() -> Option<String> {
+    take_activation_token_with(
+        || std::env::var_os(XDG_ACTIVATION_TOKEN_ENV),
+        // SAFETY: production single-instance acquisition runs at process startup,
+        // before Ronsole creates the event loop or starts worker threads.
+        || unsafe { std::env::remove_var(XDG_ACTIVATION_TOKEN_ENV) },
+    )
+}
+
+fn take_activation_token_with(
+    mut get: impl FnMut() -> Option<OsString>,
+    mut clear: impl FnMut(),
+) -> Option<String> {
+    let token = get();
+    if token.is_some() {
+        clear();
+    }
+    token
+        .and_then(|token| token.into_string().ok())
+        .filter(|token| !token.is_empty())
+}
+
+fn write_external_launch_request(
+    writer: &mut impl Write,
+    request: &ExternalLaunchRequest,
+) -> io::Result<()> {
+    let token = request
+        .activation_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(str::as_bytes)
+        .unwrap_or_default();
+    if token.len() > MAX_ACTIVATION_TOKEN_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "single-instance activation token exceeds protocol limit",
+        ));
+    }
+    let payload_len = u16::try_from(token.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "single-instance activation token exceeds protocol framing limit",
+        )
+    })?;
+    let payload_len = payload_len.to_be_bytes();
+    let header = [
+        PROTOCOL_VERSION,
+        EXTERNAL_LAUNCH_MESSAGE,
+        payload_len[0],
+        payload_len[1],
+    ];
+    writer.write_all(&header)?;
+    writer.write_all(token)
+}
+
+fn read_external_launch_request(reader: &mut impl Read) -> io::Result<ExternalLaunchRequest> {
+    let mut header = [0_u8; REQUEST_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    if header[0] != PROTOCOL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported single-instance protocol version",
+        ));
+    }
+    if header[1] != EXTERNAL_LAUNCH_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported single-instance message type",
+        ));
+    }
+
+    let payload_len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+    if payload_len > MAX_ACTIVATION_TOKEN_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "single-instance request exceeds protocol limit",
+        ));
+    }
+
+    let mut payload = [0_u8; MAX_ACTIVATION_TOKEN_BYTES];
+    reader.read_exact(&mut payload[..payload_len])?;
+    let activation_token = if payload_len == 0 {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(&payload[..payload_len])
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "single-instance activation token is not valid UTF-8",
+                    )
+                })?
+                .to_owned(),
+        )
+    };
+    Ok(ExternalLaunchRequest { activation_token })
 }
 
 fn remove_stale_socket(socket_path: &Path, uid: u32) -> io::Result<()> {
@@ -284,6 +415,8 @@ fn cleanup_socket_if_owned(socket_path: &Path, identity: SocketIdentity) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::sync::mpsc;
 
@@ -320,6 +453,25 @@ mod tests {
         }
     }
 
+    fn claim_without_activation_token(
+        socket_path: PathBuf,
+        uid: u32,
+    ) -> io::Result<SingleInstanceStatus> {
+        claim_at_with_request(socket_path, uid, ExternalLaunchRequest::default)
+    }
+
+    fn round_trip_request(request: &ExternalLaunchRequest) -> io::Result<ExternalLaunchRequest> {
+        let mut encoded = Vec::new();
+        write_external_launch_request(&mut encoded, request)?;
+        read_external_launch_request(&mut Cursor::new(encoded))
+    }
+
+    fn send_request(path: &Path, request: &ExternalLaunchRequest) {
+        let mut stream = UnixStream::connect(path).unwrap();
+        stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT)).unwrap();
+        write_external_launch_request(&mut stream, request).unwrap();
+    }
+
     #[test]
     fn runtime_directory_prefers_nonempty_xdg_and_has_per_user_fallback() {
         assert_eq!(
@@ -343,15 +495,144 @@ mod tests {
     }
 
     #[test]
+    fn external_launch_request_round_trips_without_token() {
+        let request = ExternalLaunchRequest::default();
+        let decoded = round_trip_request(&request).unwrap();
+        assert!(decoded.activation_token.is_none());
+    }
+
+    #[test]
+    fn external_launch_request_round_trips_with_token() {
+        let request = ExternalLaunchRequest {
+            activation_token: Some("wayland-token-123".to_owned()),
+        };
+        let decoded = round_trip_request(&request).unwrap();
+        assert_eq!(
+            decoded.activation_token.as_deref(),
+            Some("wayland-token-123")
+        );
+    }
+
+    #[test]
+    fn external_launch_request_debug_redacts_activation_token() {
+        let request = ExternalLaunchRequest {
+            activation_token: Some("secret-activation-token".to_owned()),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-activation-token"));
+    }
+
+    #[test]
+    fn activation_token_capture_clears_environment_and_normalizes_empty_value() {
+        let value = RefCell::new(Some(OsString::from("wayland-token-123")));
+        let clear_calls = Cell::new(0_u8);
+        let token = take_activation_token_with(
+            || value.borrow().clone(),
+            || {
+                clear_calls.set(clear_calls.get() + 1);
+                *value.borrow_mut() = None;
+            },
+        );
+        assert_eq!(token.as_deref(), Some("wayland-token-123"));
+        assert!(value.borrow().is_none());
+        assert_eq!(clear_calls.get(), 1);
+
+        let value = RefCell::new(Some(OsString::new()));
+        let token =
+            take_activation_token_with(|| value.borrow().clone(), || *value.borrow_mut() = None);
+        assert!(token.is_none());
+        assert!(value.borrow().is_none());
+
+        let clear_calls = Cell::new(0_u8);
+        let token = take_activation_token_with(|| None, || clear_calls.set(clear_calls.get() + 1));
+        assert!(token.is_none());
+        assert_eq!(clear_calls.get(), 0);
+    }
+
+    #[test]
+    fn truncated_external_launch_requests_are_rejected() {
+        let mut short_header = Cursor::new(vec![PROTOCOL_VERSION, EXTERNAL_LAUNCH_MESSAGE, 0]);
+        assert_eq!(
+            read_external_launch_request(&mut short_header)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let mut short_payload = Cursor::new(vec![
+            PROTOCOL_VERSION,
+            EXTERNAL_LAUNCH_MESSAGE,
+            0,
+            4,
+            b'a',
+            b'b',
+        ]);
+        assert_eq!(
+            read_external_launch_request(&mut short_payload)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn oversized_external_launch_request_is_rejected() {
+        let oversized = u16::try_from(MAX_ACTIVATION_TOKEN_BYTES + 1)
+            .unwrap()
+            .to_be_bytes();
+        let mut input = Cursor::new(vec![
+            PROTOCOL_VERSION,
+            EXTERNAL_LAUNCH_MESSAGE,
+            oversized[0],
+            oversized[1],
+        ]);
+        assert_eq!(
+            read_external_launch_request(&mut input).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let request = ExternalLaunchRequest {
+            activation_token: Some("x".repeat(MAX_ACTIVATION_TOKEN_BYTES + 1)),
+        };
+        assert_eq!(
+            write_external_launch_request(&mut Vec::new(), &request)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn unknown_protocol_version_and_message_type_are_rejected() {
+        let mut unknown_version =
+            Cursor::new(vec![PROTOCOL_VERSION + 1, EXTERNAL_LAUNCH_MESSAGE, 0, 0]);
+        assert_eq!(
+            read_external_launch_request(&mut unknown_version)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut unknown_type = Cursor::new(vec![PROTOCOL_VERSION, 0x7f, 0, 0]);
+        assert_eq!(
+            read_external_launch_request(&mut unknown_type)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn first_owner_is_primary_second_launch_is_secondary_and_socket_is_private() {
         let dir = TestDir::new();
         let path = dir.socket_path();
         let uid = effective_uid();
-        let primary = take_primary(claim_at(path.clone(), uid).unwrap());
+        let primary = take_primary(claim_without_activation_token(path.clone(), uid).unwrap());
         let metadata = fs::symlink_metadata(&path).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         assert!(matches!(
-            claim_at(path.clone(), uid).unwrap(),
+            claim_without_activation_token(path.clone(), uid).unwrap(),
             SingleInstanceStatus::Secondary
         ));
         drop(primary);
@@ -363,16 +644,66 @@ mod tests {
         let dir = TestDir::new();
         let path = dir.socket_path();
         let uid = effective_uid();
-        let mut primary = take_primary(claim_at(path.clone(), uid).unwrap());
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), uid).unwrap());
         let (tx, rx) = mpsc::sync_channel(1);
-        primary.start_listener(move || tx.send(()).is_ok()).unwrap();
+        primary
+            .start_listener(move |request| tx.send(request).is_ok())
+            .unwrap();
 
         assert!(matches!(
-            claim_at(path, uid).unwrap(),
+            claim_without_activation_token(path, uid).unwrap(),
             SingleInstanceStatus::Secondary
         ));
         rx.recv_timeout(Duration::from_secs(1))
             .expect("external launch was not delivered");
+    }
+
+    #[test]
+    fn listener_delivers_multiple_sequential_external_launch_requests() {
+        let dir = TestDir::new();
+        let path = dir.socket_path();
+        let uid = effective_uid();
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), uid).unwrap());
+        let (tx, rx) = mpsc::sync_channel(2);
+        primary
+            .start_listener(move |request| tx.send(request).is_ok())
+            .unwrap();
+
+        send_request(&path, &ExternalLaunchRequest::default());
+        send_request(
+            &path,
+            &ExternalLaunchRequest {
+                activation_token: Some("second-token".to_owned()),
+            },
+        );
+
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(first.activation_token.is_none());
+        assert_eq!(second.activation_token.as_deref(), Some("second-token"));
+    }
+
+    #[test]
+    fn sequential_secondary_launches_notify_the_same_primary() {
+        let dir = TestDir::new();
+        let path = dir.socket_path();
+        let uid = effective_uid();
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), uid).unwrap());
+        let (tx, rx) = mpsc::sync_channel(2);
+        primary
+            .start_listener(move |_| tx.send(()).is_ok())
+            .unwrap();
+
+        assert!(matches!(
+            claim_without_activation_token(path.clone(), uid).unwrap(),
+            SingleInstanceStatus::Secondary
+        ));
+        assert!(matches!(
+            claim_without_activation_token(path, uid).unwrap(),
+            SingleInstanceStatus::Secondary
+        ));
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -383,7 +714,8 @@ mod tests {
         drop(listener);
         assert!(path.exists());
 
-        let primary = take_primary(claim_at(path.clone(), effective_uid()).unwrap());
+        let primary =
+            take_primary(claim_without_activation_token(path.clone(), effective_uid()).unwrap());
         assert!(path.exists());
         drop(primary);
         assert!(!path.exists());
@@ -406,7 +738,7 @@ mod tests {
             let tx = tx.clone();
             workers.push(std::thread::spawn(move || {
                 start.wait();
-                let status = claim_at(path, uid).unwrap();
+                let status = claim_without_activation_token(path, uid).unwrap();
                 let is_primary = matches!(status, SingleInstanceStatus::Primary(_));
                 tx.send(is_primary).unwrap();
                 release.wait();
@@ -425,25 +757,53 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_truncated_commands_do_not_stop_listener() {
+    fn malformed_requests_do_not_stop_listener() {
         let dir = TestDir::new();
         let path = dir.socket_path();
         let uid = effective_uid();
-        let mut primary = take_primary(claim_at(path.clone(), uid).unwrap());
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), uid).unwrap());
         let (tx, rx) = mpsc::sync_channel(1);
-        primary.start_listener(move || tx.send(()).is_ok()).unwrap();
+        primary
+            .start_listener(move |request| tx.send(request).is_ok())
+            .unwrap();
 
         let mut unknown = UnixStream::connect(&path).unwrap();
-        unknown.write_all(&[0x7f]).unwrap();
+        unknown
+            .write_all(&[PROTOCOL_VERSION + 1, EXTERNAL_LAUNCH_MESSAGE, 0, 0])
+            .unwrap();
         drop(unknown);
-        drop(UnixStream::connect(&path).unwrap());
 
-        assert!(matches!(
-            claim_at(path, uid).unwrap(),
-            SingleInstanceStatus::Secondary
-        ));
-        rx.recv_timeout(Duration::from_secs(1))
-            .expect("listener stopped after malformed command");
+        let mut unknown_type = UnixStream::connect(&path).unwrap();
+        unknown_type
+            .write_all(&[PROTOCOL_VERSION, 0x7f, 0, 0])
+            .unwrap();
+        drop(unknown_type);
+
+        let mut truncated = UnixStream::connect(&path).unwrap();
+        truncated
+            .write_all(&[PROTOCOL_VERSION, EXTERNAL_LAUNCH_MESSAGE, 0])
+            .unwrap();
+        drop(truncated);
+
+        let oversized = u16::try_from(MAX_ACTIVATION_TOKEN_BYTES + 1)
+            .unwrap()
+            .to_be_bytes();
+        let mut oversized_request = UnixStream::connect(&path).unwrap();
+        oversized_request
+            .write_all(&[
+                PROTOCOL_VERSION,
+                EXTERNAL_LAUNCH_MESSAGE,
+                oversized[0],
+                oversized[1],
+            ])
+            .unwrap();
+        drop(oversized_request);
+
+        send_request(&path, &ExternalLaunchRequest::default());
+        let request = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("listener stopped after malformed request");
+        assert!(request.activation_token.is_none());
     }
 
     #[test]
@@ -451,7 +811,7 @@ mod tests {
         let dir = TestDir::new();
         let path = dir.socket_path();
         fs::write(&path, b"not a socket").unwrap();
-        let error = claim_at(path.clone(), effective_uid()).unwrap_err();
+        let error = claim_without_activation_token(path.clone(), effective_uid()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&path).unwrap(), b"not a socket");
     }
@@ -461,12 +821,12 @@ mod tests {
         let dir = TestDir::new();
         let path = dir.socket_path();
         let uid = effective_uid();
-        let mut primary = take_primary(claim_at(path.clone(), uid).unwrap());
-        primary.start_listener(|| true).unwrap();
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), uid).unwrap());
+        primary.start_listener(|_| true).unwrap();
         drop(primary);
         assert!(!path.exists());
 
-        let replacement = take_primary(claim_at(path, uid).unwrap());
+        let replacement = take_primary(claim_without_activation_token(path, uid).unwrap());
         drop(replacement);
     }
 }

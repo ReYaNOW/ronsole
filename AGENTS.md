@@ -115,7 +115,7 @@ In render, frame, glyph, input, PTY-output, and animation paths:
 - Inspect only visible rows plus bounded overscan while rendering.
 - Batch PTY output. Target one parser/grid lock and one redraw wakeup per output batch.
 - Render only when state is dirty or an animation is active.
-- Settled idle state must sleep in `ControlFlow::Wait` or `WaitUntil`.
+- Settled idle state must block in the direct Wayland poll loop until fd activity or a real deadline.
 - Unfocused, occluded, zero-size, and fully idle windows must not continuously render.
 - Use real frame `dt`; do not quantize to 60 Hz or add a sleep-based FPS limiter.
 - Keep diagnostics opt-in and out of frame loops.
@@ -133,7 +133,7 @@ In render, frame, glyph, input, PTY-output, and animation paths:
 ## 5. Platform/runtime invariants
 
 - Linux + Wayland only.
-- Do not enable `winit/x11`, GLX, or X11 features.
+- Do not enable GLX or any X11 features.
 - EGL vendor selection must happen before EGL/GLVND loads.
 - GL context priority order on Linux: High, then Default fallback for each supported context plan.
 - Context plans: OpenGL 4.1 Core, OpenGL 3.3 Core, GLES 3.0.
@@ -161,7 +161,8 @@ In render, frame, glyph, input, PTY-output, and animation paths:
 
 - `src/main.rs` — Linux startup, EGL vendor preference, allocator tuning, event-loop construction.
 - `src/runtime.rs` — Wayland window plus glutin context/surface lifecycle and graphics diagnostics.
-- `src/app.rs` — winit event routing, redraw/idle/focus/occlusion/resize lifecycle, tab-session lifecycle, shortcut dispatch.
+- `src/app.rs` — backend-independent redraw/idle/focus/occlusion/resize lifecycle, tab-session lifecycle, shortcut dispatch.
+- `src/app/direct_wayland.rs` — direct Wayland event-loop routing, bounded single-instance handoff, and frame/deadline integration.
 
 ### Renderer
 

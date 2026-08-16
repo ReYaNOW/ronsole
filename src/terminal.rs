@@ -3564,8 +3564,8 @@ impl Terminal {
         }
     }
 
-    pub fn spawn(
-        window: Option<std::sync::Arc<winit::window::Window>>,
+    pub(crate) fn spawn(
+        wake: Option<crate::wake::WakeHandle>,
         display_number: u64,
     ) -> Self {
         let title_cache = Arc::new(Mutex::new(
@@ -3582,7 +3582,7 @@ impl Terminal {
         let process = match crate::terminal_process::TerminalProcess::spawn(
             grid.clone(),
             title_cache.clone(),
-            window,
+            wake,
         ) {
             Ok(process) => Some(process),
             Err(error) => {

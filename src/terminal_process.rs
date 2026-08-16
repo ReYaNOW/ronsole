@@ -1,5 +1,6 @@
 use crate::platform::{self, ProcessTree};
 use crate::terminal::TermGrid;
+use crate::wake::WakeHandle;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -151,7 +152,7 @@ pub(crate) struct TerminalProcess {
 
 struct TerminalCleanupJob {
     process: TerminalProcess,
-    wake_window: Option<Arc<winit::window::Window>>,
+    wake: Option<WakeHandle>,
 }
 
 pub(crate) struct TerminalCleanupWorker {
@@ -168,8 +169,8 @@ impl TerminalCleanupWorker {
             .spawn(move || {
                 while let Ok(mut job) = receiver.recv() {
                     job.process.shutdown();
-                    if let Some(window) = job.wake_window {
-                        window.request_redraw();
+                    if let Some(wake) = job.wake {
+                        wake.wake();
                     }
                 }
             })
@@ -183,15 +184,12 @@ impl TerminalCleanupWorker {
     pub(crate) fn try_enqueue(
         &self,
         process: TerminalProcess,
-        wake_window: Option<Arc<winit::window::Window>>,
+        wake: Option<WakeHandle>,
     ) -> Result<(), TerminalProcess> {
         let Some(sender) = self.sender.as_ref() else {
             return Err(process);
         };
-        match sender.try_send(TerminalCleanupJob {
-            process,
-            wake_window,
-        }) {
+        match sender.try_send(TerminalCleanupJob { process, wake }) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => Err(job.process),
         }
@@ -219,7 +217,7 @@ impl TerminalProcess {
     pub(crate) fn spawn(
         grid: Arc<Mutex<TermGrid>>,
         title_cache: TerminalTitleCache,
-        window: Option<Arc<winit::window::Window>>,
+        wake: Option<WakeHandle>,
     ) -> io::Result<Self> {
         let cwd = terminal_working_directory()?;
         let shell = resolve_terminal_shell()?;
@@ -277,7 +275,7 @@ impl TerminalProcess {
             title_cache,
             shell.title,
             cwd,
-            window.clone(),
+            wake.clone(),
         ) {
             Ok(handles) => handles,
             Err(error) => {
@@ -289,7 +287,7 @@ impl TerminalProcess {
             }
         };
 
-        if let Err(error) = install_terminal_io_threads(&grid, reader, writer.clone(), window) {
+        if let Err(error) = install_terminal_io_threads(&grid, reader, writer.clone(), wake) {
             let _ = title_stop_tx.send(());
             platform::reap_unit_thread(title_worker);
             let _ = tree.terminate_forcefully();
@@ -665,7 +663,7 @@ fn install_terminal_title_refresh(
     title_cache: TerminalTitleCache,
     shell_title: String,
     initial_cwd: PathBuf,
-    window: Option<Arc<winit::window::Window>>,
+    wake: Option<WakeHandle>,
 ) -> io::Result<(std::sync::mpsc::Sender<()>, JoinHandle<()>)> {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let worker = platform::spawn_named("ronsole-session-title", move || {
@@ -681,9 +679,9 @@ fn install_terminal_title_refresh(
                 home.as_deref(),
                 &mut last_process_group,
                 &mut snapshot,
-            ) && let Some(window) = window.as_ref()
+            ) && let Some(wake) = wake.as_ref()
             {
-                window.request_redraw();
+                wake.wake();
             }
 
             match stop_rx.recv_timeout(TERMINAL_TITLE_REFRESH_INTERVAL) {
@@ -763,7 +761,7 @@ fn install_terminal_io_threads(
     grid: &Arc<Mutex<TermGrid>>,
     reader: Box<dyn Read + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    window: Option<Arc<winit::window::Window>>,
+    wake: Option<WakeHandle>,
 ) -> io::Result<()> {
     let (reply_tx, reply_rx) = terminal_reply_channel();
     let (tx, rx) = std::sync::mpsc::sync_channel::<OutputChunk>(TERMINAL_OUTPUT_QUEUE_CAPACITY);
@@ -775,9 +773,9 @@ fn install_terminal_io_threads(
     let parser_reader_finished = reader_finished.clone();
     platform::spawn_named("ronsole-terminal-parser", move || {
         let mut parser = Parser::new();
-        let request_redraw = || {
-            if let Some(window) = window.as_ref() {
-                window.request_redraw();
+        let wake_main_loop = || {
+            if let Some(wake) = wake.as_ref() {
+                wake.wake();
             }
         };
         let mut batch = Vec::with_capacity(8);
@@ -813,20 +811,20 @@ fn install_terminal_io_threads(
                         let Some(timeout) =
                             terminal_output_batch_receive_timeout(started.elapsed())
                         else {
-                            request_redraw();
+                            wake_main_loop();
                             break;
                         };
                         match rx.recv_timeout(timeout) {
                             Ok(next) => batch.push(next),
                             Err(_) => {
-                                request_redraw();
+                                wake_main_loop();
                                 break;
                             }
                         }
                     }
                     TerminalOutputBatchAction::Collect
                     | TerminalOutputBatchAction::FlushAndRedraw => {
-                        request_redraw();
+                        wake_main_loop();
                         break;
                     }
                 }
@@ -838,7 +836,7 @@ fn install_terminal_io_threads(
             let mut grid = platform::lock_recover(&parser_grid);
             if finish_terminal_output_stream(&mut parser, &mut grid) {
                 drop(grid);
-                request_redraw();
+                wake_main_loop();
             }
         }
     })

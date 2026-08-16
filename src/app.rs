@@ -1,28 +1,29 @@
 use crate::config::{
     AppConfig, DEFAULT_SCROLL_SENSITIVITY, DEFAULT_TERMINAL_BACKGROUND, DEFAULT_TERMINAL_FONT_SIZE,
-    RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP, logical_window_size,
+    RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
 };
 use crate::input::TerminalInteraction;
+use crate::input_types::{
+    CursorKind, KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton,
+    PointerPosition, ScrollDelta,
+};
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::single_line_input::SingleLineInput;
 use crate::tabs::{
-    DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move,
-    active_index_after_remove, drag_autoscroll_delta, drag_autoscroll_speed,
-    take_terminal_creation_number,
+    DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
+    drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
 };
 use crate::terminal::{Terminal, TerminalPresentationIntent};
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess};
 use std::collections::VecDeque;
 use std::time::Instant;
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CursorIcon, WindowId};
+
+mod direct_wayland;
 
 const TERMINAL_CLEANUP_PENDING_CAPACITY: usize = 16;
+const PENDING_EXTERNAL_LAUNCH_CAPACITY: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopMode {
@@ -31,8 +32,16 @@ enum LoopMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppLoopControl {
+    Exit,
+    Wait,
+    WaitUntil(Instant),
+    Poll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FramePlan {
-    request_redraw: bool,
+    request_frame: bool,
     loop_mode: LoopMode,
 }
 
@@ -44,15 +53,10 @@ enum GlobalShortcut {
     Search,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AppEvent {
-    ExternalLaunch,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum ExternalLaunchAction {
     OpenDefaultTab,
-    ActivateExistingWindow,
+    ActivateExistingWindow { activation_token: Option<String> },
 }
 
 #[inline(always)]
@@ -64,13 +68,13 @@ fn animation_dt(raw_dt: f32) -> f32 {
 fn frame_plan(renderable: bool, dirty: bool, animation_active: bool) -> FramePlan {
     if !renderable {
         return FramePlan {
-            request_redraw: false,
+            request_frame: false,
             loop_mode: LoopMode::Wait,
         };
     }
 
     FramePlan {
-        request_redraw: dirty || animation_active,
+        request_frame: dirty || animation_active,
         loop_mode: if animation_active {
             LoopMode::Poll
         } else {
@@ -80,14 +84,14 @@ fn frame_plan(renderable: bool, dirty: bool, animation_active: bool) -> FramePla
 }
 
 #[inline]
-fn exact_global_modifiers(modifiers: ModifiersState, shift: bool) -> bool {
+fn exact_global_modifiers(modifiers: Modifiers, shift: bool) -> bool {
     modifiers.control_key()
         && modifiers.shift_key() == shift
         && !modifiers.alt_key()
         && !modifiers.super_key()
 }
 
-fn global_shortcut(key: PhysicalKey, modifiers: ModifiersState) -> Option<GlobalShortcut> {
+fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShortcut> {
     match key {
         PhysicalKey::Code(KeyCode::F1) if modifiers.is_empty() => {
             Some(GlobalShortcut::ToggleSettings)
@@ -148,10 +152,8 @@ fn settings_hex_insert_text(input: &mut SingleLineInput, text: &str) -> bool {
 fn settings_background_editor_key(
     input: &mut SingleLineInput,
     key: PhysicalKey,
-    text: Option<&str>,
     ctrl: bool,
     shift: bool,
-    text_input_allowed: bool,
     paste_text: Option<&str>,
 ) -> SettingsBackgroundKeyOutcome {
     let before_text = input.text.clone();
@@ -194,11 +196,6 @@ fn settings_background_editor_key(
                 let _ = settings_hex_insert_text(input, text);
             }
         }
-        _ if text_input_allowed => {
-            if let Some(text) = text {
-                let _ = settings_hex_insert_text(input, text);
-            }
-        }
         _ => outcome.consumed = false,
     }
     outcome.text_changed = input.text != before_text;
@@ -229,34 +226,39 @@ fn ui_cursor_icon(
     settings_text_dragging: bool,
     tab_hit: TerminalTabHit,
     tab_dragging: bool,
-) -> CursorIcon {
+) -> CursorKind {
     if settings_modal_active {
         return if settings_text_dragging || settings_hit == SettingsHit::BackgroundField {
-            CursorIcon::Text
+            CursorKind::Text
         } else {
-            CursorIcon::Default
+            CursorKind::Default
         };
     }
     if tab_dragging {
-        return CursorIcon::Default;
+        return CursorKind::Default;
     }
     match tab_hit {
-        TerminalTabHit::Close(_) | TerminalTabHit::Add => CursorIcon::Pointer,
-        TerminalTabHit::Body(_) | TerminalTabHit::None => CursorIcon::Default,
+        TerminalTabHit::Close(_) | TerminalTabHit::Add => CursorKind::Pointer,
+        TerminalTabHit::Body(_) | TerminalTabHit::None => CursorKind::Default,
     }
 }
 
 #[inline]
-fn cursor_icon_change(current: CursorIcon, desired: CursorIcon) -> Option<CursorIcon> {
+fn cursor_icon_change(current: CursorKind, desired: CursorKind) -> Option<CursorKind> {
     (current != desired).then_some(desired)
 }
 
 #[inline]
-fn external_launch_action(focused: bool) -> ExternalLaunchAction {
+fn external_launch_action(
+    focused: bool,
+    request: crate::platform::single_instance::ExternalLaunchRequest,
+) -> ExternalLaunchAction {
     if focused {
         ExternalLaunchAction::OpenDefaultTab
     } else {
-        ExternalLaunchAction::ActivateExistingWindow
+        ExternalLaunchAction::ActivateExistingWindow {
+            activation_token: request.activation_token,
+        }
     }
 }
 
@@ -303,10 +305,10 @@ fn settings_animation_step(current: f32, open: bool, dt: f32) -> (f32, bool) {
 }
 
 #[inline]
-fn tab_wheel_delta(delta: MouseScrollDelta, scale: f32) -> f32 {
+fn tab_wheel_delta(delta: ScrollDelta, scale: f32) -> f32 {
     match delta {
-        MouseScrollDelta::LineDelta(_, y) => -y * 40.0 * scale.max(0.1),
-        MouseScrollDelta::PixelDelta(position) => -(position.y as f32),
+        ScrollDelta::Line { y, .. } => -y * 40.0 * scale.max(0.1),
+        ScrollDelta::Pixel { y, .. } => -y,
     }
 }
 
@@ -314,10 +316,12 @@ fn ready_terminal_presentation<I>(states: I) -> Option<(usize, bool)>
 where
     I: IntoIterator<Item = (usize, TerminalPresentationIntent, bool, bool)>,
 {
-    states.into_iter().find_map(|(index, intent, ready, reveal_tail)| {
-        (intent == TerminalPresentationIntent::ActivateWhenReady && ready)
-            .then_some((index, reveal_tail))
-    })
+    states
+        .into_iter()
+        .find_map(|(index, intent, ready, reveal_tail)| {
+            (intent == TerminalPresentationIntent::ActivateWhenReady && ready)
+                .then_some((index, reveal_tail))
+        })
 }
 
 pub struct App {
@@ -340,16 +344,16 @@ pub struct App {
     interaction: TerminalInteraction,
     terminal_cleanup: TerminalCleanupWorker,
     pending_terminal_cleanup: VecDeque<TerminalProcess>,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
     pointer_x: f32,
     pointer_y: f32,
-    cursor_icon: CursorIcon,
+    cursor_icon: CursorKind,
     settings_open: bool,
     settings_progress: f32,
     settings_active_tab: SettingsTab,
     focused: bool,
     unfocused_redraw_pending: bool,
-    pending_external_launches: u32,
+    pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
     occluded: bool,
     zero_sized: bool,
     dirty: bool,
@@ -394,16 +398,16 @@ impl App {
             interaction,
             terminal_cleanup: TerminalCleanupWorker::new(),
             pending_terminal_cleanup: VecDeque::with_capacity(TERMINAL_CLEANUP_PENDING_CAPACITY),
-            modifiers: ModifiersState::empty(),
+            modifiers: Modifiers::empty(),
             pointer_x: 0.0,
             pointer_y: 0.0,
-            cursor_icon: CursorIcon::Default,
+            cursor_icon: CursorKind::Default,
             settings_open: false,
             settings_progress: 0.0,
             settings_active_tab: SettingsTab::General,
             focused: true,
             unfocused_redraw_pending: false,
-            pending_external_launches: 0,
+            pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
             occluded: false,
             zero_sized: false,
             dirty: true,
@@ -446,19 +450,18 @@ impl App {
         }
     }
 
-    fn request_exit(&mut self, event_loop: &ActiveEventLoop) {
+    fn prepare_exit(&mut self) {
         self.persist_config_if_needed();
-        event_loop.exit();
     }
 
     fn suspend_frame_clock(&mut self) {
         self.last_frame = Instant::now();
     }
 
-    fn request_redraw(&mut self) {
+    fn request_frame(&mut self) {
         self.mark_dirty();
         if let Some(runtime) = self.runtime.as_ref() {
-            runtime.window().request_redraw();
+            runtime.request_frame();
         }
     }
 
@@ -489,12 +492,8 @@ impl App {
         let new_reporting = new
             .and_then(|index| self.terminals.get(index))
             .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting);
-        let (focus_out, focus_in) = terminal_focus_transition_plan(
-            self.focused,
-            true,
-            old_reporting,
-            new_reporting,
-        );
+        let (focus_out, focus_in) =
+            terminal_focus_transition_plan(self.focused, true, old_reporting, new_reporting);
         if let (Some(index), Some(sequence)) = (old, focus_out)
             && let Some(terminal) = self.terminals.get(index)
         {
@@ -532,16 +531,16 @@ impl App {
     }
 
     fn process_terminal_presentation_intents(&mut self) -> bool {
-        let ready = ready_terminal_presentation(
-            self.terminals.iter().enumerate().map(|(index, terminal)| {
+        let ready = ready_terminal_presentation(self.terminals.iter().enumerate().map(
+            |(index, terminal)| {
                 (
                     index,
                     terminal.presentation_intent,
                     terminal.presentation_ready(),
                     terminal.reveal_right_tail_when_presented,
                 )
-            }),
-        );
+            },
+        ));
         let Some((index, reveal_tail)) = ready else {
             return false;
         };
@@ -565,41 +564,45 @@ impl App {
     }
 
     fn add_terminal(&mut self) -> Option<usize> {
-        let window = self.runtime.as_ref()?.window_arc();
+        let wake = self.runtime.as_ref()?.wake_handle();
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
-        let terminal = Terminal::spawn(Some(window), display_number);
+        let terminal = Terminal::spawn(Some(wake), display_number);
         let index = self.terminals.len();
         self.terminals.push(terminal);
         if self.terminals.len() == 1 {
             self.active_terminal = 0;
         }
         self.request_terminal_activation(index, true);
-        self.request_redraw();
+        self.request_frame();
         Some(index)
     }
 
-    fn handle_external_launch(&mut self) {
+    fn handle_external_launch(
+        &mut self,
+        request: crate::platform::single_instance::ExternalLaunchRequest,
+    ) {
         if self.runtime.is_none() {
-            self.pending_external_launches = self.pending_external_launches.saturating_add(1);
+            if self.pending_external_launches.len() < PENDING_EXTERNAL_LAUNCH_CAPACITY {
+                self.pending_external_launches.push_back(request);
+            }
             return;
         }
-        match external_launch_action(self.focused) {
+        match external_launch_action(self.focused, request) {
             ExternalLaunchAction::OpenDefaultTab => {
                 let _ = self.add_terminal();
             }
-            ExternalLaunchAction::ActivateExistingWindow => {
-                if let Some(runtime) = self.runtime.as_ref() {
-                    runtime.activate_existing_window();
+            ExternalLaunchAction::ActivateExistingWindow { activation_token } => {
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.activate_existing_window(activation_token);
                 }
             }
         }
     }
 
     fn flush_pending_external_launches(&mut self) {
-        let pending = std::mem::take(&mut self.pending_external_launches);
-        for _ in 0..pending {
-            self.handle_external_launch();
+        while let Some(request) = self.pending_external_launches.pop_front() {
+            self.handle_external_launch(request);
         }
     }
 
@@ -659,7 +662,7 @@ impl App {
             }
         }
         self.pending_tab_reveal = Some(false);
-        self.request_redraw();
+        self.request_frame();
         false
     }
 
@@ -670,8 +673,8 @@ impl App {
         if !self.terminal_cleanup.is_available() {
             return Err(process);
         }
-        let wake_window = self.runtime.as_ref().map(WindowRuntime::window_arc);
-        match self.terminal_cleanup.try_enqueue(process, wake_window) {
+        let wake = self.runtime.as_ref().map(WindowRuntime::wake_handle);
+        match self.terminal_cleanup.try_enqueue(process, wake) {
             Ok(()) => Ok(()),
             Err(process)
                 if self.pending_terminal_cleanup.len() < TERMINAL_CLEANUP_PENDING_CAPACITY =>
@@ -687,12 +690,9 @@ impl App {
         if self.pending_terminal_cleanup.is_empty() {
             return;
         }
-        let wake_window = self.runtime.as_ref().map(WindowRuntime::window_arc);
+        let wake = self.runtime.as_ref().map(WindowRuntime::wake_handle);
         while let Some(process) = self.pending_terminal_cleanup.pop_front() {
-            match self
-                .terminal_cleanup
-                .try_enqueue(process, wake_window.clone())
-            {
+            match self.terminal_cleanup.try_enqueue(process, wake.clone()) {
                 Ok(()) => {}
                 Err(process) => {
                     self.pending_terminal_cleanup.push_front(process);
@@ -732,11 +732,11 @@ impl App {
             .is_some_and(|terminal| self.interaction.clear_text_selection(terminal))
     }
 
-    fn handle_focus_changed(&mut self, focused: bool) {
+    fn on_focus_changed(&mut self, focused: bool) {
         self.focused = focused;
         self.unfocused_redraw_pending = !focused;
-        self.modifiers = ModifiersState::empty();
-        self.interaction.set_modifiers(ModifiersState::empty());
+        self.modifiers = Modifiers::empty();
+        self.interaction.set_modifiers(Modifiers::empty());
         if self.active_terminal_presented {
             self.send_terminal_focus_state(self.active_terminal, focused);
         }
@@ -745,7 +745,7 @@ impl App {
             self.settings_background_dragging = false;
         }
         self.suspend_frame_clock();
-        self.request_redraw();
+        self.request_frame();
     }
 
     fn toggle_settings(&mut self) {
@@ -761,7 +761,7 @@ impl App {
         }
         self.settings_open = !self.settings_open;
         self.refresh_cursor_icon();
-        self.request_redraw();
+        self.request_frame();
     }
 
     fn close_settings(&mut self) {
@@ -770,7 +770,7 @@ impl App {
             self.settings_open = false;
             self.settings_background_dragging = false;
             self.refresh_cursor_icon();
-            self.request_redraw();
+            self.request_frame();
         }
     }
 
@@ -802,7 +802,7 @@ impl App {
             .set_text(&self.config.terminal_background.to_hex());
         self.settings_background_editing = false;
         self.settings_background_dragging = false;
-        self.request_redraw();
+        self.request_frame();
     }
 
     fn edit_settings_background_text(&mut self, text: &str) -> bool {
@@ -811,12 +811,12 @@ impl App {
         }
         if settings_hex_insert_text(&mut self.settings_background_input, text) {
             self.apply_valid_settings_background_draft();
-            self.request_redraw();
+            self.request_frame();
         }
         true
     }
 
-    fn handle_settings_background_key(&mut self, key: PhysicalKey, text: Option<&str>) -> bool {
+    fn handle_settings_background_key(&mut self, key: PhysicalKey) -> bool {
         if !self.settings_background_editing {
             return false;
         }
@@ -830,10 +830,8 @@ impl App {
         let outcome = settings_background_editor_key(
             &mut self.settings_background_input,
             key,
-            text,
             ctrl,
             shift,
-            !ctrl && !self.modifiers.alt_key() && !self.modifiers.super_key(),
             paste.as_deref(),
         );
         if let Some(copy) = outcome.copy_text {
@@ -847,7 +845,7 @@ impl App {
             self.apply_valid_settings_background_draft();
         }
         if outcome.visual_changed {
-            self.request_redraw();
+            self.request_frame();
         }
         outcome.consumed
     }
@@ -875,7 +873,7 @@ impl App {
         );
         self.settings_background_dragging = true;
         if changed {
-            self.request_redraw();
+            self.request_frame();
         }
     }
 
@@ -892,14 +890,14 @@ impl App {
                 self.settings_background_input
                     .set_text(&self.config.terminal_background.to_hex());
                 self.settings_background_editing = true;
-                self.request_redraw();
+                self.request_frame();
             }
             return;
         }
         if let SettingsHit::Tab(tab) = hit {
             if self.settings_active_tab != tab {
                 self.settings_active_tab = tab;
-                self.request_redraw();
+                self.request_frame();
             }
             return;
         }
@@ -976,7 +974,7 @@ impl App {
         };
         if changed {
             self.mark_config_dirty();
-            self.request_redraw();
+            self.request_frame();
         }
     }
 
@@ -986,7 +984,7 @@ impl App {
         })
     }
 
-    fn desired_cursor_icon(&self) -> CursorIcon {
+    fn desired_cursor_icon(&self) -> CursorKind {
         let settings_modal_active = self.settings_modal_active();
         let settings_hit = if settings_modal_active {
             self.settings_hit_test(self.pointer_x, self.pointer_y)
@@ -1018,7 +1016,7 @@ impl App {
         };
         self.cursor_icon = next;
         if let Some(runtime) = self.runtime.as_ref() {
-            runtime.set_cursor_icon(next);
+            runtime.set_cursor_kind(next);
         }
     }
 
@@ -1035,13 +1033,12 @@ impl App {
             || self
                 .terminal_tab_drag
                 .is_some_and(|drag| drag.threshold_passed);
-        let settings_animation = (self.settings_progress - if self.settings_open { 1.0 } else { 0.0 })
-            .abs()
-            > 0.001;
+        let settings_animation =
+            (self.settings_progress - if self.settings_open { 1.0 } else { 0.0 }).abs() > 0.001;
         self.animation_active = terminal_animation || tab_animation || settings_animation;
     }
 
-    fn apply_frame_plan(&self, event_loop: &ActiveEventLoop) {
+    fn loop_control(&self) -> AppLoopControl {
         let plan = frame_plan(
             self.renderable(),
             self.dirty,
@@ -1052,20 +1049,16 @@ impl App {
             .then(|| self.interaction.search_refresh_deadline())
             .flatten();
         let search_due = search_deadline.is_some_and(|deadline| deadline <= now);
-        if plan.request_redraw || search_due {
+        if plan.request_frame || search_due {
             if let Some(runtime) = self.runtime.as_ref() {
-                runtime.window().request_redraw();
+                runtime.request_frame();
             }
         }
         match plan.loop_mode {
-            LoopMode::Wait => {
-                if let Some(deadline) = search_deadline.filter(|deadline| *deadline > now) {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-                } else {
-                    event_loop.set_control_flow(ControlFlow::Wait);
-                }
-            }
-            LoopMode::Poll => event_loop.set_control_flow(ControlFlow::Poll),
+            LoopMode::Wait => search_deadline
+                .filter(|deadline| *deadline > now)
+                .map_or(AppLoopControl::Wait, AppLoopControl::WaitUntil),
+            LoopMode::Poll => AppLoopControl::Poll,
         }
     }
 
@@ -1094,8 +1087,8 @@ impl App {
             return false;
         }
         let old = self.terminal_tab_scroll.current;
-        let new = (old + delta.signum() * drag_autoscroll_speed(delta) * dt)
-            .clamp(0.0, strip.max_scroll);
+        let new =
+            (old + delta.signum() * drag_autoscroll_speed(delta) * dt).clamp(0.0, strip.max_scroll);
         let scroll_delta = new - old;
         if scroll_delta == 0.0 {
             return false;
@@ -1120,7 +1113,7 @@ impl App {
                 let active = self.active_terminal;
                 if let Some(terminal) = self.terminals.get_mut(active) {
                     self.interaction.open_search(terminal);
-                    self.request_redraw();
+                    self.request_frame();
                 }
             }
         }
@@ -1150,477 +1143,449 @@ impl App {
     }
 }
 
-impl ApplicationHandler<AppEvent> for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.runtime.is_some() {
+impl App {
+    fn on_runtime_ready(&mut self, runtime: WindowRuntime, width: u32, height: u32) {
+        self.zero_sized = width == 0 || height == 0;
+        if std::env::var_os("RONSOLE_GL_DIAGNOSTICS")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+        {
+            eprintln!("Ronsole graphics:\n{}", runtime.diagnostics_report());
+        }
+        self.runtime = Some(runtime);
+        self.last_frame = Instant::now();
+        let _ = self.add_terminal();
+        self.flush_pending_external_launches();
+        self.mark_dirty();
+    }
+
+    fn on_close_requested(&mut self) {
+        self.prepare_exit();
+        self.shutdown_all();
+    }
+
+    fn on_resize_with_logical_size(
+        &mut self,
+        width: u32,
+        height: u32,
+        logical_size: Option<(f64, f64)>,
+    ) {
+        self.zero_sized = width == 0 || height == 0;
+        self.suspend_frame_clock();
+        if self.zero_sized {
             return;
         }
+        if let Some((logical_width, logical_height)) = logical_size
+            && self.config.set_window_size(logical_width, logical_height)
+        {
+            self.mark_config_dirty();
+        }
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.resize(width, height);
+        }
+        self.mark_dirty();
+    }
 
-        match WindowRuntime::bootstrap(
-            event_loop,
-            self.config.window_width,
-            self.config.window_height,
-            self.config.terminal_font_size,
-            self.config.terminal_background,
-        ) {
-            Ok(runtime) => {
-                self.zero_sized = runtime.window().inner_size().width == 0
-                    || runtime.window().inner_size().height == 0;
-                if std::env::var_os("RONSOLE_GL_DIAGNOSTICS")
-                    .is_some_and(|value| value != std::ffi::OsStr::new("0"))
-                {
-                    eprintln!("Ronsole graphics:\n{}", runtime.diagnostics_report());
-                }
-                self.runtime = Some(runtime);
-                self.last_frame = Instant::now();
-                let _ = self.add_terminal();
-                self.flush_pending_external_launches();
-                self.mark_dirty();
+    fn on_scale_changed(&mut self, scale_factor: f32, width: u32, height: u32) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.update_scale_factor(scale_factor);
+            if width > 0 && height > 0 {
+                runtime.resize(width, height);
             }
-            Err(error) => {
-                eprintln!("Ronsole: {error}");
-                self.request_exit(event_loop);
+        }
+        self.terminal_tab_scroll.reset();
+        self.mark_dirty();
+    }
+
+    fn on_modifiers(&mut self, modifiers: Modifiers) {
+        self.modifiers = modifiers;
+        self.interaction.set_modifiers(modifiers);
+    }
+
+    fn on_ime_commit(&mut self, text: &str) {
+        if self.settings_modal_active() {
+            if self.settings_background_editing {
+                let _ = self.edit_settings_background_text(text);
             }
+            return;
+        }
+        let active = self.active_terminal;
+        if let Some(terminal) = self.terminals.get_mut(active)
+            && self.interaction.handle_ime_commit(text, terminal)
+        {
+            self.sync_animation_state();
+            self.request_frame();
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
-        match event {
-            AppEvent::ExternalLaunch => self.handle_external_launch(),
+    fn on_key(&mut self, key_input: KeyInput) -> bool {
+        if key_input.state.is_pressed()
+            && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
+        {
+            if self.settings_modal_active() && shortcut != GlobalShortcut::ToggleSettings {
+                return false;
+            }
+            if self.handle_global_key(shortcut) {
+                return true;
+            }
+            self.sync_animation_state();
+            return false;
+        }
+        if self.settings_modal_active() {
+            if key_input.state.is_pressed()
+                && key_input.physical_key == PhysicalKey::Code(KeyCode::Escape)
+            {
+                self.close_settings();
+            } else if key_input.state.is_pressed() && self.settings_background_editing {
+                let _ = self.handle_settings_background_key(key_input.physical_key);
+            }
+            return false;
+        }
+        let active = self.active_terminal;
+        if let Some(terminal) = self.terminals.get_mut(active)
+            && self.interaction.handle_key_event(&key_input, terminal)
+        {
+            self.sync_animation_state();
+            self.request_frame();
+        }
+        false
+    }
+
+    fn on_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.settings_modal_active() {
+            if self.settings_background_editing
+                && !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key()
+            {
+                let _ = self.edit_settings_background_text(text);
+            }
+            return;
+        }
+        let active = self.active_terminal;
+        if let Some(terminal) = self.terminals.get_mut(active)
+            && self.interaction.handle_text(text, terminal)
+        {
+            self.sync_animation_state();
+            self.request_frame();
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return;
-        };
-        if runtime.window().id() != id {
+    fn on_pointer_motion(&mut self, position: PointerPosition) {
+        let previous_x = self.pointer_x;
+        let previous_y = self.pointer_y;
+        self.pointer_x = position.x;
+        self.pointer_y = position.y;
+        if self.settings_modal_active() {
+            let previous_hit = self.settings_hit_test(previous_x, previous_y);
+            let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
+            let mut changed = previous_hit != current_hit;
+            if self.settings_background_dragging
+                && let Some(cursor) = self.settings_background_cursor_from_x(self.pointer_x)
+            {
+                changed |= update_settings_background_pointer_selection(
+                    &mut self.settings_background_input,
+                    cursor,
+                );
+            }
+            self.refresh_cursor_icon();
+            if changed {
+                self.request_frame();
+            }
             return;
         }
-
-        match event {
-            WindowEvent::CloseRequested => {
-                self.request_exit(event_loop);
-                self.shutdown_all();
-            }
-            WindowEvent::Focused(focused) => {
-                self.handle_focus_changed(focused);
-            }
-            WindowEvent::Occluded(occluded) => {
-                self.occluded = occluded;
-                self.suspend_frame_clock();
-                if !occluded {
-                    self.mark_dirty();
-                }
-            }
-            WindowEvent::Resized(size) => {
-                self.zero_sized = size.width == 0 || size.height == 0;
-                self.suspend_frame_clock();
-                if !self.zero_sized {
-                    let scale_factor = self
-                        .runtime
-                        .as_ref()
-                        .map_or(1.0, WindowRuntime::scale_factor);
-                    if let Some((width, height)) =
-                        logical_window_size(size.width, size.height, scale_factor)
-                        && self.config.set_window_size(width, height)
-                    {
-                        self.mark_config_dirty();
-                    }
-                    if let Some(runtime) = self.runtime.as_mut() {
-                        runtime.resize(size.width, size.height);
-                    }
-                    self.mark_dirty();
-                }
-            }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                let size = self
+        self.refresh_cursor_icon();
+        if let Some(drag) = self.terminal_tab_drag.as_mut() {
+            drag.current_x = self.pointer_x;
+            if !drag.threshold_passed {
+                let scale = self
                     .runtime
                     .as_ref()
-                    .map(|runtime| runtime.window().inner_size());
-                if let Some(runtime) = self.runtime.as_mut() {
-                    runtime.update_scale_factor(scale_factor as f32);
-                    if let Some(size) = size.filter(|size| size.width > 0 && size.height > 0) {
-                        runtime.resize(size.width, size.height);
-                    }
-                }
-                self.terminal_tab_scroll.reset();
-                self.mark_dirty();
+                    .map_or(1.0, WindowRuntime::scale_factor);
+                drag.threshold_passed = drag_threshold_passed(drag.start_x, drag.current_x, scale);
             }
-            WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers.state();
-                self.interaction.set_modifiers(self.modifiers);
+            self.sync_animation_state();
+            self.request_frame();
+            return;
+        }
+        if !self.interaction.terminal_selection_active()
+            && self.runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .terminal_tab_strip_layout()
+                    .rect
+                    .contains(self.pointer_x, self.pointer_y)
+            })
+        {
+            self.request_frame();
+            return;
+        }
+        let active = self.active_terminal;
+        if let (Some(runtime), Some(terminal)) =
+            (self.runtime.as_mut(), self.terminals.get_mut(active))
+        {
+            let changed = self.interaction.cursor_moved(
+                self.pointer_x,
+                self.pointer_y,
+                terminal,
+                |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
+            );
+            if changed {
+                self.sync_animation_state();
+                self.request_frame();
             }
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                if self.settings_modal_active() {
-                    if self.settings_background_editing {
-                        let _ = self.edit_settings_background_text(&text);
-                    }
-                    return;
-                }
-                let active = self.active_terminal;
-                if let Some(terminal) = self.terminals.get_mut(active)
-                    && self.interaction.handle_ime_commit(&text, terminal)
-                {
-                    self.sync_animation_state();
-                    self.request_redraw();
-                }
+        }
+    }
+
+    fn on_pointer_leave(&mut self, width: u32, height: u32) {
+        if let Some(next) = cursor_icon_change(self.cursor_icon, CursorKind::Default) {
+            self.cursor_icon = next;
+            if let Some(runtime) = self.runtime.as_ref() {
+                runtime.set_cursor_kind(next);
             }
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
-                if key_event.state == ElementState::Pressed
-                    && let Some(shortcut) = global_shortcut(key_event.physical_key, self.modifiers)
-                {
-                    if self.settings_modal_active()
-                        && shortcut != GlobalShortcut::ToggleSettings
-                    {
-                        return;
-                    }
-                    if self.handle_global_key(shortcut) {
-                        self.request_exit(event_loop);
-                        return;
-                    }
-                    self.sync_animation_state();
-                    return;
-                }
-                if self.settings_modal_active() {
-                    if key_event.state == ElementState::Pressed
-                        && key_event.physical_key == PhysicalKey::Code(KeyCode::Escape)
-                    {
-                        self.close_settings();
-                    } else if key_event.state == ElementState::Pressed
-                        && self.settings_background_editing
-                    {
-                        let _ = self.handle_settings_background_key(
-                            key_event.physical_key,
-                            key_event.logical_key.to_text(),
-                        );
-                    }
-                    return;
-                }
-                let active = self.active_terminal;
-                if let Some(terminal) = self.terminals.get_mut(active)
-                    && self.interaction.handle_key_event(&key_event, terminal)
-                {
-                    self.sync_animation_state();
-                    self.request_redraw();
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let previous_x = self.pointer_x;
-                let previous_y = self.pointer_y;
-                self.pointer_x = position.x as f32;
-                self.pointer_y = position.y as f32;
-                if self.settings_modal_active() {
-                    let previous_hit = self.settings_hit_test(previous_x, previous_y);
-                    let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
-                    let mut changed = previous_hit != current_hit;
-                    if self.settings_background_dragging
-                        && let Some(cursor) = self.settings_background_cursor_from_x(self.pointer_x)
-                    {
-                        changed |= update_settings_background_pointer_selection(
-                            &mut self.settings_background_input,
-                            cursor,
-                        );
+        }
+        if self.settings_modal_active() || self.terminal_tab_drag.is_some() {
+            return;
+        }
+        let active = self.active_terminal;
+        if let Some(terminal) = self.terminals.get_mut(active)
+            && self
+                .interaction
+                .cursor_left(width as f32, height as f32, terminal)
+        {
+            self.sync_animation_state();
+            self.request_frame();
+        }
+    }
+
+    fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        if button == PointerButton::Left
+            && state == KeyState::Pressed
+            && self.clear_active_terminal_text_selection()
+        {
+            self.request_frame();
+        }
+        if self.settings_modal_active() {
+            if button == PointerButton::Left {
+                if state == KeyState::Pressed {
+                    let hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
+                    if hit == SettingsHit::BackgroundField {
+                        let cursor = self
+                            .settings_background_cursor_from_x(self.pointer_x)
+                            .unwrap_or(self.settings_background_input.cursor);
+                        self.begin_settings_background_pointer_edit(cursor);
+                    } else {
+                        self.settings_background_dragging = false;
+                        self.apply_settings_hit(hit);
                     }
                     self.refresh_cursor_icon();
-                    if changed {
-                        self.request_redraw();
-                    }
-                    return;
-                }
-                self.refresh_cursor_icon();
-                if let Some(drag) = self.terminal_tab_drag.as_mut() {
-                    drag.current_x = self.pointer_x;
-                    if !drag.threshold_passed {
-                        let scale = self.runtime.as_ref().map_or(1.0, WindowRuntime::scale_factor);
-                        drag.threshold_passed =
-                            drag_threshold_passed(drag.start_x, drag.current_x, scale);
-                    }
-                    self.sync_animation_state();
-                    self.request_redraw();
-                    return;
-                }
-                if !self.interaction.terminal_selection_active()
-                    && self.runtime.as_ref().is_some_and(|runtime| {
-                        runtime
-                            .terminal_tab_strip_layout()
-                            .rect
-                            .contains(self.pointer_x, self.pointer_y)
-                    })
-                {
-                    self.request_redraw();
-                    return;
-                }
-                let active = self.active_terminal;
-                if let (Some(runtime), Some(terminal)) =
-                    (self.runtime.as_mut(), self.terminals.get_mut(active))
-                {
-                    let changed = self.interaction.cursor_moved(
-                        self.pointer_x,
-                        self.pointer_y,
-                        terminal,
-                        |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
-                    );
-                    if changed {
-                        self.sync_animation_state();
-                        self.request_redraw();
-                    }
+                } else if self.settings_background_dragging {
+                    self.settings_background_dragging = false;
+                    self.refresh_cursor_icon();
+                    self.request_frame();
                 }
             }
-            WindowEvent::CursorLeft { .. } => {
-                if let Some(next) = cursor_icon_change(self.cursor_icon, CursorIcon::Default) {
-                    self.cursor_icon = next;
-                    if let Some(runtime) = self.runtime.as_ref() {
-                        runtime.set_cursor_icon(next);
-                    }
+            return false;
+        }
+        if button == PointerButton::Left && state == KeyState::Pressed {
+            let hit = self
+                .runtime
+                .as_ref()
+                .map_or(TerminalTabHit::None, |runtime| {
+                    runtime.terminal_tab_hit_test(self.pointer_x, self.pointer_y)
+                });
+            match hit {
+                TerminalTabHit::Close(index) => return self.close_terminal_tab_at(index),
+                TerminalTabHit::Add => {
+                    let _ = self.add_terminal();
+                    return false;
                 }
-                if self.settings_modal_active() || self.terminal_tab_drag.is_some() {
-                    return;
+                TerminalTabHit::Body(index) => {
+                    self.terminal_tab_drag = Some(TabDragState {
+                        start_idx: index,
+                        start_x: self.pointer_x,
+                        current_x: self.pointer_x,
+                        threshold_passed: false,
+                    });
+                    self.select_terminal_tab_from_user(index);
+                    self.request_frame();
+                    return false;
                 }
-                let size = self
+                TerminalTabHit::None => {}
+            }
+        }
+        if button == PointerButton::Left
+            && state == KeyState::Released
+            && let Some(drag) = self.terminal_tab_drag.take()
+        {
+            if drag.threshold_passed
+                && let Some(destination) = self
                     .runtime
                     .as_ref()
-                    .map(|runtime| runtime.window().inner_size());
-                let active = self.active_terminal;
-                if let (Some(size), Some(terminal)) = (size, self.terminals.get_mut(active))
-                    && self
-                        .interaction
-                        .cursor_left(size.width as f32, size.height as f32, terminal)
-                {
-                    self.sync_animation_state();
-                    self.request_redraw();
-                }
+                    .and_then(|runtime| runtime.terminal_tab_drag_destination(&drag))
+            {
+                self.reorder_terminal_tab(drag.start_idx, destination);
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left
-                    && state == ElementState::Pressed
-                    && self.clear_active_terminal_text_selection()
-                {
-                    self.request_redraw();
-                }
-                if self.settings_modal_active() {
-                    if button == MouseButton::Left {
-                        if state == ElementState::Pressed {
-                            let hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
-                            if hit == SettingsHit::BackgroundField {
-                                let cursor = self
-                                    .settings_background_cursor_from_x(self.pointer_x)
-                                    .unwrap_or(self.settings_background_input.cursor);
-                                self.begin_settings_background_pointer_edit(cursor);
-                            } else {
-                                self.settings_background_dragging = false;
-                                self.apply_settings_hit(hit);
-                            }
-                            self.refresh_cursor_icon();
-                        } else if self.settings_background_dragging {
-                            self.settings_background_dragging = false;
-                            self.refresh_cursor_icon();
-                            self.request_redraw();
-                        }
-                    }
-                    return;
-                }
-                if button == MouseButton::Left && state == ElementState::Pressed {
-                    let hit = self.runtime.as_ref().map_or(TerminalTabHit::None, |runtime| {
-                        runtime.terminal_tab_hit_test(self.pointer_x, self.pointer_y)
+            self.sync_animation_state();
+            self.request_frame();
+            return false;
+        }
+        let active = self.active_terminal;
+        if let (Some(runtime), Some(terminal)) =
+            (self.runtime.as_mut(), self.terminals.get_mut(active))
+        {
+            let handled =
+                self.interaction
+                    .mouse_input(state, button, terminal, |text, x, scroll| {
+                        runtime.terminal_search_cursor_from_x(text, x, scroll)
                     });
-                    match hit {
-                        TerminalTabHit::Close(index) => {
-                            if self.close_terminal_tab_at(index) {
-                                self.request_exit(event_loop);
-                            }
-                            return;
-                        }
-                        TerminalTabHit::Add => {
-                            let _ = self.add_terminal();
-                            return;
-                        }
-                        TerminalTabHit::Body(index) => {
-                            self.terminal_tab_drag = Some(TabDragState {
-                                start_idx: index,
-                                start_x: self.pointer_x,
-                                current_x: self.pointer_x,
-                                threshold_passed: false,
-                            });
-                            self.select_terminal_tab_from_user(index);
-                            self.request_redraw();
-                            return;
-                        }
-                        TerminalTabHit::None => {}
-                    }
-                }
-                if button == MouseButton::Left && state == ElementState::Released {
-                    if let Some(drag) = self.terminal_tab_drag.take() {
-                        if drag.threshold_passed
-                            && let Some(destination) = self
-                                .runtime
-                                .as_ref()
-                                .and_then(|runtime| runtime.terminal_tab_drag_destination(&drag))
-                        {
-                            self.reorder_terminal_tab(drag.start_idx, destination);
-                        }
-                        self.sync_animation_state();
-                        self.request_redraw();
-                        return;
-                    }
-                }
-                let active = self.active_terminal;
-                if let (Some(runtime), Some(terminal)) =
-                    (self.runtime.as_mut(), self.terminals.get_mut(active))
-                {
-                    let handled = self.interaction.mouse_input(
-                        state,
-                        button,
-                        terminal,
-                        |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
-                    );
-                    if handled {
-                        self.sync_animation_state();
-                        self.request_redraw();
-                    }
-                }
+            if handled {
+                self.sync_animation_state();
+                self.request_frame();
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if self.settings_modal_active() {
-                    return;
-                }
-                if let Some(runtime) = self.runtime.as_ref() {
-                    let strip = runtime.terminal_tab_strip_layout();
-                    if strip.rect.contains(self.pointer_x, self.pointer_y) {
-                        self.terminal_tab_scroll
-                            .scroll_by(tab_wheel_delta(delta, runtime.scale_factor()));
-                        self.terminal_tab_scroll.clamp_target(0.0, strip.max_scroll);
-                        self.sync_animation_state();
-                        self.request_redraw();
-                        return;
-                    }
-                }
-                let active = self.active_terminal;
-                if let Some(terminal) = self.terminals.get_mut(active)
-                    && self.interaction.mouse_wheel(delta, terminal)
-                {
-                    self.sync_animation_state();
-                    self.request_redraw();
-                }
+        }
+        false
+    }
+
+    fn on_scroll(&mut self, delta: ScrollDelta) {
+        if self.settings_modal_active() {
+            return;
+        }
+        if let Some(runtime) = self.runtime.as_ref() {
+            let strip = runtime.terminal_tab_strip_layout();
+            if strip.rect.contains(self.pointer_x, self.pointer_y) {
+                self.terminal_tab_scroll
+                    .scroll_by(tab_wheel_delta(delta, runtime.scale_factor()));
+                self.terminal_tab_scroll.clamp_target(0.0, strip.max_scroll);
+                self.sync_animation_state();
+                self.request_frame();
+                return;
             }
-            WindowEvent::RedrawRequested => {
-                if !self.renderable() {
-                    event_loop.set_control_flow(ControlFlow::Wait);
-                    return;
-                }
+        }
+        let active = self.active_terminal;
+        if let Some(terminal) = self.terminals.get_mut(active)
+            && self.interaction.mouse_wheel(delta, terminal)
+        {
+            self.sync_animation_state();
+            self.request_frame();
+        }
+    }
 
-                let _ = self.process_terminal_presentation_intents();
-                let now = Instant::now();
-                let dt = animation_dt((now - self.last_frame).as_secs_f32());
-                self.last_frame = now;
+    fn on_frame(&mut self) -> Result<bool, String> {
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.acknowledge_wake();
+        }
+        if !self.renderable() {
+            return Ok(false);
+        }
 
-                if self.update_tab_drag_autoscroll(dt) {
-                    self.mark_dirty();
+        let _ = self.process_terminal_presentation_intents();
+        let now = Instant::now();
+        let dt = animation_dt((now - self.last_frame).as_secs_f32());
+        self.last_frame = now;
+
+        if self.update_tab_drag_autoscroll(dt) {
+            self.mark_dirty();
+        }
+        self.terminal_tab_scroll.update(dt);
+        if let Some(runtime) = self.runtime.as_ref() {
+            let max = runtime.terminal_tab_strip_layout().max_scroll;
+            self.terminal_tab_scroll.clamp_target(0.0, max);
+            self.terminal_tab_scroll.clamp_current(0.0, max);
+        }
+        let active = self.active_terminal;
+        let mut selection_autoscrolled = false;
+        if let Some(terminal) = self.terminals.get_mut(active) {
+            selection_autoscrolled = self.interaction.update_selection_autoscroll(dt, terminal);
+            terminal.scroll_y.update(dt);
+            terminal
+                .scroll_y
+                .clamp_target(0.0, self.interaction.layout.max_scroll);
+            terminal
+                .scroll_y
+                .clamp_current(0.0, self.interaction.layout.max_scroll);
+        }
+        if selection_autoscrolled {
+            self.mark_dirty();
+        }
+        let (settings_progress, _) =
+            settings_animation_step(self.settings_progress, self.settings_open, dt);
+        self.settings_progress = settings_progress;
+
+        let render_result = if let Some(runtime) = self.runtime.as_mut() {
+            Some(runtime.render_terminal_and_present(TerminalRenderParams {
+                terminals: &self.terminals,
+                active_terminal: self.active_terminal,
+                search: &mut self.interaction.search,
+                focused: self.focused,
+                tab_scroll_x: self.terminal_tab_scroll.current,
+                drag: self.terminal_tab_drag.as_ref(),
+                pointer_x: self.pointer_x,
+                pointer_y: self.pointer_y,
+                settings_progress: self.settings_progress,
+                settings_tab: self.settings_active_tab,
+                settings_font_value: &self.settings_font_value,
+                settings_scroll_value: &self.settings_scroll_value,
+                settings_background_input: &mut self.settings_background_input,
+                settings_background_editing: self.settings_background_editing,
+            }))
+        } else {
+            None
+        };
+        match render_result {
+            Some(Ok(layout)) => {
+                self.interaction.update_layout(layout);
+                let active = self.active_terminal;
+                if let Some(terminal) = self.terminals.get_mut(active) {
+                    terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
+                    terminal.scroll_y.clamp_current(0.0, layout.max_scroll);
                 }
-                self.terminal_tab_scroll.update(dt);
                 if let Some(runtime) = self.runtime.as_ref() {
                     let max = runtime.terminal_tab_strip_layout().max_scroll;
                     self.terminal_tab_scroll.clamp_target(0.0, max);
                     self.terminal_tab_scroll.clamp_current(0.0, max);
-                }
-                let active = self.active_terminal;
-                let mut selection_autoscrolled = false;
-                if let Some(terminal) = self.terminals.get_mut(active) {
-                    selection_autoscrolled =
-                        self.interaction.update_selection_autoscroll(dt, terminal);
-                    terminal.scroll_y.update(dt);
-                    terminal
-                        .scroll_y
-                        .clamp_target(0.0, self.interaction.layout.max_scroll);
-                    terminal
-                        .scroll_y
-                        .clamp_current(0.0, self.interaction.layout.max_scroll);
-                }
-                if selection_autoscrolled {
-                    self.mark_dirty();
-                }
-                let (settings_progress, _) =
-                    settings_animation_step(self.settings_progress, self.settings_open, dt);
-                self.settings_progress = settings_progress;
-
-                let render_result = if let Some(runtime) = self.runtime.as_mut() {
-                    Some(runtime.render_terminal_and_present(TerminalRenderParams {
-                        terminals: &self.terminals,
-                        active_terminal: self.active_terminal,
-                        search: &mut self.interaction.search,
-                        focused: self.focused,
-                        tab_scroll_x: self.terminal_tab_scroll.current,
-                        drag: self.terminal_tab_drag.as_ref(),
-                        pointer_x: self.pointer_x,
-                        pointer_y: self.pointer_y,
-                        settings_progress: self.settings_progress,
-                        settings_tab: self.settings_active_tab,
-                        settings_font_value: &self.settings_font_value,
-                        settings_scroll_value: &self.settings_scroll_value,
-                        settings_background_input: &mut self.settings_background_input,
-                        settings_background_editing: self.settings_background_editing,
-                    }))
-                } else {
-                    None
-                };
-                match render_result {
-                    Some(Ok(layout)) => {
-                        self.interaction.update_layout(layout);
-                        let active = self.active_terminal;
-                        if let Some(terminal) = self.terminals.get_mut(active) {
-                            terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
-                            terminal.scroll_y.clamp_current(0.0, layout.max_scroll);
-                        }
-                        if let Some(runtime) = self.runtime.as_ref() {
-                            let max = runtime.terminal_tab_strip_layout().max_scroll;
-                            self.terminal_tab_scroll.clamp_target(0.0, max);
-                            self.terminal_tab_scroll.clamp_current(0.0, max);
-                            if let Some(reveal_tail) = self.pending_tab_reveal.take() {
-                                let target = runtime.terminal_tab_reveal_target(
-                                    self.active_terminal,
-                                    reveal_tail,
-                                    self.terminal_tab_scroll.target,
-                                );
-                                self.terminal_tab_scroll.animate_to(target);
-                            }
-                        }
-                        self.refresh_cursor_icon();
-                        self.sync_animation_state();
-                        if !self.focused {
-                            self.unfocused_redraw_pending = false;
-                        }
-                        self.dirty = false;
+                    if let Some(reveal_tail) = self.pending_tab_reveal.take() {
+                        let target = runtime.terminal_tab_reveal_target(
+                            self.active_terminal,
+                            reveal_tail,
+                            self.terminal_tab_scroll.target,
+                        );
+                        self.terminal_tab_scroll.animate_to(target);
                     }
-                    Some(Err(error)) => {
-                        eprintln!("Ronsole: frame presentation failed: {error}");
-                        self.request_exit(event_loop);
-                    }
-                    None => {}
                 }
+                self.refresh_cursor_icon();
+                self.sync_animation_state();
+                if !self.focused {
+                    self.unfocused_redraw_pending = false;
+                }
+                self.dirty = false;
             }
-            _ => {}
+            Some(Err(error)) => return Err(error),
+            None => {}
         }
+        Ok(true)
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.persist_config_if_needed();
-        self.shutdown_all();
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn on_about_to_wait(&mut self) -> AppLoopControl {
         self.flush_pending_terminal_cleanup();
         if self.remove_closed_terminals() {
-            self.request_exit(event_loop);
-            return;
+            self.prepare_exit();
+            return AppLoopControl::Exit;
         }
         if self.process_terminal_presentation_intents() {
-            self.request_redraw();
+            self.request_frame();
         }
         if !self.renderable() {
             self.suspend_frame_clock();
         }
         self.sync_animation_state();
-        self.apply_frame_plan(event_loop);
+        self.loop_control()
+    }
+
+    fn on_exiting(&mut self) {
+        self.persist_config_if_needed();
+        self.shutdown_all();
     }
 }
 
@@ -1641,14 +1606,14 @@ mod tests {
         assert_eq!(
             frame_plan(true, false, false),
             FramePlan {
-                request_redraw: false,
+                request_frame: false,
                 loop_mode: LoopMode::Wait,
             }
         );
         assert_eq!(
             frame_plan(false, true, true),
             FramePlan {
-                request_redraw: false,
+                request_frame: false,
                 loop_mode: LoopMode::Wait,
             }
         );
@@ -1659,14 +1624,14 @@ mod tests {
         assert_eq!(
             frame_plan(true, true, false),
             FramePlan {
-                request_redraw: true,
+                request_frame: true,
                 loop_mode: LoopMode::Wait,
             }
         );
         assert_eq!(
             frame_plan(true, false, true),
             FramePlan {
-                request_redraw: true,
+                request_frame: true,
                 loop_mode: LoopMode::Poll,
             }
         );
@@ -1786,7 +1751,10 @@ mod tests {
         let switch = production
             .split("    fn activate_ready_terminal")
             .nth(1)
-            .and_then(|tail| tail.split("    fn process_terminal_presentation_intents").next())
+            .and_then(|tail| {
+                tail.split("    fn process_terminal_presentation_intents")
+                    .next()
+            })
             .expect("activation method must remain present");
         assert!(switch.contains("reset_for_terminal_switch"));
 
@@ -1814,13 +1782,14 @@ mod tests {
         let mut app = App::new();
         let terminal = Terminal::spawn(None, 1);
         terminal
-            .write_input(
-                format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes(),
-            )
+            .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
             .unwrap();
         let ready_deadline = Instant::now() + Duration::from_secs(3);
         while !marker.exists() {
-            assert!(Instant::now() < ready_deadline, "shell did not install SIGTERM trap");
+            assert!(
+                Instant::now() < ready_deadline,
+                "shell did not install SIGTERM trap"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         app.terminals.push(terminal);
@@ -1843,9 +1812,9 @@ mod tests {
 
     #[test]
     fn global_shortcuts_use_plain_f1_and_exact_application_modifiers() {
-        let none = ModifiersState::empty();
-        let ctrl = ModifiersState::CONTROL;
-        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let none = Modifiers::empty();
+        let ctrl = Modifiers::CONTROL;
+        let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
         assert_eq!(
             global_shortcut(PhysicalKey::Code(KeyCode::F1), none),
             Some(GlobalShortcut::ToggleSettings)
@@ -1865,38 +1834,73 @@ mod tests {
 
         for modifiers in [
             ctrl,
-            ModifiersState::ALT,
-            ModifiersState::SHIFT,
-            ModifiersState::SUPER,
-            ctrl | ModifiersState::ALT,
-            ctrl | ModifiersState::SHIFT,
-            ctrl | ModifiersState::SUPER,
+            Modifiers::ALT,
+            Modifiers::SHIFT,
+            Modifiers::SUPER,
+            ctrl | Modifiers::ALT,
+            ctrl | Modifiers::SHIFT,
+            ctrl | Modifiers::SUPER,
         ] {
-            assert_eq!(global_shortcut(PhysicalKey::Code(KeyCode::F1), modifiers), None);
+            assert_eq!(
+                global_shortcut(PhysicalKey::Code(KeyCode::F1), modifiers),
+                None
+            );
         }
-        for modifiers in [
-            ctrl_shift | ModifiersState::ALT,
-            ctrl_shift | ModifiersState::SUPER,
-        ] {
-            assert_eq!(global_shortcut(PhysicalKey::Code(KeyCode::KeyT), modifiers), None);
+        for modifiers in [ctrl_shift | Modifiers::ALT, ctrl_shift | Modifiers::SUPER] {
+            assert_eq!(
+                global_shortcut(PhysicalKey::Code(KeyCode::KeyT), modifiers),
+                None
+            );
         }
         for key in [KeyCode::Digit4, KeyCode::KeyF] {
-            for modifiers in [ctrl | ModifiersState::ALT, ctrl | ModifiersState::SUPER] {
+            for modifiers in [ctrl | Modifiers::ALT, ctrl | Modifiers::SUPER] {
                 assert_eq!(global_shortcut(PhysicalKey::Code(key), modifiers), None);
             }
         }
-        assert_eq!(global_shortcut(PhysicalKey::Code(KeyCode::KeyT), ctrl), None);
+        assert_eq!(
+            global_shortcut(PhysicalKey::Code(KeyCode::KeyT), ctrl),
+            None
+        );
     }
 
     #[test]
-    fn external_launch_action_depends_only_on_current_focus() {
+    fn focused_external_launch_opens_tab_without_reusing_activation_token() {
         assert_eq!(
-            external_launch_action(true),
+            external_launch_action(
+                true,
+                crate::platform::single_instance::ExternalLaunchRequest {
+                    activation_token: Some("one-shot-token".to_owned()),
+                },
+            ),
             ExternalLaunchAction::OpenDefaultTab
         );
+    }
+
+    #[test]
+    fn unfocused_external_launch_consumes_activation_token_once() {
         assert_eq!(
-            external_launch_action(false),
-            ExternalLaunchAction::ActivateExistingWindow
+            external_launch_action(
+                false,
+                crate::platform::single_instance::ExternalLaunchRequest {
+                    activation_token: Some("one-shot-token".to_owned()),
+                },
+            ),
+            ExternalLaunchAction::ActivateExistingWindow {
+                activation_token: Some("one-shot-token".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn unfocused_external_launch_without_token_uses_runtime_fallback_path() {
+        assert_eq!(
+            external_launch_action(
+                false,
+                crate::platform::single_instance::ExternalLaunchRequest::default(),
+            ),
+            ExternalLaunchAction::ActivateExistingWindow {
+                activation_token: None,
+            }
         );
     }
 
@@ -1904,8 +1908,14 @@ mod tests {
     fn focus_reporting_uses_xterm_sequences_only_when_enabled() {
         assert_eq!(terminal_focus_report_sequence(false, true), None);
         assert_eq!(terminal_focus_report_sequence(false, false), None);
-        assert_eq!(terminal_focus_report_sequence(true, true), Some(b"\x1b[I".as_slice()));
-        assert_eq!(terminal_focus_report_sequence(true, false), Some(b"\x1b[O".as_slice()));
+        assert_eq!(
+            terminal_focus_report_sequence(true, true),
+            Some(b"\x1b[I".as_slice())
+        );
+        assert_eq!(
+            terminal_focus_report_sequence(true, false),
+            Some(b"\x1b[O".as_slice())
+        );
     }
 
     #[test]
@@ -2045,7 +2055,7 @@ mod tests {
         );
 
         app.settings_background_input.select_all();
-        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None,));
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
         assert_eq!(app.settings_background_input.text, "");
         assert_eq!(
             app.config.terminal_background,
@@ -2068,7 +2078,7 @@ mod tests {
         let original = app.config.terminal_background;
         app.apply_settings_hit(SettingsHit::BackgroundField);
         app.settings_background_input.select_all();
-        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None,));
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
         assert!(app.edit_settings_background_text("#12"));
         assert_eq!(app.settings_background_input.text, "#12");
         assert_eq!(app.config.terminal_background, original);
@@ -2088,19 +2098,15 @@ mod tests {
         let left = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::ArrowLeft),
-            None,
             false,
             false,
-            true,
             None,
         );
         assert!(left.visual_changed);
         let select = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::ArrowLeft),
-            None,
             false,
-            true,
             true,
             None,
         );
@@ -2110,9 +2116,7 @@ mod tests {
         let copy = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::KeyC),
-            None,
             true,
-            false,
             false,
             None,
         );
@@ -2122,9 +2126,7 @@ mod tests {
         let cut = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::KeyX),
-            None,
             true,
-            false,
             false,
             None,
         );
@@ -2135,9 +2137,7 @@ mod tests {
         let paste = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::KeyV),
-            None,
             true,
-            false,
             false,
             Some("c"),
         );
@@ -2147,10 +2147,8 @@ mod tests {
         let home = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::Home),
-            None,
             false,
             false,
-            true,
             None,
         );
         assert!(home.visual_changed);
@@ -2158,9 +2156,7 @@ mod tests {
         let end_select = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::End),
-            None,
             false,
-            true,
             true,
             None,
         );
@@ -2169,9 +2165,7 @@ mod tests {
         let select_all = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::KeyA),
-            None,
             true,
-            false,
             false,
             None,
         );
@@ -2187,9 +2181,7 @@ mod tests {
         let outcome = settings_background_editor_key(
             &mut app.settings_background_input,
             PhysicalKey::Code(KeyCode::KeyV),
-            None,
             true,
-            false,
             false,
             Some("#a1b2c3"),
         );
@@ -2209,9 +2201,7 @@ mod tests {
         let invalid = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::KeyV),
-            None,
             true,
-            false,
             false,
             Some("#12GG34"),
         );
@@ -2220,9 +2210,7 @@ mod tests {
         let oversized = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::KeyV),
-            None,
             true,
-            false,
             false,
             Some("#1234567"),
         );
@@ -2232,9 +2220,7 @@ mod tests {
         let incomplete = settings_background_editor_key(
             &mut input,
             PhysicalKey::Code(KeyCode::KeyV),
-            None,
             true,
-            false,
             false,
             Some("#12"),
         );
@@ -2263,21 +2249,21 @@ mod tests {
         });
         app.apply_settings_hit(SettingsHit::BackgroundField);
         app.settings_background_input.move_cursor(1, false);
-        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Delete), None,));
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Delete)));
         assert_eq!(app.settings_background_input.text, "#12233");
         assert_eq!(
             app.config.terminal_background,
             RgbColor::new(0x11, 0x22, 0x33)
         );
-        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None,));
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
         assert_eq!(app.settings_background_input.text, "12233");
-        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Enter), None,));
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Enter)));
         assert!(!app.settings_background_editing);
         assert_eq!(app.settings_background_input.text, "#112233");
 
         app.apply_settings_hit(SettingsHit::BackgroundField);
         app.settings_background_input.select_all();
-        let _ = app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace), None);
+        let _ = app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace));
         app.apply_settings_hit(SettingsHit::BackgroundReset);
         assert_eq!(app.config.terminal_background, DEFAULT_TERMINAL_BACKGROUND);
         assert_eq!(
@@ -2308,11 +2294,11 @@ mod tests {
                 TerminalTabHit::Add,
                 false
             ),
-            CursorIcon::Text
+            CursorKind::Text
         );
         assert_eq!(
             ui_cursor_icon(true, SettingsHit::None, false, TerminalTabHit::Add, false),
-            CursorIcon::Default
+            CursorKind::Default
         );
         assert_eq!(
             ui_cursor_icon(
@@ -2322,11 +2308,11 @@ mod tests {
                 TerminalTabHit::Close(0),
                 false
             ),
-            CursorIcon::Pointer
+            CursorKind::Pointer
         );
         assert_eq!(
             ui_cursor_icon(false, SettingsHit::None, false, TerminalTabHit::Add, false),
-            CursorIcon::Pointer
+            CursorKind::Pointer
         );
         assert_eq!(
             ui_cursor_icon(
@@ -2336,7 +2322,7 @@ mod tests {
                 TerminalTabHit::Body(0),
                 false
             ),
-            CursorIcon::Default
+            CursorKind::Default
         );
         assert_eq!(
             ui_cursor_icon(
@@ -2346,15 +2332,15 @@ mod tests {
                 TerminalTabHit::None,
                 false
             ),
-            CursorIcon::Text
+            CursorKind::Text
         );
         assert_eq!(
-            cursor_icon_change(CursorIcon::Pointer, CursorIcon::Pointer),
+            cursor_icon_change(CursorKind::Pointer, CursorKind::Pointer),
             None
         );
         assert_eq!(
-            cursor_icon_change(CursorIcon::Pointer, CursorIcon::Default),
-            Some(CursorIcon::Default)
+            cursor_icon_change(CursorKind::Pointer, CursorKind::Default),
+            Some(CursorKind::Default)
         );
     }
 
@@ -2362,13 +2348,13 @@ mod tests {
     fn focus_loss_marks_one_unfocused_frame_dirty_for_separator_redraw() {
         let mut app = App::new();
         app.dirty = false;
-        app.handle_focus_changed(false);
+        app.on_focus_changed(false);
         assert!(!app.focused);
         assert!(app.unfocused_redraw_pending);
         assert!(app.dirty);
 
         app.dirty = false;
-        app.handle_focus_changed(true);
+        app.on_focus_changed(true);
         assert!(app.focused);
         assert!(!app.unfocused_redraw_pending);
         assert!(app.dirty);
@@ -2383,34 +2369,28 @@ mod tests {
             .interaction
             .set_pressed_mouse_buttons_for_test(1);
         settings_app.toggle_settings();
-        assert_eq!(
-            settings_app.interaction.pressed_mouse_buttons_for_test(),
-            0
-        );
+        assert_eq!(settings_app.interaction.pressed_mouse_buttons_for_test(), 0);
 
         let mut focus_app = App::new();
         focus_app.terminals.push(Terminal::new_for_test(8, 2, 1));
         focus_app.active_terminal_presented = true;
         focus_app.interaction.set_pressed_mouse_buttons_for_test(1);
-        focus_app.handle_focus_changed(false);
+        focus_app.on_focus_changed(false);
         assert_eq!(focus_app.interaction.pressed_mouse_buttons_for_test(), 0);
     }
 
     #[test]
     fn focus_transition_clears_app_and_terminal_modifiers_and_stale_shortcuts() {
         let mut app = App::new();
-        app.modifiers = ModifiersState::CONTROL;
-        app.interaction.set_modifiers(ModifiersState::CONTROL);
-        app.handle_focus_changed(false);
-        assert_eq!(app.modifiers, ModifiersState::empty());
-        assert_eq!(app.interaction.modifiers_for_test(), ModifiersState::empty());
-        app.handle_focus_changed(true);
-        assert_eq!(app.modifiers, ModifiersState::empty());
+        app.modifiers = Modifiers::CONTROL;
+        app.interaction.set_modifiers(Modifiers::CONTROL);
+        app.on_focus_changed(false);
+        assert_eq!(app.modifiers, Modifiers::empty());
+        assert_eq!(app.interaction.modifiers_for_test(), Modifiers::empty());
+        app.on_focus_changed(true);
+        assert_eq!(app.modifiers, Modifiers::empty());
         for key in [KeyCode::KeyT, KeyCode::KeyF, KeyCode::Digit4] {
-            assert_eq!(
-                global_shortcut(PhysicalKey::Code(key), app.modifiers),
-                None,
-            );
+            assert_eq!(global_shortcut(PhysicalKey::Code(key), app.modifiers), None,);
         }
         assert_eq!(
             global_shortcut(PhysicalKey::Code(KeyCode::F1), app.modifiers),
@@ -2435,7 +2415,7 @@ mod tests {
 
         let mut focus_app = App::new();
         focus_app.terminal_tab_drag = Some(drag());
-        focus_app.handle_focus_changed(false);
+        focus_app.on_focus_changed(false);
         assert!(!focus_app.focused);
         assert!(focus_app.terminal_tab_drag.is_none());
     }
@@ -2443,18 +2423,23 @@ mod tests {
     #[test]
     fn settings_and_focus_loss_share_pointer_cancellation_path() {
         let source = include_str!("app.rs");
-        let production = source.split("
-#[cfg(test)]").next().unwrap_or(source);
+        let production = source
+            .split(
+                "
+#[cfg(test)]",
+            )
+            .next()
+            .unwrap_or(source);
         let shared = production
             .split("    fn cancel_pointer_interactions")
             .nth(1)
-            .and_then(|tail| tail.split("    fn handle_focus_changed").next())
+            .and_then(|tail| tail.split("    fn on_focus_changed").next())
             .expect("shared pointer cancellation helper must remain present");
         assert!(shared.contains("self.terminal_tab_drag = None;"));
         assert!(shared.contains("self.interaction.cancel_pointer_interaction(terminal);"));
 
         let focus = production
-            .split("    fn handle_focus_changed")
+            .split("    fn on_focus_changed")
             .nth(1)
             .and_then(|tail| tail.split("    fn toggle_settings").next())
             .expect("focus lifecycle helper must remain present");
@@ -2494,9 +2479,9 @@ mod tests {
         let source = include_str!("app.rs");
         let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         let mouse = production
-            .split("            WindowEvent::MouseInput { state, button, .. } => {")
+            .split("    fn on_pointer_button")
             .nth(1)
-            .and_then(|tail| tail.split("            WindowEvent::MouseWheel").next())
+            .and_then(|tail| tail.split("    fn on_scroll").next())
             .expect("mouse input routing must remain present");
         let clear = mouse
             .find("self.clear_active_terminal_text_selection()")
@@ -2511,17 +2496,19 @@ mod tests {
         assert!(clear < tabs);
 
         let moved = production
-            .split("            WindowEvent::CursorMoved { position, .. } => {")
+            .split("    fn on_pointer_motion")
             .nth(1)
-            .and_then(|tail| tail.split("            WindowEvent::CursorLeft").next())
+            .and_then(|tail| tail.split("    fn on_pointer_leave").next())
             .expect("cursor moved routing must remain present");
         assert!(moved.contains("!self.interaction.terminal_selection_active()"));
         let left = production
-            .split("            WindowEvent::CursorLeft { .. } => {")
+            .split("    fn on_pointer_leave")
             .nth(1)
-            .and_then(|tail| tail.split("            WindowEvent::MouseInput").next())
+            .and_then(|tail| tail.split("    fn on_pointer_button").next())
             .expect("cursor leave routing must remain present");
-        assert!(left.contains(".cursor_left(size.width as f32, size.height as f32, terminal)"));
+        assert!(left.contains(".cursor_left("));
+        assert!(left.contains("width as f32"));
+        assert!(left.contains("height as f32"));
     }
 
     #[test]
@@ -2550,14 +2537,11 @@ mod tests {
     #[test]
     fn tab_wheel_scroll_uses_vertical_wheel_for_horizontal_strip() {
         assert_eq!(
-            tab_wheel_delta(MouseScrollDelta::LineDelta(0.0, 1.0), 1.0),
+            tab_wheel_delta(ScrollDelta::Line { x: 0.0, y: 1.0 }, 1.0),
             -40.0
         );
         assert_eq!(
-            tab_wheel_delta(
-                MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -12.5)),
-                1.0,
-            ),
+            tab_wheel_delta(ScrollDelta::Pixel { x: 0.0, y: -12.5 }, 1.0,),
             12.5
         );
     }

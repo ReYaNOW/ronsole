@@ -1,15 +1,16 @@
+use crate::input_types::{
+    KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton, ScrollDelta,
+};
 use crate::platform::Clipboard;
 use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target};
 use crate::search::{SearchRefreshCause, TerminalSearchState};
 use crate::terminal::{MouseTrackingMode, Terminal};
 use std::path::{Path, PathBuf};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
 pub(crate) struct TerminalInteraction {
     pub search: TerminalSearchState,
     pub layout: TerminalUiLayout,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
     clipboard: Option<Clipboard>,
     mouse_x: f32,
     mouse_y: f32,
@@ -54,7 +55,7 @@ impl Default for TerminalInteraction {
         Self {
             search: TerminalSearchState::default(),
             layout: TerminalUiLayout::default(),
-            modifiers: ModifiersState::empty(),
+            modifiers: Modifiers::empty(),
             clipboard: None,
             mouse_x: 0.0,
             mouse_y: 0.0,
@@ -67,7 +68,7 @@ impl Default for TerminalInteraction {
 }
 
 impl TerminalInteraction {
-    pub(crate) fn set_modifiers(&mut self, modifiers: ModifiersState) {
+    pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
     }
 
@@ -76,7 +77,7 @@ impl TerminalInteraction {
     }
 
     #[cfg(test)]
-    pub(crate) fn modifiers_for_test(&self) -> ModifiersState {
+    pub(crate) fn modifiers_for_test(&self) -> Modifiers {
         self.modifiers
     }
 
@@ -315,8 +316,8 @@ impl TerminalInteraction {
         crate::platform::lock_recover(&terminal.grid).selection = None;
     }
 
-    fn handle_search_key(&mut self, key_event: &KeyEvent, terminal: &mut Terminal) -> bool {
-        if !search_owns_keyboard(&self.search) || key_event.state != ElementState::Pressed {
+    fn handle_search_key(&mut self, key_event: &KeyInput, terminal: &mut Terminal) -> bool {
+        if !search_owns_keyboard(&self.search) || key_event.state != KeyState::Pressed {
             return false;
         }
         if search_key_falls_through_to_terminal(
@@ -328,12 +329,15 @@ impl TerminalInteraction {
         }
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
-        let super_key = self.modifiers.super_key();
         let mut edited = false;
         match key_event.physical_key {
             PhysicalKey::Code(KeyCode::Escape) => self.close_search(terminal),
             PhysicalKey::Code(KeyCode::Enter) => {
-                if shift { self.search.previous(); } else { self.search.next(); }
+                if shift {
+                    self.search.previous();
+                } else {
+                    self.search.next();
+                }
                 self.jump_to_search_match(terminal);
             }
             PhysicalKey::Code(KeyCode::ArrowUp) => {
@@ -351,8 +355,14 @@ impl TerminalInteraction {
                 let end = self.search.text.chars().count();
                 self.search.move_cursor(end, shift);
             }
-            PhysicalKey::Code(KeyCode::Backspace) => { self.search.backspace(); edited = true; }
-            PhysicalKey::Code(KeyCode::Delete) => { self.search.delete_forward(); edited = true; }
+            PhysicalKey::Code(KeyCode::Backspace) => {
+                self.search.backspace();
+                edited = true;
+            }
+            PhysicalKey::Code(KeyCode::Delete) => {
+                self.search.delete_forward();
+                edited = true;
+            }
             PhysicalKey::Code(KeyCode::KeyA) if ctrl => self.search.select_all(),
             PhysicalKey::Code(KeyCode::KeyC) if ctrl => {
                 if let Some(text) = self.search.selected_text()
@@ -371,20 +381,15 @@ impl TerminalInteraction {
                 }
             }
             PhysicalKey::Code(KeyCode::KeyV) if ctrl => {
-                if let Some(text) = self.clipboard().and_then(|clipboard| clipboard.get_text().ok()) {
+                if let Some(text) = self
+                    .clipboard()
+                    .and_then(|clipboard| clipboard.get_text().ok())
+                {
                     let clean = text.replace(['\r', '\n'], "");
                     if !clean.is_empty() {
                         self.search.insert_text(&clean);
                         edited = true;
                     }
-                }
-            }
-            _ if !ctrl && !super_key => {
-                if let Some(text) = key_event.logical_key.to_text()
-                    && !text.contains(['\r', '\n'])
-                {
-                    self.search.insert_text(text);
-                    edited = true;
                 }
             }
             _ => {}
@@ -411,21 +416,26 @@ impl TerminalInteraction {
         false
     }
 
-    pub(crate) fn handle_key_event(&mut self, key_event: &KeyEvent, terminal: &mut Terminal) -> bool {
+    pub(crate) fn handle_key_event(
+        &mut self,
+        key_event: &KeyInput,
+        terminal: &mut Terminal,
+    ) -> bool {
         if self.handle_search_key(key_event, terminal) {
             return true;
         }
-        if key_event.state != ElementState::Pressed {
+        if key_event.state != KeyState::Pressed {
             return false;
         }
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
-        let super_key = self.modifiers.super_key();
 
         if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV) {
             let bracketed_paste = crate::platform::lock_recover(&terminal.grid).bracketed_paste;
-            let file_list = self.clipboard().and_then(|clipboard| clipboard.get_file_list().ok());
+            let file_list = self
+                .clipboard()
+                .and_then(|clipboard| clipboard.get_file_list().ok());
             let paste = terminal_clipboard_paste_bytes(file_list.as_deref(), None).or_else(|| {
                 self.clipboard()
                     .and_then(|clipboard| clipboard.get_text().ok())
@@ -445,7 +455,9 @@ impl TerminalInteraction {
                     let text = grid.get_selection_text();
                     grid.selection = None;
                     drop(grid);
-                    if !text.is_empty() && let Some(clipboard) = self.clipboard() {
+                    if !text.is_empty()
+                        && let Some(clipboard) = self.clipboard()
+                    {
                         let _ = clipboard.set_text(text);
                     }
                 }
@@ -458,19 +470,35 @@ impl TerminalInteraction {
         }
         let app_cursor = grid.app_cursor_keys;
         drop(grid);
-        if let Some(bytes) = terminal_key_sequence(
-            key_event.physical_key,
-            key_event.logical_key.to_text(),
-            shift,
-            ctrl,
-            alt,
-            super_key,
-            app_cursor,
-        ) {
+        if let Some(bytes) =
+            terminal_key_sequence(key_event.physical_key, shift, ctrl, alt, app_cursor)
+        {
             let _ = terminal.write_input(&bytes);
             return true;
         }
         false
+    }
+
+    pub(crate) fn handle_text(&mut self, text: &str, terminal: &mut Terminal) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let super_key = self.modifiers.super_key();
+        if search_owns_keyboard(&self.search) {
+            if ctrl || super_key || text.contains(['\r', '\n']) {
+                return false;
+            }
+            self.search.insert_text(text);
+            self.refresh_search(terminal, SearchRefreshCause::User);
+            return true;
+        }
+        let Some(bytes) = terminal_text_sequence(text, ctrl, alt, super_key) else {
+            return false;
+        };
+        let _ = terminal.write_input(&bytes);
+        true
     }
 
     pub(crate) fn cursor_moved(
@@ -544,8 +572,8 @@ impl TerminalInteraction {
 
     pub(crate) fn mouse_input(
         &mut self,
-        state: ElementState,
-        button: MouseButton,
+        state: KeyState,
+        button: PointerButton,
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
     ) -> bool {
@@ -553,7 +581,7 @@ impl TerminalInteraction {
         let y = self.mouse_y;
         update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, state);
 
-        if state == ElementState::Released && self.pointer_capture != PointerCapture::None {
+        if state == KeyState::Released && self.pointer_capture != PointerCapture::None {
             self.finish_terminal_selection(terminal);
             let capture = release_pointer_capture(&mut self.pointer_capture);
             self.terminal_selection_anchor = None;
@@ -564,8 +592,8 @@ impl TerminalInteraction {
         }
 
         if let Some(search) = self.layout.search
-            && state == ElementState::Pressed
-            && button == MouseButton::Left
+            && state == KeyState::Pressed
+            && button == PointerButton::Left
         {
             if search.close.contains(x, y) {
                 self.pointer_capture = PointerCapture::SearchControl;
@@ -604,8 +632,8 @@ impl TerminalInteraction {
         }
 
         if let Some(scrollbar) = self.layout.scrollbar
-            && state == ElementState::Pressed
-            && button == MouseButton::Left
+            && state == KeyState::Pressed
+            && button == PointerButton::Left
             && scrollbar.track.contains(x, y)
             && let Some((offset, target)) = terminal_scrollbar_drag_target(y, scrollbar, None)
         {
@@ -621,7 +649,7 @@ impl TerminalInteraction {
         if !self.layout.body.contains(x, y) {
             return false;
         }
-        if state == ElementState::Pressed {
+        if state == KeyState::Pressed {
             let search_owned_selection = self.search.owns_grid_selection();
             terminal_body_takes_search_focus(&mut self.search);
             if search_owned_selection {
@@ -649,8 +677,8 @@ impl TerminalInteraction {
         }
 
         if !tracking
-            && button == MouseButton::Left
-            && state == ElementState::Pressed
+            && button == PointerButton::Left
+            && state == KeyState::Pressed
             && let Some((cell_x, cell_y)) = terminal_cell_at(self.layout, terminal, x, y)
         {
             self.terminal_selection_anchor = Some((cell_x, cell_y));
@@ -660,7 +688,7 @@ impl TerminalInteraction {
         false
     }
 
-    pub(crate) fn mouse_wheel(&mut self, delta: MouseScrollDelta, terminal: &mut Terminal) -> bool {
+    pub(crate) fn mouse_wheel(&mut self, delta: ScrollDelta, terminal: &mut Terminal) -> bool {
         if !self.layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
         let dy = terminal_wheel_delta(delta, self.layout.char_h, self.scroll_sensitivity);
         let grid = crate::platform::lock_recover(&terminal.grid);
@@ -856,7 +884,7 @@ fn search_owns_keyboard(search: &TerminalSearchState) -> bool {
 fn search_key_falls_through_to_terminal(
     search: &TerminalSearchState,
     physical_key: PhysicalKey,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
 ) -> bool {
     if !search_owns_keyboard(search) {
         return false;
@@ -873,11 +901,11 @@ fn search_key_falls_through_to_terminal(
 }
 
 #[inline]
-fn terminal_wheel_delta(delta: MouseScrollDelta, char_h: f32, sensitivity: f32) -> f32 {
+fn terminal_wheel_delta(delta: ScrollDelta, char_h: f32, sensitivity: f32) -> f32 {
     let sensitivity = crate::config::normalize_scroll_sensitivity(sensitivity);
     match delta {
-        MouseScrollDelta::LineDelta(_, y) => y * 4.0 * char_h.max(0.0) * sensitivity,
-        MouseScrollDelta::PixelDelta(position) => position.y as f32 * sensitivity,
+        ScrollDelta::Line { y, .. } => y * 4.0 * char_h.max(0.0) * sensitivity,
+        ScrollDelta::Pixel { y, .. } => y * sensitivity,
     }
 }
 
@@ -932,8 +960,8 @@ fn terminal_mouse_event_sequence(
     capture: PointerCapture,
     tracking: MouseTrackingMode,
     sgr: bool,
-    state: ElementState,
-    button: MouseButton,
+    state: KeyState,
+    button: PointerButton,
     x: f32,
     y: f32,
 ) -> Option<Vec<u8>> {
@@ -946,7 +974,7 @@ fn terminal_mouse_event_sequence(
         code,
         cell_x,
         cell_y,
-        state == ElementState::Pressed,
+        state == KeyState::Pressed,
         sgr,
     ))
 }
@@ -998,12 +1026,12 @@ fn terminal_mouse_wheel_sequence(
     Some(input)
 }
 
-fn terminal_mouse_button_code(button: MouseButton) -> Option<u8> {
+fn terminal_mouse_button_code(button: PointerButton) -> Option<u8> {
     match button {
-        MouseButton::Left => Some(0),
-        MouseButton::Middle => Some(1),
-        MouseButton::Right => Some(2),
-        MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
+        PointerButton::Left => Some(0),
+        PointerButton::Middle => Some(1),
+        PointerButton::Right => Some(2),
+        PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => None,
     }
 }
 
@@ -1028,12 +1056,12 @@ fn terminal_mouse_protocol_sequence(
     ]
 }
 
-fn update_pressed_mouse_buttons(buttons: &mut u8, button: MouseButton, state: ElementState) {
+fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: KeyState) {
     let Some(code) = terminal_mouse_button_code(button) else {
         return;
     };
     let bit = 1u8 << code;
-    if state == ElementState::Pressed {
+    if state == KeyState::Pressed {
         *buttons |= bit;
     } else {
         *buttons &= !bit;
@@ -1098,15 +1126,15 @@ fn terminal_shell_escape_path(path: &Path, out: &mut Vec<u8>) {
 
 fn terminal_key_sequence(
     physical_key: PhysicalKey,
-    logical_text: Option<&str>,
     shift: bool,
     ctrl: bool,
     alt: bool,
-    super_key: bool,
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
     let seq = match physical_key {
-        PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => terminal_alt_prefixed(b"\r", alt),
+        PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+            terminal_alt_prefixed(b"\r", alt)
+        }
         PhysicalKey::Code(KeyCode::Backspace) if ctrl => terminal_alt_prefixed(b"\x17", alt),
         PhysicalKey::Code(KeyCode::Backspace) if shift => terminal_alt_prefixed(b"\x08", alt),
         PhysicalKey::Code(KeyCode::Backspace) => terminal_alt_prefixed(b"\x7f", alt),
@@ -1117,12 +1145,24 @@ fn terminal_key_sequence(
         PhysicalKey::Code(KeyCode::Delete) => terminal_tilde_key(3, shift, alt, ctrl),
         PhysicalKey::Code(KeyCode::PageUp) => terminal_tilde_key(5, shift, alt, ctrl),
         PhysicalKey::Code(KeyCode::PageDown) => terminal_tilde_key(6, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::Home) => terminal_cursor_key(b'H', app_cursor_keys, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::End) => terminal_cursor_key(b'F', app_cursor_keys, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::ArrowUp) => terminal_cursor_key(b'A', app_cursor_keys, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::ArrowDown) => terminal_cursor_key(b'B', app_cursor_keys, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::ArrowRight) => terminal_cursor_key(b'C', app_cursor_keys, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::ArrowLeft) => terminal_cursor_key(b'D', app_cursor_keys, shift, alt, ctrl),
+        PhysicalKey::Code(KeyCode::Home) => {
+            terminal_cursor_key(b'H', app_cursor_keys, shift, alt, ctrl)
+        }
+        PhysicalKey::Code(KeyCode::End) => {
+            terminal_cursor_key(b'F', app_cursor_keys, shift, alt, ctrl)
+        }
+        PhysicalKey::Code(KeyCode::ArrowUp) => {
+            terminal_cursor_key(b'A', app_cursor_keys, shift, alt, ctrl)
+        }
+        PhysicalKey::Code(KeyCode::ArrowDown) => {
+            terminal_cursor_key(b'B', app_cursor_keys, shift, alt, ctrl)
+        }
+        PhysicalKey::Code(KeyCode::ArrowRight) => {
+            terminal_cursor_key(b'C', app_cursor_keys, shift, alt, ctrl)
+        }
+        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+            terminal_cursor_key(b'D', app_cursor_keys, shift, alt, ctrl)
+        }
         PhysicalKey::Code(KeyCode::F1) => terminal_function_key(11, b'P', shift, alt, ctrl),
         PhysicalKey::Code(KeyCode::F2) => terminal_function_key(12, b'Q', shift, alt, ctrl),
         PhysicalKey::Code(KeyCode::F3) => terminal_function_key(13, b'R', shift, alt, ctrl),
@@ -1135,34 +1175,56 @@ fn terminal_key_sequence(
         PhysicalKey::Code(KeyCode::F10) => terminal_function_key(21, 0, shift, alt, ctrl),
         PhysicalKey::Code(KeyCode::F11) => terminal_function_key(23, 0, shift, alt, ctrl),
         PhysicalKey::Code(KeyCode::F12) => terminal_function_key(24, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::Space) | PhysicalKey::Code(KeyCode::Digit2) if ctrl => terminal_alt_prefixed(b"\x00", alt),
+        PhysicalKey::Code(KeyCode::Space) | PhysicalKey::Code(KeyCode::Digit2) if ctrl => {
+            terminal_alt_prefixed(b"\x00", alt)
+        }
         PhysicalKey::Code(KeyCode::Digit6) if ctrl => terminal_alt_prefixed(b"\x1e", alt),
-        PhysicalKey::Code(KeyCode::Minus) | PhysicalKey::Code(KeyCode::Slash) if ctrl => terminal_alt_prefixed(b"\x1f", alt),
+        PhysicalKey::Code(KeyCode::Minus) | PhysicalKey::Code(KeyCode::Slash) if ctrl => {
+            terminal_alt_prefixed(b"\x1f", alt)
+        }
         PhysicalKey::Code(KeyCode::BracketLeft) if ctrl => terminal_alt_prefixed(b"\x1b", alt),
         PhysicalKey::Code(KeyCode::Backslash) if ctrl => terminal_alt_prefixed(b"\x1c", alt),
         PhysicalKey::Code(KeyCode::BracketRight) if ctrl => terminal_alt_prefixed(b"\x1d", alt),
         PhysicalKey::Code(code) if ctrl => {
             let control = match code {
-                KeyCode::KeyA => 0x01, KeyCode::KeyB => 0x02, KeyCode::KeyC => 0x03,
-                KeyCode::KeyD => 0x04, KeyCode::KeyE => 0x05, KeyCode::KeyG => 0x07,
-                KeyCode::KeyH => 0x08, KeyCode::KeyI => 0x09, KeyCode::KeyJ => 0x0a,
-                KeyCode::KeyK => 0x0b, KeyCode::KeyL => 0x0c, KeyCode::KeyM => 0x0d,
-                KeyCode::KeyN => 0x0e, KeyCode::KeyO => 0x0f, KeyCode::KeyP => 0x10,
-                KeyCode::KeyQ => 0x11, KeyCode::KeyR => 0x12, KeyCode::KeyS => 0x13,
-                KeyCode::KeyT => 0x14, KeyCode::KeyU => 0x15, KeyCode::KeyW => 0x17,
-                KeyCode::KeyX => 0x18, KeyCode::KeyY => 0x19, KeyCode::KeyZ => 0x1a,
+                KeyCode::KeyA => 0x01,
+                KeyCode::KeyB => 0x02,
+                KeyCode::KeyC => 0x03,
+                KeyCode::KeyD => 0x04,
+                KeyCode::KeyE => 0x05,
+                KeyCode::KeyG => 0x07,
+                KeyCode::KeyH => 0x08,
+                KeyCode::KeyI => 0x09,
+                KeyCode::KeyJ => 0x0a,
+                KeyCode::KeyK => 0x0b,
+                KeyCode::KeyL => 0x0c,
+                KeyCode::KeyM => 0x0d,
+                KeyCode::KeyN => 0x0e,
+                KeyCode::KeyO => 0x0f,
+                KeyCode::KeyP => 0x10,
+                KeyCode::KeyQ => 0x11,
+                KeyCode::KeyR => 0x12,
+                KeyCode::KeyS => 0x13,
+                KeyCode::KeyT => 0x14,
+                KeyCode::KeyU => 0x15,
+                KeyCode::KeyW => 0x17,
+                KeyCode::KeyX => 0x18,
+                KeyCode::KeyY => 0x19,
+                KeyCode::KeyZ => 0x1a,
                 _ => return None,
             };
             terminal_alt_prefixed(&[control], alt)
         }
-        _ if !ctrl && !super_key => {
-            let text = logical_text?;
-            if alt { let mut out = Vec::with_capacity(text.len() + 1); out.push(0x1b); out.extend_from_slice(text.as_bytes()); out }
-            else { text.as_bytes().to_vec() }
-        }
         _ => return None,
     };
     Some(seq)
+}
+
+fn terminal_text_sequence(text: &str, ctrl: bool, alt: bool, super_key: bool) -> Option<Vec<u8>> {
+    if text.is_empty() || ctrl || super_key {
+        return None;
+    }
+    Some(terminal_alt_prefixed(text.as_bytes(), alt))
 }
 
 fn terminal_modifier(shift: bool, alt: bool, ctrl: bool) -> Option<u8> {
@@ -1205,8 +1267,101 @@ mod tests {
 
     #[test]
     fn terminal_encoder_keeps_plain_f1_and_ctrl_t_sequences() {
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F1), None, false, false, false, false, false), Some(b"\x1bOP".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyT), Some("t"), false, true, false, false, false), Some(vec![0x14]));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F1), false, false, false, false), Some(b"\x1bOP".to_vec()));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyT), false, true, false, false), Some(vec![0x14]));
+    }
+
+    #[test]
+    fn project_owned_keyboard_contract_separates_physical_keys_from_text() {
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyA), false, false, false, false,),
+            None,
+        );
+        assert_eq!(
+            terminal_text_sequence("Ж界", false, false, false),
+            Some("Ж界".as_bytes().to_vec()),
+        );
+        assert_eq!(
+            terminal_text_sequence("x", false, true, false),
+            Some(b"\x1bx".to_vec()),
+        );
+
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyA), false, true, false, false,),
+            Some(vec![0x01]),
+        );
+        assert_eq!(terminal_text_sequence("a", true, false, false), None);
+        assert_eq!(terminal_text_sequence("a", false, false, true), None);
+    }
+
+    #[test]
+    fn project_owned_keyboard_contract_covers_navigation_modifiers_and_release() {
+        assert_eq!(
+            terminal_key_sequence(
+                PhysicalKey::Code(KeyCode::ArrowUp),
+                true,
+                false,
+                false,
+                false,
+            ),
+            Some(b"\x1b[1;2A".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(
+                PhysicalKey::Code(KeyCode::ArrowLeft),
+                false,
+                false,
+                true,
+                false,
+            ),
+            Some(b"\x1b[1;3D".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::Home), false, true, false, false,),
+            Some(b"\x1b[1;5H".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::End), false, false, false, false,),
+            Some(b"\x1b[F".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(
+                PhysicalKey::Code(KeyCode::PageUp),
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some(b"\x1b[5~".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(
+                PhysicalKey::Code(KeyCode::PageDown),
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some(b"\x1b[6~".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::F5), false, false, false, false,),
+            Some(b"\x1b[15~".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::F12), false, true, true, false,),
+            Some(b"\x1b[24;7~".to_vec()),
+        );
+
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        assert!(!interaction.handle_key_event(
+            &KeyInput {
+                state: KeyState::Released,
+                physical_key: PhysicalKey::Code(KeyCode::ArrowUp),
+            },
+            &mut terminal,
+        ));
     }
 
     #[test]
@@ -1215,12 +1370,12 @@ mod tests {
         search.open();
         assert!(search_owns_keyboard(&search));
 
-        let none = ModifiersState::empty();
-        let ctrl = ModifiersState::CONTROL;
-        let alt = ModifiersState::ALT;
-        let shift = ModifiersState::SHIFT;
-        let super_key = ModifiersState::SUPER;
-        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let none = Modifiers::empty();
+        let ctrl = Modifiers::CONTROL;
+        let alt = Modifiers::ALT;
+        let shift = Modifiers::SHIFT;
+        let super_key = Modifiers::SUPER;
+        let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
 
         assert!(!search_key_falls_through_to_terminal(
             &search,
@@ -1243,10 +1398,8 @@ mod tests {
         assert_eq!(
             terminal_key_sequence(
                 PhysicalKey::Code(KeyCode::KeyT),
-                Some("t"),
                 false,
                 true,
-                false,
                 false,
                 false,
             ),
@@ -1277,12 +1430,12 @@ mod tests {
 
     #[test]
     fn terminal_wheel_delta_matches_donor_line_height_and_sensitivity() {
-        let line = MouseScrollDelta::LineDelta(0.0, 1.0);
+        let line = ScrollDelta::Line { x: 0.0, y: 1.0 };
         assert_eq!(terminal_wheel_delta(line, 24.0, 1.0), 96.0);
         assert_eq!(terminal_wheel_delta(line, 24.0, 0.5), 48.0);
         assert_eq!(terminal_wheel_delta(line, 24.0, 2.0), 192.0);
 
-        let pixel = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -12.5));
+        let pixel = ScrollDelta::Pixel { x: 0.0, y: -12.5 };
         assert_eq!(terminal_wheel_delta(pixel, 24.0, 1.0), -12.5);
         assert_eq!(terminal_wheel_delta(pixel, 24.0, 2.0), -25.0);
     }
@@ -1328,8 +1481,8 @@ mod tests {
 
         update_pressed_mouse_buttons(
             &mut interaction.pressed_mouse_buttons,
-            MouseButton::Left,
-            ElementState::Pressed,
+            PointerButton::Left,
+            KeyState::Pressed,
         );
         assert_eq!(interaction.pressed_mouse_buttons, 1);
         assert!(terminal_mouse_motion_sequence(
@@ -1406,11 +1559,9 @@ mod tests {
         assert_eq!(
             terminal_key_sequence(
                 PhysicalKey::Code(KeyCode::F1),
-                None,
                 false,
                 true,
                 true,
-                false,
                 false,
             ),
             Some(b"\x1b[1;7P".to_vec()),
@@ -1419,10 +1570,10 @@ mod tests {
 
     #[test]
     fn terminal_key_sequences_cover_navigation_and_modifiers() {
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::ArrowUp), None, false, false, false, false, false), Some(b"\x1b[A".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::ArrowUp), None, false, false, false, false, true), Some(b"\x1bOA".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Delete), None, true, true, false, false, false), Some(b"\x1b[3;6~".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F12), None, false, false, false, false, false), Some(b"\x1b[24~".to_vec()));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::ArrowUp), false, false, false, false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::ArrowUp), false, false, false, true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Delete), true, true, false, false), Some(b"\x1b[3;6~".to_vec()));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F12), false, false, false, false), Some(b"\x1b[24~".to_vec()));
     }
 
     #[test]
@@ -1566,8 +1717,8 @@ mod tests {
         interaction.mouse_x = x;
         interaction.mouse_y = y;
         assert!(interaction.mouse_input(
-            ElementState::Pressed,
-            MouseButton::Left,
+            KeyState::Pressed,
+            PointerButton::Left,
             terminal,
             |_, _, _| 0,
         ));
@@ -1699,8 +1850,8 @@ mod tests {
                 .is_none()
         );
         assert!(interaction.mouse_input(
-            ElementState::Released,
-            MouseButton::Left,
+            KeyState::Released,
+            PointerButton::Left,
             &mut terminal,
             |_, _, _| 0,
         ));
@@ -1713,8 +1864,8 @@ mod tests {
         begin_terminal_selection(&mut interaction, &mut terminal, 25.0, 400.0);
         assert!(interaction.cursor_moved(75.0, 400.0, &mut terminal, |_, _, _| 0));
         assert!(interaction.mouse_input(
-            ElementState::Released,
-            MouseButton::Left,
+            KeyState::Released,
+            PointerButton::Left,
             &mut terminal,
             |_, _, _| 0,
         ));
@@ -1784,8 +1935,8 @@ mod tests {
         assert!(interaction.animation_active(&terminal));
 
         assert!(interaction.mouse_input(
-            ElementState::Released,
-            MouseButton::Left,
+            KeyState::Released,
+            PointerButton::Left,
             &mut terminal,
             |_, _, _| 0,
         ));
@@ -1814,8 +1965,8 @@ mod tests {
         }
         assert!(interaction.clear_text_selection(&mut terminal));
         assert!(interaction.mouse_input(
-            ElementState::Pressed,
-            MouseButton::Left,
+            KeyState::Pressed,
+            PointerButton::Left,
             &mut terminal,
             |_, _, _| 0,
         ));
@@ -1838,15 +1989,11 @@ mod tests {
         assert!(!search_owns_keyboard(&search));
         assert_eq!(search.text, "needle");
         assert_eq!(
-            terminal_key_sequence(
-                PhysicalKey::Code(KeyCode::KeyA),
-                Some("a"),
-                false,
-                false,
-                false,
-                false,
-                false,
-            ),
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyA), false, false, false, false),
+            None
+        );
+        assert_eq!(
+            terminal_text_sequence("a", false, false, false),
             Some(b"a".to_vec())
         );
         assert_eq!(search.text, "needle");
@@ -1897,8 +2044,8 @@ mod tests {
                 capture,
                 MouseTrackingMode::Press,
                 true,
-                ElementState::Pressed,
-                MouseButton::Left,
+                KeyState::Pressed,
+                PointerButton::Left,
                 x,
                 y,
             )
@@ -1908,8 +2055,8 @@ mod tests {
                 capture,
                 MouseTrackingMode::Press,
                 true,
-                ElementState::Released,
-                MouseButton::Left,
+                KeyState::Released,
+                PointerButton::Left,
                 x,
                 y,
             )
@@ -1921,8 +2068,8 @@ mod tests {
             PointerCapture::None,
             MouseTrackingMode::Press,
             true,
-            ElementState::Pressed,
-            MouseButton::Left,
+            KeyState::Pressed,
+            PointerButton::Left,
             x,
             y,
         )
@@ -1932,8 +2079,8 @@ mod tests {
             PointerCapture::None,
             MouseTrackingMode::Press,
             true,
-            ElementState::Released,
-            MouseButton::Left,
+            KeyState::Released,
+            PointerButton::Left,
             x,
             y,
         )
@@ -1962,21 +2109,21 @@ mod tests {
         let layout = mouse_test_layout(0.0);
         let x = layout.text_x + 5.0;
         let y = layout.body.y + 100.0;
-        for button in [MouseButton::Back, MouseButton::Forward, MouseButton::Other(9)] {
+        for button in [PointerButton::Back, PointerButton::Forward, PointerButton::Other(9)] {
             assert_eq!(terminal_mouse_button_code(button), None);
             assert!(terminal_mouse_event_sequence(
                 layout,
                 PointerCapture::None,
                 MouseTrackingMode::Press,
                 true,
-                ElementState::Pressed,
+                KeyState::Pressed,
                 button,
                 x,
                 y,
             )
             .is_none());
             let mut pressed = 0u8;
-            update_pressed_mouse_buttons(&mut pressed, button, ElementState::Pressed);
+            update_pressed_mouse_buttons(&mut pressed, button, KeyState::Pressed);
             assert_eq!(pressed, 0);
         }
     }
