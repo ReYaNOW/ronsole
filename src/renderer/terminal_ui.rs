@@ -12,7 +12,6 @@ pub(crate) const TERMINAL_TEXT_SCALE: f32 = 1.05;
 const TERMINAL_TAB_BAR_PAD: f32 = 8.0;
 const TERMINAL_TAB_BAR_TOP: f32 = 6.0;
 const TERMINAL_TAB_HEIGHT: f32 = 32.0;
-const TERMINAL_TAB_BOTTOM_GAP: f32 = 4.0;
 const TERMINAL_TAB_NATURAL_CHROME: f32 = 56.0;
 const TERMINAL_TAB_CLOSE_SIZE: f32 = 20.0;
 const TERMINAL_TAB_CLOSE_HIT_PAD: f32 = 4.0;
@@ -82,7 +81,8 @@ pub(crate) struct TerminalUiLayout {
 
 #[inline]
 pub(crate) fn terminal_tab_body_top(scale: f32) -> f32 {
-    ((TERMINAL_TAB_BAR_TOP + TERMINAL_TAB_HEIGHT + TERMINAL_TAB_BOTTOM_GAP) * scale).round()
+    let strip = terminal_tab_strip_rect(0.0, scale);
+    (strip.y + strip.h).round()
 }
 
 #[inline]
@@ -110,6 +110,53 @@ fn terminal_tab_strip_rect(width: f32, scale: f32) -> Rect {
         w: width.max(0.0),
         h: (TERMINAL_TAB_HEIGHT * scale).round().max(1.0),
     }
+}
+
+#[inline]
+fn terminal_body_rect(width: f32, height: f32, scale: f32) -> Rect {
+    let y = terminal_tab_body_top(scale);
+    Rect {
+        x: 0.0,
+        y,
+        w: width.max(0.0),
+        h: (height.max(0.0) - y).max(0.0),
+    }
+}
+
+#[inline]
+fn terminal_focus_separator_rect(body: Rect, scale: f32) -> Option<Rect> {
+    let h = (2.0 * scale.max(0.0)).round().max(1.0).min(body.h.max(0.0));
+    (body.w > 0.0 && h > 0.0).then_some(Rect {
+        x: body.x,
+        y: body.y,
+        w: body.w,
+        h,
+    })
+}
+
+#[inline]
+fn terminal_tab_add_glyph_geometry(add: Rect, scale: f32) -> (Rect, Rect) {
+    let max_extent = add.w.min(add.h).max(0.0);
+    let thickness = (2.0 * scale.max(0.0)).round().max(1.0).min(max_extent);
+    let arm = (12.0 * scale.max(0.0))
+        .round()
+        .max(thickness)
+        .min(max_extent);
+    let cx = add.x + add.w * 0.5;
+    let cy = add.y + add.h * 0.5;
+    let horizontal = Rect {
+        x: (cx - arm * 0.5).round(),
+        y: (cy - thickness * 0.5).round(),
+        w: arm,
+        h: thickness,
+    };
+    let vertical = Rect {
+        x: (cx - thickness * 0.5).round(),
+        y: (cy - arm * 0.5).round(),
+        w: thickness,
+        h: arm,
+    };
+    (horizontal, vertical)
 }
 
 #[inline]
@@ -222,9 +269,67 @@ fn settings_modal_rect(width: f32, height: f32, scale: f32, progress: f32) -> Re
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SettingsTab {
+    #[default]
+    General,
+    Help,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SettingsTabSpec {
+    tab: SettingsTab,
+    title: &'static str,
+}
+
+const SETTINGS_TABS: [SettingsTabSpec; 2] = [
+    SettingsTabSpec {
+        tab: SettingsTab::General,
+        title: "Основные",
+    },
+    SettingsTabSpec {
+        tab: SettingsTab::Help,
+        title: "Помощь",
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SettingsHelpEntry {
+    shortcut: &'static str,
+    description: &'static str,
+}
+
+const SETTINGS_HELP_ENTRIES: [SettingsHelpEntry; 5] = [
+    SettingsHelpEntry {
+        shortcut: "F1",
+        description: "Открыть/закрыть настройки",
+    },
+    SettingsHelpEntry {
+        shortcut: "Ctrl + Shift + T",
+        description: "Новая вкладка",
+    },
+    SettingsHelpEntry {
+        shortcut: "Ctrl + 4",
+        description: "Закрыть текущую вкладку",
+    },
+    SettingsHelpEntry {
+        shortcut: "Ctrl + F",
+        description: "Поиск в терминале",
+    },
+    SettingsHelpEntry {
+        shortcut: "Esc",
+        description: "Закрыть настройки или активный поиск",
+    },
+];
+
+const SETTINGS_TITLE: &str = "Настройки";
+const SETTINGS_FONT_LABEL: &str = "Размер шрифта";
+const SETTINGS_SCROLL_LABEL: &str = "Чувствительность прокрутки";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SettingsHit {
     #[default]
     None,
+    Tab(SettingsTab),
     FontDecrease,
     FontIncrease,
     ScrollDecrease,
@@ -240,22 +345,50 @@ struct SettingsLine {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SettingsRowLayout {
     label: SettingsLine,
+    label_max_x: f32,
     minus: Rect,
     value: SettingsLine,
+    value_max_x: f32,
     plus: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsHelpRowLayout {
+    keycap: Rect,
+    key: SettingsLine,
+    key_max_x: f32,
+    description: SettingsLine,
+    description_max_x: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsSidebarTabMetrics {
+    top: f32,
+    row_h: f32,
+    gap: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SettingsLayout {
     modal: Rect,
-    clip: Option<Rect>,
+    inner: Option<Rect>,
+    divider: Option<Rect>,
+    content_clip: Option<Rect>,
+    content_body: Option<Rect>,
+    tabs: [Option<Rect>; SETTINGS_TABS.len()],
     title: Option<SettingsLine>,
     font: Option<SettingsRowLayout>,
     scroll: Option<SettingsRowLayout>,
+    help: [Option<SettingsHelpRowLayout>; SETTINGS_HELP_ENTRIES.len()],
 }
 
 impl SettingsLayout {
     fn hit_test(self, x: f32, y: f32) -> SettingsHit {
+        for (index, spec) in SETTINGS_TABS.iter().enumerate() {
+            if self.tabs[index].is_some_and(|rect| rect.contains(x, y)) {
+                return SettingsHit::Tab(spec.tab);
+            }
+        }
         if let Some(row) = self.font {
             if row.minus.contains(x, y) {
                 return SettingsHit::FontDecrease;
@@ -276,12 +409,47 @@ impl SettingsLayout {
     }
 }
 
+#[inline]
+fn settings_tab_title(tab: SettingsTab) -> &'static str {
+    SETTINGS_TABS
+        .iter()
+        .find(|spec| spec.tab == tab)
+        .map_or(SETTINGS_TABS[0].title, |spec| spec.title)
+}
+
+fn settings_sidebar_tab_metrics(
+    inner_h: f32,
+    tab_count: usize,
+    scale: f32,
+) -> SettingsSidebarTabMetrics {
+    let scale = scale.max(0.0);
+    let top = (20.0 * scale).min((inner_h * 0.10).max(0.0));
+    if tab_count == 0 {
+        return SettingsSidebarTabMetrics {
+            top,
+            row_h: 0.0,
+            gap: 0.0,
+        };
+    }
+    let bottom = (20.0 * scale).min((inner_h - top).max(0.0) * 0.12);
+    let available = (inner_h - top - bottom).max(0.0);
+    let desired_gap = 4.0 * scale;
+    let gap = if tab_count > 1 {
+        desired_gap.min(available / (tab_count - 1) as f32)
+    } else {
+        0.0
+    };
+    let row_h = ((available - gap * tab_count.saturating_sub(1) as f32) / tab_count as f32)
+        .clamp(0.0, 36.0 * scale);
+    SettingsSidebarTabMetrics { top, row_h, gap }
+}
+
 fn settings_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsRowLayout> {
     let button = (30.0 * scale).round().max(1.0);
     let gap = (8.0 * scale).round().max(1.0);
     let value_w = (72.0 * scale).round().max(1.0);
     let control_w = button * 2.0 + value_w + gap * 2.0;
-    let label_room = (120.0 * scale).round().max(1.0);
+    let label_room = (64.0 * scale).round().max(1.0);
     if clip.w < control_w + label_room || top < clip.y || top + button > clip.y + clip.h {
         return None;
     }
@@ -305,12 +473,61 @@ fn settings_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsRowLa
             x: clip.x.round(),
             baseline_y,
         },
+        label_max_x: (minus.x - gap).round(),
         minus,
         value: SettingsLine {
             x: (value_x + 8.0 * scale).round(),
             baseline_y,
         },
+        value_max_x: (plus.x - gap).round(),
         plus,
+    })
+}
+
+fn settings_help_row_layout(
+    content: Rect,
+    index: usize,
+    scale: f32,
+) -> Option<SettingsHelpRowLayout> {
+    let row_step = (44.0 * scale).round().max(1.0);
+    let row_h = (32.0 * scale).round().max(1.0);
+    let top = (content.y + 8.0 * scale + index as f32 * row_step).round();
+    if top < content.y || top + row_h > content.y + content.h {
+        return None;
+    }
+
+    let keycap_h = (26.0 * scale).round().max(1.0).min(row_h);
+    let keycap_y = (top + (row_h - keycap_h) * 0.5).round();
+    let desired_keycap_w = (170.0 * scale).round().max(1.0);
+    let keycap_w = desired_keycap_w
+        .min((content.w * 0.38).round().max(0.0))
+        .min(content.w);
+    let remaining = (content.w - keycap_w).max(0.0);
+    let gap = (24.0 * scale).round().min(remaining * 0.25).max(0.0);
+    let description_x = (content.x + keycap_w + gap).round();
+    if keycap_w <= 0.0 || description_x >= content.x + content.w {
+        return None;
+    }
+
+    let baseline_y = (top + row_h * 0.68).round();
+    let keycap = Rect {
+        x: content.x.round(),
+        y: keycap_y,
+        w: keycap_w,
+        h: keycap_h,
+    };
+    Some(SettingsHelpRowLayout {
+        keycap,
+        key: SettingsLine {
+            x: (keycap.x + 10.0 * scale).round(),
+            baseline_y,
+        },
+        key_max_x: (keycap.x + keycap.w - 8.0 * scale).round(),
+        description: SettingsLine {
+            x: description_x,
+            baseline_y,
+        },
+        description_max_x: (content.x + content.w).round(),
     })
 }
 
@@ -319,6 +536,7 @@ fn settings_layout(
     height: f32,
     scale: f32,
     progress: f32,
+    active_tab: SettingsTab,
 ) -> SettingsLayout {
     let scale = scale.max(0.0);
     let modal = settings_modal_rect(width, height, scale, progress);
@@ -329,42 +547,128 @@ fn settings_layout(
         };
     }
 
-    let pad_x = (28.0 * scale).min(modal.w * 0.2).max(0.0);
-    let pad_y = (20.0 * scale).min(modal.h * 0.2).max(0.0);
-    let clip_x = (modal.x + pad_x).round();
-    let clip_y = (modal.y + pad_y).round();
-    let clip_right = (modal.x + modal.w - pad_x).round();
-    let clip_bottom = (modal.y + modal.h - pad_y).round();
-    let clip = Rect {
-        x: clip_x,
-        y: clip_y,
-        w: (clip_right - clip_x).max(0.0),
-        h: (clip_bottom - clip_y).max(0.0),
+    let pad_top = (35.0 * scale).min(modal.h * 0.2).max(0.0);
+    let pad_bottom = (30.0 * scale)
+        .min((modal.h - pad_top).max(0.0) * 0.2)
+        .max(0.0);
+    let pad_h = (40.0 * scale).min(modal.w * 0.2).max(0.0);
+    let inner_x = (modal.x + pad_h).round();
+    let inner_y = (modal.y + pad_top).round();
+    let inner_right = (modal.x + modal.w - pad_h).round();
+    let inner_bottom = (modal.y + modal.h - pad_bottom).round();
+    let inner = Rect {
+        x: inner_x,
+        y: inner_y,
+        w: (inner_right - inner_x).max(0.0),
+        h: (inner_bottom - inner_y).max(0.0),
     };
-    if clip.w <= 0.0 || clip.h <= 0.0 {
+    if inner.w <= 0.0 || inner.h <= 0.0 {
         return SettingsLayout {
             modal,
             ..SettingsLayout::default()
         };
     }
 
-    let safe_bottom = clip.y + clip.h;
-    let title_y = (modal.y + 52.0 * scale).round();
-    let title = (title_y >= clip.y && title_y <= safe_bottom).then_some(SettingsLine {
-        x: clip.x.round(),
-        baseline_y: title_y,
-    });
-    let first_top = (modal.y + 88.0 * scale).round();
-    let row_gap = (54.0 * scale).round().max(1.0);
-    let font = settings_row_layout(clip, first_top, scale);
-    let scroll = settings_row_layout(clip, first_top + row_gap, scale);
+    let sidebar_w = (200.0 * scale).min((inner.w * 0.35).max(0.0));
+    let divider_w = (1.0 * scale).round().max(1.0).min(inner.w);
+    let divider_x = (inner.x + sidebar_w)
+        .round()
+        .min(inner.x + inner.w - divider_w);
+    let divider = Rect {
+        x: divider_x,
+        y: inner.y,
+        w: divider_w,
+        h: inner.h,
+    };
+
+    let tab_metrics = settings_sidebar_tab_metrics(inner.h, SETTINGS_TABS.len(), scale);
+    let tab_inset = (10.0 * scale).min((sidebar_w * 0.2).max(0.0));
+    let tab_w = (sidebar_w - tab_inset * 2.0).max(0.0);
+    let mut tabs = [None; SETTINGS_TABS.len()];
+    for (index, slot) in tabs.iter_mut().enumerate() {
+        let y = (inner.y + tab_metrics.top + index as f32 * (tab_metrics.row_h + tab_metrics.gap))
+            .round();
+        if tab_w > 0.0
+            && tab_metrics.row_h > 0.0
+            && y >= inner.y
+            && y + tab_metrics.row_h <= inner.y + inner.h + 0.001
+        {
+            *slot = Some(Rect {
+                x: (inner.x + tab_inset).round(),
+                y,
+                w: tab_w.round(),
+                h: tab_metrics.row_h.round(),
+            });
+        }
+    }
+
+    let pane_left = (divider.x + divider.w).min(inner.x + inner.w);
+    let pane_w = (inner.x + inner.w - pane_left).max(0.0);
+    let content_left_gap = (30.0 * scale).min(pane_w * 0.20).max(0.0);
+    let content_right_gap = (18.0 * scale)
+        .min((pane_w - content_left_gap).max(0.0) * 0.20)
+        .max(0.0);
+    let content_x = (pane_left + content_left_gap).round();
+    let content_right = (inner.x + inner.w - content_right_gap).round();
+    let content_clip = Rect {
+        x: content_x,
+        y: inner.y,
+        w: (content_right - content_x).max(0.0),
+        h: inner.h,
+    };
+    if content_clip.w <= 0.0 {
+        return SettingsLayout {
+            modal,
+            inner: Some(inner),
+            divider: Some(divider),
+            tabs,
+            ..SettingsLayout::default()
+        };
+    }
+
+    let title_y = (inner.y + 40.0 * scale).round();
+    let title = (title_y >= content_clip.y && title_y <= content_clip.y + content_clip.h)
+        .then_some(SettingsLine {
+            x: content_clip.x.round(),
+            baseline_y: title_y,
+        });
+    let body_y = (inner.y + 70.0 * scale).round().min(inner.y + inner.h);
+    let body_bottom = (inner.y + inner.h - 20.0 * scale).round().max(body_y);
+    let content_body = Rect {
+        x: content_clip.x,
+        y: body_y,
+        w: content_clip.w,
+        h: (body_bottom - body_y).max(0.0),
+    };
+
+    let mut font = None;
+    let mut scroll = None;
+    let mut help = [None; SETTINGS_HELP_ENTRIES.len()];
+    match active_tab {
+        SettingsTab::General => {
+            let first_top = (content_body.y + 12.0 * scale).round();
+            let row_gap = (54.0 * scale).round().max(1.0);
+            font = settings_row_layout(content_body, first_top, scale);
+            scroll = settings_row_layout(content_body, first_top + row_gap, scale);
+        }
+        SettingsTab::Help => {
+            for (index, slot) in help.iter_mut().enumerate() {
+                *slot = settings_help_row_layout(content_body, index, scale);
+            }
+        }
+    }
 
     SettingsLayout {
         modal,
-        clip: Some(clip),
+        inner: Some(inner),
+        divider: Some(divider),
+        content_clip: Some(content_clip),
+        content_body: Some(content_body),
+        tabs,
         title,
         font,
         scroll,
+        help,
     }
 }
 
@@ -1139,16 +1443,6 @@ impl Renderer {
                 ];
             }
             self.push_rounded_rect(tab_x, strip.y, tab_w, strip.h, 0.0, bg);
-            if active {
-                self.push_rounded_rect(
-                    tab_x,
-                    strip.y + strip.h - (2.0 * s).round().max(1.0),
-                    tab_w,
-                    (2.0 * s).round().max(1.0),
-                    0.0,
-                    self.palette.accent,
-                );
-            }
             if idx + 1 < terminals.len() {
                 self.push_rounded_rect(
                     tab_x + tab_w - 1.0,
@@ -1226,24 +1520,21 @@ impl Renderer {
                     [self.palette.fg[0], self.palette.fg[1], self.palette.fg[2], 0.10],
                 );
             }
-            let thickness = (1.5 * s).round().max(1.0);
-            let arm = (9.0 * s).round().max(thickness);
-            let cx = (add_raw.x + add_raw.w * 0.5).round();
-            let cy = (add_raw.y + add_raw.h * 0.5).round();
+            let (horizontal, vertical) = terminal_tab_add_glyph_geometry(add_raw, s);
             self.push_rounded_rect(
-                cx - arm * 0.5,
-                cy - thickness * 0.5,
-                arm,
-                thickness,
-                thickness * 0.5,
+                horizontal.x,
+                horizontal.y,
+                horizontal.w,
+                horizontal.h,
+                horizontal.h * 0.5,
                 [0.82, 0.82, 0.84, 1.0],
             );
             self.push_rounded_rect(
-                cx - thickness * 0.5,
-                cy - arm * 0.5,
-                thickness,
-                arm,
-                thickness * 0.5,
+                vertical.x,
+                vertical.y,
+                vertical.w,
+                vertical.h,
+                vertical.w * 0.5,
                 [0.82, 0.82, 0.84, 1.0],
             );
         }
@@ -1264,6 +1555,7 @@ impl Renderer {
     fn draw_settings(
         &mut self,
         progress: f32,
+        active_tab: SettingsTab,
         pointer_x: f32,
         pointer_y: f32,
         font_value: &str,
@@ -1275,73 +1567,203 @@ impl Renderer {
         }
         let s = self.scale_factor;
         let smooth = progress * progress * (3.0 - 2.0 * progress);
-        self.push_rounded_rect(
+        self.push_rect(
             0.0,
             0.0,
             self.width,
             self.height,
-            0.0,
             [0.0, 0.0, 0.0, 0.60 * smooth],
         );
-        let layout = settings_layout(self.width, self.height, s, progress);
+
+        let layout = settings_layout(self.width, self.height, s, progress, active_tab);
         let modal = layout.modal;
-        let radius = (12.0 * s).round().max(1.0);
+        if modal.w <= 0.0 || modal.h <= 0.0 {
+            self.flush();
+            return;
+        }
+
+        let outer_radius = (10.0 * s).round().max(1.0);
         self.push_rounded_rect(
+            modal.x - 1.0,
+            modal.y - 1.0,
+            modal.w + 2.0,
+            modal.h + 2.0,
+            outer_radius,
+            [0.224, 0.231, 0.251, 1.0],
+        );
+        self.push_rounded_rect_gradient(
             modal.x,
             modal.y,
             modal.w,
             modal.h,
-            radius,
-            [0.18, 0.19, 0.24, 1.0],
+            outer_radius,
+            [
+                [0.26, 0.20, 0.36, 1.0],
+                [0.12, 0.13, 0.22, 1.0],
+            ],
         );
-        let border = (1.0 * s).round().max(1.0).min(modal.h);
-        if modal.w > 0.0 && border > 0.0 {
+
+        if let Some(inner) = layout.inner {
+            let inner_radius = (8.0 * s).round().max(1.0);
             self.push_rounded_rect(
-                modal.x,
-                modal.y,
-                modal.w,
-                border,
-                0.0,
-                self.palette.accent,
+                inner.x - 1.0,
+                inner.y - 1.0,
+                inner.w + 2.0,
+                inner.h + 2.0,
+                inner_radius,
+                [0.224, 0.231, 0.251, 0.80],
+            );
+            self.push_rounded_rect(
+                inner.x,
+                inner.y,
+                inner.w,
+                inner.h,
+                inner_radius,
+                [0.15, 0.16, 0.20, 1.0],
+            );
+        }
+        if let Some(divider) = layout.divider {
+            self.push_rect(
+                divider.x,
+                divider.y,
+                divider.w,
+                divider.h,
+                [1.0, 1.0, 1.0, 0.05],
+            );
+        }
+        if layout
+            .inner
+            .is_some_and(|inner| inner.y - modal.y >= 24.0 * s)
+        {
+            self.draw_ui_text_clipped(
+                SETTINGS_TITLE,
+                (modal.x + 40.0 * s).round(),
+                (modal.x + modal.w - 40.0 * s).round(),
+                (modal.y + 25.0 * s).round(),
+                [0.875, 0.882, 0.902, 1.0],
+                0.90,
             );
         }
         self.flush();
 
         let hovered = layout.hit_test(pointer_x, pointer_y);
-        if let Some(clip) = layout.clip {
-            self.set_clip(clip.x, clip.y, clip.w, clip.h);
-            if let Some(title) = layout.title {
-                self.draw_ui_text(
-                    "Settings",
-                    title.x,
-                    title.baseline_y,
-                    self.palette.fg,
-                    1.05,
-                );
-            }
-            if let Some(row) = layout.font {
-                self.draw_settings_row(
-                    row,
-                    "Font size",
-                    font_value,
-                    hovered,
-                    SettingsHit::FontDecrease,
-                    SettingsHit::FontIncrease,
-                );
-            }
-            if let Some(row) = layout.scroll {
-                self.draw_settings_row(
-                    row,
-                    "Scroll sensitivity",
-                    scroll_value,
-                    hovered,
-                    SettingsHit::ScrollDecrease,
-                    SettingsHit::ScrollIncrease,
+        if let Some(inner) = layout.inner {
+            self.set_clip(inner.x, inner.y, inner.w, inner.h);
+            for (index, spec) in SETTINGS_TABS.iter().enumerate() {
+                let Some(rect) = layout.tabs[index] else {
+                    continue;
+                };
+                let is_active = spec.tab == active_tab;
+                let is_hovered = hovered == SettingsHit::Tab(spec.tab);
+                if is_active || is_hovered {
+                    self.push_rounded_rect(
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        (6.0 * s).round().max(1.0),
+                        [1.0, 1.0, 1.0, if is_active { 0.10 } else { 0.05 }],
+                    );
+                }
+                let text_x = (rect.x + 15.0 * s).round();
+                let baseline_y = (rect.y + rect.h * 0.5 + 5.0 * s).round();
+                self.draw_ui_text_clipped(
+                    spec.title,
+                    text_x,
+                    (rect.x + rect.w - 8.0 * s).round(),
+                    baseline_y,
+                    if is_active {
+                        [1.0, 1.0, 1.0, 1.0]
+                    } else {
+                        [0.70, 0.70, 0.70, 1.0]
+                    },
+                    0.95,
                 );
             }
             self.flush();
             self.clear_clip();
         }
+
+        let Some(content_clip) = layout.content_clip else {
+            return;
+        };
+        self.set_clip(
+            content_clip.x,
+            content_clip.y,
+            content_clip.w,
+            content_clip.h,
+        );
+
+        if let Some(title) = layout.title {
+            let tab_title = settings_tab_title(active_tab);
+            let title_x = (title.x - 14.0 * s).round();
+            let pill_h = (30.0 * s).round().max(1.0);
+            let pill_y = (title.baseline_y - 22.0 * s).round();
+            let title_width = self.terminal_ui_text_width(tab_title, 1.1);
+            let pill_w = (title_width + 28.0 * s)
+                .round()
+                .min((content_clip.x + content_clip.w - title_x).max(0.0));
+            if pill_w > 0.0 {
+                self.push_rounded_rect(
+                    title_x - 1.0,
+                    pill_y - 1.0,
+                    pill_w + 2.0,
+                    pill_h + 2.0,
+                    (6.0 * s).round().max(1.0),
+                    [0.35, 0.26, 0.48, 1.0],
+                );
+                self.push_rounded_rect(
+                    title_x,
+                    pill_y,
+                    pill_w,
+                    pill_h,
+                    (6.0 * s).round().max(1.0),
+                    [0.26, 0.20, 0.36, 1.0],
+                );
+                self.draw_ui_text_clipped(
+                    tab_title,
+                    (title_x + 14.0 * s).round(),
+                    (title_x + pill_w - 10.0 * s).round(),
+                    title.baseline_y,
+                    [1.0, 1.0, 1.0, 1.0],
+                    1.1,
+                );
+            }
+        }
+
+        match active_tab {
+            SettingsTab::General => {
+                if let Some(row) = layout.font {
+                    self.draw_settings_row(
+                        row,
+                        SETTINGS_FONT_LABEL,
+                        font_value,
+                        hovered,
+                        SettingsHit::FontDecrease,
+                        SettingsHit::FontIncrease,
+                    );
+                }
+                if let Some(row) = layout.scroll {
+                    self.draw_settings_row(
+                        row,
+                        SETTINGS_SCROLL_LABEL,
+                        scroll_value,
+                        hovered,
+                        SettingsHit::ScrollDecrease,
+                        SettingsHit::ScrollIncrease,
+                    );
+                }
+            }
+            SettingsTab::Help => {
+                for (row, entry) in layout.help.iter().zip(SETTINGS_HELP_ENTRIES.iter()) {
+                    if let Some(row) = *row {
+                        self.draw_settings_help_row(row, *entry);
+                    }
+                }
+            }
+        }
+        self.flush();
+        self.clear_clip();
     }
 
     fn draw_settings_row(
@@ -1354,7 +1776,7 @@ impl Renderer {
         plus_hit: SettingsHit,
     ) {
         let s = self.scale_factor;
-        let normal = [0.27, 0.28, 0.34, 1.0];
+        let normal = [0.224, 0.231, 0.251, 1.0];
         let hover = self.palette.accent_with_alpha(0.55);
         let radius = (5.0 * s).round().max(1.0);
         self.push_rounded_rect(
@@ -1373,7 +1795,14 @@ impl Renderer {
             radius,
             if hovered == plus_hit { hover } else { normal },
         );
-        self.draw_ui_text(label, row.label.x, row.label.baseline_y, self.palette.fg, 0.90);
+        self.draw_ui_text_clipped(
+            label,
+            row.label.x,
+            row.label_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
         self.draw_ui_text(
             "-",
             (row.minus.x + 10.0 * s).round(),
@@ -1381,7 +1810,14 @@ impl Renderer {
             self.palette.fg,
             0.90,
         );
-        self.draw_ui_text(value, row.value.x, row.value.baseline_y, self.palette.fg, 0.90);
+        self.draw_ui_text_clipped(
+            value,
+            row.value.x,
+            row.value_max_x,
+            row.value.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
         self.draw_ui_text(
             "+",
             (row.plus.x + 8.0 * s).round(),
@@ -1391,13 +1827,58 @@ impl Renderer {
         );
     }
 
+    fn draw_settings_help_row(&mut self, row: SettingsHelpRowLayout, entry: SettingsHelpEntry) {
+        let s = self.scale_factor;
+        let radius = (4.0 * s).round().max(1.0);
+        self.push_rounded_rect(
+            row.keycap.x - 1.0,
+            row.keycap.y - 1.0,
+            row.keycap.w + 2.0,
+            row.keycap.h + 2.0,
+            radius,
+            [0.306, 0.319, 0.341, 1.0],
+        );
+        self.push_rounded_rect(
+            row.keycap.x,
+            row.keycap.y,
+            row.keycap.w,
+            row.keycap.h,
+            radius,
+            [0.224, 0.231, 0.251, 1.0],
+        );
+        self.draw_ui_text_clipped(
+            entry.shortcut,
+            row.key.x,
+            row.key_max_x,
+            row.key.baseline_y,
+            [0.875, 0.882, 0.902, 1.0],
+            0.95,
+        );
+        self.draw_ui_text_clipped(
+            entry.description,
+            row.description.x,
+            row.description_max_x,
+            row.description.baseline_y,
+            [0.663, 0.690, 0.729, 1.0],
+            1.0,
+        );
+    }
+
     pub(crate) fn settings_hit_test(
         &self,
         progress: f32,
+        active_tab: SettingsTab,
         x: f32,
         y: f32,
     ) -> SettingsHit {
-        settings_layout(self.width, self.height, self.scale_factor, progress).hit_test(x, y)
+        settings_layout(
+            self.width,
+            self.height,
+            self.scale_factor,
+            progress,
+            active_tab,
+        )
+        .hit_test(x, y)
     }
 
     pub(crate) fn terminal_tab_hit_test(&self, x: f32, y: f32) -> TerminalTabHit {
@@ -1476,6 +1957,7 @@ impl Renderer {
         pointer_x: f32,
         pointer_y: f32,
         settings_progress: f32,
+        settings_tab: SettingsTab,
         settings_font_value: &str,
         settings_scroll_value: &str,
     ) -> TerminalUiLayout {
@@ -1499,6 +1981,7 @@ impl Renderer {
         );
         self.draw_settings(
             settings_progress,
+            settings_tab,
             pointer_x,
             pointer_y,
             settings_font_value,
@@ -1519,13 +2002,7 @@ impl Renderer {
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
         let s = self.scale_factor;
-        let body_top = terminal_tab_body_top(s);
-        let body = Rect {
-            x: 0.0,
-            y: body_top,
-            w: self.width,
-            h: (self.height - body_top).max(0.0),
-        };
+        let body = terminal_body_rect(self.width, self.height, s);
         let char_w = self.terminal_char_width();
         let char_h = self.line_height * TERMINAL_TEXT_SCALE;
         let visible_rows = terminal_visible_rows(body.h, char_h, s);
@@ -1673,23 +2150,12 @@ impl Renderer {
         self.clear_clip();
         drop(grid);
 
-        if focused {
-            let border = (2.0 * s).max(1.0).round();
-            self.push_rounded_rect(body.x, body.y, body.w, border, 0.0, palette.accent);
+        if focused && let Some(separator) = terminal_focus_separator_rect(body, s) {
             self.push_rounded_rect(
-                body.x,
-                body.y + body.h - border,
-                body.w,
-                border,
-                0.0,
-                palette.accent,
-            );
-            self.push_rounded_rect(body.x, body.y, border, body.h, 0.0, palette.accent);
-            self.push_rounded_rect(
-                body.x + body.w - border,
-                body.y,
-                border,
-                body.h,
+                separator.x,
+                separator.y,
+                separator.w,
+                separator.h,
                 0.0,
                 palette.accent,
             );
@@ -2148,9 +2614,82 @@ mod tests {
 
     #[test]
     fn terminal_tab_bar_reserves_body_space_at_fractional_scale() {
-        assert_eq!(terminal_tab_body_top(1.0), 42.0);
-        assert_eq!(terminal_tab_body_top(1.3333334), 56.0);
-        assert_eq!(terminal_tab_body_top(1.5), 63.0);
+        for (scale, expected_top) in [(1.0, 38.0), (1.25, 48.0), (1.3333333, 51.0), (1.5, 57.0)] {
+            let strip = terminal_tab_strip_rect(1280.0, scale);
+            let body = terminal_body_rect(1280.0, 720.0, scale);
+            assert_eq!(terminal_tab_body_top(scale), expected_top);
+            assert_eq!(body.y, strip.y + strip.h);
+            assert_eq!(body.y, expected_top);
+            assert_eq!(body.x, 0.0);
+            assert_eq!(body.w, 1280.0);
+            assert_eq!(body.h, 720.0 - expected_top);
+        }
+    }
+
+    #[test]
+    fn terminal_focus_separator_matches_body_top_and_full_width_at_fractional_scale() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let body = terminal_body_rect(1280.0, 720.0, scale);
+            let separator = terminal_focus_separator_rect(body, scale)
+                .expect("visible terminal body should have a separator");
+            assert_eq!(separator.x, body.x);
+            assert_eq!(separator.y, body.y);
+            assert_eq!(separator.w, body.w);
+            assert!(separator.h > 0.0 && separator.h <= body.h);
+            for value in [separator.x, separator.y, separator.w, separator.h] {
+                assert!(value.is_finite());
+            }
+            assert_eq!(separator.x.fract(), 0.0);
+            assert_eq!(separator.y.fract(), 0.0);
+            assert_eq!(separator.h.fract(), 0.0);
+        }
+    }
+
+    #[test]
+    fn terminal_plus_glyph_is_donor_sized_centered_and_bounded() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let size = (TERMINAL_ADD_SIZE * scale).round().max(1.0);
+            let add = Rect {
+                x: 100.0,
+                y: 20.0,
+                w: size,
+                h: size,
+            };
+            let (horizontal, vertical) = terminal_tab_add_glyph_geometry(add, scale);
+            assert!(horizontal.w >= (11.0 * scale).round());
+            assert!(vertical.h >= (11.0 * scale).round());
+            assert!(horizontal.h >= (2.0 * scale).round().max(1.0));
+            assert!(vertical.w >= (2.0 * scale).round().max(1.0));
+            for rect in [horizontal, vertical] {
+                for value in [rect.x, rect.y, rect.w, rect.h] {
+                    assert!(value.is_finite());
+                }
+                assert!(rect.x >= add.x && rect.y >= add.y);
+                assert!(rect.x + rect.w <= add.x + add.w);
+                assert!(rect.y + rect.h <= add.y + add.h);
+            }
+            let add_cx = add.x + add.w * 0.5;
+            let add_cy = add.y + add.h * 0.5;
+            let horizontal_cx = horizontal.x + horizontal.w * 0.5;
+            let horizontal_cy = horizontal.y + horizontal.h * 0.5;
+            let vertical_cx = vertical.x + vertical.w * 0.5;
+            let vertical_cy = vertical.y + vertical.h * 0.5;
+            assert!((horizontal_cx - add_cx).abs() <= 0.5);
+            assert!((horizontal_cy - add_cy).abs() <= 0.5);
+            assert!((vertical_cx - add_cx).abs() <= 0.5);
+            assert!((vertical_cy - add_cy).abs() <= 0.5);
+        }
+        let add = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 20.0,
+            h: 20.0,
+        };
+        let (horizontal, vertical) = terminal_tab_add_glyph_geometry(add, 1.0);
+        assert_eq!(horizontal.w, 12.0);
+        assert_eq!(horizontal.h, 2.0);
+        assert_eq!(vertical.w, 2.0);
+        assert_eq!(vertical.h, 12.0);
     }
 
     #[test]
@@ -2217,10 +2756,74 @@ mod tests {
     }
 
     #[test]
+    fn settings_sidebar_tabs_fit_inside_inner_panel_at_fractional_scale() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let layout = settings_layout(
+                1100.0 * scale,
+                720.0 * scale,
+                scale,
+                1.0,
+                SettingsTab::General,
+            );
+            let inner = layout
+                .inner
+                .expect("large settings modal should have inner panel");
+            let metrics = settings_sidebar_tab_metrics(inner.h, SETTINGS_TABS.len(), scale);
+            let bottom = metrics.top
+                + metrics.row_h * SETTINGS_TABS.len() as f32
+                + metrics.gap * SETTINGS_TABS.len().saturating_sub(1) as f32;
+            assert!(bottom <= inner.h + 0.001);
+            for rect in layout.tabs.into_iter().flatten() {
+                for value in [rect.x, rect.y, rect.w, rect.h] {
+                    assert!(value.is_finite());
+                }
+                assert!(rect.x >= inner.x && rect.y >= inner.y);
+                assert!(rect.x + rect.w <= inner.x + inner.w + 0.001);
+                assert!(rect.y + rect.h <= inner.y + inner.h + 0.001);
+            }
+        }
+
+        let tiny = settings_layout(100.0, 80.0, 1.3333333, 1.0, SettingsTab::General);
+        for rect in tiny.tabs.into_iter().flatten() {
+            for value in [rect.x, rect.y, rect.w, rect.h] {
+                assert!(value.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn settings_tab_hit_testing_uses_the_drawn_sidebar_rects() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        let general = layout.tabs[0].expect("general tab should fit");
+        let help = layout.tabs[1].expect("help tab should fit");
+        let (x, y) = center(general);
+        assert_eq!(
+            layout.hit_test(x, y),
+            SettingsHit::Tab(SettingsTab::General)
+        );
+        let (x, y) = center(help);
+        assert_eq!(layout.hit_test(x, y), SettingsHit::Tab(SettingsTab::Help));
+        let inner = layout.inner.expect("inner panel should fit");
+        assert_eq!(
+            layout.hit_test(inner.x + inner.w - 2.0, inner.y + inner.h - 2.0),
+            SettingsHit::None,
+        );
+    }
+
+    #[test]
     fn settings_controls_are_bounded_disjoint_and_hit_test_the_drawn_geometry() {
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
-            let layout = settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0);
-            let clip = layout.clip.expect("large settings modal should have content clip");
+            let layout = settings_layout(
+                1100.0 * scale,
+                720.0 * scale,
+                scale,
+                1.0,
+                SettingsTab::General,
+            );
+            let clip = layout
+                .content_body
+                .expect("large settings modal should have content body");
             let font = layout.font.expect("font controls should fit");
             let scroll = layout.scroll.expect("scroll controls should fit");
             for rect in [font.minus, font.plus, scroll.minus, scroll.plus] {
@@ -2233,6 +2836,8 @@ mod tests {
             }
             assert!(font.minus.x + font.minus.w < font.plus.x);
             assert!(font.minus.y + font.minus.h < scroll.minus.y);
+            assert!(font.label_max_x <= font.minus.x);
+            assert!(scroll.label_max_x <= scroll.minus.x);
             let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
             let (x, y) = center(font.minus);
             assert_eq!(layout.hit_test(x, y), SettingsHit::FontDecrease);
@@ -2242,20 +2847,119 @@ mod tests {
             assert_eq!(layout.hit_test(x, y), SettingsHit::ScrollDecrease);
             let (x, y) = center(scroll.plus);
             assert_eq!(layout.hit_test(x, y), SettingsHit::ScrollIncrease);
-            assert_eq!(layout.hit_test(clip.x + 1.0, clip.y + 1.0), SettingsHit::None);
         }
+    }
+
+    #[test]
+    fn help_tab_has_no_hidden_general_control_hitboxes() {
+        let general = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let help = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Help);
+        assert!(help.font.is_none());
+        assert!(help.scroll.is_none());
+        let font_minus = general.font.expect("general controls should fit").minus;
+        let x = font_minus.x + font_minus.w * 0.5;
+        let y = font_minus.y + font_minus.h * 0.5;
+        assert_eq!(help.hit_test(x, y), SettingsHit::None);
+    }
+
+    #[test]
+    fn help_keycaps_are_bounded_and_leave_a_separate_description_column() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let layout =
+                settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, SettingsTab::Help);
+            let body = layout.content_body.expect("help content should fit");
+            let rows = layout.help.into_iter().flatten().collect::<Vec<_>>();
+            assert_eq!(rows.len(), SETTINGS_HELP_ENTRIES.len());
+            for row in rows {
+                for value in [
+                    row.keycap.x,
+                    row.keycap.y,
+                    row.keycap.w,
+                    row.keycap.h,
+                    row.description.x,
+                    row.description.baseline_y,
+                ] {
+                    assert!(value.is_finite());
+                }
+                assert!(row.keycap.x >= body.x && row.keycap.y >= body.y);
+                assert!(row.keycap.x + row.keycap.w <= body.x + body.w + 0.001);
+                assert!(row.keycap.y + row.keycap.h <= body.y + body.h + 0.001);
+                assert!(row.description.x > row.keycap.x + row.keycap.w);
+                assert!(row.description_max_x <= body.x + body.w + 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_static_labels_and_help_shortcuts_are_russian_and_app_owned() {
+        assert_eq!(SETTINGS_TITLE, "Настройки");
+        assert_eq!(
+            SETTINGS_TABS,
+            [
+                SettingsTabSpec {
+                    tab: SettingsTab::General,
+                    title: "Основные",
+                },
+                SettingsTabSpec {
+                    tab: SettingsTab::Help,
+                    title: "Помощь",
+                },
+            ],
+        );
+        assert_eq!(SETTINGS_FONT_LABEL, "Размер шрифта");
+        assert_eq!(SETTINGS_SCROLL_LABEL, "Чувствительность прокрутки");
+        assert_eq!(
+            SETTINGS_HELP_ENTRIES,
+            [
+                SettingsHelpEntry {
+                    shortcut: "F1",
+                    description: "Открыть/закрыть настройки",
+                },
+                SettingsHelpEntry {
+                    shortcut: "Ctrl + Shift + T",
+                    description: "Новая вкладка",
+                },
+                SettingsHelpEntry {
+                    shortcut: "Ctrl + 4",
+                    description: "Закрыть текущую вкладку",
+                },
+                SettingsHelpEntry {
+                    shortcut: "Ctrl + F",
+                    description: "Поиск в терминале",
+                },
+                SettingsHelpEntry {
+                    shortcut: "Esc",
+                    description: "Закрыть настройки или активный поиск",
+                },
+            ],
+        );
     }
 
     #[test]
     fn settings_layout_stays_finite_when_window_is_too_small_for_controls() {
         for (width, height) in [(0.0, 0.0), (10.0, 10.0), (40.0, 40.0), (100.0, 80.0)] {
-            let layout = settings_layout(width, height, 1.3333333, 1.0);
-            for value in [layout.modal.x, layout.modal.y, layout.modal.w, layout.modal.h] {
-                assert!(value.is_finite());
-            }
-            if let Some(clip) = layout.clip {
-                for value in [clip.x, clip.y, clip.w, clip.h] {
+            for tab in [SettingsTab::General, SettingsTab::Help] {
+                let layout = settings_layout(width, height, 1.3333333, 1.0, tab);
+                for value in [
+                    layout.modal.x,
+                    layout.modal.y,
+                    layout.modal.w,
+                    layout.modal.h,
+                ] {
                     assert!(value.is_finite());
+                }
+                for rect in [
+                    layout.inner,
+                    layout.divider,
+                    layout.content_clip,
+                    layout.content_body,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    for value in [rect.x, rect.y, rect.w, rect.h] {
+                        assert!(value.is_finite());
+                    }
                 }
             }
         }
@@ -2263,14 +2967,26 @@ mod tests {
 
     #[test]
     fn settings_hit_test_tracks_animated_modal_position() {
-        let mid = settings_layout(1100.0, 720.0, 1.0, 0.5);
-        let final_layout = settings_layout(1100.0, 720.0, 1.0, 1.0);
+        let mid = settings_layout(1100.0, 720.0, 1.0, 0.5, SettingsTab::General);
+        let final_layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
         let mid_minus = mid.font.expect("mid-animation controls should fit").minus;
         let final_minus = final_layout.font.expect("final controls should fit").minus;
-        let mid_center = (mid_minus.x + mid_minus.w * 0.5, mid_minus.y + mid_minus.h * 0.5);
-        let final_center = (final_minus.x + final_minus.w * 0.5, final_minus.y + final_minus.h * 0.5);
-        assert_eq!(mid.hit_test(mid_center.0, mid_center.1), SettingsHit::FontDecrease);
-        assert_eq!(mid.hit_test(final_center.0, final_center.1), SettingsHit::None);
+        let mid_center = (
+            mid_minus.x + mid_minus.w * 0.5,
+            mid_minus.y + mid_minus.h * 0.5,
+        );
+        let final_center = (
+            final_minus.x + final_minus.w * 0.5,
+            final_minus.y + final_minus.h * 0.5,
+        );
+        assert_eq!(
+            mid.hit_test(mid_center.0, mid_center.1),
+            SettingsHit::FontDecrease
+        );
+        assert_eq!(
+            mid.hit_test(final_center.0, final_center.1),
+            SettingsHit::None
+        );
         assert_eq!(
             final_layout.hit_test(final_center.0, final_center.1),
             SettingsHit::FontDecrease

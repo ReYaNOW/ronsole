@@ -196,6 +196,7 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub pointer_x: f32,
     pub pointer_y: f32,
     pub settings_progress: f32,
+    pub settings_tab: crate::renderer::SettingsTab,
     pub settings_font_value: &'a str,
     pub settings_scroll_value: &'a str,
 }
@@ -313,6 +314,7 @@ impl WindowRuntime {
             params.pointer_x,
             params.pointer_y,
             params.settings_progress,
+            params.settings_tab,
             params.settings_font_value,
             params.settings_scroll_value,
         );
@@ -329,10 +331,11 @@ impl WindowRuntime {
     pub(crate) fn settings_hit_test(
         &self,
         progress: f32,
+        active_tab: crate::renderer::SettingsTab,
         x: f32,
         y: f32,
     ) -> crate::renderer::SettingsHit {
-        self.renderer.settings_hit_test(progress, x, y)
+        self.renderer.settings_hit_test(progress, active_tab, x, y)
     }
 
     pub fn terminal_tab_strip_layout(&self) -> crate::renderer::TerminalTabStripLayout {

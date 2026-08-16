@@ -1,6 +1,6 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
-    SettingsHit, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
+    SettingsHit, SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
     terminal_scrollbar_drag_target,
 };
 use glow::HasContext;
@@ -716,59 +716,22 @@ impl Renderer {
         radius: f32,
         color: [f32; 4],
     ) {
-        let width = width.round();
-        let height = height.round();
-        let x1 = x.round();
-        let y1 = y.round();
-        let x2 = (x + width).round();
-        let y2 = (y + height).round();
-        let half_w = width * 0.5;
-        let half_h = height * 0.5;
+        self.push_rounded_rect_gradient(x, y, width, height, radius, [color, color]);
+    }
+
+    fn push_rounded_rect_gradient(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+        colors: [[f32; 4]; 2],
+    ) {
         self.ensure_vertex_capacity(6);
-        self.vertices.extend_from_slice(&[
-            Vertex {
-                pos: [x1, y1],
-                uv: [-half_w, -half_h],
-                color,
-                mode: 3.0,
-                sdf_params: [half_w, half_h, radius],
-            },
-            Vertex {
-                pos: [x2, y1],
-                uv: [half_w, -half_h],
-                color,
-                mode: 3.0,
-                sdf_params: [half_w, half_h, radius],
-            },
-            Vertex {
-                pos: [x2, y2],
-                uv: [half_w, half_h],
-                color,
-                mode: 3.0,
-                sdf_params: [half_w, half_h, radius],
-            },
-            Vertex {
-                pos: [x1, y1],
-                uv: [-half_w, -half_h],
-                color,
-                mode: 3.0,
-                sdf_params: [half_w, half_h, radius],
-            },
-            Vertex {
-                pos: [x2, y2],
-                uv: [half_w, half_h],
-                color,
-                mode: 3.0,
-                sdf_params: [half_w, half_h, radius],
-            },
-            Vertex {
-                pos: [x1, y2],
-                uv: [-half_w, half_h],
-                color,
-                mode: 3.0,
-                sdf_params: [half_w, half_h, radius],
-            },
-        ]);
+        self.vertices.extend_from_slice(&rounded_rect_vertices(
+            x, y, width, height, radius, colors[0], colors[1],
+        ));
     }
 
     fn push_quad(
@@ -1449,6 +1412,38 @@ fn quad_vertices(
     [v1, v2, v3, v1, v3, v4]
 }
 
+fn rounded_rect_vertices(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+    top_color: [f32; 4],
+    bottom_color: [f32; 4],
+) -> [Vertex; 6] {
+    let width = width.round();
+    let height = height.round();
+    let x1 = x.round();
+    let y1 = y.round();
+    let x2 = (x + width).round();
+    let y2 = (y + height).round();
+    let half_w = width * 0.5;
+    let half_h = height * 0.5;
+    let sdf_params = [half_w, half_h, radius];
+    let vertex = |pos, uv, color| Vertex {
+        pos,
+        uv,
+        color,
+        mode: 3.0,
+        sdf_params,
+    };
+    let v1 = vertex([x1, y1], [-half_w, -half_h], top_color);
+    let v2 = vertex([x2, y1], [half_w, -half_h], top_color);
+    let v3 = vertex([x2, y2], [half_w, half_h], bottom_color);
+    let v4 = vertex([x1, y2], [-half_w, half_h], bottom_color);
+    [v1, v2, v3, v1, v3, v4]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1492,6 +1487,22 @@ mod tests {
         assert!(vertices.iter().all(|vertex| vertex.mode == SOLID_RECT_MODE));
         assert!(vertices.iter().all(|vertex| vertex.sdf_params == [0.0; 3]));
         assert_ne!(SOLID_RECT_MODE, 3.0);
+    }
+
+    #[test]
+    fn rounded_rect_gradient_vertices_keep_top_and_bottom_colors() {
+        let top = [0.26, 0.20, 0.36, 1.0];
+        let bottom = [0.12, 0.13, 0.22, 1.0];
+        let vertices = rounded_rect_vertices(1.2, 2.2, 100.0, 50.0, 8.0, top, bottom);
+
+        assert_eq!(vertices[0].pos, [1.0, 2.0]);
+        assert_eq!(vertices[2].pos, [101.0, 52.0]);
+        assert_eq!(vertices[0].color, top);
+        assert_eq!(vertices[1].color, top);
+        assert_eq!(vertices[2].color, bottom);
+        assert_eq!(vertices[5].color, bottom);
+        assert!(vertices.iter().all(|vertex| vertex.mode == 3.0));
+        assert_eq!(vertices[0].sdf_params, [50.0, 25.0, 8.0]);
     }
 
     #[test]

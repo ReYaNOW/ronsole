@@ -70,24 +70,6 @@ fn compact_line_capacity_after_resize(line: &mut Vec<Cell>, cols: usize) {
     *line = compact;
 }
 
-#[inline]
-fn should_compact_scrollback_storage(storage_cols: usize, new_cols: usize) -> bool {
-    new_cols < storage_cols && storage_cols >= new_cols.max(1).saturating_mul(2)
-}
-
-fn compact_scrollback_line_after_major_shrink(line: &mut Vec<Cell>, cols: usize) {
-    line.truncate(cols);
-    repair_wide_line(line);
-    let target = cols.max(1);
-    let threshold = target.saturating_mul(2).max(128);
-    if line.capacity() <= threshold {
-        return;
-    }
-    let mut compact = Vec::with_capacity(target.max(line.len()));
-    compact.extend(line.iter().cloned());
-    *line = compact;
-}
-
 fn repair_wide_line_with_blank(line: &mut [Cell], blank: &Cell) {
     let mut column = 0usize;
     while column < line.len() {
@@ -122,10 +104,394 @@ fn csi_count(params: &Params, max: usize) -> usize {
     usize::from(raw.max(1)).min(max)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LineMeta {
+    soft_wrapped: bool,
+    used_cols: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReflowAnchor {
+    row: usize,
+    column: usize,
+    wrap_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReflowedAnchor {
+    row: usize,
+    column: usize,
+    wrap_pending: bool,
+}
+
+struct ReflowResult {
+    scrollback: std::collections::VecDeque<Vec<Cell>>,
+    scrollback_meta: std::collections::VecDeque<LineMeta>,
+    lines: std::collections::VecDeque<Vec<Cell>>,
+    line_meta: std::collections::VecDeque<LineMeta>,
+    anchors: Vec<Option<ReflowedAnchor>>,
+}
+
+fn remove_line_with_meta(
+    lines: &mut std::collections::VecDeque<Vec<Cell>>,
+    meta: &mut std::collections::VecDeque<LineMeta>,
+    index: usize,
+) -> Option<(Vec<Cell>, LineMeta)> {
+    debug_assert_eq!(lines.len(), meta.len());
+    let line = lines.remove(index)?;
+    let state = meta.remove(index).unwrap_or_default();
+    debug_assert_eq!(lines.len(), meta.len());
+    Some((line, state))
+}
+
+fn insert_line_with_meta(
+    lines: &mut std::collections::VecDeque<Vec<Cell>>,
+    meta: &mut std::collections::VecDeque<LineMeta>,
+    index: usize,
+    line: Vec<Cell>,
+    state: LineMeta,
+) {
+    debug_assert_eq!(lines.len(), meta.len());
+    let index = index.min(lines.len());
+    lines.insert(index, line);
+    meta.insert(index, state);
+    debug_assert_eq!(lines.len(), meta.len());
+}
+
+fn resize_physical_columns(
+    lines: &mut std::collections::VecDeque<Vec<Cell>>,
+    meta: &mut std::collections::VecDeque<LineMeta>,
+    new_cols: usize,
+) {
+    debug_assert_eq!(lines.len(), meta.len());
+    for (line, state) in lines.iter_mut().zip(meta.iter_mut()) {
+        line.resize(new_cols, Cell::default());
+        repair_wide_line(line);
+        compact_line_capacity_after_resize(line, new_cols);
+        state.used_cols = state.used_cols.min(new_cols);
+    }
+}
+
+fn semantic_used_cols(line: &[Cell], state: LineMeta, cols: usize) -> usize {
+    let styled_used_cols = line
+        .iter()
+        .take(cols)
+        .rposition(|cell| *cell != Cell::default())
+        .map_or(0, |column| column + 1);
+    state
+        .used_cols
+        .max(styled_used_cols)
+        .min(cols)
+        .min(line.len())
+}
+
+fn emit_reflowed_logical_line(
+    mut cells: Vec<Cell>,
+    anchors: &[(usize, usize, bool)],
+    new_cols: usize,
+    output_lines: &mut std::collections::VecDeque<Vec<Cell>>,
+    output_meta: &mut std::collections::VecDeque<LineMeta>,
+    mapped: &mut [Option<ReflowedAnchor>],
+) {
+    debug_assert!(new_cols >= 2);
+    if let Some(max_anchor) = anchors.iter().map(|(_, offset, _)| *offset).max()
+        && cells.len() < max_anchor
+    {
+        cells.resize(max_anchor, Cell::default());
+    }
+
+    let mut row = vec![Cell::default(); new_cols];
+    let mut row_used = 0usize;
+    let mut logical_offset = 0usize;
+    let mut index = 0usize;
+
+    let map_at = |mapped: &mut [Option<ReflowedAnchor>],
+                  logical_offset: usize,
+                  row: usize,
+                  column: usize,
+                  wrap_pending: bool,
+                  pending_only: Option<bool>| {
+        for &(anchor_index, offset, was_pending) in anchors {
+            if offset != logical_offset || mapped[anchor_index].is_some() {
+                continue;
+            }
+            if let Some(required_pending) = pending_only
+                && was_pending != required_pending
+            {
+                continue;
+            }
+            mapped[anchor_index] = Some(ReflowedAnchor {
+                row,
+                column,
+                wrap_pending: wrap_pending && was_pending,
+            });
+        }
+    };
+
+    if cells.is_empty() {
+        let row_index = output_lines.len();
+        map_at(mapped, 0, row_index, 0, false, None);
+        output_lines.push_back(row);
+        output_meta.push_back(LineMeta::default());
+        return;
+    }
+
+    while index < cells.len() {
+        let wide =
+            cells[index].is_wide() && index + 1 < cells.len() && cells[index + 1].is_wide_spacer();
+
+        if row_used == new_cols {
+            let row_index = output_lines.len();
+            map_at(
+                mapped,
+                logical_offset,
+                row_index,
+                new_cols - 1,
+                true,
+                Some(true),
+            );
+            output_lines.push_back(row);
+            output_meta.push_back(LineMeta {
+                soft_wrapped: true,
+                used_cols: new_cols,
+            });
+            row = vec![Cell::default(); new_cols];
+            row_used = 0;
+            let row_index = output_lines.len();
+            map_at(mapped, logical_offset, row_index, 0, false, None);
+            continue;
+        }
+
+        if wide && row_used + 2 > new_cols {
+            output_lines.push_back(row);
+            output_meta.push_back(LineMeta {
+                soft_wrapped: true,
+                used_cols: row_used,
+            });
+            row = vec![Cell::default(); new_cols];
+            row_used = 0;
+            let row_index = output_lines.len();
+            map_at(mapped, logical_offset, row_index, 0, false, None);
+            continue;
+        }
+
+        let row_index = output_lines.len();
+        map_at(mapped, logical_offset, row_index, row_used, false, None);
+
+        if wide {
+            row[row_used] = cells[index].clone();
+            map_at(
+                mapped,
+                logical_offset + 1,
+                row_index,
+                row_used + 1,
+                false,
+                None,
+            );
+            row[row_used + 1] = cells[index + 1].clone();
+            row_used += 2;
+            logical_offset += 2;
+            index += 2;
+        } else {
+            row[row_used] = cells[index].clone();
+            row_used += 1;
+            logical_offset += 1;
+            index += 1;
+        }
+    }
+
+    let row_index = output_lines.len();
+    if row_used == new_cols {
+        map_at(
+            mapped,
+            logical_offset,
+            row_index,
+            new_cols - 1,
+            true,
+            Some(true),
+        );
+        map_at(
+            mapped,
+            logical_offset,
+            row_index,
+            new_cols - 1,
+            false,
+            Some(false),
+        );
+    } else {
+        map_at(mapped, logical_offset, row_index, row_used, false, None);
+    }
+    output_lines.push_back(row);
+    output_meta.push_back(LineMeta {
+        soft_wrapped: false,
+        used_cols: row_used,
+    });
+}
+
+fn reflow_normal_buffer(
+    mut scrollback: std::collections::VecDeque<Vec<Cell>>,
+    mut scrollback_meta: std::collections::VecDeque<LineMeta>,
+    mut lines: std::collections::VecDeque<Vec<Cell>>,
+    mut line_meta: std::collections::VecDeque<LineMeta>,
+    columns: (usize, usize),
+    visible_rows: usize,
+    anchors: &[ReflowAnchor],
+) -> ReflowResult {
+    let (old_cols, new_cols) = columns;
+    debug_assert!(new_cols >= 2);
+    debug_assert_eq!(scrollback.len(), scrollback_meta.len());
+    debug_assert_eq!(lines.len(), line_meta.len());
+
+    let old_scrollback_len = scrollback.len();
+    let mut last_keep = anchors
+        .iter()
+        .filter_map(|anchor| anchor.row.checked_sub(old_scrollback_len))
+        .filter(|row| *row < lines.len())
+        .max()
+        .unwrap_or(0);
+    for row in 0..lines.len() {
+        let state = line_meta.get(row).copied().unwrap_or_default();
+        let continues_from_previous = row > 0
+            && line_meta
+                .get(row - 1)
+                .is_some_and(|previous| previous.soft_wrapped);
+        let used_cols = lines
+            .get(row)
+            .map_or(state.used_cols.min(old_cols), |line| {
+                semantic_used_cols(line, state, old_cols)
+            });
+        if used_cols > 0 || state.soft_wrapped || continues_from_previous {
+            last_keep = last_keep.max(row);
+        }
+    }
+    let keep_lines = if lines.is_empty() {
+        0
+    } else {
+        (last_keep + 1).min(lines.len())
+    };
+    while lines.len() > keep_lines {
+        let index = lines.len() - 1;
+        let _ = remove_line_with_meta(&mut lines, &mut line_meta, index);
+    }
+
+    scrollback.append(&mut lines);
+    scrollback_meta.append(&mut line_meta);
+
+    let mut output_lines = std::collections::VecDeque::new();
+    let mut output_meta = std::collections::VecDeque::new();
+    let mut mapped = vec![None; anchors.len()];
+    let mut logical_cells = Vec::new();
+    let mut logical_anchors = Vec::new();
+    let mut input_row = 0usize;
+
+    while !scrollback.is_empty() {
+        let Some((mut line, state)) =
+            remove_line_with_meta(&mut scrollback, &mut scrollback_meta, 0)
+        else {
+            break;
+        };
+        line.truncate(old_cols);
+        repair_wide_line(&mut line);
+
+        let logical_base = logical_cells.len();
+        let mut used_cols = semantic_used_cols(&line, state, old_cols);
+        for (anchor_index, anchor) in anchors.iter().enumerate() {
+            if anchor.row == input_row {
+                let column = anchor.column.min(old_cols);
+                used_cols = used_cols.max(column.min(line.len()));
+                logical_anchors.push((
+                    anchor_index,
+                    logical_base + column.min(line.len()),
+                    anchor.wrap_pending,
+                ));
+            }
+        }
+        if used_cols > 0
+            && line.get(used_cols - 1).is_some_and(Cell::is_wide)
+            && used_cols < line.len()
+            && line.get(used_cols).is_some_and(Cell::is_wide_spacer)
+        {
+            used_cols += 1;
+        }
+        logical_cells.extend(line.into_iter().take(used_cols));
+
+        input_row += 1;
+        if !state.soft_wrapped {
+            emit_reflowed_logical_line(
+                std::mem::take(&mut logical_cells),
+                &logical_anchors,
+                new_cols,
+                &mut output_lines,
+                &mut output_meta,
+                &mut mapped,
+            );
+            logical_anchors.clear();
+        }
+    }
+    if !logical_cells.is_empty() || !logical_anchors.is_empty() {
+        emit_reflowed_logical_line(
+            logical_cells,
+            &logical_anchors,
+            new_cols,
+            &mut output_lines,
+            &mut output_meta,
+            &mut mapped,
+        );
+    }
+
+    if output_lines.is_empty() && visible_rows > 0 {
+        output_lines.push_back(vec![Cell::default(); new_cols]);
+        output_meta.push_back(LineMeta::default());
+    }
+
+    let viewport_row = mapped
+        .first()
+        .and_then(|anchor| *anchor)
+        .map_or(0, |anchor| anchor.row.min(output_lines.len()));
+    while output_lines.len().saturating_sub(viewport_row) < visible_rows {
+        output_lines.push_back(vec![Cell::default(); new_cols]);
+        output_meta.push_back(LineMeta::default());
+    }
+    let scrollback_len = output_lines
+        .len()
+        .saturating_sub(visible_rows)
+        .max(viewport_row);
+    let mut visible = output_lines.split_off(scrollback_len.min(output_lines.len()));
+    let mut visible_meta = output_meta.split_off(scrollback_len.min(output_meta.len()));
+
+    while visible.len() < visible_rows {
+        visible.push_back(vec![Cell::default(); new_cols]);
+        visible_meta.push_back(LineMeta::default());
+    }
+    while output_lines.len() > 10_000 {
+        let _ = remove_line_with_meta(&mut output_lines, &mut output_meta, 0);
+    }
+
+    for anchor in mapped.iter_mut().flatten() {
+        anchor.row = anchor
+            .row
+            .saturating_sub(scrollback_len)
+            .min(visible_rows.saturating_sub(1));
+        anchor.column = anchor.column.min(new_cols.saturating_sub(1));
+        anchor.wrap_pending &= anchor.column + 1 == new_cols;
+    }
+
+    ReflowResult {
+        scrollback: output_lines,
+        scrollback_meta: output_meta,
+        lines: visible,
+        line_meta: visible_meta,
+        anchors: mapped,
+    }
+}
+
 pub struct TermGrid {
     pub scrollback: std::collections::VecDeque<Vec<Cell>>,
+    scrollback_meta: std::collections::VecDeque<LineMeta>,
     pub lines: std::collections::VecDeque<Vec<Cell>>,
+    line_meta: std::collections::VecDeque<LineMeta>,
     pub alt_lines: Option<std::collections::VecDeque<Vec<Cell>>>,
+    alt_line_meta: Option<std::collections::VecDeque<LineMeta>>,
     pub alt_saved_cursor: Option<(usize, usize)>,
     pub is_alt: bool,
     pub cols: usize,
@@ -167,13 +533,18 @@ pub struct TermGrid {
 impl TermGrid {
     pub fn new(cols: usize, visible_rows: usize) -> Self {
         let mut lines = std::collections::VecDeque::new();
+        let mut line_meta = std::collections::VecDeque::new();
         for _ in 0..visible_rows {
             lines.push_back(vec![Cell::default(); cols]);
+            line_meta.push_back(LineMeta::default());
         }
         Self {
             scrollback: std::collections::VecDeque::new(),
+            scrollback_meta: std::collections::VecDeque::new(),
             lines,
+            line_meta,
             alt_lines: None,
+            alt_line_meta: None,
             alt_saved_cursor: None,
             is_alt: false,
             cols,
@@ -246,32 +617,142 @@ impl TermGrid {
         self.presentation_ready && self.presentation_layout_ready
     }
 
+    fn push_scrollback_row(&mut self, line: Vec<Cell>, state: LineMeta) {
+        self.scrollback_storage_cols = self.scrollback_storage_cols.max(line.len());
+        let index = self.scrollback.len();
+        insert_line_with_meta(
+            &mut self.scrollback,
+            &mut self.scrollback_meta,
+            index,
+            line,
+            state,
+        );
+        if self.scrollback.len() > 10_000
+            && let Some((mut old, _)) =
+                remove_line_with_meta(&mut self.scrollback, &mut self.scrollback_meta, 0)
+            && self.pool.len() < 128
+        {
+            old.clear();
+            self.pool.push(old);
+        }
+    }
+
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
         if new_cols == self.cols && new_rows == self.visible_rows {
             return;
         }
 
+        let mut resized_wrap_pending = None;
         if new_cols != self.cols {
             let old_cols = self.cols;
             self.selection = None;
-            if should_compact_scrollback_storage(self.scrollback_storage_cols, new_cols) {
-                for line in &mut self.scrollback {
-                    compact_scrollback_line_after_major_shrink(line, new_cols);
+            let full_region = self.scroll_region == (0, self.visible_rows.saturating_sub(1));
+
+            if new_cols >= 2 && full_region {
+                if self.is_alt {
+                    if let (Some(normal_lines), Some(normal_meta)) =
+                        (self.alt_lines.take(), self.alt_line_meta.take())
+                    {
+                        let scrollback_len = self.scrollback.len();
+                        let mut anchors = vec![ReflowAnchor {
+                            row: scrollback_len,
+                            column: 0,
+                            wrap_pending: false,
+                        }];
+                        let normal_cursor_anchor = self.alt_saved_cursor.map(|(x, y)| {
+                            anchors.push(ReflowAnchor {
+                                row: scrollback_len + y.min(self.visible_rows.saturating_sub(1)),
+                                column: x.min(old_cols.saturating_sub(1)),
+                                wrap_pending: false,
+                            });
+                            anchors.len() - 1
+                        });
+                        let result = reflow_normal_buffer(
+                            std::mem::take(&mut self.scrollback),
+                            std::mem::take(&mut self.scrollback_meta),
+                            normal_lines,
+                            normal_meta,
+                            (old_cols, new_cols),
+                            self.visible_rows,
+                            &anchors,
+                        );
+                        self.scrollback = result.scrollback;
+                        self.scrollback_meta = result.scrollback_meta;
+                        self.alt_lines = Some(result.lines);
+                        self.alt_line_meta = Some(result.line_meta);
+                        if let Some(anchor_index) = normal_cursor_anchor
+                            && let Some(anchor) = result.anchors[anchor_index]
+                        {
+                            self.alt_saved_cursor = Some((anchor.column, anchor.row));
+                        }
+                    }
+                    resize_physical_columns(&mut self.lines, &mut self.line_meta, new_cols);
+                    self.cur_x = self.cur_x.min(new_cols.saturating_sub(1));
+                    self.wrap_pending = false;
+                } else {
+                    let scrollback_len = self.scrollback.len();
+                    let mut anchors = vec![
+                        ReflowAnchor {
+                            row: scrollback_len,
+                            column: 0,
+                            wrap_pending: false,
+                        },
+                        ReflowAnchor {
+                            row: scrollback_len
+                                + self.cur_y.min(self.visible_rows.saturating_sub(1)),
+                            column: if self.wrap_pending {
+                                self.cur_x.saturating_add(1).min(old_cols)
+                            } else {
+                                self.cur_x.min(old_cols.saturating_sub(1))
+                            },
+                            wrap_pending: self.wrap_pending,
+                        },
+                    ];
+                    let saved_anchor = self.saved_cursor.map(|(x, y)| {
+                        anchors.push(ReflowAnchor {
+                            row: scrollback_len + y.min(self.visible_rows.saturating_sub(1)),
+                            column: x.min(old_cols.saturating_sub(1)),
+                            wrap_pending: false,
+                        });
+                        anchors.len() - 1
+                    });
+                    let result = reflow_normal_buffer(
+                        std::mem::take(&mut self.scrollback),
+                        std::mem::take(&mut self.scrollback_meta),
+                        std::mem::take(&mut self.lines),
+                        std::mem::take(&mut self.line_meta),
+                        (old_cols, new_cols),
+                        self.visible_rows,
+                        &anchors,
+                    );
+                    self.scrollback = result.scrollback;
+                    self.scrollback_meta = result.scrollback_meta;
+                    self.lines = result.lines;
+                    self.line_meta = result.line_meta;
+                    if let Some(anchor) = result.anchors.get(1).and_then(|anchor| *anchor) {
+                        self.cur_x = anchor.column;
+                        self.cur_y = anchor.row;
+                        resized_wrap_pending = Some(anchor.wrap_pending);
+                    }
+                    if let Some(anchor_index) = saved_anchor
+                        && let Some(anchor) = result.anchors[anchor_index]
+                    {
+                        self.saved_cursor = Some((anchor.column, anchor.row));
+                    }
                 }
                 self.scrollback_storage_cols = new_cols;
-            }
-            for line in self.lines.iter_mut() {
-                line.resize(new_cols, Cell::default());
-                repair_wide_line(line);
-                compact_line_capacity_after_resize(line, new_cols);
-            }
-            if let Some(alt) = &mut self.alt_lines {
-                for line in alt.iter_mut() {
-                    line.resize(new_cols, Cell::default());
-                    repair_wide_line(line);
-                    compact_line_capacity_after_resize(line, new_cols);
+            } else {
+                resize_physical_columns(&mut self.scrollback, &mut self.scrollback_meta, new_cols);
+                resize_physical_columns(&mut self.lines, &mut self.line_meta, new_cols);
+                if let (Some(alt), Some(alt_meta)) = (&mut self.alt_lines, &mut self.alt_line_meta)
+                {
+                    resize_physical_columns(alt, alt_meta, new_cols);
                 }
+                self.scrollback_storage_cols = new_cols;
+                self.cur_x = self.cur_x.min(new_cols.saturating_sub(1));
+                self.wrap_pending = false;
             }
+
             for line in &mut self.pool {
                 compact_line_capacity_after_resize(line, new_cols);
             }
@@ -294,19 +775,23 @@ impl TermGrid {
             let drop_top = diff - drop_bottom;
 
             for _ in 0..drop_bottom {
-                if let Some(mut line) = self.lines.pop_back() {
-                    if self.pool.len() < 128 {
-                        line.clear();
-                        self.pool.push(line);
-                    }
+                let Some(index) = self.lines.len().checked_sub(1) else {
+                    break;
+                };
+                if let Some((mut line, _)) =
+                    remove_line_with_meta(&mut self.lines, &mut self.line_meta, index)
+                    && self.pool.len() < 128
+                {
+                    line.clear();
+                    self.pool.push(line);
                 }
             }
             for _ in 0..drop_top {
-                if let Some(top) = self.lines.pop_front() {
-                    if !self.is_alt {
-                        self.scrollback_storage_cols = self.scrollback_storage_cols.max(top.len());
-                        self.scrollback.push_back(top);
-                    }
+                if let Some((top, state)) =
+                    remove_line_with_meta(&mut self.lines, &mut self.line_meta, 0)
+                    && !self.is_alt
+                {
+                    self.push_scrollback_row(top, state);
                 }
             }
 
@@ -321,11 +806,19 @@ impl TermGrid {
                 let from_scrollback = diff.min(self.scrollback.len());
 
                 for _ in 0..from_scrollback {
-                    if let Some(mut row) = self.scrollback.pop_back() {
+                    let Some(index) = self.scrollback.len().checked_sub(1) else {
+                        break;
+                    };
+                    if let Some((mut row, mut state)) = remove_line_with_meta(
+                        &mut self.scrollback,
+                        &mut self.scrollback_meta,
+                        index,
+                    ) {
                         row.resize(self.cols, Cell::default());
                         repair_wide_line(&mut row);
                         compact_line_capacity_after_resize(&mut row, self.cols);
-                        self.lines.push_front(row);
+                        state.used_cols = state.used_cols.min(self.cols);
+                        insert_line_with_meta(&mut self.lines, &mut self.line_meta, 0, row, state);
                     }
                 }
 
@@ -337,7 +830,14 @@ impl TermGrid {
                         .unwrap_or_else(|| Vec::with_capacity(self.cols));
                     line.resize(self.cols, Cell::default());
                     line.fill(Cell::default());
-                    self.lines.push_back(line);
+                    let index = self.lines.len();
+                    insert_line_with_meta(
+                        &mut self.lines,
+                        &mut self.line_meta,
+                        index,
+                        line,
+                        LineMeta::default(),
+                    );
                 }
 
                 self.cur_y += from_scrollback;
@@ -346,21 +846,31 @@ impl TermGrid {
                 }
             } else {
                 for _ in 0..diff {
-                    self.lines.push_back(vec![Cell::default(); self.cols]);
+                    let index = self.lines.len();
+                    insert_line_with_meta(
+                        &mut self.lines,
+                        &mut self.line_meta,
+                        index,
+                        vec![Cell::default(); self.cols],
+                        LineMeta::default(),
+                    );
                 }
             }
         }
 
-        if let Some(alt) = &mut self.alt_lines {
+        if let (Some(alt), Some(alt_meta)) = (&mut self.alt_lines, &mut self.alt_line_meta) {
             let alt_current_rows = alt.len();
             if new_rows < alt_current_rows {
                 let diff = alt_current_rows - new_rows;
                 for _ in 0..diff {
-                    if let Some(mut line) = alt.pop_back() {
-                        if self.pool.len() < 128 {
-                            line.clear();
-                            self.pool.push(line);
-                        }
+                    let Some(index) = alt.len().checked_sub(1) else {
+                        break;
+                    };
+                    if let Some((mut line, _)) = remove_line_with_meta(alt, alt_meta, index)
+                        && self.pool.len() < 128
+                    {
+                        line.clear();
+                        self.pool.push(line);
                     }
                 }
             } else if new_rows > alt_current_rows {
@@ -372,7 +882,8 @@ impl TermGrid {
                         .unwrap_or_else(|| Vec::with_capacity(self.cols));
                     line.resize(self.cols, Cell::default());
                     line.fill(Cell::default());
-                    alt.push_back(line);
+                    let index = alt.len();
+                    insert_line_with_meta(alt, alt_meta, index, line, LineMeta::default());
                 }
             }
             if let Some((_, ref mut sy)) = self.alt_saved_cursor {
@@ -380,13 +891,21 @@ impl TermGrid {
             }
         }
 
-        while self.scrollback.len() > 10000 {
-            self.scrollback.pop_front();
+        while self.scrollback.len() > 10_000 {
+            let _ = remove_line_with_meta(&mut self.scrollback, &mut self.scrollback_meta, 0);
         }
         self.visible_rows = new_rows;
         self.cur_x = self.cur_x.min(self.cols.saturating_sub(1));
         self.cur_y = self.cur_y.min(self.visible_rows.saturating_sub(1));
-        self.wrap_pending = false;
+        if let Some((ref mut sx, ref mut sy)) = self.saved_cursor {
+            *sx = (*sx).min(self.cols.saturating_sub(1));
+            *sy = (*sy).min(self.visible_rows.saturating_sub(1));
+        }
+        if let Some((ref mut sx, ref mut sy)) = self.alt_saved_cursor {
+            *sx = (*sx).min(self.cols.saturating_sub(1));
+            *sy = (*sy).min(self.visible_rows.saturating_sub(1));
+        }
+        self.wrap_pending = resized_wrap_pending.unwrap_or(false) && self.cur_x + 1 == self.cols;
         self.join_next = false;
 
         if was_full_region {
@@ -410,8 +929,7 @@ impl TermGrid {
         }
         if self.wrap_pending {
             if self.autowrap {
-                self.newline();
-                self.cur_x = 0;
+                self.soft_wrap_to_next_line();
             }
             self.wrap_pending = false;
         }
@@ -432,13 +950,16 @@ impl TermGrid {
                 if let Some(line) = self.lines.get_mut(self.cur_y) {
                     clear_wide_footprint(line, self.cur_x, &blank);
                 }
-                self.newline();
-                self.cur_x = 0;
+                self.soft_wrap_to_next_line();
             }
         }
         let fg = terminal_effective_foreground(self.cur_fg, self.cur_bold);
         let bg = self.cur_bg;
         let blank = Cell::blank_with_background(bg);
+        let previous_used = self
+            .line_meta
+            .get(self.cur_y)
+            .map_or(0, |state| state.used_cols);
         if let Some(line) = self.lines.get_mut(self.cur_y) {
             if self.insert_mode {
                 let tail = &mut line[self.cur_x..];
@@ -463,6 +984,14 @@ impl TermGrid {
                 cell.set_wide_spacer(fg, bg);
                 cell.set_sgr_style(self.cur_inverse, self.cur_underline, self.cur_dim);
             }
+        }
+        if let Some(state) = self.line_meta.get_mut(self.cur_y) {
+            if self.insert_mode && self.cur_x < previous_used {
+                state.used_cols = previous_used.saturating_add(width).min(self.cols);
+            }
+            state.used_cols = state
+                .used_cols
+                .max(self.cur_x.saturating_add(width).min(self.cols));
         }
         let next = self.cur_x.saturating_add(width);
         if next >= self.cols {
@@ -610,25 +1139,41 @@ impl TermGrid {
     }
 
     fn hard_reset_terminal_state(&mut self) {
-        if self.is_alt
-            && let Some(normal_lines) = self.alt_lines.take()
-        {
-            self.lines = normal_lines;
+        if self.is_alt {
+            if let Some(normal_lines) = self.alt_lines.take() {
+                self.lines = normal_lines;
+            }
+            if let Some(normal_meta) = self.alt_line_meta.take() {
+                self.line_meta = normal_meta;
+            }
         }
         self.is_alt = false;
         self.alt_lines = None;
+        self.alt_line_meta = None;
 
-        self.lines.truncate(self.visible_rows);
-        while self.lines.len() < self.visible_rows {
-            self.lines.push_back(vec![Cell::default(); self.cols]);
+        while self.lines.len() > self.visible_rows {
+            let index = self.lines.len() - 1;
+            let _ = remove_line_with_meta(&mut self.lines, &mut self.line_meta, index);
         }
-        for line in &mut self.lines {
+        while self.lines.len() < self.visible_rows {
+            let index = self.lines.len();
+            insert_line_with_meta(
+                &mut self.lines,
+                &mut self.line_meta,
+                index,
+                vec![Cell::default(); self.cols],
+                LineMeta::default(),
+            );
+        }
+        for (line, state) in self.lines.iter_mut().zip(self.line_meta.iter_mut()) {
             line.resize(self.cols, Cell::default());
             line.fill(Cell::default());
             repair_wide_line(line);
+            *state = LineMeta::default();
         }
 
         self.scrollback.clear();
+        self.scrollback_meta.clear();
         self.scrollback_storage_cols = self.cols;
         self.selection = None;
         self.tab_stops = default_tab_stops(self.cols);
@@ -639,12 +1184,27 @@ impl TermGrid {
         self.dirty = true;
     }
 
-    pub fn newline(&mut self) {
+    fn advance_to_next_line(&mut self) {
         if self.cur_y == self.scroll_region.1 {
             self.scroll_region_up(1);
         } else if self.cur_y + 1 < self.visible_rows {
             self.cur_y += 1;
         }
+    }
+
+    fn soft_wrap_to_next_line(&mut self) {
+        if let Some(state) = self.line_meta.get_mut(self.cur_y) {
+            state.soft_wrapped = true;
+        }
+        self.advance_to_next_line();
+        self.cur_x = 0;
+    }
+
+    pub fn newline(&mut self) {
+        if let Some(state) = self.line_meta.get_mut(self.cur_y) {
+            state.soft_wrapped = false;
+        }
+        self.advance_to_next_line();
     }
 
     pub fn scroll_region_up(&mut self, rows: usize) {
@@ -655,33 +1215,19 @@ impl TermGrid {
         let rows = rows.min(bottom - top + 1);
         let blank = Cell::blank_with_background(self.cur_bg);
         for _ in 0..rows {
-            let mut removed = self
-                .lines
-                .remove(top)
-                .unwrap_or_else(|| vec![blank.clone(); self.cols]);
+            let (mut removed, removed_meta) =
+                remove_line_with_meta(&mut self.lines, &mut self.line_meta, top)
+                    .unwrap_or_else(|| (vec![blank.clone(); self.cols], LineMeta::default()));
             if top == 0 && bottom == self.visible_rows.saturating_sub(1) {
                 if !self.is_alt {
-                    self.scrollback_storage_cols = self.scrollback_storage_cols.max(removed.len());
-                    self.scrollback.push_back(removed);
-                    if self.scrollback.len() > 10000 {
-                        if let Some(mut old) = self.scrollback.pop_front() {
-                            if self.pool.len() < 128 {
-                                old.clear();
-                                self.pool.push(old);
-                            }
-                        }
-                    }
-                } else {
-                    if self.pool.len() < 128 {
-                        removed.clear();
-                        self.pool.push(removed);
-                    }
-                }
-            } else {
-                if self.pool.len() < 128 {
+                    self.push_scrollback_row(removed, removed_meta);
+                } else if self.pool.len() < 128 {
                     removed.clear();
                     self.pool.push(removed);
                 }
+            } else if self.pool.len() < 128 {
+                removed.clear();
+                self.pool.push(removed);
             }
             let mut new_line = self
                 .pool
@@ -689,7 +1235,13 @@ impl TermGrid {
                 .unwrap_or_else(|| Vec::with_capacity(self.cols));
             new_line.resize(self.cols, blank.clone());
             new_line.fill(blank.clone());
-            self.lines.insert(bottom, new_line);
+            insert_line_with_meta(
+                &mut self.lines,
+                &mut self.line_meta,
+                bottom,
+                new_line,
+                LineMeta::default(),
+            );
         }
         self.dirty = true;
     }
@@ -702,11 +1254,12 @@ impl TermGrid {
         let rows = rows.min(bottom - top + 1);
         let blank = Cell::blank_with_background(self.cur_bg);
         for _ in 0..rows {
-            if let Some(mut removed) = self.lines.remove(bottom) {
-                if self.pool.len() < 128 {
-                    removed.clear();
-                    self.pool.push(removed);
-                }
+            if let Some((mut removed, _)) =
+                remove_line_with_meta(&mut self.lines, &mut self.line_meta, bottom)
+                && self.pool.len() < 128
+            {
+                removed.clear();
+                self.pool.push(removed);
             }
             let mut new_line = self
                 .pool
@@ -714,9 +1267,31 @@ impl TermGrid {
                 .unwrap_or_else(|| Vec::with_capacity(self.cols));
             new_line.resize(self.cols, blank.clone());
             new_line.fill(blank.clone());
-            self.lines.insert(top, new_line);
+            insert_line_with_meta(
+                &mut self.lines,
+                &mut self.line_meta,
+                top,
+                new_line,
+                LineMeta::default(),
+            );
         }
         self.dirty = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_scrollback_row_for_test(
+        &mut self,
+        row: Vec<Cell>,
+        used_cols: usize,
+        soft_wrapped: bool,
+    ) {
+        self.push_scrollback_row(
+            row,
+            LineMeta {
+                soft_wrapped,
+                used_cols: used_cols.min(self.cols),
+            },
+        );
     }
 
     pub fn get_selection_text(&self) -> String {
@@ -770,9 +1345,67 @@ mod tests {
     }
 
     fn set_line(grid: &mut TermGrid, row: usize, text: &str) {
+        let mut used_cols = 0usize;
         for (x, ch) in text.chars().enumerate() {
             grid.lines[row][x].c = ch;
+            used_cols = x + 1;
         }
+        if let Some(state) = grid.line_meta.get_mut(row) {
+            state.used_cols = used_cols.min(grid.cols);
+            state.soft_wrapped = false;
+        }
+    }
+
+    fn assert_line_metadata_invariant(grid: &TermGrid) {
+        assert_eq!(grid.scrollback.len(), grid.scrollback_meta.len());
+        assert_eq!(grid.lines.len(), grid.line_meta.len());
+        if let Some(alt) = &grid.alt_lines {
+            assert_eq!(
+                alt.len(),
+                grid.alt_line_meta.as_ref().map_or(0, |meta| meta.len())
+            );
+        } else {
+            assert!(grid.alt_line_meta.is_none());
+        }
+        assert!(
+            grid.scrollback_meta
+                .iter()
+                .chain(grid.line_meta.iter())
+                .all(|state| state.used_cols <= grid.cols)
+        );
+    }
+
+    fn logical_cell_lines(grid: &TermGrid) -> Vec<Vec<Cell>> {
+        let mut logical = Vec::new();
+        let mut current = Vec::new();
+        for (row, state) in grid
+            .scrollback
+            .iter()
+            .zip(grid.scrollback_meta.iter())
+            .chain(grid.lines.iter().zip(grid.line_meta.iter()))
+        {
+            current.extend(row.iter().take(state.used_cols).cloned());
+            if !state.soft_wrapped {
+                logical.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            logical.push(current);
+        }
+        logical
+    }
+
+    fn logical_texts(grid: &TermGrid) -> Vec<String> {
+        logical_cell_lines(grid)
+            .into_iter()
+            .map(|cells| {
+                let mut text = String::new();
+                for cell in cells {
+                    cell.append_text_to(&mut text);
+                }
+                text
+            })
+            .collect()
     }
 
     fn assert_wide_line_invariant(line: &[Cell]) {
@@ -878,64 +1511,307 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_compaction_runs_only_for_major_column_shrink() {
-        assert!(!should_compact_scrollback_storage(120, 119));
-        assert!(!should_compact_scrollback_storage(120, 61));
-        assert!(should_compact_scrollback_storage(120, 60));
-
+    fn scrollback_reflow_releases_obsolete_row_capacity() {
         let mut grid = TermGrid::new(4096, 1);
-        grid.scrollback.push_back(vec![Cell::default(); 4096]);
+        grid.push_scrollback_row_for_test(vec![Cell::default(); 4096], 4096, false);
         let before_capacity = grid.scrollback[0].capacity();
+
         grid.resize(64, 1);
-        assert_eq!(grid.scrollback[0].len(), 64);
-        assert!(grid.scrollback[0].capacity() < before_capacity);
-        assert!(grid.scrollback[0].capacity() <= 128);
+
+        assert_eq!(grid.scrollback.len(), 64);
+        assert!(grid.scrollback.iter().all(|row| row.len() == 64));
+        assert!(
+            grid.scrollback
+                .iter()
+                .all(|row| row.capacity() < before_capacity && row.capacity() <= 128)
+        );
+        assert_eq!(grid.scrollback_storage_cols, 64);
+        assert_line_metadata_invariant(&grid);
     }
 
     #[test]
-    fn gradual_column_shrink_uses_cumulative_scrollback_storage_watermark() {
+    fn repeated_column_reflow_keeps_scrollback_storage_width_bounded() {
         let mut grid = TermGrid::new(4096, 1);
         let mut history = vec![Cell::default(); 4096];
         history[0].c = 'A';
         history[79].c = 'Z';
-        grid.scrollback.push_back(history);
-        let original_capacity = grid.scrollback[0].capacity();
-        let widths = [3000, 2000, 1200, 700, 400, 240, 140, 80];
-        let mut expected_storage_cols = 4096;
-        let mut expected_compactions = 0;
-        let mut actual_compactions = 0;
+        grid.push_scrollback_row_for_test(history, 80, false);
 
-        for width in widths {
-            if should_compact_scrollback_storage(expected_storage_cols, width) {
-                expected_compactions += 1;
-                expected_storage_cols = width;
-            }
-            let before_storage_cols = grid.scrollback_storage_cols;
+        for width in [3000, 2000, 1200, 700, 400, 240, 140, 80] {
             grid.resize(width, 1);
-            actual_compactions += usize::from(grid.scrollback_storage_cols != before_storage_cols);
+            assert!(grid.scrollback.iter().all(|row| row.len() == width));
+            assert!(
+                grid.scrollback
+                    .iter()
+                    .all(|row| { row.capacity() <= width.saturating_mul(2).max(128) })
+            );
+            assert_eq!(grid.scrollback_storage_cols, width);
+            assert_line_metadata_invariant(&grid);
         }
 
-        assert_eq!(expected_compactions, 4);
-        assert_eq!(actual_compactions, 4);
-        assert_eq!(grid.scrollback_storage_cols, 80);
-        assert_eq!(grid.scrollback[0].len(), 80);
-        assert!(grid.scrollback[0].capacity() < original_capacity);
-        assert!(grid.scrollback[0].capacity() <= 160);
-        assert_eq!(grid.scrollback[0][0].c, 'A');
-        assert_eq!(grid.scrollback[0][79].c, 'Z');
+        let logical = logical_cell_lines(&grid);
+        assert_eq!(logical[0][0].c, 'A');
+        assert_eq!(logical[0][79].c, 'Z');
     }
 
     #[test]
-    fn minor_column_shrink_does_not_reallocate_scrollback_rows() {
+    fn minor_column_shrink_reflows_scrollback_without_hidden_tail_storage() {
         let mut grid = TermGrid::new(120, 1);
-        grid.scrollback.push_back(vec![Cell::default(); 120]);
-        let before_len = grid.scrollback[0].len();
-        let before_capacity = grid.scrollback[0].capacity();
+        let mut history = vec![Cell::default(); 120];
+        history[0].c = 'A';
+        history[119].c = 'Z';
+        grid.push_scrollback_row_for_test(history, 120, false);
 
         grid.resize(119, 1);
 
-        assert_eq!(grid.scrollback[0].len(), before_len);
-        assert_eq!(grid.scrollback[0].capacity(), before_capacity);
+        assert_eq!(grid.scrollback.len(), 2);
+        assert!(grid.scrollback.iter().all(|row| row.len() == 119));
+        let logical = logical_cell_lines(&grid);
+        assert_eq!(logical[0][0].c, 'A');
+        assert_eq!(logical[0][119].c, 'Z');
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn horizontal_resize_shrink_reflows_soft_wrapped_logical_line() {
+        let mut grid = TermGrid::new(6, 4);
+        feed(&mut grid, b"abcdefghij");
+        assert_eq!(logical_texts(&grid)[0], "abcdefghij");
+
+        grid.resize(4, 4);
+
+        assert_eq!(logical_texts(&grid)[0], "abcdefghij");
+        assert_eq!(
+            grid.line_meta[0],
+            LineMeta {
+                soft_wrapped: true,
+                used_cols: 4
+            }
+        );
+        assert_eq!(
+            grid.line_meta[1],
+            LineMeta {
+                soft_wrapped: true,
+                used_cols: 4
+            }
+        );
+        assert_eq!(
+            grid.line_meta[2],
+            LineMeta {
+                soft_wrapped: false,
+                used_cols: 2
+            }
+        );
+        assert_eq!((grid.cur_x, grid.cur_y), (2, 2));
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn horizontal_resize_widen_unwraps_soft_wrapped_logical_line() {
+        let mut grid = TermGrid::new(4, 3);
+        feed(&mut grid, b"abcdefgh");
+        assert!(grid.line_meta[0].soft_wrapped);
+        assert!(grid.wrap_pending);
+
+        grid.resize(10, 3);
+
+        assert_eq!(logical_texts(&grid)[0], "abcdefgh");
+        assert_eq!(
+            grid.line_meta[0],
+            LineMeta {
+                soft_wrapped: false,
+                used_cols: 8
+            }
+        );
+        assert_eq!((grid.cur_x, grid.cur_y), (8, 0));
+        assert!(!grid.wrap_pending);
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn horizontal_resize_preserves_hard_newline_boundaries() {
+        let mut grid = TermGrid::new(4, 4);
+        feed(&mut grid, b"abcd\r\nefgh");
+        assert!(!grid.line_meta[0].soft_wrapped);
+
+        grid.resize(10, 4);
+
+        let logical = logical_texts(&grid);
+        assert_eq!(logical[0], "abcd");
+        assert_eq!(logical[1], "efgh");
+        assert!(!grid.line_meta[0].soft_wrapped);
+        assert!(!grid.line_meta[1].soft_wrapped);
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn horizontal_resize_round_trip_preserves_cell_state_and_unicode_attachments() {
+        let mut grid = TermGrid::new(8, 5);
+        feed(&mut grid, b"\x1b[31;44;1;2;4;7m");
+        feed(&mut grid, "A✔\u{FE0F}e\u{0301}界BCDEFGH".as_bytes());
+        let before = logical_cell_lines(&grid)[0].clone();
+        assert!(before.iter().any(Cell::is_wide));
+        assert!(before.iter().any(|cell| !cell.zero_width().is_empty()));
+        assert!(
+            before
+                .iter()
+                .any(|cell| cell.presentation != CELL_PRESENTATION_AUTO)
+        );
+        assert!(before.iter().any(Cell::is_inverse));
+        assert!(before.iter().any(Cell::is_underlined));
+        assert!(before.iter().any(Cell::is_dim));
+
+        grid.resize(4, 5);
+        for row in grid.scrollback.iter().chain(grid.lines.iter()) {
+            assert_wide_line_invariant(row);
+        }
+        grid.resize(12, 5);
+
+        assert_eq!(logical_cell_lines(&grid)[0], before);
+        for row in grid.scrollback.iter().chain(grid.lines.iter()) {
+            assert_wide_line_invariant(row);
+        }
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn horizontal_resize_preserves_background_only_cells() {
+        let red = TerminalColor::indexed(1);
+        let mut grid = TermGrid::new(4, 2);
+        feed(&mut grid, b"\x1b[41m\x1b[2J");
+        assert!(grid.lines.iter().flatten().all(|cell| cell.bg == red));
+
+        grid.resize(2, 2);
+
+        let logical = logical_cell_lines(&grid);
+        assert_eq!(logical.len(), 2);
+        assert!(logical.iter().all(|line| line.len() == 4));
+        assert!(logical.iter().flatten().all(|cell| cell.bg == red));
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn horizontal_resize_keeps_wide_glyph_footprint_together_at_boundary() {
+        let mut grid = TermGrid::new(6, 4);
+        feed(&mut grid, "abc界Z".as_bytes());
+
+        grid.resize(4, 4);
+
+        assert_eq!(grid.lines[0][0].c, 'a');
+        assert_eq!(grid.lines[0][2].c, 'c');
+        assert_eq!(grid.lines[0][3].c, ' ');
+        assert!(grid.lines[1][0].is_wide());
+        assert!(grid.lines[1][1].is_wide_spacer());
+        assert_eq!(grid.lines[1][2].c, 'Z');
+        assert_eq!(grid.line_meta[0].used_cols, 3);
+        assert!(grid.line_meta[0].soft_wrapped);
+        for row in &grid.lines {
+            assert_wide_line_invariant(row);
+        }
+        assert_eq!(logical_texts(&grid)[0], "abc界Z");
+    }
+
+    #[test]
+    fn horizontal_resize_maps_cursor_and_wrap_pending_to_new_width() {
+        let mut grid = TermGrid::new(4, 3);
+        feed(&mut grid, b"abcd");
+        assert_eq!((grid.cur_x, grid.cur_y, grid.wrap_pending), (3, 0, true));
+
+        grid.resize(2, 3);
+        assert_eq!((grid.cur_x, grid.cur_y, grid.wrap_pending), (1, 1, true));
+        assert_eq!(logical_texts(&grid)[0], "abcd");
+
+        grid.resize(8, 3);
+        assert_eq!((grid.cur_x, grid.cur_y, grid.wrap_pending), (4, 0, false));
+        assert_eq!(logical_texts(&grid)[0], "abcd");
+    }
+
+    #[test]
+    fn horizontal_resize_reflows_logical_line_across_scrollback_boundary() {
+        let mut grid = TermGrid::new(4, 2);
+        feed(&mut grid, b"abcdefghi");
+        assert_eq!(grid.scrollback.len(), 1);
+        assert!(grid.scrollback_meta[0].soft_wrapped);
+
+        grid.resize(3, 2);
+
+        assert_eq!(logical_texts(&grid)[0], "abcdefghi");
+        assert_eq!(grid.scrollback.len(), 1);
+        assert!(grid.scrollback_meta[0].soft_wrapped);
+        assert!(grid.line_meta[0].soft_wrapped);
+        assert!(!grid.line_meta[1].soft_wrapped);
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn horizontal_resize_does_not_join_hard_scrollback_boundary() {
+        let mut grid = TermGrid::new(4, 2);
+        feed(&mut grid, b"abcd\r\nefgh\r\ni");
+        assert_eq!(grid.scrollback.len(), 1);
+        assert!(!grid.scrollback_meta[0].soft_wrapped);
+
+        grid.resize(8, 2);
+
+        let logical = logical_texts(&grid);
+        assert_eq!(logical[0], "abcd");
+        assert_eq!(logical[1], "efgh");
+        assert_eq!(logical[2], "i");
+        assert_eq!(grid.scrollback.len(), 1);
+        assert!(!grid.scrollback_meta[0].soft_wrapped);
+    }
+
+    #[test]
+    fn alt_screen_column_resize_reflows_hidden_normal_history_only() {
+        let mut grid = TermGrid::new(4, 3);
+        feed(&mut grid, b"abcdefgh");
+        feed(&mut grid, b"\x1b[?1049hALT");
+        assert!(grid.is_alt);
+
+        grid.resize(8, 3);
+
+        assert!(grid.is_alt);
+        assert_eq!(
+            grid.lines[0]
+                .iter()
+                .take(3)
+                .map(|cell| cell.c)
+                .collect::<String>(),
+            "ALT"
+        );
+        assert!(grid.lines.iter().all(|line| line.len() == 8));
+        feed(&mut grid, b"\x1b[?1049l");
+
+        assert!(!grid.is_alt);
+        assert_eq!(logical_texts(&grid)[0], "abcdefgh");
+        assert_eq!(grid.line_meta[0].used_cols, 8);
+        assert!(!grid.line_meta[0].soft_wrapped);
+        assert_line_metadata_invariant(&grid);
+    }
+
+    #[test]
+    fn custom_scroll_region_column_resize_keeps_conservative_physical_rows() {
+        let mut grid = TermGrid::new(6, 3);
+        set_line(&mut grid, 0, "abcdef");
+        set_line(&mut grid, 1, "ghijkl");
+        set_line(&mut grid, 2, "mnopqr");
+        grid.scroll_region = (1, 2);
+
+        grid.resize(8, 3);
+
+        assert_eq!(
+            grid.lines[0].iter().map(|cell| cell.c).collect::<String>(),
+            "abcdef  "
+        );
+        assert_eq!(
+            grid.lines[1].iter().map(|cell| cell.c).collect::<String>(),
+            "ghijkl  "
+        );
+        assert_eq!(
+            grid.lines[2].iter().map(|cell| cell.c).collect::<String>(),
+            "mnopqr  "
+        );
+        assert!(grid.scrollback.is_empty());
+        assert_line_metadata_invariant(&grid);
     }
 
     #[test]
@@ -1109,7 +1985,7 @@ mod tests {
         for (index, c) in "old    ".chars().enumerate() {
             old[index].c = c;
         }
-        grid.scrollback.push_back(old);
+        grid.push_scrollback_row_for_test(old, 7, false);
         set_line(&mut grid, 0, "visible");
         set_line(&mut grid, 1, "screen ");
         grid.cur_x = 3;
@@ -1381,7 +2257,7 @@ mod tests {
         set_line(&mut grid, 1, "def");
         let mut scrollback_cell = Cell::default();
         scrollback_cell.c = 's';
-        grid.scrollback.push_back(vec![scrollback_cell; 3]);
+        grid.push_scrollback_row_for_test(vec![scrollback_cell; 3], 3, false);
         grid.saved_cursor = Some((2, 1));
 
         grid.resize(3, 4);
@@ -1405,7 +2281,7 @@ mod tests {
         assert!(grid.is_alt);
         grid.alt_saved_cursor = Some((9, 9));
         grid.resize(5, 5);
-        assert_eq!(grid.alt_saved_cursor, Some((9, 4)));
+        assert_eq!(grid.alt_saved_cursor, Some((2, 3)));
         assert_eq!(grid.lines.len(), 5);
         assert!(grid.lines.iter().all(|line| line.len() == 5));
         grid.resize(5, 3);
@@ -1775,26 +2651,26 @@ mod tests {
     }
 
     #[test]
-    fn minor_column_shrink_clears_stale_selection_and_copy_never_reads_hidden_tail() {
+    fn column_reflow_clears_selection_and_copy_uses_reflowed_rows() {
         let mut grid = TermGrid::new(13, 1);
         let mut row = vec![Cell::default(); 13];
         for (cell, c) in row.iter_mut().zip("hit....SECRET".chars()) {
             cell.c = c;
         }
-        grid.scrollback.push_back(row);
-        let before_len = grid.scrollback[0].len();
-        let before_capacity = grid.scrollback[0].capacity();
+        grid.push_scrollback_row_for_test(row, 13, false);
         grid.selection = Some((7, 0, 12, 0));
 
         grid.resize(7, 1);
 
-        assert_eq!(grid.scrollback[0].len(), before_len);
-        assert_eq!(grid.scrollback[0].capacity(), before_capacity);
         assert!(grid.selection.is_none());
-        grid.selection = Some((7, 0, 12, 0));
-        assert_eq!(grid.get_selection_text(), "");
+        assert_eq!(grid.scrollback.len(), 2);
+        assert!(grid.scrollback.iter().all(|row| row.len() == 7));
+        assert_eq!(logical_texts(&grid)[0], "hit....SECRET");
         grid.selection = Some((0, 0, 2, 0));
         assert_eq!(grid.get_selection_text(), "hit");
+        grid.selection = Some((0, 1, 5, 1));
+        assert_eq!(grid.get_selection_text(), "SECRET");
+        assert_line_metadata_invariant(&grid);
     }
 
     #[test]
@@ -1902,7 +2778,7 @@ mod tests {
         let mut grid = TermGrid::new(16, 4);
         grid.mark_presentation_ready();
         grid.mark_presentation_layout_ready();
-        grid.scrollback.push_back(vec![Cell::default(); 16]);
+        grid.push_scrollback_row_for_test(vec![Cell::default(); 16], 0, false);
         grid.selection = Some((0, 0, 2, 0));
         feed(
             &mut grid,
@@ -1937,7 +2813,7 @@ mod tests {
         let mut grid = TermGrid::new(16, 4);
         let mut history = vec![Cell::default(); 16];
         history[0].c = 'H';
-        grid.scrollback.push_back(history);
+        grid.push_scrollback_row_for_test(history, 1, false);
         feed(
             &mut grid,
             b"VISIBLE\x1b[31;44;1;2;4;7m\x1b[4h\x1b[2;3r\x1b[?6h\x1b[?7l\x1b[?1h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[3;7H\x1b[s",
@@ -1959,7 +2835,7 @@ mod tests {
         const XTERM_256COLOR_RESET: &[u8] =
             b"\x1bc\x1b]104\x07\x1b[!p\x1b[?3;4l\x1b[4l\x1b>\x1b[?69l";
         let mut grid = TermGrid::new(16, 4);
-        grid.scrollback.push_back(vec![Cell::default(); 16]);
+        grid.push_scrollback_row_for_test(vec![Cell::default(); 16], 0, false);
         feed(
             &mut grid,
             b"dirty\x1b[31;44;1;2;4;7m\x1b[4h\x1b[2;3r\x1b[?6h\x1b[?7l\x1b[?1h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[?1049hALT",
@@ -2205,6 +3081,7 @@ impl Perform for TermGrid {
                                 self.is_alt = true;
                                 self.alt_saved_cursor = Some((self.cur_x, self.cur_y));
                                 let mut alt = std::collections::VecDeque::new();
+                                let mut alt_meta = std::collections::VecDeque::new();
                                 for _ in 0..self.visible_rows {
                                     let mut line = self
                                         .pool
@@ -2213,8 +3090,11 @@ impl Perform for TermGrid {
                                     line.resize(self.cols, Cell::default());
                                     line.fill(Cell::default());
                                     alt.push_back(line);
+                                    alt_meta.push_back(LineMeta::default());
                                 }
                                 self.alt_lines = Some(std::mem::replace(&mut self.lines, alt));
+                                self.alt_line_meta =
+                                    Some(std::mem::replace(&mut self.line_meta, alt_meta));
                                 self.cur_x = 0;
                                 self.cur_y = 0;
                                 self.wrap_pending = false;
@@ -2229,6 +3109,9 @@ impl Perform for TermGrid {
                                             self.pool.push(line);
                                         }
                                     }
+                                }
+                                if let Some(normal_meta) = self.alt_line_meta.take() {
+                                    self.line_meta = normal_meta;
                                 }
                                 if let Some((x, y)) = self.alt_saved_cursor.take() {
                                     self.cur_x = x;
@@ -2320,9 +3203,16 @@ impl Perform for TermGrid {
                                 repair_wide_line_with_blank(line, &blank);
                             }
                         }
+                        if let Some(state) = self.line_meta.get_mut(self.cur_y) {
+                            state.used_cols = state.used_cols.min(self.cur_x);
+                            state.soft_wrapped = false;
+                        }
                         for i in (self.cur_y + 1)..self.visible_rows {
                             if let Some(line) = self.lines.get_mut(i) {
                                 line.fill(blank.clone());
+                            }
+                            if let Some(state) = self.line_meta.get_mut(i) {
+                                *state = LineMeta::default();
                             }
                         }
                     }
@@ -2330,6 +3220,9 @@ impl Perform for TermGrid {
                         for i in 0..self.cur_y {
                             if let Some(line) = self.lines.get_mut(i) {
                                 line.fill(blank.clone());
+                            }
+                            if let Some(state) = self.line_meta.get_mut(i) {
+                                *state = LineMeta::default();
                             }
                         }
                         if let Some(line) = self.lines.get_mut(self.cur_y) {
@@ -2339,12 +3232,14 @@ impl Perform for TermGrid {
                         }
                     }
                     2 => {
-                        for line in self.lines.iter_mut() {
+                        for (line, state) in self.lines.iter_mut().zip(self.line_meta.iter_mut()) {
                             line.fill(blank.clone());
+                            *state = LineMeta::default();
                         }
                     }
                     3 => {
                         self.scrollback.clear();
+                        self.scrollback_meta.clear();
                         self.scrollback_storage_cols = self.cols;
                         self.selection = None;
                     }
@@ -2370,6 +3265,19 @@ impl Perform for TermGrid {
                         2 => {
                             line.fill(blank);
                         }
+                        _ => {}
+                    }
+                }
+                if let Some(state) = self.line_meta.get_mut(self.cur_y) {
+                    match param {
+                        0 => {
+                            state.used_cols = state.used_cols.min(self.cur_x);
+                            state.soft_wrapped = false;
+                        }
+                        1 if self.cur_x + 1 >= state.used_cols => {
+                            *state = LineMeta::default();
+                        }
+                        2 => *state = LineMeta::default(),
                         _ => {}
                     }
                 }
@@ -2406,11 +3314,12 @@ impl Perform for TermGrid {
                 let count = csi_count(params, bottom - self.cur_y + 1);
                 let blank = Cell::blank_with_background(self.cur_bg);
                 for _ in 0..count {
-                    if let Some(mut line) = self.lines.remove(bottom) {
-                        if self.pool.len() < 128 {
-                            line.clear();
-                            self.pool.push(line);
-                        }
+                    if let Some((mut line, _)) =
+                        remove_line_with_meta(&mut self.lines, &mut self.line_meta, bottom)
+                        && self.pool.len() < 128
+                    {
+                        line.clear();
+                        self.pool.push(line);
                     }
                     let mut new_line = self
                         .pool
@@ -2418,7 +3327,13 @@ impl Perform for TermGrid {
                         .unwrap_or_else(|| Vec::with_capacity(self.cols));
                     new_line.resize(self.cols, blank.clone());
                     new_line.fill(blank.clone());
-                    self.lines.insert(self.cur_y, new_line);
+                    insert_line_with_meta(
+                        &mut self.lines,
+                        &mut self.line_meta,
+                        self.cur_y,
+                        new_line,
+                        LineMeta::default(),
+                    );
                 }
             }
             'M' => {
@@ -2429,11 +3344,12 @@ impl Perform for TermGrid {
                 let count = csi_count(params, bottom - self.cur_y + 1);
                 let blank = Cell::blank_with_background(self.cur_bg);
                 for _ in 0..count {
-                    if let Some(mut line) = self.lines.remove(self.cur_y) {
-                        if self.pool.len() < 128 {
-                            line.clear();
-                            self.pool.push(line);
-                        }
+                    if let Some((mut line, _)) =
+                        remove_line_with_meta(&mut self.lines, &mut self.line_meta, self.cur_y)
+                        && self.pool.len() < 128
+                    {
+                        line.clear();
+                        self.pool.push(line);
                     }
                     let mut new_line = self
                         .pool
@@ -2441,13 +3357,21 @@ impl Perform for TermGrid {
                         .unwrap_or_else(|| Vec::with_capacity(self.cols));
                     new_line.resize(self.cols, blank.clone());
                     new_line.fill(blank.clone());
-                    self.lines.insert(bottom, new_line);
+                    insert_line_with_meta(
+                        &mut self.lines,
+                        &mut self.line_meta,
+                        bottom,
+                        new_line,
+                        LineMeta::default(),
+                    );
                 }
             }
             'P' => {
                 let blank = Cell::blank_with_background(self.cur_bg);
+                let mut deleted = 0usize;
                 if let Some(line) = self.lines.get_mut(self.cur_y) {
                     let count = csi_count(params, line.len().saturating_sub(self.cur_x));
+                    deleted = count;
                     if count > 0 {
                         let tail = &mut line[self.cur_x..];
                         tail.rotate_left(count);
@@ -2456,9 +3380,17 @@ impl Perform for TermGrid {
                     }
                     repair_wide_line_with_blank(line, &blank);
                 }
+                if deleted > 0
+                    && let Some(state) = self.line_meta.get_mut(self.cur_y)
+                    && self.cur_x < state.used_cols
+                {
+                    let removed = deleted.min(state.used_cols - self.cur_x);
+                    state.used_cols = state.used_cols.saturating_sub(removed);
+                }
             }
             'X' => {
                 let blank = Cell::blank_with_background(self.cur_bg);
+                let mut erased_end = None;
                 if let Some(line) = self.lines.get_mut(self.cur_y) {
                     let start = self.cur_x.min(line.len());
                     let count = csi_count(params, line.len().saturating_sub(start));
@@ -2466,6 +3398,16 @@ impl Perform for TermGrid {
                     if start < end {
                         line[start..end].fill(blank.clone());
                         repair_wide_line_with_blank(line, &blank);
+                        erased_end = Some((start, end));
+                    }
+                }
+                if let Some((start, end)) = erased_end
+                    && let Some(state) = self.line_meta.get_mut(self.cur_y)
+                    && end >= state.used_cols
+                {
+                    state.used_cols = state.used_cols.min(start);
+                    if end >= self.cols {
+                        state.soft_wrapped = false;
                     }
                 }
             }
@@ -2540,6 +3482,12 @@ impl Perform for TermGrid {
                     tail.rotate_right(count.min(tail.len()));
                     tail[..count].fill(blank.clone());
                     repair_wide_line_with_blank(line, &blank);
+                }
+                if count > 0
+                    && let Some(state) = self.line_meta.get_mut(self.cur_y)
+                    && self.cur_x < state.used_cols
+                {
+                    state.used_cols = state.used_cols.saturating_add(count).min(self.cols);
                 }
             }
             'S' => {

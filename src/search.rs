@@ -588,30 +588,38 @@ mod tests {
     }
 
     #[test]
-    fn search_ignores_stale_scrollback_columns_past_current_terminal_width() {
+    fn search_uses_reflowed_scrollback_rows_after_width_change() {
         let mut grid = TermGrid::new(12, 1);
         let mut history = vec![crate::terminal::Cell::default(); 12];
         for (index, c) in "hit   needle".chars().enumerate() {
             history[index].c = c;
         }
-        grid.scrollback.push_back(history);
+        grid.push_scrollback_row_for_test(history, 12, false);
 
         grid.resize(7, 1);
         assert_eq!(grid.cols, 7);
-        assert_eq!(grid.scrollback[0].len(), 12);
+        assert_eq!(grid.scrollback.len(), 2);
+        assert!(grid.scrollback.iter().all(|row| row.len() == 7));
 
-        let mut hidden = TerminalSearchState::default();
-        hidden.open();
-        hidden.insert_text("needle");
-        assert!(hidden.recompute_if_needed(&grid, SearchRefreshCause::User));
-        assert!(hidden.results.is_empty());
-
-        let mut visible = TerminalSearchState::default();
-        visible.open();
-        visible.insert_text("hit");
-        assert!(visible.recompute_if_needed(&grid, SearchRefreshCause::User));
+        let mut second_row = TerminalSearchState::default();
+        second_row.open();
+        second_row.insert_text("eedle");
+        assert!(second_row.recompute_if_needed(&grid, SearchRefreshCause::User));
         assert_eq!(
-            visible.active_match(),
+            second_row.active_match(),
+            Some(TerminalSearchMatch {
+                start_x: 0,
+                y: 1,
+                end_x: 4,
+            })
+        );
+
+        let mut first_row = TerminalSearchState::default();
+        first_row.open();
+        first_row.insert_text("hit");
+        assert!(first_row.recompute_if_needed(&grid, SearchRefreshCause::User));
+        assert_eq!(
+            first_row.active_match(),
             Some(TerminalSearchMatch {
                 start_x: 0,
                 y: 0,

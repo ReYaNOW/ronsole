@@ -2,7 +2,7 @@ use crate::config::{
     AppConfig, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP, logical_window_size,
 };
 use crate::input::TerminalInteraction;
-use crate::renderer::{SettingsHit, TerminalTabHit};
+use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::tabs::{
@@ -174,6 +174,7 @@ pub struct App {
     pointer_y: f32,
     settings_open: bool,
     settings_progress: f32,
+    settings_active_tab: SettingsTab,
     focused: bool,
     occluded: bool,
     zero_sized: bool,
@@ -219,6 +220,7 @@ impl App {
             pointer_y: 0.0,
             settings_open: false,
             settings_progress: 0.0,
+            settings_active_tab: SettingsTab::General,
             focused: true,
             occluded: false,
             zero_sized: false,
@@ -547,6 +549,13 @@ impl App {
     }
 
     fn apply_settings_hit(&mut self, hit: SettingsHit) {
+        if let SettingsHit::Tab(tab) = hit {
+            if self.settings_active_tab != tab {
+                self.settings_active_tab = tab;
+                self.request_redraw();
+            }
+            return;
+        }
         let changed = match hit {
             SettingsHit::FontDecrease | SettingsHit::FontIncrease => {
                 let delta = if hit == SettingsHit::FontDecrease {
@@ -580,7 +589,7 @@ impl App {
                     true
                 }
             }
-            SettingsHit::None => false,
+            SettingsHit::None | SettingsHit::Tab(_) => false,
         };
         if changed {
             self.mark_config_dirty();
@@ -590,7 +599,7 @@ impl App {
 
     fn settings_hit_test(&self, x: f32, y: f32) -> SettingsHit {
         self.runtime.as_ref().map_or(SettingsHit::None, |runtime| {
-            runtime.settings_hit_test(self.settings_progress, x, y)
+            runtime.settings_hit_test(self.settings_progress, self.settings_active_tab, x, y)
         })
     }
 
@@ -1041,6 +1050,7 @@ impl ApplicationHandler for App {
                         pointer_x: self.pointer_x,
                         pointer_y: self.pointer_y,
                         settings_progress: self.settings_progress,
+                        settings_tab: self.settings_active_tab,
                         settings_font_value: &self.settings_font_value,
                         settings_scroll_value: &self.settings_scroll_value,
                     }))
@@ -1407,6 +1417,25 @@ mod tests {
         app.toggle_settings();
         app.close_settings();
         assert!(!app.settings_open);
+    }
+
+    #[test]
+    fn settings_tab_switch_is_ui_only_and_does_not_dirty_config() {
+        let mut app = App::new();
+        app.config_dirty = false;
+        app.dirty = false;
+        assert_eq!(app.settings_active_tab, SettingsTab::General);
+
+        app.apply_settings_hit(SettingsHit::Tab(SettingsTab::Help));
+
+        assert_eq!(app.settings_active_tab, SettingsTab::Help);
+        assert!(!app.config_dirty);
+        assert!(app.dirty);
+
+        app.dirty = false;
+        app.apply_settings_hit(SettingsHit::Tab(SettingsTab::Help));
+        assert!(!app.config_dirty);
+        assert!(!app.dirty);
     }
 
     #[test]
