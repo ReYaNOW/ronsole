@@ -16,6 +16,7 @@ const TERMINAL_TAB_BOTTOM_GAP: f32 = 4.0;
 const TERMINAL_TAB_NATURAL_CHROME: f32 = 56.0;
 const TERMINAL_TAB_CLOSE_SIZE: f32 = 20.0;
 const TERMINAL_TAB_CLOSE_HIT_PAD: f32 = 4.0;
+const SEARCH_ICON_VISUAL_SCALE: f32 = 0.56;
 const TERMINAL_TAB_CLOSE_RIGHT_PADDING: f32 = TERMINAL_TAB_TEXT_PAD - TERMINAL_TAB_CLOSE_HIT_PAD;
 const TERMINAL_TAB_TEXT_PAD: f32 = 16.0;
 const TERMINAL_ADD_SIZE: f32 = 20.0;
@@ -205,7 +206,7 @@ fn fit_centered_rect(
     }
 }
 
-fn settings_placeholder_layout(width: f32, height: f32, scale: f32, progress: f32) -> Rect {
+fn settings_modal_rect(width: f32, height: f32, scale: f32, progress: f32) -> Rect {
     let scale = scale.max(0.0);
     let mut outer = fit_centered_rect(
         width,
@@ -220,64 +221,150 @@ fn settings_placeholder_layout(width: f32, height: f32, scale: f32, progress: f3
     outer
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SettingsHit {
+    #[default]
+    None,
+    FontDecrease,
+    FontIncrease,
+    ScrollDecrease,
+    ScrollIncrease,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct SettingsPlaceholderLine {
+struct SettingsLine {
     x: f32,
     baseline_y: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct SettingsPlaceholderContentLayout {
-    clip: Option<Rect>,
-    title: Option<SettingsPlaceholderLine>,
-    description: Option<SettingsPlaceholderLine>,
+struct SettingsRowLayout {
+    label: SettingsLine,
+    minus: Rect,
+    value: SettingsLine,
+    plus: Rect,
 }
 
-fn settings_placeholder_content_layout(
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsLayout {
     modal: Rect,
+    clip: Option<Rect>,
+    title: Option<SettingsLine>,
+    font: Option<SettingsRowLayout>,
+    scroll: Option<SettingsRowLayout>,
+}
+
+impl SettingsLayout {
+    fn hit_test(self, x: f32, y: f32) -> SettingsHit {
+        if let Some(row) = self.font {
+            if row.minus.contains(x, y) {
+                return SettingsHit::FontDecrease;
+            }
+            if row.plus.contains(x, y) {
+                return SettingsHit::FontIncrease;
+            }
+        }
+        if let Some(row) = self.scroll {
+            if row.minus.contains(x, y) {
+                return SettingsHit::ScrollDecrease;
+            }
+            if row.plus.contains(x, y) {
+                return SettingsHit::ScrollIncrease;
+            }
+        }
+        SettingsHit::None
+    }
+}
+
+fn settings_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsRowLayout> {
+    let button = (30.0 * scale).round().max(1.0);
+    let gap = (8.0 * scale).round().max(1.0);
+    let value_w = (72.0 * scale).round().max(1.0);
+    let control_w = button * 2.0 + value_w + gap * 2.0;
+    let label_room = (120.0 * scale).round().max(1.0);
+    if clip.w < control_w + label_room || top < clip.y || top + button > clip.y + clip.h {
+        return None;
+    }
+
+    let plus = Rect {
+        x: (clip.x + clip.w - button).round(),
+        y: top.round(),
+        w: button,
+        h: button,
+    };
+    let value_x = (plus.x - gap - value_w).round();
+    let minus = Rect {
+        x: (value_x - gap - button).round(),
+        y: top.round(),
+        w: button,
+        h: button,
+    };
+    let baseline_y = (top + button * 0.70).round();
+    Some(SettingsRowLayout {
+        label: SettingsLine {
+            x: clip.x.round(),
+            baseline_y,
+        },
+        minus,
+        value: SettingsLine {
+            x: (value_x + 8.0 * scale).round(),
+            baseline_y,
+        },
+        plus,
+    })
+}
+
+fn settings_layout(
+    width: f32,
+    height: f32,
     scale: f32,
-) -> SettingsPlaceholderContentLayout {
+    progress: f32,
+) -> SettingsLayout {
     let scale = scale.max(0.0);
+    let modal = settings_modal_rect(width, height, scale, progress);
     if modal.w <= 0.0 || modal.h <= 0.0 {
-        return SettingsPlaceholderContentLayout::default();
+        return SettingsLayout {
+            modal,
+            ..SettingsLayout::default()
+        };
     }
 
     let pad_x = (28.0 * scale).min(modal.w * 0.2).max(0.0);
     let pad_y = (20.0 * scale).min(modal.h * 0.2).max(0.0);
+    let clip_x = (modal.x + pad_x).round();
+    let clip_y = (modal.y + pad_y).round();
+    let clip_right = (modal.x + modal.w - pad_x).round();
+    let clip_bottom = (modal.y + modal.h - pad_y).round();
     let clip = Rect {
-        x: modal.x + pad_x,
-        y: modal.y + pad_y,
-        w: (modal.w - pad_x * 2.0).max(0.0),
-        h: (modal.h - pad_y * 2.0).max(0.0),
+        x: clip_x,
+        y: clip_y,
+        w: (clip_right - clip_x).max(0.0),
+        h: (clip_bottom - clip_y).max(0.0),
     };
-    let min_title_room = (12.0 * scale).max(1.0);
-    if clip.w <= 0.0 || clip.h < min_title_room {
-        return SettingsPlaceholderContentLayout {
-            clip: (clip.w > 0.0 && clip.h > 0.0).then_some(clip),
-            ..SettingsPlaceholderContentLayout::default()
+    if clip.w <= 0.0 || clip.h <= 0.0 {
+        return SettingsLayout {
+            modal,
+            ..SettingsLayout::default()
         };
     }
 
-    let bottom_inset = (6.0 * scale).min(clip.h * 0.2).max(0.0);
-    let safe_bottom = clip.y + clip.h - bottom_inset;
-    let title = SettingsPlaceholderLine {
-        x: (modal.x + 28.0 * scale)
-            .clamp(clip.x, clip.x + clip.w)
-            .round(),
-        baseline_y: (modal.y + 52.0 * scale)
-            .clamp(clip.y, safe_bottom.max(clip.y))
-            .round(),
-    };
-    let description_y = (title.baseline_y + 36.0 * scale).round();
-    let description = (description_y <= safe_bottom + 0.001).then_some(SettingsPlaceholderLine {
-        x: title.x,
-        baseline_y: description_y,
+    let safe_bottom = clip.y + clip.h;
+    let title_y = (modal.y + 52.0 * scale).round();
+    let title = (title_y >= clip.y && title_y <= safe_bottom).then_some(SettingsLine {
+        x: clip.x.round(),
+        baseline_y: title_y,
     });
+    let first_top = (modal.y + 88.0 * scale).round();
+    let row_gap = (54.0 * scale).round().max(1.0);
+    let font = settings_row_layout(clip, first_top, scale);
+    let scroll = settings_row_layout(clip, first_top + row_gap, scale);
 
-    SettingsPlaceholderContentLayout {
+    SettingsLayout {
+        modal,
         clip: Some(clip),
-        title: Some(title),
-        description,
+        title,
+        font,
+        scroll,
     }
 }
 
@@ -645,18 +732,30 @@ impl Renderer {
         Some(glyph)
     }
 
-    fn draw_search_icon(&mut self, icon: SearchIcon, rect: Rect, color: [f32; 4]) {
+    fn draw_search_icon(
+        &mut self,
+        icon: SearchIcon,
+        rect: Rect,
+        visual_scale: Option<f32>,
+        color: [f32; 4],
+    ) {
         let Some(glyph) = self.search_icon(icon) else {
             return;
         };
-        let size = rect.w.min(rect.h) * 0.56;
-        let x = (rect.x + (rect.w - size) * 0.5).round();
-        let y = (rect.y + (rect.h - size) * 0.5).round();
+        let visual = visual_scale.map_or(rect, |scale| {
+            let size = rect.w.min(rect.h) * scale;
+            Rect {
+                x: (rect.x + (rect.w - size) * 0.5).round(),
+                y: (rect.y + (rect.h - size) * 0.5).round(),
+                w: size,
+                h: size,
+            }
+        });
         self.push_quad(
-            x,
-            y,
-            size,
-            size,
+            visual.x,
+            visual.y,
+            visual.w,
+            visual.h,
             glyph.u,
             glyph.v,
             glyph.uw,
@@ -834,16 +933,36 @@ impl Renderer {
         }
 
         let muted = [0.82, 0.82, 0.84, 1.0];
-        self.draw_search_icon(SearchIcon::Close, geometry.close, muted);
+        self.draw_search_icon(
+            SearchIcon::Close,
+            geometry.close,
+            Some(SEARCH_ICON_VISUAL_SCALE),
+            muted,
+        );
         if geometry.show_nav {
-            self.draw_search_icon(SearchIcon::Next, geometry.next, muted);
-            self.draw_search_icon(SearchIcon::Previous, geometry.previous, muted);
+            self.draw_search_icon(
+                SearchIcon::Next,
+                geometry.next,
+                Some(SEARCH_ICON_VISUAL_SCALE),
+                muted,
+            );
+            self.draw_search_icon(
+                SearchIcon::Previous,
+                geometry.previous,
+                Some(SEARCH_ICON_VISUAL_SCALE),
+                muted,
+            );
         }
         if geometry.show_case {
             self.draw_search_icon(
                 SearchIcon::Case,
                 geometry.case_toggle,
-                if search.case_sensitive { palette.accent } else { muted },
+                Some(SEARCH_ICON_VISUAL_SCALE),
+                if search.case_sensitive {
+                    palette.accent
+                } else {
+                    muted
+                },
             );
         }
 
@@ -1044,6 +1163,9 @@ impl Renderer {
             let can_show_close = tab_w >= 56.0 * s;
             let show_close = terminal_tab_show_close(tab_w, s, active, hovered);
             hitboxes[idx] = terminal_tab_hitbox_geometry(tab_x, tab_w, strip, show_close, s);
+            let close_hovered = hitboxes[idx]
+                .close
+                .is_some_and(|rect| rect.contains(pointer_x, pointer_y));
             let close_icon = show_close
                 .then(|| terminal_tab_close_geometry(tab_x, tab_w, strip, s).0);
 
@@ -1057,7 +1179,34 @@ impl Renderer {
                 self.draw_ui_text_clipped(&titles[idx], title_x, title_max_x, baseline, title_color, 1.0);
             }
             if let Some(close_icon) = close_icon.filter(|icon| clipped_rect(*icon, strip).is_some()) {
-                self.draw_search_icon(SearchIcon::Close, close_icon, [0.82, 0.82, 0.84, 1.0]);
+                if close_hovered {
+                    if let Some(close_hit) = hitboxes[idx].close {
+                        self.push_rounded_rect(
+                            close_hit.x,
+                            close_hit.y,
+                            close_hit.w,
+                            close_hit.h,
+                            4.0 * s,
+                            [
+                                self.palette.fg[0],
+                                self.palette.fg[1],
+                                self.palette.fg[2],
+                                0.10,
+                            ],
+                        );
+                    }
+                }
+                let icon_color = if close_hovered {
+                    self.palette.fg
+                } else {
+                    [
+                        self.palette.fg[0],
+                        self.palette.fg[1],
+                        self.palette.fg[2],
+                        0.80,
+                    ]
+                };
+                self.draw_search_icon(SearchIcon::Close, close_icon, None, icon_color);
             }
         }
 
@@ -1112,7 +1261,14 @@ impl Renderer {
         self.terminal_tab_hitboxes = hitboxes;
     }
 
-    fn draw_settings_placeholder(&mut self, progress: f32) {
+    fn draw_settings(
+        &mut self,
+        progress: f32,
+        pointer_x: f32,
+        pointer_y: f32,
+        font_value: &str,
+        scroll_value: &str,
+    ) {
         let progress = progress.clamp(0.0, 1.0);
         if progress <= 0.0 {
             return;
@@ -1127,7 +1283,8 @@ impl Renderer {
             0.0,
             [0.0, 0.0, 0.0, 0.60 * smooth],
         );
-        let modal = settings_placeholder_layout(self.width, self.height, s, progress);
+        let layout = settings_layout(self.width, self.height, s, progress);
+        let modal = layout.modal;
         let radius = (12.0 * s).round().max(1.0);
         self.push_rounded_rect(
             modal.x,
@@ -1149,10 +1306,11 @@ impl Renderer {
             );
         }
         self.flush();
-        let content = settings_placeholder_content_layout(modal, s);
-        if let Some(clip) = content.clip {
+
+        let hovered = layout.hit_test(pointer_x, pointer_y);
+        if let Some(clip) = layout.clip {
             self.set_clip(clip.x, clip.y, clip.w, clip.h);
-            if let Some(title) = content.title {
+            if let Some(title) = layout.title {
                 self.draw_ui_text(
                     "Settings",
                     title.x,
@@ -1161,18 +1319,85 @@ impl Renderer {
                     1.05,
                 );
             }
-            if let Some(description) = content.description {
-                self.draw_ui_text(
-                    "Terminal settings will be added later.",
-                    description.x,
-                    description.baseline_y,
-                    [self.palette.fg[0], self.palette.fg[1], self.palette.fg[2], 0.62],
-                    0.90,
+            if let Some(row) = layout.font {
+                self.draw_settings_row(
+                    row,
+                    "Font size",
+                    font_value,
+                    hovered,
+                    SettingsHit::FontDecrease,
+                    SettingsHit::FontIncrease,
+                );
+            }
+            if let Some(row) = layout.scroll {
+                self.draw_settings_row(
+                    row,
+                    "Scroll sensitivity",
+                    scroll_value,
+                    hovered,
+                    SettingsHit::ScrollDecrease,
+                    SettingsHit::ScrollIncrease,
                 );
             }
             self.flush();
             self.clear_clip();
         }
+    }
+
+    fn draw_settings_row(
+        &mut self,
+        row: SettingsRowLayout,
+        label: &str,
+        value: &str,
+        hovered: SettingsHit,
+        minus_hit: SettingsHit,
+        plus_hit: SettingsHit,
+    ) {
+        let s = self.scale_factor;
+        let normal = [0.27, 0.28, 0.34, 1.0];
+        let hover = self.palette.accent_with_alpha(0.55);
+        let radius = (5.0 * s).round().max(1.0);
+        self.push_rounded_rect(
+            row.minus.x,
+            row.minus.y,
+            row.minus.w,
+            row.minus.h,
+            radius,
+            if hovered == minus_hit { hover } else { normal },
+        );
+        self.push_rounded_rect(
+            row.plus.x,
+            row.plus.y,
+            row.plus.w,
+            row.plus.h,
+            radius,
+            if hovered == plus_hit { hover } else { normal },
+        );
+        self.draw_ui_text(label, row.label.x, row.label.baseline_y, self.palette.fg, 0.90);
+        self.draw_ui_text(
+            "-",
+            (row.minus.x + 10.0 * s).round(),
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        self.draw_ui_text(value, row.value.x, row.value.baseline_y, self.palette.fg, 0.90);
+        self.draw_ui_text(
+            "+",
+            (row.plus.x + 8.0 * s).round(),
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+    }
+
+    pub(crate) fn settings_hit_test(
+        &self,
+        progress: f32,
+        x: f32,
+        y: f32,
+    ) -> SettingsHit {
+        settings_layout(self.width, self.height, self.scale_factor, progress).hit_test(x, y)
     }
 
     pub(crate) fn terminal_tab_hit_test(&self, x: f32, y: f32) -> TerminalTabHit {
@@ -1251,6 +1476,8 @@ impl Renderer {
         pointer_x: f32,
         pointer_y: f32,
         settings_progress: f32,
+        settings_font_value: &str,
+        settings_scroll_value: &str,
     ) -> TerminalUiLayout {
         let layout = if let Some(terminal) = terminals.get(active_terminal) {
             self.render_terminal_body(terminal, search, focused && settings_progress <= 0.0)
@@ -1270,7 +1497,13 @@ impl Renderer {
             pointer_x,
             pointer_y,
         );
-        self.draw_settings_placeholder(settings_progress);
+        self.draw_settings(
+            settings_progress,
+            pointer_x,
+            pointer_y,
+            settings_font_value,
+            settings_scroll_value,
+        );
         layout
     }
 
@@ -1369,7 +1602,9 @@ impl Renderer {
                             bg = Some(if active { SEARCH_ACTIVE } else { SEARCH_MATCH });
                         }
                     }
-                    if let Some(color) = bg { self.push_rounded_rect(x, draw_y, cell_w, char_h, 0.0, color); }
+                    if let Some(color) = bg {
+                        self.push_rect(x, draw_y, cell_w, char_h, color);
+                    }
                     if cell.c != ' ' && !cell.is_wide_spacer() {
                         let glyph_cell_w = if cell.is_wide() {
                             let (_, wide_x2) =
@@ -1566,6 +1801,52 @@ mod tests {
         let top_row_y = terminal_row_draw_y(body, bottom_pad, 20.0, 40, 0, max_scroll);
         assert_eq!(top_row_y, 8.0);
         assert_eq!(visible_row_range(40, 28, max_scroll, 20.0).start, 0);
+    }
+
+    #[test]
+    fn fractional_terminal_row_background_quads_share_vertical_boundaries() {
+        let mut reproduced_legacy_gap = false;
+        for char_h in [27.3_f32, 34.65, 36.75, 40.95] {
+            let body = Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 100.3 + 2.0 * char_h,
+            };
+            let upper_y = terminal_row_draw_y(body, 0.0, char_h, 2, 0, 0.0);
+            let lower_y = terminal_row_draw_y(body, 0.0, char_h, 2, 1, 0.0);
+            let upper = super::super::quad_vertices(
+                10.0,
+                upper_y,
+                20.0,
+                char_h,
+                -1.0,
+                -1.0,
+                0.0,
+                0.0,
+                [1.0; 4],
+                super::super::SOLID_RECT_MODE,
+                [0.0; 3],
+            );
+            let lower = super::super::quad_vertices(
+                10.0,
+                lower_y,
+                20.0,
+                char_h,
+                -1.0,
+                -1.0,
+                0.0,
+                0.0,
+                [1.0; 4],
+                super::super::SOLID_RECT_MODE,
+                [0.0; 3],
+            );
+
+            assert_eq!(upper[2].pos[1], lower[0].pos[1]);
+            let legacy_rounded_bottom = (upper_y + char_h.round()).round();
+            reproduced_legacy_gap |= legacy_rounded_bottom != lower[0].pos[1];
+        }
+        assert!(reproduced_legacy_gap);
     }
 
     #[test]
@@ -1896,7 +2177,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_placeholder_fits_tiny_and_large_windows_at_fractional_scale() {
+    fn settings_modal_fits_tiny_and_large_windows_at_fractional_scale() {
         for (width, height) in [
             (0.0, 0.0),
             (10.0, 10.0),
@@ -1904,120 +2185,95 @@ mod tests {
             (100.0, 80.0),
             (200.0, 100.0),
             (500.0, 300.0),
-            (1000.0, 700.0),
+            (1100.0, 720.0),
             (1600.0, 1000.0),
         ] {
-            for scale in [1.0, 1.3333333] {
-                let rect = settings_placeholder_layout(width, height, scale, 1.0);
-                assert!(rect.x.is_finite());
-                assert!(rect.y.is_finite());
-                assert!(rect.w.is_finite());
-                assert!(rect.h.is_finite());
+            for scale in [1.0, 1.25, 1.3333333, 1.5] {
+                let rect = settings_modal_rect(width, height, scale, 1.0);
+                for value in [rect.x, rect.y, rect.w, rect.h] {
+                    assert!(value.is_finite());
+                }
                 assert!(rect.x >= 0.0 && rect.y >= 0.0);
                 assert!(rect.w >= 0.0 && rect.h >= 0.0);
                 assert!(rect.x + rect.w <= width.max(0.0) + 0.51);
                 assert!(rect.y + rect.h <= height.max(0.0) + 0.51);
             }
         }
-        assert_eq!(
-            settings_placeholder_layout(100.0, 80.0, 1.0, 1.0),
-            Rect {
-                x: 20.0,
-                y: 20.0,
-                w: 60.0,
-                h: 40.0,
-            },
-        );
     }
 
     #[test]
     fn settings_modal_vertical_motion_uses_raw_progress_while_backdrop_can_smoothstep() {
-        let start = settings_placeholder_layout(100.0, 80.0, 1.0, 0.0);
-        let quarter = settings_placeholder_layout(100.0, 80.0, 1.0, 0.25);
-        let mid = settings_placeholder_layout(100.0, 80.0, 1.0, 0.5);
-        let end = settings_placeholder_layout(100.0, 80.0, 1.0, 1.0);
+        let start = settings_modal_rect(100.0, 80.0, 1.0, 0.0);
+        let quarter = settings_modal_rect(100.0, 80.0, 1.0, 0.25);
+        let mid = settings_modal_rect(100.0, 80.0, 1.0, 0.5);
+        let end = settings_modal_rect(100.0, 80.0, 1.0, 1.0);
         assert_eq!(start.y, 180.0);
         assert_eq!(quarter.y, 140.0);
         assert_eq!(mid.y, 100.0);
         assert_eq!(end.y, 20.0);
-        assert_eq!(mid.y, ((start.y + end.y) * 0.5).round());
         let smooth_quarter = 0.25_f32 * 0.25 * (3.0 - 2.0 * 0.25);
         let eased_quarter_y = (start.y + (end.y - start.y) * smooth_quarter).round();
         assert_ne!(quarter.y, eased_quarter_y);
     }
 
     #[test]
-    fn settings_placeholder_content_stays_inside_tiny_fitted_modal() {
-        let modal = settings_placeholder_layout(100.0, 80.0, 1.0, 1.0);
-        assert_eq!(
-            modal,
-            Rect {
-                x: 20.0,
-                y: 20.0,
-                w: 60.0,
-                h: 40.0,
+    fn settings_controls_are_bounded_disjoint_and_hit_test_the_drawn_geometry() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let layout = settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0);
+            let clip = layout.clip.expect("large settings modal should have content clip");
+            let font = layout.font.expect("font controls should fit");
+            let scroll = layout.scroll.expect("scroll controls should fit");
+            for rect in [font.minus, font.plus, scroll.minus, scroll.plus] {
+                for value in [rect.x, rect.y, rect.w, rect.h] {
+                    assert!(value.is_finite());
+                }
+                assert!(rect.x >= clip.x && rect.y >= clip.y);
+                assert!(rect.x + rect.w <= clip.x + clip.w + 0.001);
+                assert!(rect.y + rect.h <= clip.y + clip.h + 0.001);
             }
-        );
-        let content = settings_placeholder_content_layout(modal, 1.0);
-        let clip = content.clip.expect("tiny modal should retain a bounded title clip");
-        let title = content.title.expect("100x80 modal should retain its title");
-        assert_eq!(clip, Rect { x: 32.0, y: 28.0, w: 36.0, h: 24.0 });
-        assert_eq!(title, SettingsPlaceholderLine { x: 48.0, baseline_y: 47.0 });
-        assert!(title.x >= modal.x && title.x <= modal.x + modal.w);
-        assert!(title.baseline_y >= modal.y && title.baseline_y <= modal.y + modal.h);
-        assert_eq!(content.description, None);
-        assert!(clip.x >= modal.x && clip.y >= modal.y);
-        assert!(clip.x + clip.w <= modal.x + modal.w + 0.001);
-        assert!(clip.y + clip.h <= modal.y + modal.h + 0.001);
-    }
-
-    #[test]
-    fn settings_placeholder_description_hides_when_modal_height_is_too_small() {
-        let modal = settings_placeholder_layout(200.0, 100.0, 1.0, 1.0);
-        let content = settings_placeholder_content_layout(modal, 1.0);
-        let title = content.title.expect("title should fit 200x100 modal");
-        assert!(title.baseline_y <= modal.y + modal.h);
-        assert_eq!(content.description, None);
-    }
-
-    #[test]
-    fn settings_placeholder_content_is_finite_and_bounded_at_fractional_scale() {
-        let modal = settings_placeholder_layout(100.0, 80.0, 1.3333333, 1.0);
-        let content = settings_placeholder_content_layout(modal, 1.3333333);
-        let clip = content.clip.expect("fractional tiny modal should keep finite content clip");
-        let title = content.title.expect("fractional tiny modal should keep title");
-        for value in [clip.x, clip.y, clip.w, clip.h, title.x, title.baseline_y] {
-            assert!(value.is_finite());
-        }
-        assert!(clip.x >= modal.x && clip.y >= modal.y);
-        assert!(clip.x + clip.w <= modal.x + modal.w + 0.001);
-        assert!(clip.y + clip.h <= modal.y + modal.h + 0.001);
-        assert!(title.x >= clip.x && title.x <= clip.x + clip.w + 0.001);
-        assert!(title.baseline_y >= clip.y && title.baseline_y <= clip.y + clip.h + 0.001);
-    }
-
-    #[test]
-    fn settings_placeholder_text_is_hidden_without_usable_content_area() {
-        for (width, height) in [(0.0, 0.0), (10.0, 10.0), (40.0, 40.0)] {
-            let modal = settings_placeholder_layout(width, height, 1.0, 1.0);
-            let content = settings_placeholder_content_layout(modal, 1.0);
-            assert_eq!(content.title, None);
-            assert_eq!(content.description, None);
+            assert!(font.minus.x + font.minus.w < font.plus.x);
+            assert!(font.minus.y + font.minus.h < scroll.minus.y);
+            let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+            let (x, y) = center(font.minus);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::FontDecrease);
+            let (x, y) = center(font.plus);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::FontIncrease);
+            let (x, y) = center(scroll.minus);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::ScrollDecrease);
+            let (x, y) = center(scroll.plus);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::ScrollIncrease);
+            assert_eq!(layout.hit_test(clip.x + 1.0, clip.y + 1.0), SettingsHit::None);
         }
     }
 
     #[test]
-    fn settings_placeholder_large_window_preserves_title_and_description_layout() {
-        let modal = settings_placeholder_layout(1100.0, 720.0, 1.0, 1.0);
-        let content = settings_placeholder_content_layout(modal, 1.0);
-        assert_eq!(modal, Rect { x: 50.0, y: 20.0, w: 1000.0, h: 680.0 });
+    fn settings_layout_stays_finite_when_window_is_too_small_for_controls() {
+        for (width, height) in [(0.0, 0.0), (10.0, 10.0), (40.0, 40.0), (100.0, 80.0)] {
+            let layout = settings_layout(width, height, 1.3333333, 1.0);
+            for value in [layout.modal.x, layout.modal.y, layout.modal.w, layout.modal.h] {
+                assert!(value.is_finite());
+            }
+            if let Some(clip) = layout.clip {
+                for value in [clip.x, clip.y, clip.w, clip.h] {
+                    assert!(value.is_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_hit_test_tracks_animated_modal_position() {
+        let mid = settings_layout(1100.0, 720.0, 1.0, 0.5);
+        let final_layout = settings_layout(1100.0, 720.0, 1.0, 1.0);
+        let mid_minus = mid.font.expect("mid-animation controls should fit").minus;
+        let final_minus = final_layout.font.expect("final controls should fit").minus;
+        let mid_center = (mid_minus.x + mid_minus.w * 0.5, mid_minus.y + mid_minus.h * 0.5);
+        let final_center = (final_minus.x + final_minus.w * 0.5, final_minus.y + final_minus.h * 0.5);
+        assert_eq!(mid.hit_test(mid_center.0, mid_center.1), SettingsHit::FontDecrease);
+        assert_eq!(mid.hit_test(final_center.0, final_center.1), SettingsHit::None);
         assert_eq!(
-            content.title,
-            Some(SettingsPlaceholderLine { x: 78.0, baseline_y: 72.0 })
-        );
-        assert_eq!(
-            content.description,
-            Some(SettingsPlaceholderLine { x: 78.0, baseline_y: 108.0 })
+            final_layout.hit_test(final_center.0, final_center.1),
+            SettingsHit::FontDecrease
         );
     }
 
@@ -2120,5 +2376,65 @@ mod tests {
         assert_eq!(close.x, 144.0);
         assert!(body.x + body.w <= close.x);
         assert!(close.x + close.w <= 180.0);
+    }
+
+    #[test]
+    fn terminal_close_geometry_keeps_donor_visual_size_and_hit_padding() {
+        for scale in [1.0_f32, 1.25, 1.333_333_3, 1.5] {
+            let strip = Rect {
+                x: 0.0,
+                y: (6.0 * scale).round(),
+                w: 360.0 * scale,
+                h: (32.0 * scale).round(),
+            };
+            let (icon, hit) =
+                terminal_tab_close_geometry(20.0 * scale, 180.0 * scale, strip, scale);
+            let pad = TERMINAL_TAB_CLOSE_HIT_PAD * scale;
+
+            assert!((icon.w - TERMINAL_TAB_CLOSE_SIZE * scale).abs() < 0.001);
+            assert!((icon.h - TERMINAL_TAB_CLOSE_SIZE * scale).abs() < 0.001);
+            assert!((hit.x - (icon.x - pad)).abs() < 0.001);
+            assert!((hit.y - (icon.y - pad)).abs() < 0.001);
+            assert!((hit.w - (icon.w + pad * 2.0)).abs() < 0.001);
+            assert!((hit.h - (icon.h + pad * 2.0)).abs() < 0.001);
+            for value in [icon.x, icon.y, icon.w, icon.h, hit.x, hit.y, hit.w, hit.h] {
+                assert!(value.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_close_hover_depends_only_on_close_hitbox() {
+        let strip = Rect {
+            x: 0.0,
+            y: 6.0,
+            w: 240.0,
+            h: 32.0,
+        };
+        let hitbox = terminal_tab_hitbox_geometry(10.0, 180.0, strip, true, 1.0);
+        let body = hitbox.body.expect("visible tab body");
+        let close = hitbox.close.expect("visible close hitbox");
+
+        let close_hovered = |hitbox: TerminalTabHitbox, x: f32, y: f32| {
+            hitbox.close.is_some_and(|rect| rect.contains(x, y))
+        };
+        assert!(!close_hovered(
+            hitbox,
+            body.x + body.w * 0.5,
+            body.y + body.h * 0.5,
+        ));
+        assert!(close_hovered(
+            hitbox,
+            close.x + close.w * 0.5,
+            close.y + close.h * 0.5,
+        ));
+        assert!(!close_hovered(
+            TerminalTabHitbox {
+                body: hitbox.body,
+                close: None,
+            },
+            close.x + close.w * 0.5,
+            close.y + close.h * 0.5,
+        ));
     }
 }

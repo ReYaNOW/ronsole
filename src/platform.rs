@@ -54,10 +54,26 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
     user_home_dir_with(|name| std::env::var_os(name))
 }
 
+pub(crate) fn config_home_dir() -> Option<PathBuf> {
+    config_home_dir_with(|name| std::env::var_os(name))
+}
+
 fn user_home_dir_with(mut env_value: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
     env_value("HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn config_home_dir_with(mut env_value: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env_value("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            env_value("HOME")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|home| home.join(".config"))
+        })
 }
 
 
@@ -125,6 +141,30 @@ mod tests {
             None
         );
         assert_eq!(user_home_dir_with(|_| Some(OsString::new())), None);
+    }
+
+    #[test]
+    fn config_home_prefers_xdg_and_falls_back_to_linux_home() {
+        assert_eq!(
+            config_home_dir_with(|name| match name {
+                "XDG_CONFIG_HOME" => Some(OsString::from("/tmp/xdg")),
+                "HOME" => Some(OsString::from("/home/reyan")),
+                _ => None,
+            }),
+            Some(PathBuf::from("/tmp/xdg"))
+        );
+        assert_eq!(
+            config_home_dir_with(|name| {
+                (name == "HOME").then(|| OsString::from("/home/reyan"))
+            }),
+            Some(PathBuf::from("/home/reyan/.config"))
+        );
+        assert_eq!(
+            config_home_dir_with(|name| {
+                (name == "XDG_CONFIG_HOME").then(OsString::new)
+            }),
+            None
+        );
     }
 
 }

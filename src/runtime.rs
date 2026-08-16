@@ -107,11 +107,11 @@ fn blocking_swap_interval() -> SwapInterval {
     SwapInterval::Wait(NonZeroU32::MIN)
 }
 
-fn window_attributes() -> WindowAttributes {
+fn window_attributes(logical_width: f64, logical_height: f64) -> WindowAttributes {
     Window::default_attributes()
         .with_title("Ronsole")
         .with_name("ronsole", "ronsole")
-        .with_inner_size(LogicalSize::new(1100.0, 720.0))
+        .with_inner_size(LogicalSize::new(logical_width, logical_height))
         .with_transparent(false)
 }
 
@@ -196,6 +196,8 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub pointer_x: f32,
     pub pointer_y: f32,
     pub settings_progress: f32,
+    pub settings_font_value: &'a str,
+    pub settings_scroll_value: &'a str,
 }
 
 pub struct WindowRuntime {
@@ -210,12 +212,18 @@ pub struct WindowRuntime {
 }
 
 impl WindowRuntime {
-    pub fn bootstrap(event_loop: &ActiveEventLoop) -> Result<Self, String> {
+    pub fn bootstrap(
+        event_loop: &ActiveEventLoop,
+        logical_width: f64,
+        logical_height: f64,
+        terminal_font_size: f32,
+    ) -> Result<Self, String> {
         let template = ConfigTemplateBuilder::new()
             .with_transparency(false)
             .with_depth_size(0)
             .with_stencil_size(0);
-        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attributes()));
+        let display_builder = DisplayBuilder::new()
+            .with_window_attributes(Some(window_attributes(logical_width, logical_height)));
         let (window, gl_config) = display_builder
             .build(event_loop, template, |configs| {
                 configs
@@ -240,8 +248,12 @@ impl WindowRuntime {
             raw_window_handle,
             not_current_context,
         )?;
-        let renderer = Renderer::new(create_glow_context(&gl_config), window.scale_factor() as f32)
-            .map_err(|error| format!("renderer initialization failed: {error}"))?;
+        let renderer = Renderer::new(
+            create_glow_context(&gl_config),
+            window.scale_factor() as f32,
+            terminal_font_size,
+        )
+        .map_err(|error| format!("renderer initialization failed: {error}"))?;
         let mut runtime = Self {
             renderer,
             config: gl_config,
@@ -272,6 +284,10 @@ impl WindowRuntime {
         self.renderer.update_scale_factor(scale_factor);
     }
 
+    pub(crate) fn set_terminal_font_size(&mut self, logical_size: f32) -> bool {
+        self.renderer.set_terminal_font_size(logical_size)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         let Some(width) = NonZeroU32::new(width) else {
             return;
@@ -297,6 +313,8 @@ impl WindowRuntime {
             params.pointer_x,
             params.pointer_y,
             params.settings_progress,
+            params.settings_font_value,
+            params.settings_scroll_value,
         );
         self.surface
             .swap_buffers(&self.context)
@@ -306,6 +324,15 @@ impl WindowRuntime {
 
     pub fn terminal_tab_hit_test(&self, x: f32, y: f32) -> crate::renderer::TerminalTabHit {
         self.renderer.terminal_tab_hit_test(x, y)
+    }
+
+    pub(crate) fn settings_hit_test(
+        &self,
+        progress: f32,
+        x: f32,
+        y: f32,
+    ) -> crate::renderer::SettingsHit {
+        self.renderer.settings_hit_test(progress, x, y)
     }
 
     pub fn terminal_tab_strip_layout(&self) -> crate::renderer::TerminalTabStripLayout {

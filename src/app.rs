@@ -1,5 +1,8 @@
+use crate::config::{
+    AppConfig, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP, logical_window_size,
+};
 use crate::input::TerminalInteraction;
-use crate::renderer::TerminalTabHit;
+use crate::renderer::{SettingsHit, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::tabs::{
@@ -73,7 +76,7 @@ fn exact_global_modifiers(modifiers: ModifiersState, shift: bool) -> bool {
 
 fn global_shortcut(key: PhysicalKey, modifiers: ModifiersState) -> Option<GlobalShortcut> {
     match key {
-        PhysicalKey::Code(KeyCode::F1) if exact_global_modifiers(modifiers, false) => {
+        PhysicalKey::Code(KeyCode::F1) if modifiers.is_empty() => {
             Some(GlobalShortcut::ToggleSettings)
         }
         PhysicalKey::Code(KeyCode::KeyT) if exact_global_modifiers(modifiers, true) => {
@@ -151,6 +154,11 @@ where
 
 pub struct App {
     runtime: Option<WindowRuntime>,
+    config: AppConfig,
+    config_dirty: bool,
+    config_save_attempted: bool,
+    settings_font_value: String,
+    settings_scroll_value: String,
     terminals: Vec<Terminal>,
     active_terminal: usize,
     active_terminal_presented: bool,
@@ -175,9 +183,27 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::from_config(AppConfig::default())
+    }
+
+    pub fn load() -> Self {
+        Self::from_config(AppConfig::load())
+    }
+
+    fn from_config(config: AppConfig) -> Self {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_scroll_sensitivity(config.scroll_sensitivity);
+        let settings_font_value = format!("{:.0}", config.terminal_font_size);
+        let settings_scroll_value = format!("{:.2}", config.scroll_sensitivity);
         Self {
             runtime: None,
+            config,
+            config_dirty: false,
+            config_save_attempted: false,
+            settings_font_value,
+            settings_scroll_value,
             terminals: Vec::new(),
             active_terminal: 0,
             active_terminal_presented: false,
@@ -185,7 +211,7 @@ impl App {
             terminal_tab_scroll: ScrollState::new(7.0),
             terminal_tab_drag: None,
             pending_tab_reveal: None,
-            interaction: TerminalInteraction::default(),
+            interaction,
             terminal_cleanup: TerminalCleanupWorker::new(),
             pending_terminal_cleanup: VecDeque::with_capacity(TERMINAL_CLEANUP_PENDING_CAPACITY),
             modifiers: ModifiersState::empty(),
@@ -215,6 +241,27 @@ impl App {
     #[inline(always)]
     fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    fn mark_config_dirty(&mut self) {
+        self.config_dirty = true;
+        self.config_save_attempted = false;
+    }
+
+    fn persist_config_if_needed(&mut self) {
+        if !self.config_dirty || self.config_save_attempted {
+            return;
+        }
+        self.config_save_attempted = true;
+        match self.config.save() {
+            Ok(()) => self.config_dirty = false,
+            Err(error) => eprintln!("Ronsole: failed to persist config: {error}"),
+        }
+    }
+
+    fn request_exit(&mut self, event_loop: &ActiveEventLoop) {
+        self.persist_config_if_needed();
+        event_loop.exit();
     }
 
     fn suspend_frame_clock(&mut self) {
@@ -499,6 +546,53 @@ impl App {
         }
     }
 
+    fn apply_settings_hit(&mut self, hit: SettingsHit) {
+        let changed = match hit {
+            SettingsHit::FontDecrease | SettingsHit::FontIncrease => {
+                let delta = if hit == SettingsHit::FontDecrease {
+                    -TERMINAL_FONT_SIZE_STEP
+                } else {
+                    TERMINAL_FONT_SIZE_STEP
+                };
+                if !self.config.adjust_terminal_font_size(delta) {
+                    false
+                } else {
+                    let logical_size = self.config.terminal_font_size;
+                    if let Some(runtime) = self.runtime.as_mut() {
+                        let _ = runtime.set_terminal_font_size(logical_size);
+                    }
+                    self.settings_font_value = format!("{logical_size:.0}");
+                    true
+                }
+            }
+            SettingsHit::ScrollDecrease | SettingsHit::ScrollIncrease => {
+                let delta = if hit == SettingsHit::ScrollDecrease {
+                    -SCROLL_SENSITIVITY_STEP
+                } else {
+                    SCROLL_SENSITIVITY_STEP
+                };
+                if !self.config.adjust_scroll_sensitivity(delta) {
+                    false
+                } else {
+                    let sensitivity = self.config.scroll_sensitivity;
+                    self.interaction.set_scroll_sensitivity(sensitivity);
+                    self.settings_scroll_value = format!("{sensitivity:.2}");
+                    true
+                }
+            }
+            SettingsHit::None => false,
+        };
+        if changed {
+            self.mark_config_dirty();
+            self.request_redraw();
+        }
+    }
+
+    fn settings_hit_test(&self, x: f32, y: f32) -> SettingsHit {
+        self.runtime.as_ref().map_or(SettingsHit::None, |runtime| {
+            runtime.settings_hit_test(self.settings_progress, x, y)
+        })
+    }
 
     fn sync_animation_state(&mut self) {
         let terminal_animation = self
@@ -631,7 +725,12 @@ impl ApplicationHandler for App {
             return;
         }
 
-        match WindowRuntime::bootstrap(event_loop) {
+        match WindowRuntime::bootstrap(
+            event_loop,
+            self.config.window_width,
+            self.config.window_height,
+            self.config.terminal_font_size,
+        ) {
             Ok(runtime) => {
                 self.zero_sized = runtime.window().inner_size().width == 0
                     || runtime.window().inner_size().height == 0;
@@ -647,7 +746,7 @@ impl ApplicationHandler for App {
             }
             Err(error) => {
                 eprintln!("Ronsole: {error}");
-                event_loop.exit();
+                self.request_exit(event_loop);
             }
         }
     }
@@ -662,8 +761,8 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
+                self.request_exit(event_loop);
                 self.shutdown_all();
-                event_loop.exit();
             }
             WindowEvent::Focused(focused) => {
                 self.handle_focus_changed(focused);
@@ -679,6 +778,16 @@ impl ApplicationHandler for App {
                 self.zero_sized = size.width == 0 || size.height == 0;
                 self.suspend_frame_clock();
                 if !self.zero_sized {
+                    let scale_factor = self
+                        .runtime
+                        .as_ref()
+                        .map_or(1.0, WindowRuntime::scale_factor);
+                    if let Some((width, height)) =
+                        logical_window_size(size.width, size.height, scale_factor)
+                        && self.config.set_window_size(width, height)
+                    {
+                        self.mark_config_dirty();
+                    }
                     if let Some(runtime) = self.runtime.as_mut() {
                         runtime.resize(size.width, size.height);
                     }
@@ -725,7 +834,7 @@ impl ApplicationHandler for App {
                         return;
                     }
                     if self.handle_global_key(shortcut) {
-                        event_loop.exit();
+                        self.request_exit(event_loop);
                         return;
                     }
                     self.sync_animation_state();
@@ -748,9 +857,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let previous_x = self.pointer_x;
+                let previous_y = self.pointer_y;
                 self.pointer_x = position.x as f32;
                 self.pointer_y = position.y as f32;
                 if self.settings_modal_active() {
+                    let previous_hit = self.settings_hit_test(previous_x, previous_y);
+                    let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
+                    if previous_hit != current_hit {
+                        self.request_redraw();
+                    }
                     return;
                 }
                 if let Some(drag) = self.terminal_tab_drag.as_mut() {
@@ -791,6 +907,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if self.settings_modal_active() {
+                    if button == MouseButton::Left && state == ElementState::Pressed {
+                        let hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
+                        self.apply_settings_hit(hit);
+                    }
                     return;
                 }
                 if button == MouseButton::Left && state == ElementState::Pressed {
@@ -800,7 +920,7 @@ impl ApplicationHandler for App {
                     match hit {
                         TerminalTabHit::Close(index) => {
                             if self.close_terminal_tab_at(index) {
-                                event_loop.exit();
+                                self.request_exit(event_loop);
                             }
                             return;
                         }
@@ -921,6 +1041,8 @@ impl ApplicationHandler for App {
                         pointer_x: self.pointer_x,
                         pointer_y: self.pointer_y,
                         settings_progress: self.settings_progress,
+                        settings_font_value: &self.settings_font_value,
+                        settings_scroll_value: &self.settings_scroll_value,
                     }))
                 } else {
                     None
@@ -951,7 +1073,7 @@ impl ApplicationHandler for App {
                     }
                     Some(Err(error)) => {
                         eprintln!("Ronsole: frame presentation failed: {error}");
-                        event_loop.exit();
+                        self.request_exit(event_loop);
                     }
                     None => {}
                 }
@@ -961,13 +1083,14 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.persist_config_if_needed();
         self.shutdown_all();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.flush_pending_terminal_cleanup();
         if self.remove_closed_terminals() {
-            event_loop.exit();
+            self.request_exit(event_loop);
             return;
         }
         if self.process_terminal_presentation_intents() {
@@ -1199,11 +1322,12 @@ mod tests {
     }
 
     #[test]
-    fn global_shortcuts_require_exact_application_modifiers() {
+    fn global_shortcuts_use_plain_f1_and_exact_application_modifiers() {
+        let none = ModifiersState::empty();
         let ctrl = ModifiersState::CONTROL;
         let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert_eq!(
-            global_shortcut(PhysicalKey::Code(KeyCode::F1), ctrl),
+            global_shortcut(PhysicalKey::Code(KeyCode::F1), none),
             Some(GlobalShortcut::ToggleSettings)
         );
         assert_eq!(
@@ -1220,9 +1344,13 @@ mod tests {
         );
 
         for modifiers in [
+            ctrl,
+            ModifiersState::ALT,
+            ModifiersState::SHIFT,
+            ModifiersState::SUPER,
             ctrl | ModifiersState::ALT,
-            ctrl | ModifiersState::SUPER,
             ctrl | ModifiersState::SHIFT,
+            ctrl | ModifiersState::SUPER,
         ] {
             assert_eq!(global_shortcut(PhysicalKey::Code(KeyCode::F1), modifiers), None);
         }
@@ -1237,10 +1365,6 @@ mod tests {
                 assert_eq!(global_shortcut(PhysicalKey::Code(key), modifiers), None);
             }
         }
-        assert_eq!(
-            global_shortcut(PhysicalKey::Code(KeyCode::F1), ModifiersState::empty()),
-            None,
-        );
         assert_eq!(global_shortcut(PhysicalKey::Code(KeyCode::KeyT), ctrl), None);
     }
 
@@ -1270,6 +1394,19 @@ mod tests {
             terminal_focus_transition_plan(false, true, true, true),
             (None, None)
         );
+    }
+
+    #[test]
+    fn settings_toggle_and_escape_close_contract_is_stable() {
+        let mut app = App::new();
+        assert!(!app.settings_open);
+        app.toggle_settings();
+        assert!(app.settings_open);
+        app.toggle_settings();
+        assert!(!app.settings_open);
+        app.toggle_settings();
+        app.close_settings();
+        assert!(!app.settings_open);
     }
 
     #[test]
@@ -1304,12 +1441,16 @@ mod tests {
         assert_eq!(app.interaction.modifiers_for_test(), ModifiersState::empty());
         app.handle_focus_changed(true);
         assert_eq!(app.modifiers, ModifiersState::empty());
-        for key in [KeyCode::KeyT, KeyCode::KeyF, KeyCode::Digit4, KeyCode::F1] {
+        for key in [KeyCode::KeyT, KeyCode::KeyF, KeyCode::Digit4] {
             assert_eq!(
                 global_shortcut(PhysicalKey::Code(key), app.modifiers),
                 None,
             );
         }
+        assert_eq!(
+            global_shortcut(PhysicalKey::Code(KeyCode::F1), app.modifiers),
+            Some(GlobalShortcut::ToggleSettings),
+        );
     }
 
     #[test]

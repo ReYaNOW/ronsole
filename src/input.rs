@@ -15,6 +15,7 @@ pub(crate) struct TerminalInteraction {
     mouse_y: f32,
     pressed_mouse_buttons: u8,
     pointer_capture: PointerCapture,
+    scroll_sensitivity: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,6 +59,7 @@ impl Default for TerminalInteraction {
             mouse_y: 0.0,
             pressed_mouse_buttons: 0,
             pointer_capture: PointerCapture::None,
+            scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
         }
     }
 }
@@ -65,6 +67,10 @@ impl Default for TerminalInteraction {
 impl TerminalInteraction {
     pub(crate) fn set_modifiers(&mut self, modifiers: ModifiersState) {
         self.modifiers = modifiers;
+    }
+
+    pub(crate) fn set_scroll_sensitivity(&mut self, sensitivity: f32) {
+        self.scroll_sensitivity = crate::config::normalize_scroll_sensitivity(sensitivity);
     }
 
     #[cfg(test)]
@@ -511,10 +517,7 @@ impl TerminalInteraction {
 
     pub(crate) fn mouse_wheel(&mut self, delta: MouseScrollDelta, terminal: &mut Terminal) -> bool {
         if !self.layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
-        let dy = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y * 40.0,
-            MouseScrollDelta::PixelDelta(position) => position.y as f32,
-        };
+        let dy = terminal_wheel_delta(delta, self.layout.char_h, self.scroll_sensitivity);
         let grid = crate::platform::lock_recover(&terminal.grid);
         let is_alt = grid.is_alt;
         let tracking_mode = grid.mouse_tracking_mode;
@@ -634,9 +637,18 @@ fn search_key_falls_through_to_terminal(
     let alt = modifiers.alt_key();
     let super_key = modifiers.super_key();
     match physical_key {
-        PhysicalKey::Code(KeyCode::F1) => !ctrl && !shift && !alt && !super_key,
+        PhysicalKey::Code(KeyCode::F1) => ctrl || shift || alt || super_key,
         PhysicalKey::Code(KeyCode::KeyT) => ctrl && !shift && !alt && !super_key,
         _ => false,
+    }
+}
+
+#[inline]
+fn terminal_wheel_delta(delta: MouseScrollDelta, char_h: f32, sensitivity: f32) -> f32 {
+    let sensitivity = crate::config::normalize_scroll_sensitivity(sensitivity);
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y * 4.0 * char_h.max(0.0) * sensitivity,
+        MouseScrollDelta::PixelDelta(position) => position.y as f32 * sensitivity,
     }
 }
 
@@ -974,38 +986,36 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn plain_f1_reaches_pty_and_ctrl_t_remains_control_character() {
+    fn terminal_encoder_keeps_plain_f1_and_ctrl_t_sequences() {
         assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F1), None, false, false, false, false, false), Some(b"\x1bOP".to_vec()));
         assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyT), Some("t"), false, true, false, false, false), Some(vec![0x14]));
     }
 
     #[test]
-    fn focused_search_falls_through_only_for_plain_f1_and_ctrl_t_terminal_contract() {
+    fn focused_search_falls_through_for_modified_f1_and_ctrl_t_terminal_contract() {
         let mut search = TerminalSearchState::default();
         search.open();
         assert!(search_owns_keyboard(&search));
 
         let none = ModifiersState::empty();
         let ctrl = ModifiersState::CONTROL;
+        let alt = ModifiersState::ALT;
+        let shift = ModifiersState::SHIFT;
+        let super_key = ModifiersState::SUPER;
         let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
-        assert!(search_key_falls_through_to_terminal(
+        assert!(!search_key_falls_through_to_terminal(
             &search,
             PhysicalKey::Code(KeyCode::F1),
             none,
         ));
-        assert_eq!(
-            terminal_key_sequence(
+        for modifiers in [ctrl, alt, shift, super_key, ctrl_shift] {
+            assert!(search_key_falls_through_to_terminal(
+                &search,
                 PhysicalKey::Code(KeyCode::F1),
-                None,
-                false,
-                false,
-                false,
-                false,
-                false,
-            ),
-            Some(b"\x1bOP".to_vec()),
-        );
+                modifiers,
+            ));
+        }
 
         assert!(search_key_falls_through_to_terminal(
             &search,
@@ -1045,6 +1055,18 @@ mod tests {
             PhysicalKey::Code(KeyCode::KeyT),
             ctrl_shift,
         ));
+    }
+
+    #[test]
+    fn terminal_wheel_delta_matches_donor_line_height_and_sensitivity() {
+        let line = MouseScrollDelta::LineDelta(0.0, 1.0);
+        assert_eq!(terminal_wheel_delta(line, 24.0, 1.0), 96.0);
+        assert_eq!(terminal_wheel_delta(line, 24.0, 0.5), 48.0);
+        assert_eq!(terminal_wheel_delta(line, 24.0, 2.0), 192.0);
+
+        let pixel = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -12.5));
+        assert_eq!(terminal_wheel_delta(pixel, 24.0, 1.0), -12.5);
+        assert_eq!(terminal_wheel_delta(pixel, 24.0, 2.0), -25.0);
     }
 
     #[test]

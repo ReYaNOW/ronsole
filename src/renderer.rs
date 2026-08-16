@@ -1,6 +1,7 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
-    TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout, terminal_scrollbar_drag_target,
+    SettingsHit, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
+    terminal_scrollbar_drag_target,
 };
 use glow::HasContext;
 use rustc_hash::FxHashMap;
@@ -17,10 +18,54 @@ const ATLAS_SIZE_H: i32 = 1024;
 const PRIMARY_ATLAS_INTERNAL_FORMAT: u32 = glow::R8;
 const PRIMARY_ATLAS_UPLOAD_FORMAT: u32 = glow::RED;
 const COLOR_ATLAS_MODE: f32 = 10.0;
+const SOLID_RECT_MODE: f32 = 2.0;
 const GLYPH_PRESENTATION_AUTO: u8 = 0;
 const GLYPH_PRESENTATION_TEXT: u8 = 1;
 const GLYPH_PRESENTATION_EMOJI: u8 = 2;
 const DEFAULT_ACCENT_COLOR: [f32; 4] = [114.0 / 255.0, 89.0 / 255.0, 175.0 / 255.0, 1.0];
+const UI_FONT_LOGICAL_SIZE: f32 = 18.0;
+const LEGACY_TERMINAL_FONT_LOGICAL_SIZE: f32 = 18.0;
+const LEGACY_TERMINAL_LINE_HEIGHT: f32 = 26.0;
+const LEGACY_TERMINAL_BASELINE_OFFSET: f32 = 19.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalFontMetrics {
+    raster_size: f32,
+    line_height: f32,
+    baseline_offset: f32,
+}
+
+fn terminal_font_metrics(logical_size: f32, scale_factor: f32) -> TerminalFontMetrics {
+    let logical_size = if logical_size.is_finite() && logical_size > 0.0 {
+        logical_size
+    } else {
+        crate::config::DEFAULT_TERMINAL_FONT_SIZE
+    };
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let ratio = logical_size / LEGACY_TERMINAL_FONT_LOGICAL_SIZE;
+    TerminalFontMetrics {
+        raster_size: logical_size * scale_factor,
+        line_height: (LEGACY_TERMINAL_LINE_HEIGHT * ratio * scale_factor)
+            .round()
+            .max(1.0),
+        baseline_offset: (LEGACY_TERMINAL_BASELINE_OFFSET * ratio * scale_factor)
+            .round()
+            .max(1.0),
+    }
+}
+
+fn ui_font_size(scale_factor: f32) -> f32 {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    UI_FONT_LOGICAL_SIZE * scale_factor
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalPalette {
@@ -91,16 +136,7 @@ fn terminal_accent_from_kde_content(content: Option<&str>) -> [f32; 4] {
 }
 
 fn load_terminal_palette() -> TerminalPalette {
-    let config_root = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(std::path::PathBuf::from)
-                .map(|home| home.join(".config"))
-        });
-    let kde_content = config_root
+    let kde_content = crate::platform::config_home_dir()
         .and_then(|root| std::fs::read_to_string(root.join("kdeglobals")).ok());
     TerminalPalette::new(terminal_accent_from_kde_content(kde_content.as_deref()))
 }
@@ -237,7 +273,9 @@ pub struct Renderer {
     color_atlas_y: i32,
     color_row_h: i32,
     ascii_advances: [f32; 128],
-    font_size: f32,
+    terminal_font_logical_size: f32,
+    terminal_font_size: f32,
+    ui_font_size: f32,
     scale_factor: f32,
     width: f32,
     height: f32,
@@ -259,8 +297,15 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(gl: glow::Context, scale_factor: f32) -> Result<Self, String> {
+    pub fn new(
+        gl: glow::Context,
+        scale_factor: f32,
+        terminal_font_logical_size: f32,
+    ) -> Result<Self, String> {
         let scale_factor = scale_factor.max(0.1);
+        let terminal_font_logical_size =
+            crate::config::normalize_terminal_font_size(terminal_font_logical_size);
+        let terminal_metrics = terminal_font_metrics(terminal_font_logical_size, scale_factor);
         let diagnostics = unsafe {
             GraphicsDiagnostics {
                 vendor: gl.get_parameter_string(glow::VENDOR),
@@ -358,12 +403,14 @@ impl Renderer {
             color_atlas_y: 2,
             color_row_h: 0,
             ascii_advances: [0.0; 128],
-            font_size: 18.0 * scale_factor,
+            terminal_font_logical_size,
+            terminal_font_size: terminal_metrics.raster_size,
+            ui_font_size: ui_font_size(scale_factor),
             scale_factor,
             width: 1.0,
             height: 1.0,
-            line_height: (26.0 * scale_factor).round(),
-            baseline_offset: (19.0 * scale_factor).round(),
+            line_height: terminal_metrics.line_height,
+            baseline_offset: terminal_metrics.baseline_offset,
             scratch_buffer: String::with_capacity(128),
             search_icons: [None; 4],
             terminal_tab_display_titles: Vec::with_capacity(8),
@@ -411,15 +458,34 @@ impl Renderer {
         }
         self.flush();
         self.scale_factor = scale_factor;
-        self.font_size = 18.0 * scale_factor;
-        self.line_height = (26.0 * scale_factor).round();
-        self.baseline_offset = (19.0 * scale_factor).round();
+        let terminal_metrics = terminal_font_metrics(self.terminal_font_logical_size, scale_factor);
+        self.terminal_font_size = terminal_metrics.raster_size;
+        self.ui_font_size = ui_font_size(scale_factor);
+        self.line_height = terminal_metrics.line_height;
+        self.baseline_offset = terminal_metrics.baseline_offset;
         self.reset_atlases();
         self.prewarm_ascii();
         self.prewarm_search_icons();
         self.terminal_tab_x_anim.clear();
         self.terminal_tab_hitboxes.clear();
         self.terminal_tab_strip_layout = TerminalTabStripLayout::default();
+    }
+
+    pub(crate) fn set_terminal_font_size(&mut self, logical_size: f32) -> bool {
+        let logical_size = crate::config::normalize_terminal_font_size(logical_size);
+        if (self.terminal_font_logical_size - logical_size).abs() < 0.001 {
+            return false;
+        }
+        self.flush();
+        self.terminal_font_logical_size = logical_size;
+        let terminal_metrics = terminal_font_metrics(logical_size, self.scale_factor);
+        self.terminal_font_size = terminal_metrics.raster_size;
+        self.line_height = terminal_metrics.line_height;
+        self.baseline_offset = terminal_metrics.baseline_offset;
+        self.reset_atlases();
+        self.prewarm_ascii();
+        self.prewarm_search_icons();
+        true
     }
 
     fn prewarm_ascii(&mut self) {
@@ -494,7 +560,7 @@ impl Renderer {
             &self.ui_fonts,
             &mut self.scale_context,
             c,
-            self.font_size,
+            self.ui_font_size,
             prefer_color,
         );
         let glyph = self.finish_rasterized_glyph(c, rasterized, prefer_color, true)?;
@@ -517,7 +583,7 @@ impl Renderer {
             &self.fonts,
             &mut self.scale_context,
             c,
-            self.font_size,
+            self.terminal_font_size,
             prefer_color,
         );
         let glyph = if let Some(glyph) =
@@ -621,6 +687,22 @@ impl Renderer {
             glyph.vh,
             color,
             glyph.mode,
+            [0.0, 0.0, 0.0],
+        );
+    }
+
+    fn push_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
+        self.push_quad(
+            x,
+            y,
+            width,
+            height,
+            -1.0,
+            -1.0,
+            0.0,
+            0.0,
+            color,
+            SOLID_RECT_MODE,
             [0.0, 0.0, 0.0],
         );
     }
@@ -1393,6 +1475,26 @@ mod tests {
     }
 
     #[test]
+    fn solid_rect_quad_mode_is_opaque_not_rounded_sdf() {
+        let vertices = quad_vertices(
+            1.2,
+            2.6,
+            10.1,
+            20.2,
+            -1.0,
+            -1.0,
+            0.0,
+            0.0,
+            [1.0; 4],
+            SOLID_RECT_MODE,
+            [0.0; 3],
+        );
+        assert!(vertices.iter().all(|vertex| vertex.mode == SOLID_RECT_MODE));
+        assert!(vertices.iter().all(|vertex| vertex.sdf_params == [0.0; 3]));
+        assert_ne!(SOLID_RECT_MODE, 3.0);
+    }
+
+    #[test]
     fn glyph_quad_keeps_shared_baseline_rounding() {
         let glyph = GlyphInfo {
             u: 0.0,
@@ -1440,6 +1542,47 @@ mod tests {
         assert_eq!(PRIMARY_ATLAS_INTERNAL_FORMAT, glow::R8);
         assert_eq!(PRIMARY_ATLAS_UPLOAD_FORMAT, glow::RED);
         assert!(MAX_VERTICES >= 32_768);
+    }
+
+    #[test]
+    fn terminal_font_metrics_preserve_legacy_proportions_and_scale() {
+        assert_eq!(
+            terminal_font_metrics(18.0, 1.0),
+            TerminalFontMetrics {
+                raster_size: 18.0,
+                line_height: 26.0,
+                baseline_offset: 19.0,
+            }
+        );
+        assert_eq!(
+            terminal_font_metrics(18.0, 1.5),
+            TerminalFontMetrics {
+                raster_size: 27.0,
+                line_height: 39.0,
+                baseline_offset: 29.0,
+            }
+        );
+        let smaller = terminal_font_metrics(16.0, 1.0);
+        assert!(smaller.raster_size < 18.0);
+        assert!(smaller.line_height < 26.0);
+        assert!(smaller.baseline_offset < 19.0);
+        for scale in [1.25, 1.3333334, 1.5] {
+            let metrics = terminal_font_metrics(16.0, scale);
+            assert!(metrics.raster_size.is_finite() && metrics.raster_size > 0.0);
+            assert!(metrics.line_height.is_finite() && metrics.line_height >= 1.0);
+            assert!(metrics.baseline_offset.is_finite() && metrics.baseline_offset >= 1.0);
+            assert_eq!(metrics.line_height.fract(), 0.0);
+            assert_eq!(metrics.baseline_offset.fract(), 0.0);
+        }
+    }
+
+    #[test]
+    fn ui_font_raster_size_is_independent_of_terminal_font_setting() {
+        let scale = 1.5;
+        let ui = ui_font_size(scale);
+        assert_eq!(ui, 27.0);
+        assert_ne!(terminal_font_metrics(16.0, scale).raster_size, ui);
+        assert_eq!(ui_font_size(scale), ui);
     }
 
     #[test]

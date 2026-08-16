@@ -2,6 +2,7 @@
 compile_error!("Ronsole supports Linux/Wayland only");
 
 mod app;
+mod config;
 mod platform;
 mod renderer;
 mod runtime;
@@ -126,7 +127,7 @@ fn main() {
     };
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = app::App::new();
+    let mut app = app::App::load();
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("Ronsole: event loop failed: {error}");
     }
