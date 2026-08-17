@@ -7,6 +7,7 @@ use crate::input_types::{
     CursorKind, KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton,
     PointerPosition, ScrollDelta,
 };
+use crate::launch::TerminalLaunchSpec;
 use crate::platform::{KdeActivationWorker, kde_session_active};
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
@@ -25,7 +26,7 @@ mod automation;
 mod direct_wayland;
 
 pub(crate) use automation::{
-    AutomationOptions, automation_options_from_env, write_automation_startup_failure,
+    AutomationOptions, automation_options_from_args, write_automation_startup_failure,
 };
 
 const TERMINAL_CLEANUP_PENDING_CAPACITY: usize = 16;
@@ -60,12 +61,17 @@ enum GlobalShortcut {
     Search,
 }
 
-#[derive(PartialEq, Eq)]
-enum ExternalLaunchAction {
-    OpenDefaultTab,
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalLaunchActivation {
     WaylandXdgActivation { activation_token: String },
     KdeForceActivate,
     WaylandBestEffort,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExternalLaunchPlan {
+    terminal_launch: Option<TerminalLaunchSpec>,
+    activation: Option<ExternalLaunchActivation>,
 }
 
 #[inline(always)]
@@ -279,19 +285,27 @@ fn cursor_icon_change(current: CursorKind, desired: CursorKind) -> Option<Cursor
 }
 
 #[inline]
-fn external_launch_action(
+fn external_launch_plan(
     focused: bool,
     kde_session: bool,
     request: crate::platform::single_instance::ExternalLaunchRequest,
-) -> ExternalLaunchAction {
-    if focused {
-        ExternalLaunchAction::OpenDefaultTab
+) -> ExternalLaunchPlan {
+    let explicit_terminal = request.launch.working_directory.is_some()
+        || !request.launch.command.is_empty()
+        || request.launch.hold;
+    let terminal_launch = (focused || explicit_terminal).then_some(request.launch);
+    let activation = if focused {
+        None
     } else if let Some(activation_token) = request.activation_token {
-        ExternalLaunchAction::WaylandXdgActivation { activation_token }
+        Some(ExternalLaunchActivation::WaylandXdgActivation { activation_token })
     } else if kde_session {
-        ExternalLaunchAction::KdeForceActivate
+        Some(ExternalLaunchActivation::KdeForceActivate)
     } else {
-        ExternalLaunchAction::WaylandBestEffort
+        Some(ExternalLaunchActivation::WaylandBestEffort)
+    };
+    ExternalLaunchPlan {
+        terminal_launch,
+        activation,
     }
 }
 
@@ -603,10 +617,14 @@ impl App {
     }
 
     fn add_terminal(&mut self) -> Option<usize> {
+        self.add_terminal_with_launch(TerminalLaunchSpec::default())
+    }
+
+    fn add_terminal_with_launch(&mut self, launch: TerminalLaunchSpec) -> Option<usize> {
         let wake = self.runtime.as_ref()?.wake_handle();
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
-        let terminal = Terminal::spawn(Some(wake), display_number);
+        let terminal = Terminal::spawn(Some(wake), display_number, launch);
         let index = self.terminals.len();
         self.terminals.push(terminal);
         if self.terminals.len() == 1 {
@@ -629,22 +647,24 @@ impl App {
         }
         let kde_session =
             !self.focused && request.activation_token.is_none() && kde_session_active();
-        match external_launch_action(self.focused, kde_session, request) {
-            ExternalLaunchAction::OpenDefaultTab => {
-                let _ = self.add_terminal();
-            }
-            ExternalLaunchAction::WaylandXdgActivation { activation_token } => {
+        let plan = external_launch_plan(self.focused, kde_session, request);
+        if let Some(launch) = plan.terminal_launch {
+            let _ = self.add_terminal_with_launch(launch);
+        }
+        match plan.activation {
+            None => {}
+            Some(ExternalLaunchActivation::WaylandXdgActivation { activation_token }) => {
                 if let Some(runtime) = self.runtime.as_mut() {
                     runtime.activate_existing_window(Some(activation_token));
                 }
             }
-            ExternalLaunchAction::KdeForceActivate => {
+            Some(ExternalLaunchActivation::KdeForceActivate) => {
                 let worker = self
                     .kde_activation_worker
                     .get_or_insert_with(KdeActivationWorker::new);
                 worker.try_activate(std::process::id());
             }
-            ExternalLaunchAction::WaylandBestEffort => {
+            Some(ExternalLaunchActivation::WaylandBestEffort) => {
                 if let Some(runtime) = self.runtime.as_mut() {
                     runtime.activate_existing_window(None);
                 }
@@ -1224,6 +1244,12 @@ impl App {
         let mut index = self.terminals.len();
         while index > 0 {
             index -= 1;
+            if let Some(process) = self.terminals[index].take_finished_held_process_for_cleanup() {
+                if let Err(process) = self.try_schedule_terminal_cleanup(process) {
+                    self.terminals[index].restore_process_after_cleanup_backpressure(process);
+                }
+                continue;
+            }
             if self.terminals[index].is_closed() && self.close_terminal_tab_at(index) {
                 return true;
             }
@@ -1233,7 +1259,13 @@ impl App {
 }
 
 impl App {
-    fn on_runtime_ready(&mut self, runtime: WindowRuntime, width: u32, height: u32) {
+    fn on_runtime_ready(
+        &mut self,
+        runtime: WindowRuntime,
+        width: u32,
+        height: u32,
+        initial_launch: TerminalLaunchSpec,
+    ) {
         self.zero_sized = width == 0 || height == 0;
         if std::env::var_os("RONSOLE_GL_DIAGNOSTICS")
             .is_some_and(|value| value != std::ffi::OsStr::new("0"))
@@ -1242,7 +1274,7 @@ impl App {
         }
         self.runtime = Some(runtime);
         self.last_frame = Instant::now();
-        let _ = self.add_terminal();
+        let _ = self.add_terminal_with_launch(initial_launch);
         self.flush_pending_external_launches();
         self.mark_dirty();
     }
@@ -1917,9 +1949,35 @@ mod tests {
         let renderer = include_str!("renderer/terminal_ui.rs");
 
         assert_eq!(production.matches("Terminal::spawn(").count(), 1);
-        assert_eq!(production.matches("self.add_terminal()").count(), 4);
+        assert_eq!(production.matches("fn add_terminal_with_launch").count(), 1);
+        assert!(
+            production.contains("self.add_terminal_with_launch(TerminalLaunchSpec::default())")
+        );
+        assert_eq!(production.matches("self.add_terminal()").count(), 2);
+        let startup = production
+            .split("    fn on_runtime_ready")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn on_close_requested").next())
+            .expect("runtime startup path must remain present");
+        assert_eq!(startup.matches("add_terminal_with_launch(").count(), 1);
+        assert!(startup.contains("self.add_terminal_with_launch(initial_launch)"));
+        assert!(!startup.contains("self.add_terminal()"));
         assert!(production.contains("GlobalShortcut::NewTab"));
         assert!(production.contains("TerminalTabHit::Add"));
+
+        let external = production
+            .split("    fn handle_external_launch")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn flush_pending_external_launches").next())
+            .expect("external terminal routing must remain present");
+        assert_eq!(external.matches("add_terminal_with_launch(").count(), 1);
+        let add_terminal = external
+            .find("self.add_terminal_with_launch(launch)")
+            .expect("external terminal requests must use the shared factory");
+        let activation = external
+            .find("match plan.activation")
+            .expect("external activation routing must remain separate");
+        assert!(add_terminal < activation);
 
         let close = production
             .split("    fn close_terminal_tab_at")
@@ -1977,7 +2035,7 @@ mod tests {
             std::process::id()
         ));
         let mut app = App::new();
-        let terminal = Terminal::spawn(None, 1);
+        let terminal = Terminal::spawn(None, 1, TerminalLaunchSpec::default());
         terminal
             .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
             .unwrap();
@@ -2005,6 +2063,100 @@ mod tests {
         assert_eq!(app.terminals.len(), 1);
         let _ = std::fs::remove_file(&marker);
         println!("App non-final close enqueue duration={elapsed:?}");
+    }
+
+    #[test]
+    fn direct_command_hold_keeps_tab_and_releases_finished_process_to_cleanup_worker() {
+        use std::ffi::OsString;
+        use std::time::Duration;
+
+        let mut app = App::new();
+        let held = Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec {
+                working_directory: None,
+                command: vec![OsString::from("/bin/true")],
+                hold: true,
+            },
+        );
+        app.terminals.push(held);
+        app.active_terminal = 0;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.terminals[0].has_process() {
+            assert!(!app.remove_closed_terminals());
+            assert!(
+                Instant::now() < deadline,
+                "held direct command did not release process ownership"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(app.terminals.len(), 1);
+        assert!(!app.terminals[0].is_closed());
+        assert_eq!(app.loop_control(), AppLoopControl::Wait);
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn direct_command_without_hold_remains_eligible_for_auto_close() {
+        use std::ffi::OsString;
+        use std::time::Duration;
+
+        let mut app = App::new();
+        app.terminals.push(Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec {
+                working_directory: None,
+                command: vec![OsString::from("/bin/true")],
+                hold: false,
+            },
+        ));
+        app.active_terminal = 0;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if app.remove_closed_terminals() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "non-held direct command did not become eligible for auto close"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(app.terminals.is_empty());
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn direct_command_spawn_failure_stays_as_ready_error_terminal() {
+        let terminal = Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec {
+                working_directory: Some("/tmp".into()),
+                command: vec!["/definitely/missing/ronsole-test-command".into()],
+                hold: false,
+            },
+        );
+
+        assert!(!terminal.has_process());
+        assert!(terminal.presentation_ready());
+        let mut title = String::new();
+        terminal.write_display_title(&mut title);
+        assert_eq!(title, "terminal error (1)");
+
+        let source = include_str!("terminal.rs");
+        let spawn = source
+            .split("    pub(crate) fn spawn(")
+            .nth(1)
+            .and_then(|tail| tail.split("    pub fn write_display_title").next())
+            .expect("terminal spawn path must remain present");
+        assert!(spawn.contains("write_terminal_spawn_error(&mut grid, &error)"));
     }
 
     #[test]
@@ -2111,71 +2263,210 @@ mod tests {
         assert!(app.dirty);
     }
 
-    #[test]
-    fn focused_external_launch_with_token_opens_tab_without_using_token() {
-        assert!(matches!(
-            external_launch_action(
-                true,
-                true,
-                crate::platform::single_instance::ExternalLaunchRequest {
-                    activation_token: Some("one-shot-token".to_owned()),
-                },
-            ),
-            ExternalLaunchAction::OpenDefaultTab
-        ));
+    fn external_request(
+        launch: TerminalLaunchSpec,
+        activation_token: Option<&str>,
+    ) -> crate::platform::single_instance::ExternalLaunchRequest {
+        crate::platform::single_instance::ExternalLaunchRequest {
+            activation_token: activation_token.map(str::to_owned),
+            launch,
+        }
     }
 
     #[test]
-    fn focused_external_launch_without_token_opens_tab() {
-        assert!(matches!(
-            external_launch_action(
+    fn focused_bare_launch_with_token_opens_default_tab_without_activation() {
+        assert_eq!(
+            external_launch_plan(
                 true,
                 true,
-                crate::platform::single_instance::ExternalLaunchRequest::default(),
+                external_request(TerminalLaunchSpec::default(), Some("one-shot-token")),
             ),
-            ExternalLaunchAction::OpenDefaultTab
-        ));
-    }
-
-    #[test]
-    fn unfocused_external_launch_with_supplied_token_uses_only_xdg_activation() {
-        let action = external_launch_action(
-            false,
-            true,
-            crate::platform::single_instance::ExternalLaunchRequest {
-                activation_token: Some("one-shot-token".to_owned()),
-            },
+            ExternalLaunchPlan {
+                terminal_launch: Some(TerminalLaunchSpec::default()),
+                activation: None,
+            }
         );
-        assert!(matches!(
-            action,
-            ExternalLaunchAction::WaylandXdgActivation {
-                activation_token
-            } if activation_token == "one-shot-token"
-        ));
     }
 
     #[test]
-    fn unfocused_kde_launch_without_token_uses_force_activation_worker() {
-        assert!(matches!(
-            external_launch_action(
+    fn focused_bare_launch_without_token_opens_default_tab_without_activation() {
+        assert_eq!(
+            external_launch_plan(
+                true,
+                true,
+                crate::platform::single_instance::ExternalLaunchRequest::default(),
+            ),
+            ExternalLaunchPlan {
+                terminal_launch: Some(TerminalLaunchSpec::default()),
+                activation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn unfocused_bare_launch_with_supplied_token_uses_only_xdg_activation() {
+        assert_eq!(
+            external_launch_plan(
+                false,
+                true,
+                external_request(TerminalLaunchSpec::default(), Some("one-shot-token")),
+            ),
+            ExternalLaunchPlan {
+                terminal_launch: None,
+                activation: Some(ExternalLaunchActivation::WaylandXdgActivation {
+                    activation_token: "one-shot-token".to_owned(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn unfocused_bare_kde_launch_without_token_uses_force_activation_worker() {
+        assert_eq!(
+            external_launch_plan(
                 false,
                 true,
                 crate::platform::single_instance::ExternalLaunchRequest::default(),
             ),
-            ExternalLaunchAction::KdeForceActivate
-        ));
+            ExternalLaunchPlan {
+                terminal_launch: None,
+                activation: Some(ExternalLaunchActivation::KdeForceActivate),
+            }
+        );
     }
 
     #[test]
-    fn unfocused_non_kde_launch_without_token_keeps_generic_wayland_best_effort() {
-        assert!(matches!(
-            external_launch_action(
+    fn unfocused_bare_non_kde_launch_without_token_keeps_generic_wayland_best_effort() {
+        assert_eq!(
+            external_launch_plan(
                 false,
                 false,
                 crate::platform::single_instance::ExternalLaunchRequest::default(),
             ),
-            ExternalLaunchAction::WaylandBestEffort
-        ));
+            ExternalLaunchPlan {
+                terminal_launch: None,
+                activation: Some(ExternalLaunchActivation::WaylandBestEffort),
+            }
+        );
+    }
+
+    #[test]
+    fn focused_custom_workdir_launch_opens_requested_tab_without_activation() {
+        let launch = TerminalLaunchSpec {
+            working_directory: Some("/tmp/custom-cwd".into()),
+            command: Vec::new(),
+            hold: false,
+        };
+        assert_eq!(
+            external_launch_plan(true, true, external_request(launch.clone(), None)),
+            ExternalLaunchPlan {
+                terminal_launch: Some(launch),
+                activation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn focused_custom_command_launch_opens_requested_tab_without_activation() {
+        let launch = TerminalLaunchSpec {
+            working_directory: None,
+            command: vec!["htop".into(), "-d".into(), "10".into()],
+            hold: false,
+        };
+        assert_eq!(
+            external_launch_plan(true, false, external_request(launch.clone(), None)),
+            ExternalLaunchPlan {
+                terminal_launch: Some(launch),
+                activation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn focused_hold_only_launch_opens_requested_tab_without_activation() {
+        let launch = TerminalLaunchSpec {
+            working_directory: None,
+            command: Vec::new(),
+            hold: true,
+        };
+        assert_eq!(
+            external_launch_plan(true, false, external_request(launch.clone(), None)),
+            ExternalLaunchPlan {
+                terminal_launch: Some(launch),
+                activation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn unfocused_custom_command_with_token_opens_requested_tab_and_uses_xdg_activation() {
+        let launch = TerminalLaunchSpec {
+            working_directory: None,
+            command: vec!["htop".into()],
+            hold: false,
+        };
+        assert_eq!(
+            external_launch_plan(
+                false,
+                true,
+                external_request(launch.clone(), Some("one-shot-token")),
+            ),
+            ExternalLaunchPlan {
+                terminal_launch: Some(launch),
+                activation: Some(ExternalLaunchActivation::WaylandXdgActivation {
+                    activation_token: "one-shot-token".to_owned(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn unfocused_custom_workdir_on_kde_opens_requested_tab_and_uses_kde_activation() {
+        let launch = TerminalLaunchSpec {
+            working_directory: Some("/tmp/custom-cwd".into()),
+            command: Vec::new(),
+            hold: false,
+        };
+        assert_eq!(
+            external_launch_plan(false, true, external_request(launch.clone(), None)),
+            ExternalLaunchPlan {
+                terminal_launch: Some(launch),
+                activation: Some(ExternalLaunchActivation::KdeForceActivate),
+            }
+        );
+    }
+
+    #[test]
+    fn unfocused_custom_hold_off_kde_opens_requested_tab_and_uses_generic_activation() {
+        let launch = TerminalLaunchSpec {
+            working_directory: None,
+            command: Vec::new(),
+            hold: true,
+        };
+        assert_eq!(
+            external_launch_plan(false, false, external_request(launch.clone(), None)),
+            ExternalLaunchPlan {
+                terminal_launch: Some(launch),
+                activation: Some(ExternalLaunchActivation::WaylandBestEffort),
+            }
+        );
+    }
+
+    #[test]
+    fn pending_external_launch_before_runtime_ready_preserves_full_request() {
+        let request = external_request(
+            TerminalLaunchSpec {
+                working_directory: Some("/tmp/pending-cwd".into()),
+                command: vec!["program".into(), "arg one".into(), "--child-option".into()],
+                hold: true,
+            },
+            Some("pending-token"),
+        );
+        let mut app = App::new();
+        app.handle_external_launch(request.clone());
+
+        assert_eq!(app.pending_external_launches.len(), 1);
+        assert_eq!(app.pending_external_launches.front(), Some(&request));
     }
 
     #[test]

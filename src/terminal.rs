@@ -1,3 +1,4 @@
+use crate::launch::TerminalLaunchSpec;
 use std::io;
 use std::sync::{Arc, Mutex};
 use vte::{Params, Parser, Perform};
@@ -1443,6 +1444,7 @@ mod tests {
         let mut terminal = Terminal {
             grid: grid.clone(),
             process: None,
+            hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
@@ -2907,7 +2909,7 @@ mod tests {
     fn real_pty_shell_emits_output_and_observes_resize() {
         use std::time::{Duration, Instant};
 
-        let mut terminal = Terminal::spawn(None, 1);
+        let mut terminal = Terminal::spawn(None, 1, TerminalLaunchSpec::default());
         terminal.resize_pty(120, 40);
         terminal
             .write_input(b"printf '__RONS_PTY__\\n'; stty size; exit\r")
@@ -2938,6 +2940,81 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         terminal.shutdown();
+    }
+
+    #[test]
+    fn direct_pty_command_preserves_argv_cwd_relative_program_and_env() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ronsole-direct-command-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixture");
+        std::fs::write(
+            &fixture,
+            b"#!/bin/sh\nprintf '__DIRECT__\\r\\n'\nprintf '__ARG1__<%s>\\r\\n' \"$1\"\nprintf '__ARG2__<%s>\\r\\n' \"$2\"\nprintf '__ARG3__<%s>\\r\\n' \"$3\"\nprintf '__PWD__<%s>\\r\\n' \"$PWD\"\nprintf '__TERM__<%s>\\r\\n' \"$TERM\"\nprintf '__COLORTERM__<%s>\\r\\n' \"$COLORTERM\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let launch = TerminalLaunchSpec {
+            working_directory: Some(root.clone()),
+            command: vec![
+                OsString::from("./fixture"),
+                OsString::from("arg one"),
+                OsString::from("--something"),
+                OsString::from("русский/utf8"),
+            ],
+            hold: false,
+        };
+        let mut terminal = Terminal::spawn(None, 1, launch);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let text = loop {
+            let text = {
+                let grid = crate::platform::lock_recover(&terminal.grid);
+                grid.scrollback
+                    .iter()
+                    .chain(grid.lines.iter())
+                    .flat_map(|line| line.iter().map(|cell| cell.c))
+                    .collect::<String>()
+            };
+            if text.contains("__DIRECT__")
+                && text.contains("__ARG1__<arg one>")
+                && text.contains("__ARG2__<--something>")
+                && text.contains("__ARG3__<русский/utf8>")
+                && text.contains(&format!("__PWD__<{}>", root.display()))
+                && text.contains("__TERM__<xterm-256color>")
+                && text.contains("__COLORTERM__<truecolor>")
+            {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "direct PTY command output did not reach the terminal grid: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(text.contains("__DIRECT__"));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !terminal.is_closed() {
+            assert!(
+                Instant::now() < deadline,
+                "direct PTY command did not report exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        terminal.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3528,6 +3605,7 @@ pub(crate) enum TerminalPresentationIntent {
 pub struct Terminal {
     pub grid: Arc<Mutex<TermGrid>>,
     process: Option<crate::terminal_process::TerminalProcess>,
+    hold: bool,
     pub scroll_y: crate::scroll::ScrollState,
     pub(crate) presentation_intent: TerminalPresentationIntent,
     pub(crate) reveal_right_tail_when_presented: bool,
@@ -3557,6 +3635,7 @@ impl Terminal {
                 title_cache.clone(),
             ))),
             process: None,
+            hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
@@ -3567,7 +3646,9 @@ impl Terminal {
     pub(crate) fn spawn(
         wake: Option<crate::wake::WakeHandle>,
         display_number: u64,
+        launch: TerminalLaunchSpec,
     ) -> Self {
+        let hold = launch.hold;
         let title_cache = Arc::new(Mutex::new(
             crate::terminal_process::TerminalTitleState::new_numbered(
                 "terminal".to_string(),
@@ -3583,6 +3664,7 @@ impl Terminal {
             grid.clone(),
             title_cache.clone(),
             wake,
+            launch,
         ) {
             Ok(process) => Some(process),
             Err(error) => {
@@ -3597,6 +3679,7 @@ impl Terminal {
         Self {
             grid,
             process,
+            hold,
             scroll_y: crate::scroll::ScrollState::new(7.0),
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
@@ -3620,9 +3703,29 @@ impl Terminal {
     }
 
     pub fn is_closed(&mut self) -> bool {
-        self.process
+        !self.hold
+            && self
+                .process
+                .as_mut()
+                .is_some_and(|process| process.try_wait().unwrap_or(true))
+    }
+
+    pub(crate) fn take_finished_held_process_for_cleanup(
+        &mut self,
+    ) -> Option<crate::terminal_process::TerminalProcess> {
+        if !self.hold {
+            return None;
+        }
+        let finished = self
+            .process
             .as_mut()
-            .is_some_and(|process| process.try_wait().unwrap_or(true))
+            .is_some_and(|process| process.try_wait().unwrap_or(true));
+        if finished { self.process.take() } else { None }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_process(&self) -> bool {
+        self.process.is_some()
     }
 
     pub fn shutdown(&mut self) {

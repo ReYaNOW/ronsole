@@ -36,15 +36,8 @@ pub(crate) struct AutomationOptions {
     pub(crate) timeout: Duration,
 }
 
-pub(crate) fn automation_options_from_env() -> Result<Option<AutomationOptions>, String> {
-    if !std::env::args_os()
-        .skip(1)
-        .any(|arg| arg == OsStr::new("--pgo-train"))
-    {
-        return Ok(None);
-    }
-    let args = std::env::args_os().collect::<Vec<_>>();
-    parse_automation_args(&args)
+pub(crate) fn automation_options_from_args(args: &[OsString]) -> Result<AutomationOptions, String> {
+    parse_automation_args(args)?.ok_or_else(|| "--pgo-train is required".to_string())
 }
 
 pub(crate) fn write_automation_startup_failure(
@@ -1603,7 +1596,7 @@ mod tests {
 
     #[test]
     fn cli_parser_accepts_frozen_contract() {
-        let parsed = parse_automation_args(&args(&[
+        let parsed = automation_options_from_args(&args(&[
             "ronsole",
             "--pgo-train",
             "--pgo-workspace",
@@ -1613,7 +1606,6 @@ mod tests {
             "--pgo-timeout-seconds",
             "120",
         ]))
-        .unwrap()
         .unwrap();
         assert_eq!(parsed.workspace, Path::new("/tmp/workspace"));
         assert_eq!(parsed.report, Path::new("/tmp/report.json"));
@@ -1653,7 +1645,7 @@ mod tests {
                 "0",
             ]),
         ] {
-            assert!(parse_automation_args(&invalid).is_err());
+            assert!(automation_options_from_args(&invalid).is_err());
         }
     }
 

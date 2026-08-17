@@ -1,3 +1,4 @@
+use crate::launch::TerminalLaunchSpec;
 use crate::platform::{self, ProcessTree};
 use crate::terminal::TermGrid;
 use crate::wake::WakeHandle;
@@ -218,10 +219,10 @@ impl TerminalProcess {
         grid: Arc<Mutex<TermGrid>>,
         title_cache: TerminalTitleCache,
         wake: Option<WakeHandle>,
+        launch: TerminalLaunchSpec,
     ) -> io::Result<Self> {
-        let cwd = terminal_working_directory()?;
-        let shell = resolve_terminal_shell()?;
-        let fallback = terminal_fallback_title(Some(&cwd), &shell.title);
+        let (command, cwd, process_title, spawn_target) = terminal_launch_command(launch)?;
+        let fallback = terminal_fallback_title(Some(&cwd), &process_title);
         platform::lock_recover(&title_cache).set_fallback(fallback);
 
         let pty_system = NativePtySystem::default();
@@ -234,13 +235,8 @@ impl TerminalProcess {
             })
             .map_err(|error| io::Error::other(format!("failed to open PTY: {error}")))?;
 
-        let mut command = CommandBuilder::new(&shell.executable);
-        command.cwd(cwd.as_os_str());
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-
         let mut child = pair.slave.spawn_command(command).map_err(|error| {
-            io::Error::other(format!("failed to spawn terminal shell: {error}"))
+            io::Error::other(format!("failed to spawn {spawn_target}: {error}"))
         })?;
         drop(pair.slave);
 
@@ -273,7 +269,7 @@ impl TerminalProcess {
         let (title_stop_tx, title_worker) = match install_terminal_title_refresh(
             master_pty.clone(),
             title_cache,
-            shell.title,
+            process_title,
             cwd,
             wake.clone(),
         ) {
@@ -896,6 +892,34 @@ fn install_terminal_io_threads(
     Ok(())
 }
 
+fn terminal_launch_command(
+    launch: TerminalLaunchSpec,
+) -> io::Result<(CommandBuilder, PathBuf, String, &'static str)> {
+    let cwd = match launch.working_directory {
+        Some(cwd) => cwd,
+        None => terminal_working_directory()?,
+    };
+    let (mut command, process_title, spawn_target) = if launch.command.is_empty() {
+        let shell = resolve_terminal_shell()?;
+        (
+            CommandBuilder::new(&shell.executable),
+            shell.title,
+            "terminal shell",
+        )
+    } else {
+        let process_title = terminal_shell_title(Path::new(&launch.command[0]));
+        (
+            CommandBuilder::from_argv(launch.command),
+            process_title,
+            "terminal command",
+        )
+    };
+    command.cwd(cwd.as_os_str());
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    Ok((command, cwd, process_title, spawn_target))
+}
+
 pub(crate) fn resolve_terminal_shell() -> io::Result<TerminalShellSpec> {
     resolve_terminal_shell_with(std::env::var_os("SHELL"), platform::resolve_executable)
 }
@@ -1159,6 +1183,39 @@ mod tests {
         let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(production.contains("command.env(\"TERM\", \"xterm-256color\")"));
         assert!(production.contains("command.env(\"COLORTERM\", \"truecolor\")"));
+    }
+
+    #[test]
+    fn direct_launch_builder_preserves_raw_argv_cwd_title_and_terminal_env() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let cwd = PathBuf::from("/tmp/ronsole-direct-launch");
+        let raw_arg = OsString::from_vec(vec![b'r', b'a', b'w', 0xff, b'x']);
+        let argv = vec![
+            OsString::from("/usr/bin/example-tool"),
+            OsString::from("arg one"),
+            OsString::from("--something"),
+            OsString::from("русский/utf8"),
+            raw_arg,
+        ];
+        let launch = TerminalLaunchSpec {
+            working_directory: Some(cwd.clone()),
+            command: argv.clone(),
+            hold: true,
+        };
+
+        let (command, resolved_cwd, title, spawn_target) = terminal_launch_command(launch).unwrap();
+
+        assert_eq!(resolved_cwd, cwd);
+        assert_eq!(command.get_argv(), &argv);
+        assert_eq!(
+            command.get_cwd().map(|cwd| PathBuf::from(cwd.as_os_str())),
+            Some(cwd)
+        );
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(title, "example-tool");
+        assert_eq!(spawn_target, "terminal command");
     }
 
     #[test]

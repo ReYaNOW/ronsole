@@ -1,4 +1,5 @@
 use super::{App, AppLoopControl};
+use crate::launch::TerminalLaunchSpec;
 use crate::platform::single_instance::{ExternalLaunchRequest, PrimaryInstance};
 use crate::runtime::{WaylandRuntimeEvents, WindowRuntime, poll_timeout_millis};
 use crate::wayland_input::WaylandInputEvent;
@@ -11,8 +12,9 @@ impl App {
     pub(crate) fn run_direct_wayland(
         &mut self,
         primary_instance: &mut PrimaryInstance,
+        initial_launch: TerminalLaunchSpec,
     ) -> Result<(), String> {
-        let result = self.run_direct_wayland_inner(primary_instance);
+        let result = self.run_direct_wayland_inner(primary_instance, initial_launch);
         if let Err(error) = result.as_ref() {
             self.interrupt_automation(&format!("Wayland runtime failure: {error}"));
         }
@@ -23,6 +25,7 @@ impl App {
     fn run_direct_wayland_inner(
         &mut self,
         primary_instance: &mut PrimaryInstance,
+        initial_launch: TerminalLaunchSpec,
     ) -> Result<(), String> {
         let runtime = WindowRuntime::bootstrap_wayland(
             self.config.window_width,
@@ -32,7 +35,12 @@ impl App {
         )?;
         let metrics = runtime.wayland_metrics();
         let wake = runtime.wake_handle();
-        self.on_runtime_ready(runtime, metrics.physical_width, metrics.physical_height);
+        self.on_runtime_ready(
+            runtime,
+            metrics.physical_width,
+            metrics.physical_height,
+            initial_launch,
+        );
         self.on_resize_with_logical_size(
             metrics.physical_width,
             metrics.physical_height,
@@ -45,7 +53,7 @@ impl App {
         let (launch_tx, launch_rx) = sync_channel(EXTERNAL_LAUNCH_QUEUE_CAPACITY);
         primary_instance
             .start_listener(move |request| {
-                if launch_tx.send(request).is_err() {
+                if launch_tx.try_send(request).is_err() {
                     return false;
                 }
                 wake.wake();
@@ -216,13 +224,29 @@ mod tests {
             sender
                 .try_send(ExternalLaunchRequest {
                     activation_token: Some(format!("token-{index}")),
+                    launch: TerminalLaunchSpec {
+                        working_directory: Some(format!("/tmp/session-{index}").into()),
+                        command: vec![format!("command-{index}").into()],
+                        hold: index % 2 == 0,
+                    },
                 })
                 .unwrap();
         }
         for index in 0..EXTERNAL_LAUNCH_QUEUE_CAPACITY {
             let request = receiver.try_recv().unwrap();
-            let expected = format!("token-{index}");
-            assert_eq!(request.activation_token.as_deref(), Some(expected.as_str()));
+            let expected_token = format!("token-{index}");
+            let expected_command = std::ffi::OsString::from(format!("command-{index}"));
+            let expected_workdir = std::path::PathBuf::from(format!("/tmp/session-{index}"));
+            assert_eq!(
+                request.activation_token.as_deref(),
+                Some(expected_token.as_str())
+            );
+            assert_eq!(
+                request.launch.working_directory.as_deref(),
+                Some(expected_workdir.as_path())
+            );
+            assert_eq!(request.launch.command, vec![expected_command]);
+            assert_eq!(request.launch.hold, index % 2 == 0);
         }
     }
 

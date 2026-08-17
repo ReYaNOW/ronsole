@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod input;
 mod input_types;
+mod launch;
 mod platform;
 mod renderer;
 mod runtime;
@@ -119,17 +120,29 @@ fn tune_glibc_allocator() {
 }
 
 fn main() -> ExitCode {
-    let automation_options: Option<app::AutomationOptions> =
-        match app::automation_options_from_env() {
-            Ok(options) => options,
+    let args = env::args_os().collect::<Vec<_>>();
+    let (automation_options, initial_launch): (Option<app::AutomationOptions>, _) =
+        match launch::parse_startup_args_with_current_dir(&args, env::current_dir) {
+            Ok(launch::StartupMode::Normal(launch)) => (None, launch),
+            Ok(launch::StartupMode::PgoAutomation) => {
+                let options = match app::automation_options_from_args(&args) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        eprintln!("Ronsole: invalid PGO automation arguments: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                (Some(options), launch::TerminalLaunchSpec::default())
+            }
             Err(error) => {
-                eprintln!("Ronsole: invalid PGO automation arguments: {error}");
+                eprintln!("Ronsole: invalid arguments: {error}");
                 return ExitCode::FAILURE;
             }
         };
     let pgo_training = automation_options.is_some();
 
-    let mut primary_instance = match platform::single_instance::acquire_single_instance() {
+    let single_instance = platform::single_instance::acquire_single_instance(&initial_launch);
+    let mut primary_instance = match single_instance {
         Ok(platform::single_instance::SingleInstanceStatus::Primary(primary)) => primary,
         Ok(platform::single_instance::SingleInstanceStatus::Secondary) => {
             if let Some(options) = automation_options.as_ref() {
@@ -153,9 +166,8 @@ fn main() -> ExitCode {
                 {
                     eprintln!("Ronsole: failed to write PGO startup report: {report_error}");
                 }
-                return ExitCode::FAILURE;
             }
-            return ExitCode::SUCCESS;
+            return ExitCode::FAILURE;
         }
     };
 
@@ -173,7 +185,7 @@ fn main() -> ExitCode {
     } else {
         app::App::load()
     };
-    if let Err(error) = app.run_direct_wayland(&mut primary_instance) {
+    if let Err(error) = app.run_direct_wayland(&mut primary_instance, initial_launch) {
         eprintln!("Ronsole: Wayland runtime failed: {error}");
         if pgo_training {
             return ExitCode::FAILURE;
@@ -232,16 +244,40 @@ mod tests {
     }
 
     #[test]
+    fn startup_cli_classification_precedes_single_instance_and_wayland_startup() {
+        let source = include_str!("main.rs");
+        let capture = source
+            .find("let args = env::args_os().collect::<Vec<_>>()")
+            .expect("startup must capture raw argv once");
+        let classify = source
+            .find("launch::parse_startup_args_with_current_dir(&args, env::current_dir)")
+            .expect("startup mode classifier must remain present");
+        let pgo = source
+            .find("app::automation_options_from_args(&args)")
+            .expect("PGO parser must consume the captured argv");
+        let gate = source
+            .find("acquire_single_instance(&initial_launch)")
+            .expect("single-instance gate must remain present");
+        let direct_loop = source
+            .find("app.run_direct_wayland(&mut primary_instance, initial_launch)")
+            .expect("direct Wayland app loop must remain present");
+        assert!(capture < classify);
+        assert!(classify < pgo);
+        assert!(pgo < gate);
+        assert!(gate < direct_loop);
+    }
+
+    #[test]
     fn single_instance_gate_precedes_direct_wayland_app_loop() {
         let source = include_str!("main.rs");
         let gate = source
-            .find("acquire_single_instance()")
+            .find("acquire_single_instance(&initial_launch)")
             .expect("single-instance gate must remain present");
         let app = source
             .find("app::App::load()")
             .expect("app construction must remain present");
         let direct_loop = source
-            .find("app.run_direct_wayland(&mut primary_instance)")
+            .find("app.run_direct_wayland(&mut primary_instance, initial_launch)")
             .expect("direct Wayland app loop must remain present");
         assert!(gate < app);
         assert!(app < direct_loop);
