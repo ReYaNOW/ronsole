@@ -3,7 +3,7 @@ use crate::input_types::{
 };
 use crate::platform::Clipboard;
 use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target};
-use crate::search::{SearchRefreshCause, TerminalSearchState};
+use crate::search::{SearchRefreshCause, TerminalSearchHit, TerminalSearchState};
 use crate::terminal::{MouseTrackingMode, Terminal};
 use std::path::{Path, PathBuf};
 
@@ -595,39 +595,43 @@ impl TerminalInteraction {
             && state == KeyState::Pressed
             && button == PointerButton::Left
         {
-            if search.close.contains(x, y) {
-                self.pointer_capture = PointerCapture::SearchControl;
-                self.close_search(terminal);
-                return true;
-            }
-            if search.next.contains(x, y) {
-                self.pointer_capture = PointerCapture::SearchControl;
-                self.search.next();
-                self.jump_to_search_match(terminal);
-                return true;
-            }
-            if search.previous.contains(x, y) {
-                self.pointer_capture = PointerCapture::SearchControl;
-                self.search.previous();
-                self.jump_to_search_match(terminal);
-                return true;
-            }
-            if search.case_toggle.contains(x, y) {
-                self.pointer_capture = PointerCapture::SearchControl;
-                self.search.toggle_case();
-                self.refresh_search(terminal, SearchRefreshCause::User);
-                return true;
-            }
-            if search.input.contains(x, y) {
-                let local_x = x - search.input.x - 5.0 * self.layout.scale;
-                let cursor = search_cursor_from_x(&self.search.text, local_x, self.search.scroll_x);
-                begin_search_pointer_selection(&mut self.search, cursor);
-                self.pointer_capture = PointerCapture::SearchInput;
-                return true;
-            }
-            if search.outer.contains(x, y) {
-                self.pointer_capture = PointerCapture::SearchControl;
-                return true;
+            match search.hit_test(x, y) {
+                TerminalSearchHit::Close => {
+                    self.pointer_capture = PointerCapture::SearchControl;
+                    self.close_search(terminal);
+                    return true;
+                }
+                TerminalSearchHit::Next => {
+                    self.pointer_capture = PointerCapture::SearchControl;
+                    self.search.next();
+                    self.jump_to_search_match(terminal);
+                    return true;
+                }
+                TerminalSearchHit::Previous => {
+                    self.pointer_capture = PointerCapture::SearchControl;
+                    self.search.previous();
+                    self.jump_to_search_match(terminal);
+                    return true;
+                }
+                TerminalSearchHit::CaseToggle => {
+                    self.pointer_capture = PointerCapture::SearchControl;
+                    self.search.toggle_case();
+                    self.refresh_search(terminal, SearchRefreshCause::User);
+                    return true;
+                }
+                TerminalSearchHit::Input => {
+                    let local_x = x - search.input.x - 5.0 * self.layout.scale;
+                    let cursor =
+                        search_cursor_from_x(&self.search.text, local_x, self.search.scroll_x);
+                    begin_search_pointer_selection(&mut self.search, cursor);
+                    self.pointer_capture = PointerCapture::SearchInput;
+                    return true;
+                }
+                TerminalSearchHit::Chrome => {
+                    self.pointer_capture = PointerCapture::SearchControl;
+                    return true;
+                }
+                TerminalSearchHit::None => {}
             }
         }
 
@@ -931,7 +935,9 @@ fn terminal_mouse_cell_y(layout: TerminalUiLayout, y: f32) -> usize {
 #[inline]
 fn terminal_protocol_pointer_target(layout: TerminalUiLayout, x: f32, y: f32) -> bool {
     layout.body.contains(x, y)
-        && !layout.search.is_some_and(|search| search.outer.contains(x, y))
+        && !layout
+            .search
+            .is_some_and(|search| search.hit_test(x, y) != TerminalSearchHit::None)
         && !layout
             .scrollbar
             .is_some_and(|scrollbar| scrollbar.track.contains(x, y))

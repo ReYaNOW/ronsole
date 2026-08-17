@@ -2,7 +2,8 @@ use super::*;
 use crate::scroll::{ScrollbarThumb, scrollbar_drag_target, scrollbar_thumb};
 use crate::single_line_input::SingleLineInput;
 use crate::search::{
-    Rect, SearchRefreshCause, TerminalSearchGeometry, TerminalSearchState, terminal_search_geometry,
+    Rect, SearchRefreshCause, TerminalSearchGeometry, TerminalSearchHit, TerminalSearchState,
+    terminal_search_geometry,
 };
 use crate::terminal::{
     CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Cell, TermGrid, Terminal, TerminalColor,
@@ -24,6 +25,7 @@ const TAB_STRIP_EDGE_FADE_ALPHA: f32 = 0.4;
 const TAB_STRIP_EDGE_FADE_WIDTH: f32 = 40.0;
 const SEARCH_MATCH: [f32; 4] = [0.60, 0.60, 0.60, 0.35];
 const SEARCH_ACTIVE: [f32; 4] = [1.0, 0.60, 0.0, 0.50];
+const SEARCH_BUTTON_HOVER: [f32; 4] = [0.26, 0.28, 0.30, 1.0];
 const SCROLLBAR: [f32; 4] = [0.70, 0.33, 0.54, 0.80];
 const FPS_OVERLAY_WIDTH: f32 = 90.0;
 const FPS_OVERLAY_HEIGHT: f32 = 25.0;
@@ -184,6 +186,40 @@ fn terminal_focus_separator_rect(body: Rect, scale: f32) -> Option<Rect> {
 }
 
 #[inline]
+fn terminal_body_content_clip(body: Rect, separator: Option<Rect>) -> Option<Rect> {
+    let x = if body.x.is_finite() { body.x } else { 0.0 };
+    let y = if body.y.is_finite() { body.y } else { 0.0 };
+    let w = if body.w.is_finite() {
+        body.w.max(0.0)
+    } else {
+        0.0
+    };
+    let h = if body.h.is_finite() {
+        body.h.max(0.0)
+    } else {
+        0.0
+    };
+    let bottom = y + h;
+    if w <= 0.0 || h <= 0.0 || !bottom.is_finite() {
+        return None;
+    }
+    let clip_y = separator
+        .and_then(|separator| {
+            let separator_bottom = separator.y + separator.h;
+            separator_bottom.is_finite().then_some(separator_bottom)
+        })
+        .unwrap_or(y)
+        .clamp(y, bottom);
+    let clip_h = (bottom - clip_y).max(0.0);
+    (clip_h > 0.0).then_some(Rect {
+        x,
+        y: clip_y,
+        w,
+        h: clip_h,
+    })
+}
+
+#[inline]
 fn terminal_focus_separator_color(accent: [f32; 4], focused: bool) -> [f32; 4] {
     if focused {
         [accent[0], accent[1], accent[2], 1.0]
@@ -194,7 +230,7 @@ fn terminal_focus_separator_color(accent: [f32; 4], focused: bool) -> [f32; 4] {
 
 #[inline]
 fn terminal_tab_surface_color(background: [f32; 4], active: bool, hovered: bool) -> [f32; 4] {
-    let lift = 0.026 + if active { 0.010 } else { 0.0 } + if hovered { 0.018 } else { 0.0 };
+    let lift = 0.036 + if active { 0.010 } else { 0.0 } + if hovered { 0.018 } else { 0.0 };
     [
         (background[0] + lift).clamp(0.0, 1.0),
         (background[1] + lift).clamp(0.0, 1.0),
@@ -1273,6 +1309,23 @@ impl Renderer {
         );
     }
 
+    fn draw_search_button(&mut self, icon: SearchIcon, rect: Rect, color: [f32; 4], hovered: bool) {
+        if rect.w <= 0.0 || rect.h <= 0.0 {
+            return;
+        }
+        if hovered {
+            self.push_rounded_rect(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                (4.0 * self.scale_factor).round().max(1.0),
+                SEARCH_BUTTON_HOVER,
+            );
+        }
+        self.draw_search_icon(icon, rect, Some(SEARCH_ICON_VISUAL_SCALE), color);
+    }
+
     fn terminal_glyph(&mut self, c: char, presentation: u8) -> Option<GlyphInfo> {
         let prefer_color = if terminal_force_text_presentation(c) {
             Some(false)
@@ -1350,10 +1403,13 @@ impl Renderer {
         &mut self,
         search: &mut TerminalSearchState,
         body: Rect,
+        pointer_x: f32,
+        pointer_y: f32,
     ) -> TerminalSearchGeometry {
         let s = self.scale_factor;
         let palette = self.palette;
         let geometry = terminal_search_geometry(self.width, body.y, s);
+        let hovered = geometry.hit_test(pointer_x, pointer_y);
         let radius = 6.0 * s;
         self.push_rounded_rect(
             geometry.outer.x,
@@ -1454,36 +1510,36 @@ impl Renderer {
         }
 
         let muted = [0.82, 0.82, 0.84, 1.0];
-        self.draw_search_icon(
+        self.draw_search_button(
             SearchIcon::Close,
             geometry.close,
-            Some(SEARCH_ICON_VISUAL_SCALE),
             muted,
+            hovered == TerminalSearchHit::Close,
         );
         if geometry.show_nav {
-            self.draw_search_icon(
+            self.draw_search_button(
                 SearchIcon::Next,
                 geometry.next,
-                Some(SEARCH_ICON_VISUAL_SCALE),
                 muted,
+                hovered == TerminalSearchHit::Next,
             );
-            self.draw_search_icon(
+            self.draw_search_button(
                 SearchIcon::Previous,
                 geometry.previous,
-                Some(SEARCH_ICON_VISUAL_SCALE),
                 muted,
+                hovered == TerminalSearchHit::Previous,
             );
         }
         if geometry.show_case {
-            self.draw_search_icon(
+            self.draw_search_button(
                 SearchIcon::Case,
                 geometry.case_toggle,
-                Some(SEARCH_ICON_VISUAL_SCALE),
                 if search.case_sensitive {
                     palette.accent
                 } else {
                     muted
                 },
+                hovered == TerminalSearchHit::CaseToggle,
             );
         }
 
@@ -2371,6 +2427,8 @@ impl Renderer {
                 search,
                 focused && settings_progress <= 0.0,
                 focused,
+                pointer_x,
+                pointer_y,
             )
         } else {
             let palette = self.palette;
@@ -2410,6 +2468,8 @@ impl Renderer {
         search: &mut TerminalSearchState,
         input_focused: bool,
         window_focused: bool,
+        pointer_x: f32,
+        pointer_y: f32,
     ) -> TerminalUiLayout {
         let palette = self.palette;
         unsafe {
@@ -2445,10 +2505,19 @@ impl Renderer {
         let scroll_offset = terminal_render_scroll_offset(terminal.scroll_y.current, max_scroll, grid.is_alt);
         let text_x = body.x + 10.0 * s;
         let (_, bottom_pad) = terminal_text_padding(s);
+        let separator = terminal_focus_separator_rect(body, s);
+        let content_clip = terminal_body_content_clip(body, separator);
 
         self.flush();
-        self.set_clip(body.x, body.y, body.w, body.h);
-        if presentation_visible {
+        if let Some(content_clip) = content_clip {
+            self.set_clip(
+                content_clip.x,
+                content_clip.y,
+                content_clip.w,
+                content_clip.h,
+            );
+        }
+        if presentation_visible && content_clip.is_some() {
             let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
             for layer in TERMINAL_BODY_LAYERS {
                 for i in visible_range.clone() {
@@ -2610,17 +2679,19 @@ impl Renderer {
                 }
             }
         }
+        if content_clip.is_some() {
+            self.flush();
+            self.clear_clip();
+        }
         let scrollbar = if presentation_visible {
             terminal_scrollbar_layout(body, s, char_h, total_lines, terminal.scroll_y.current)
         } else { None };
         if let Some(scrollbar) = scrollbar {
             self.push_rounded_rect(scrollbar.thumb.x, scrollbar.thumb.y, scrollbar.thumb.w, scrollbar.thumb.h, scrollbar.thumb.w / 2.0, SCROLLBAR);
         }
-        self.flush();
-        self.clear_clip();
         drop(grid);
 
-        if let Some(separator) = terminal_focus_separator_rect(body, s) {
+        if let Some(separator) = separator {
             self.push_rounded_rect(
                 separator.x,
                 separator.y,
@@ -2631,7 +2702,9 @@ impl Renderer {
             );
         }
 
-        let search_geometry = search.shown.then(|| self.draw_search_overlay(search, body));
+        let search_geometry = search
+            .shown
+            .then(|| self.draw_search_overlay(search, body, pointer_x, pointer_y));
         self.flush();
 
         TerminalUiLayout {
@@ -2689,6 +2762,9 @@ mod tests {
                 w: 800.0,
                 h: (173.0 * scale).round(),
             };
+            let separator = terminal_focus_separator_rect(body, scale);
+            let content_clip = terminal_body_content_clip(body, separator)
+                .expect("normal terminal body should retain drawable content below separator");
             let char_h = 26.0 * scale;
             let visible_rows = terminal_visible_rows(body.h, char_h, scale);
             let (_, bottom_pad) = terminal_text_padding(scale);
@@ -2731,7 +2807,7 @@ mod tests {
                         w: 1.0,
                         h: glyph_h,
                     };
-                    if clipped_rect(glyph_rect, body).is_some() {
+                    if clipped_rect(glyph_rect, content_clip).is_some() {
                         assert!(
                             range.contains(&row),
                             "scale={scale} scroll={scroll_offset} row={row} range={range:?}"
@@ -3299,6 +3375,70 @@ mod tests {
     }
 
     #[test]
+    fn terminal_body_content_clip_excludes_separator_without_changing_body_extent() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let body = terminal_body_rect(1280.0, 720.0, scale);
+            let separator = terminal_focus_separator_rect(body, scale)
+                .expect("visible terminal body should have a separator");
+            let clip = terminal_body_content_clip(body, Some(separator))
+                .expect("normal terminal body should retain drawable content below separator");
+            let body_bottom = body.y + body.h;
+
+            assert_eq!(separator.y, body.y);
+            assert!(clip.y >= separator.y + separator.h);
+            assert!(clip.y >= body.y);
+            assert!(clip.y <= body_bottom);
+            assert_eq!(clip.x, body.x);
+            assert_eq!(clip.w, body.w);
+            assert_eq!(clip.y + clip.h, body_bottom);
+            for value in [clip.x, clip.y, clip.w, clip.h] {
+                assert!(value.is_finite());
+            }
+        }
+
+        let tiny_body = Rect {
+            x: 3.0,
+            y: 5.0,
+            w: 20.0,
+            h: 0.25,
+        };
+        let tiny_separator = terminal_focus_separator_rect(tiny_body, 1.5)
+            .expect("positive body should produce a bounded separator");
+        assert_eq!(tiny_separator.h, tiny_body.h);
+        assert_eq!(
+            terminal_body_content_clip(tiny_body, Some(tiny_separator)),
+            None
+        );
+
+        let smaller_body = Rect {
+            h: 0.125,
+            ..tiny_body
+        };
+        assert!(smaller_body.h < tiny_separator.h);
+        assert_eq!(
+            terminal_body_content_clip(smaller_body, Some(tiny_separator)),
+            None
+        );
+
+        let larger_body = Rect {
+            h: 2.25,
+            ..tiny_body
+        };
+        let larger_separator = terminal_focus_separator_rect(larger_body, 1.0)
+            .expect("positive body should produce a bounded separator");
+        let larger_clip = terminal_body_content_clip(larger_body, Some(larger_separator))
+            .expect("body taller than separator should retain drawable content");
+        assert!(larger_clip.h > 0.0);
+        assert_eq!(larger_clip.y + larger_clip.h, larger_body.y + larger_body.h);
+
+        let zero_width_body = Rect {
+            w: 0.0,
+            ..tiny_body
+        };
+        assert_eq!(terminal_body_content_clip(zero_width_body, None), None);
+    }
+
+    #[test]
     fn terminal_focus_separator_color_is_opaque_and_darker_when_unfocused() {
         let accent = [0.60, 0.40, 0.80, 0.35];
         let focused = terminal_focus_separator_color(accent, true);
@@ -3320,9 +3460,7 @@ mod tests {
         assert!(idle[0] > background[0]);
         assert!(idle[1] > background[1]);
         assert!(idle[2] > background[2]);
-
-        let old_idle_lift = 0.018;
-        assert!(idle[0] - background[0] > old_idle_lift);
+        assert!(idle[0] - background[0] >= 0.035);
         let active = terminal_tab_surface_color(background, true, false);
         let hovered = terminal_tab_surface_color(background, false, true);
         let active_hovered = terminal_tab_surface_color(background, true, true);
@@ -3341,7 +3479,7 @@ mod tests {
             assert!(
                 derived[..3]
                     .iter()
-                    .all(|component| (0.0..=1.0).contains(component))
+                    .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
             );
         }
     }

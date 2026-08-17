@@ -68,6 +68,39 @@ pub(crate) struct TerminalSearchGeometry {
     pub counter_reserve: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TerminalSearchHit {
+    #[default]
+    None,
+    Chrome,
+    Input,
+    Close,
+    Previous,
+    Next,
+    CaseToggle,
+}
+
+impl TerminalSearchGeometry {
+    #[inline]
+    pub(crate) fn hit_test(self, x: f32, y: f32) -> TerminalSearchHit {
+        if self.close.contains(x, y) {
+            TerminalSearchHit::Close
+        } else if self.show_nav && self.next.contains(x, y) {
+            TerminalSearchHit::Next
+        } else if self.show_nav && self.previous.contains(x, y) {
+            TerminalSearchHit::Previous
+        } else if self.show_case && self.case_toggle.contains(x, y) {
+            TerminalSearchHit::CaseToggle
+        } else if self.input.contains(x, y) {
+            TerminalSearchHit::Input
+        } else if self.outer.contains(x, y) {
+            TerminalSearchHit::Chrome
+        } else {
+            TerminalSearchHit::None
+        }
+    }
+}
+
 pub(crate) fn terminal_search_geometry(
     window_w: f32,
     body_y: f32,
@@ -926,5 +959,47 @@ mod tests {
                 assert!(geometry.text_viewport_w >= 0.0);
             }
         }
+    }
+
+    #[test]
+    fn search_geometry_hit_test_distinguishes_controls_chrome_and_outside() {
+        let geometry = terminal_search_geometry(800.0, 38.0, 1.0);
+        let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+
+        let (x, y) = center(geometry.input);
+        assert_eq!(geometry.hit_test(x, y), TerminalSearchHit::Input);
+        let (x, y) = center(geometry.close);
+        assert_eq!(geometry.hit_test(x, y), TerminalSearchHit::Close);
+        let (x, y) = center(geometry.previous);
+        assert_eq!(geometry.hit_test(x, y), TerminalSearchHit::Previous);
+        let (x, y) = center(geometry.next);
+        assert_eq!(geometry.hit_test(x, y), TerminalSearchHit::Next);
+        let (x, y) = center(geometry.case_toggle);
+        assert_eq!(geometry.hit_test(x, y), TerminalSearchHit::CaseToggle);
+        assert_eq!(
+            geometry.hit_test(geometry.outer.x + 2.0, geometry.outer.y + 2.0),
+            TerminalSearchHit::Chrome
+        );
+        assert_eq!(geometry.hit_test(0.0, 0.0), TerminalSearchHit::None);
+    }
+
+    #[test]
+    fn narrow_search_geometry_has_no_hidden_control_hits() {
+        let geometry = terminal_search_geometry(240.0, 38.0, 1.0);
+        assert!(!geometry.show_nav);
+        assert!(!geometry.show_case);
+        assert_eq!(geometry.previous, Rect::default());
+        assert_eq!(geometry.next, Rect::default());
+        assert_eq!(geometry.case_toggle, Rect::default());
+        assert_ne!(geometry.hit_test(0.0, 0.0), TerminalSearchHit::Previous);
+        assert_ne!(geometry.hit_test(0.0, 0.0), TerminalSearchHit::Next);
+        assert_ne!(geometry.hit_test(0.0, 0.0), TerminalSearchHit::CaseToggle);
+
+        let close_x = geometry.close.x + geometry.close.w * 0.5;
+        let close_y = geometry.close.y + geometry.close.h * 0.5;
+        assert_eq!(
+            geometry.hit_test(close_x, close_y),
+            TerminalSearchHit::Close
+        );
     }
 }

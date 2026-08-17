@@ -12,6 +12,7 @@ use crate::platform::{KdeActivationWorker, kde_session_active};
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
+use crate::search::TerminalSearchHit;
 use crate::single_line_input::SingleLineInput;
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
@@ -260,6 +261,7 @@ fn ui_cursor_icon(
     settings_modal_active: bool,
     settings_hit: SettingsHit,
     settings_text_dragging: bool,
+    search_hit: TerminalSearchHit,
     tab_hit: TerminalTabHit,
     tab_dragging: bool,
 ) -> CursorKind {
@@ -269,6 +271,15 @@ fn ui_cursor_icon(
         } else {
             CursorKind::Default
         };
+    }
+    match search_hit {
+        TerminalSearchHit::Input => return CursorKind::Text,
+        TerminalSearchHit::Close
+        | TerminalSearchHit::Previous
+        | TerminalSearchHit::Next
+        | TerminalSearchHit::CaseToggle => return CursorKind::Pointer,
+        TerminalSearchHit::Chrome => return CursorKind::Default,
+        TerminalSearchHit::None => {}
     }
     if tab_dragging {
         return CursorKind::Default;
@@ -1069,6 +1080,13 @@ impl App {
         })
     }
 
+    fn search_hit_test(&self, x: f32, y: f32) -> TerminalSearchHit {
+        self.interaction
+            .layout
+            .search
+            .map_or(TerminalSearchHit::None, |search| search.hit_test(x, y))
+    }
+
     fn desired_cursor_icon(&self) -> CursorKind {
         let settings_modal_active = self.settings_modal_active();
         let settings_hit = if settings_modal_active {
@@ -1076,7 +1094,12 @@ impl App {
         } else {
             SettingsHit::None
         };
-        let tab_hit = if settings_modal_active {
+        let search_hit = if settings_modal_active {
+            TerminalSearchHit::None
+        } else {
+            self.search_hit_test(self.pointer_x, self.pointer_y)
+        };
+        let tab_hit = if settings_modal_active || search_hit != TerminalSearchHit::None {
             TerminalTabHit::None
         } else {
             self.runtime
@@ -1089,6 +1112,7 @@ impl App {
             settings_modal_active,
             settings_hit,
             self.settings_background_dragging,
+            search_hit,
             tab_hit,
             self.terminal_tab_drag.is_some(),
         )
@@ -1417,7 +1441,12 @@ impl App {
             }
             return;
         }
+        let search_hover_changed = self.search_hit_test(previous_x, previous_y)
+            != self.search_hit_test(self.pointer_x, self.pointer_y);
         self.refresh_cursor_icon();
+        if search_hover_changed {
+            self.request_frame();
+        }
         if let Some(drag) = self.terminal_tab_drag.as_mut() {
             drag.current_x = self.pointer_x;
             if !drag.threshold_passed {
@@ -2856,13 +2885,21 @@ mod tests {
                 true,
                 SettingsHit::BackgroundField,
                 false,
+                TerminalSearchHit::Close,
                 TerminalTabHit::Add,
                 false
             ),
             CursorKind::Text
         );
         assert_eq!(
-            ui_cursor_icon(true, SettingsHit::None, false, TerminalTabHit::Add, false),
+            ui_cursor_icon(
+                true,
+                SettingsHit::None,
+                false,
+                TerminalSearchHit::Input,
+                TerminalTabHit::Add,
+                false
+            ),
             CursorKind::Default
         );
         assert_eq!(
@@ -2870,13 +2907,10 @@ mod tests {
                 false,
                 SettingsHit::None,
                 false,
+                TerminalSearchHit::None,
                 TerminalTabHit::Close(0),
                 false
             ),
-            CursorKind::Pointer
-        );
-        assert_eq!(
-            ui_cursor_icon(false, SettingsHit::None, false, TerminalTabHit::Add, false),
             CursorKind::Pointer
         );
         assert_eq!(
@@ -2884,6 +2918,18 @@ mod tests {
                 false,
                 SettingsHit::None,
                 false,
+                TerminalSearchHit::None,
+                TerminalTabHit::Add,
+                false
+            ),
+            CursorKind::Pointer
+        );
+        assert_eq!(
+            ui_cursor_icon(
+                false,
+                SettingsHit::None,
+                false,
+                TerminalSearchHit::None,
                 TerminalTabHit::Body(0),
                 false
             ),
@@ -2894,6 +2940,7 @@ mod tests {
                 true,
                 SettingsHit::Outside,
                 true,
+                TerminalSearchHit::None,
                 TerminalTabHit::None,
                 false
             ),
@@ -2906,6 +2953,61 @@ mod tests {
         assert_eq!(
             cursor_icon_change(CursorKind::Pointer, CursorKind::Default),
             Some(CursorKind::Default)
+        );
+    }
+
+    #[test]
+    fn search_cursor_policy_uses_text_pointer_and_chrome_priority_before_tabs() {
+        assert_eq!(
+            ui_cursor_icon(
+                false,
+                SettingsHit::None,
+                false,
+                TerminalSearchHit::Input,
+                TerminalTabHit::Add,
+                false
+            ),
+            CursorKind::Text
+        );
+        for hit in [
+            TerminalSearchHit::Close,
+            TerminalSearchHit::Previous,
+            TerminalSearchHit::Next,
+            TerminalSearchHit::CaseToggle,
+        ] {
+            assert_eq!(
+                ui_cursor_icon(
+                    false,
+                    SettingsHit::None,
+                    false,
+                    hit,
+                    TerminalTabHit::Body(0),
+                    false
+                ),
+                CursorKind::Pointer
+            );
+        }
+        assert_eq!(
+            ui_cursor_icon(
+                false,
+                SettingsHit::None,
+                false,
+                TerminalSearchHit::Chrome,
+                TerminalTabHit::Add,
+                false
+            ),
+            CursorKind::Default
+        );
+        assert_eq!(
+            ui_cursor_icon(
+                false,
+                SettingsHit::None,
+                false,
+                TerminalSearchHit::None,
+                TerminalTabHit::None,
+                false
+            ),
+            CursorKind::Default
         );
     }
 
