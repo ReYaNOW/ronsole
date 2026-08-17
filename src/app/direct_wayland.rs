@@ -13,6 +13,9 @@ impl App {
         primary_instance: &mut PrimaryInstance,
     ) -> Result<(), String> {
         let result = self.run_direct_wayland_inner(primary_instance);
+        if let Err(error) = result.as_ref() {
+            self.interrupt_automation(&format!("Wayland runtime failure: {error}"));
+        }
         self.on_exiting();
         result
     }
@@ -64,6 +67,7 @@ impl App {
 
     fn handle_wayland_runtime_events(&mut self, events: WaylandRuntimeEvents) -> bool {
         if events.close_requested {
+            self.interrupt_automation("Wayland compositor requested window close");
             self.on_close_requested();
             return true;
         }
@@ -93,6 +97,7 @@ impl App {
                 WaylandInputEvent::Modifiers(modifiers) => self.on_modifiers(modifiers),
                 WaylandInputEvent::Key(input) => {
                     if self.on_key(input) {
+                        self.interrupt_automation("keyboard path closed the final terminal");
                         self.prepare_exit();
                         return true;
                     }
@@ -108,6 +113,7 @@ impl App {
                 }
                 WaylandInputEvent::PointerButton(state, button) => {
                     if self.on_pointer_button(state, button) {
+                        self.interrupt_automation("pointer path closed the final terminal");
                         self.prepare_exit();
                         return true;
                     }
@@ -134,12 +140,12 @@ impl App {
                 runtime.take_wayland_events()
             };
             if self.handle_wayland_runtime_events(pending_events) {
-                return Ok(());
+                return self.take_automation_exit_result();
             }
 
             let control = self.on_about_to_wait();
             if control == AppLoopControl::Exit {
-                return Ok(());
+                return self.take_automation_exit_result();
             }
 
             let frame_ready = self
@@ -183,7 +189,7 @@ impl App {
                 .take_wayland_events();
 
             if self.handle_wayland_runtime_events(events) {
-                return Ok(());
+                return self.take_automation_exit_result();
             }
 
             if outcome.woke {

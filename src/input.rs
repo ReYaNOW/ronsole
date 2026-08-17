@@ -1349,6 +1349,18 @@ mod tests {
             Some(b"\x1b[15~".to_vec()),
         );
         assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::F8), false, false, false, false,),
+            Some(b"\x1b[19~".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::F8), true, false, false, false,),
+            Some(b"\x1b[19;2~".to_vec()),
+        );
+        assert_eq!(
+            terminal_key_sequence(PhysicalKey::Code(KeyCode::F8), false, false, true, false,),
+            Some(b"\x1b[19;3~".to_vec()),
+        );
+        assert_eq!(
             terminal_key_sequence(PhysicalKey::Code(KeyCode::F12), false, true, true, false,),
             Some(b"\x1b[24;7~".to_vec()),
         );

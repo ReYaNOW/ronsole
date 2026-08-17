@@ -20,14 +20,15 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{
-    wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_cursor::{CursorImageBuffer, CursorTheme};
@@ -46,6 +47,9 @@ use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::toplevel_icon::v1::client::{
+    xdg_toplevel_icon_manager_v1, xdg_toplevel_icon_v1,
+};
 
 const WAYLAND_COMPOSITOR_MAX_VERSION: u32 = 6;
 const WAYLAND_SEAT_MAX_VERSION: u32 = 9;
@@ -57,6 +61,12 @@ const DEFAULT_CURSOR_SIZE: u32 = 24;
 const MAX_CURSOR_BASE_SIZE: u32 = 128;
 const MAX_CURSOR_SCALE_BUCKET: u32 = 8;
 const MAX_CURSOR_THEME_SIZE: u32 = 512;
+const XDG_TOPLEVEL_ICON_MANAGER_VERSION: u32 = 1;
+const MAX_TOPLEVEL_ICON_SIZE: u32 = 512;
+const MAX_TOPLEVEL_ICON_SIZES: usize = 8;
+const FALLBACK_TOPLEVEL_ICON_SIZES: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
+const TOPLEVEL_ICON_MEMFD_NAME: &[u8] = b"ronsole-toplevel-icon\0";
+const TOPLEVEL_ICON_PNG: &[u8] = include_bytes!("icons/logo.png");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GlContextPlan {
@@ -485,6 +495,306 @@ fn load_cursor_image_from_theme(
     )))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ToplevelIconBufferLayout {
+    size: i32,
+    stride: i32,
+    pool_size: i32,
+    byte_len: usize,
+}
+
+fn toplevel_icon_buffer_layout(size: u32) -> Option<ToplevelIconBufferLayout> {
+    if !(1..=MAX_TOPLEVEL_ICON_SIZE).contains(&size) {
+        return None;
+    }
+    let stride = size.checked_mul(4)?;
+    let byte_len = stride.checked_mul(size)?;
+    Some(ToplevelIconBufferLayout {
+        size: i32::try_from(size).ok()?,
+        stride: i32::try_from(stride).ok()?,
+        pool_size: i32::try_from(byte_len).ok()?,
+        byte_len: usize::try_from(byte_len).ok()?,
+    })
+}
+
+fn push_toplevel_icon_preferred_size(sizes: &mut Vec<u32>, size: i32) {
+    if sizes.len() >= MAX_TOPLEVEL_ICON_SIZES {
+        return;
+    }
+    let Ok(size) = u32::try_from(size) else {
+        return;
+    };
+    if toplevel_icon_buffer_layout(size).is_some() && !sizes.contains(&size) {
+        sizes.push(size);
+    }
+}
+
+fn resolved_toplevel_icon_sizes(preferred_sizes: &[u32]) -> Vec<u32> {
+    if preferred_sizes.is_empty() {
+        FALLBACK_TOPLEVEL_ICON_SIZES.to_vec()
+    } else {
+        preferred_sizes.to_vec()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToplevelIconStatus {
+    Pending,
+    Applied,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToplevelIconApplyPlan {
+    Wait,
+    Apply,
+    Applied,
+    Disabled,
+}
+
+#[derive(Debug)]
+struct ToplevelIconState {
+    manager_global_name: Option<u32>,
+    preferred_sizes: Vec<u32>,
+    preferences_done: bool,
+    status: ToplevelIconStatus,
+}
+
+impl Default for ToplevelIconState {
+    fn default() -> Self {
+        Self {
+            manager_global_name: None,
+            preferred_sizes: Vec::new(),
+            preferences_done: false,
+            status: ToplevelIconStatus::Pending,
+        }
+    }
+}
+
+impl ToplevelIconState {
+    fn manager_announced(&mut self, name: u32) -> bool {
+        if self.status != ToplevelIconStatus::Pending || self.manager_global_name.is_some() {
+            return false;
+        }
+        self.manager_global_name = Some(name);
+        self.preferred_sizes.clear();
+        self.preferences_done = false;
+        true
+    }
+
+    fn manager_removed(&mut self, name: u32) -> bool {
+        if self.manager_global_name != Some(name) {
+            return false;
+        }
+        self.manager_global_name = None;
+        self.preferred_sizes.clear();
+        self.preferences_done = false;
+        true
+    }
+
+    fn push_preferred_size(&mut self, size: i32) {
+        if self.status == ToplevelIconStatus::Pending && !self.preferences_done {
+            push_toplevel_icon_preferred_size(&mut self.preferred_sizes, size);
+        }
+    }
+
+    fn finish_preferences(&mut self) {
+        if self.status == ToplevelIconStatus::Pending {
+            self.preferences_done = true;
+        }
+    }
+
+    fn apply_plan(
+        &self,
+        manager_available: bool,
+        toplevel_available: bool,
+        shm_available: bool,
+    ) -> ToplevelIconApplyPlan {
+        match self.status {
+            ToplevelIconStatus::Applied => ToplevelIconApplyPlan::Applied,
+            ToplevelIconStatus::Disabled => ToplevelIconApplyPlan::Disabled,
+            ToplevelIconStatus::Pending
+                if manager_available
+                    && self.preferences_done
+                    && toplevel_available
+                    && shm_available =>
+            {
+                ToplevelIconApplyPlan::Apply
+            }
+            ToplevelIconStatus::Pending => ToplevelIconApplyPlan::Wait,
+        }
+    }
+}
+
+fn write_toplevel_icon_argb8888(
+    pixels: &[tiny_skia::PremultipliedColorU8],
+    destination: &mut [u8],
+) -> Result<(), String> {
+    let expected_len = pixels
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| "toplevel icon pixel byte size overflowed".to_string())?;
+    if destination.len() != expected_len {
+        return Err("toplevel icon destination size does not match pixel count".to_string());
+    }
+
+    for (pixel, output) in pixels.iter().zip(destination.chunks_exact_mut(4)) {
+        let packed = (u32::from(pixel.alpha()) << 24)
+            | (u32::from(pixel.red()) << 16)
+            | (u32::from(pixel.green()) << 8)
+            | u32::from(pixel.blue());
+        output.copy_from_slice(&packed.to_ne_bytes());
+    }
+    Ok(())
+}
+
+fn decode_toplevel_icon_logo() -> Result<tiny_skia::Pixmap, String> {
+    tiny_skia::Pixmap::decode_png(TOPLEVEL_ICON_PNG)
+        .map_err(|error| format!("embedded Ronsole icon PNG decode failed: {error}"))
+}
+
+fn scale_toplevel_icon(source: &tiny_skia::Pixmap, size: u32) -> Result<tiny_skia::Pixmap, String> {
+    let _ = toplevel_icon_buffer_layout(size)
+        .ok_or_else(|| format!("invalid toplevel icon size {size}"))?;
+    let mut destination = tiny_skia::Pixmap::new(size, size)
+        .ok_or_else(|| format!("failed to allocate {size}x{size} toplevel icon pixmap"))?;
+    let paint = tiny_skia::PixmapPaint {
+        quality: tiny_skia::FilterQuality::Bicubic,
+        ..Default::default()
+    };
+    let scale_x = size as f32 / source.width() as f32;
+    let scale_y = size as f32 / source.height() as f32;
+    destination.draw_pixmap(
+        0,
+        0,
+        source.as_ref(),
+        &paint,
+        tiny_skia::Transform::from_scale(scale_x, scale_y),
+        None,
+    );
+    Ok(destination)
+}
+
+fn create_toplevel_icon_shm_fd(
+    pixmap: &tiny_skia::Pixmap,
+    layout: ToplevelIconBufferLayout,
+) -> Result<OwnedFd, String> {
+    let fd = unsafe {
+        libc::memfd_create(
+            TOPLEVEL_ICON_MEMFD_NAME.as_ptr().cast(),
+            libc::MFD_CLOEXEC as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "creating toplevel icon memfd failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let truncate_len = libc::off_t::try_from(layout.byte_len)
+        .map_err(|_| "toplevel icon shm size does not fit off_t".to_string())?;
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), truncate_len) } != 0 {
+        return Err(format!(
+            "sizing toplevel icon memfd failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            layout.byte_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(format!(
+            "mapping toplevel icon memfd failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let write_result = unsafe {
+        let destination = std::slice::from_raw_parts_mut(mapping.cast::<u8>(), layout.byte_len);
+        write_toplevel_icon_argb8888(pixmap.pixels(), destination)
+    };
+    let unmap_result = unsafe { libc::munmap(mapping, layout.byte_len) };
+    write_result?;
+    if unmap_result != 0 {
+        return Err(format!(
+            "unmapping toplevel icon memfd failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(fd)
+}
+
+struct ToplevelIconBufferResource {
+    _fd: OwnedFd,
+    pool: wl_shm_pool::WlShmPool,
+    buffer: wl_buffer::WlBuffer,
+}
+
+impl ToplevelIconBufferResource {
+    fn destroy(self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
+}
+
+fn destroy_toplevel_icon_buffers(buffers: Vec<ToplevelIconBufferResource>) {
+    for buffer in buffers {
+        buffer.destroy();
+    }
+}
+
+fn prepare_toplevel_icon_buffers(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<WaylandState>,
+    sizes: &[u32],
+) -> Result<Vec<ToplevelIconBufferResource>, String> {
+    if sizes.is_empty() || sizes.len() > MAX_TOPLEVEL_ICON_SIZES {
+        return Err("toplevel icon size list is empty or exceeds the bounded limit".to_string());
+    }
+    let source = decode_toplevel_icon_logo()?;
+    let mut buffers = Vec::with_capacity(sizes.len());
+    for &size in sizes {
+        let result = (|| {
+            let layout = toplevel_icon_buffer_layout(size)
+                .ok_or_else(|| format!("invalid toplevel icon size {size}"))?;
+            let pixmap = scale_toplevel_icon(&source, size)?;
+            let fd = create_toplevel_icon_shm_fd(&pixmap, layout)?;
+            let pool = shm.create_pool(fd.as_fd(), layout.pool_size, qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                layout.size,
+                layout.size,
+                layout.stride,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            );
+            Ok(ToplevelIconBufferResource {
+                _fd: fd,
+                pool,
+                buffer,
+            })
+        })();
+        match result {
+            Ok(buffer) => buffers.push(buffer),
+            Err(error) => {
+                destroy_toplevel_icon_buffers(buffers);
+                return Err(error);
+            }
+        }
+    }
+    Ok(buffers)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WaylandWindowMetrics {
     pub(crate) logical_width: u32,
@@ -638,6 +948,8 @@ struct WaylandState {
     activation: Option<xdg_activation_v1::XdgActivationV1>,
     pending_activation_token: Option<xdg_activation_token_v1::XdgActivationTokenV1>,
     decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+    toplevel_icon_manager: Option<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1>,
+    toplevel_icon_state: ToplevelIconState,
     fractional_scale_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     viewporter: Option<wp_viewporter::WpViewporter>,
     seat_global_name: Option<u32>,
@@ -689,6 +1001,8 @@ impl WaylandState {
             activation: None,
             pending_activation_token: None,
             decoration_manager: None,
+            toplevel_icon_manager: None,
+            toplevel_icon_state: ToplevelIconState::default(),
             fractional_scale_manager: None,
             viewporter: None,
             seat_global_name: None,
@@ -824,7 +1138,63 @@ impl WaylandState {
         if let Some(surface) = self.surface.as_ref() {
             surface.commit();
         }
+        self.try_apply_toplevel_icon(qh);
         Ok(())
+    }
+
+    fn try_apply_toplevel_icon(&mut self, qh: &QueueHandle<Self>) {
+        let plan = self.toplevel_icon_state.apply_plan(
+            self.toplevel_icon_manager.is_some(),
+            self.toplevel.is_some() && self.surface.is_some(),
+            self.shm.is_some(),
+        );
+        if plan != ToplevelIconApplyPlan::Apply {
+            return;
+        }
+
+        let (Some(manager), Some(toplevel), Some(surface), Some(shm)) = (
+            self.toplevel_icon_manager.as_ref().cloned(),
+            self.toplevel.as_ref().cloned(),
+            self.surface.as_ref().cloned(),
+            self.shm.as_ref().cloned(),
+        ) else {
+            return;
+        };
+        let sizes = resolved_toplevel_icon_sizes(&self.toplevel_icon_state.preferred_sizes);
+        let buffers = match prepare_toplevel_icon_buffers(&shm, qh, &sizes) {
+            Ok(buffers) => buffers,
+            Err(error) => {
+                self.disable_toplevel_icon(error);
+                return;
+            }
+        };
+
+        let icon = manager.create_icon(qh, ());
+        for resource in &buffers {
+            icon.add_buffer(&resource.buffer, 1);
+        }
+        manager.set_icon(&toplevel, Some(&icon));
+        surface.commit();
+        icon.destroy();
+        destroy_toplevel_icon_buffers(buffers);
+        self.toplevel_icon_state.status = ToplevelIconStatus::Applied;
+    }
+
+    fn disable_toplevel_icon(&mut self, error: String) {
+        if self.toplevel_icon_state.status != ToplevelIconStatus::Pending {
+            return;
+        }
+        self.toplevel_icon_state.status = ToplevelIconStatus::Disabled;
+        eprintln!("Wayland toplevel icon disabled: {error}");
+    }
+
+    fn remove_toplevel_icon_manager(&mut self, name: u32) {
+        if !self.toplevel_icon_state.manager_removed(name) {
+            return;
+        }
+        if let Some(manager) = self.toplevel_icon_manager.take() {
+            manager.destroy();
+        }
     }
 
     fn cancel_pending_activation_token(&mut self) {
@@ -1398,6 +1768,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                         qh,
                         (),
                     ));
+                    state.try_apply_toplevel_icon(qh);
                 }
                 "xdg_wm_base" if state.wm_base.is_none() => {
                     state.wm_base = Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(
@@ -1425,6 +1796,19 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                             qh,
                             (),
                         ),
+                    );
+                }
+                "xdg_toplevel_icon_manager_v1"
+                    if state.toplevel_icon_state.manager_announced(name) =>
+                {
+                    state.toplevel_icon_manager = Some(
+                        registry
+                            .bind::<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, _, _>(
+                                name,
+                                version.min(XDG_TOPLEVEL_ICON_MANAGER_VERSION),
+                                qh,
+                                (),
+                            ),
                     );
                 }
                 "wp_fractional_scale_manager_v1" if state.fractional_scale_manager.is_none() => {
@@ -1488,6 +1872,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
             {
                 state.release_activation();
             }
+            wl_registry::Event::GlobalRemove { name }
+                if state.toplevel_icon_state.manager_global_name == Some(name) =>
+            {
+                state.remove_toplevel_icon_manager(name);
+            }
             _ => {}
         }
     }
@@ -1495,6 +1884,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
 
 delegate_noop!(WaylandState: ignore wl_compositor::WlCompositor);
 delegate_noop!(WaylandState: ignore wl_shm::WlShm);
+delegate_noop!(WaylandState: ignore wl_shm_pool::WlShmPool);
+delegate_noop!(WaylandState: ignore wl_buffer::WlBuffer);
 delegate_noop!(WaylandState: ignore xdg_activation_v1::XdgActivationV1);
 delegate_noop!(WaylandState: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(WaylandState: ignore zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1);
@@ -1505,6 +1896,29 @@ delegate_noop!(WaylandState: ignore wp_viewport::WpViewport);
 delegate_noop!(WaylandState: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WaylandState: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
 delegate_noop!(WaylandState: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
+delegate_noop!(WaylandState: ignore xdg_toplevel_icon_v1::XdgToplevelIconV1);
+
+impl Dispatch<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1,
+        event: xdg_toplevel_icon_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_toplevel_icon_manager_v1::Event::IconSize { size } => {
+                state.toplevel_icon_state.push_preferred_size(size);
+            }
+            xdg_toplevel_icon_manager_v1::Event::Done => {
+                state.toplevel_icon_state.finish_preferences();
+                state.try_apply_toplevel_icon(qh);
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
     fn event(
@@ -2185,6 +2599,9 @@ impl Drop for DirectWaylandBackend {
         if let Some(decoration_manager) = self.state.decoration_manager.take() {
             decoration_manager.destroy();
         }
+        if let Some(toplevel_icon_manager) = self.state.toplevel_icon_manager.take() {
+            toplevel_icon_manager.destroy();
+        }
         if let Some(fractional_scale_manager) = self.state.fractional_scale_manager.take() {
             fractional_scale_manager.destroy();
         }
@@ -2209,6 +2626,7 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub active_terminal: usize,
     pub search: &'a mut crate::search::TerminalSearchState,
     pub focused: bool,
+    pub show_fps: bool,
     pub tab_scroll_x: f32,
     pub drag: Option<&'a crate::tabs::TabDragState>,
     pub pointer_x: f32,
@@ -2349,6 +2767,10 @@ impl WindowRuntime {
         self.renderer.set_terminal_background(background)
     }
 
+    pub(crate) fn reset_fps_counter(&mut self) {
+        self.renderer.reset_fps_counter();
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         let Some(width) = NonZeroU32::new(width) else {
             return;
@@ -2364,11 +2786,13 @@ impl WindowRuntime {
         &mut self,
         params: TerminalRenderParams<'_>,
     ) -> Result<crate::renderer::TerminalUiLayout, String> {
+        let show_fps = params.show_fps;
         let layout = self.renderer.render_terminal_app(
             params.terminals,
             params.active_terminal,
             params.search,
             params.focused,
+            show_fps,
             params.tab_scroll_x,
             params.drag,
             params.pointer_x,
@@ -2383,6 +2807,9 @@ impl WindowRuntime {
         self.surface
             .swap_buffers(&self.context)
             .map_err(|error| format!("swap buffers failed: {error}"))?;
+        if show_fps {
+            self.renderer.record_presented_frame(Instant::now());
+        }
         self.wayland.mark_presented();
         Ok(layout)
     }
@@ -2563,6 +2990,118 @@ mod tests {
         assert_eq!(
             activation_request_plan(true, false, false, false),
             ActivationRequestPlan::MissingFallbackContext
+        );
+    }
+
+    #[test]
+    fn toplevel_icon_preferred_sizes_are_sanitized_deduplicated_and_bounded() {
+        let mut sizes = Vec::new();
+        for size in [-1, 0, 64, 64, 513, 32, 16, 24, 48, 96, 128, 256, 512, 8] {
+            push_toplevel_icon_preferred_size(&mut sizes, size);
+        }
+        assert_eq!(sizes, [64, 32, 16, 24, 48, 96, 128, 256]);
+        assert_eq!(sizes.len(), MAX_TOPLEVEL_ICON_SIZES);
+    }
+
+    #[test]
+    fn toplevel_icon_buffer_layout_rejects_invalid_and_overflowing_sizes() {
+        assert_eq!(toplevel_icon_buffer_layout(0), None);
+        assert_eq!(
+            toplevel_icon_buffer_layout(MAX_TOPLEVEL_ICON_SIZE + 1),
+            None
+        );
+        assert_eq!(toplevel_icon_buffer_layout(u32::MAX), None);
+
+        let layout = toplevel_icon_buffer_layout(MAX_TOPLEVEL_ICON_SIZE)
+            .expect("bounded maximum icon size should have a valid shm layout");
+        assert_eq!(layout.size, MAX_TOPLEVEL_ICON_SIZE as i32);
+        assert_eq!(layout.stride, (MAX_TOPLEVEL_ICON_SIZE * 4) as i32);
+        assert_eq!(
+            layout.pool_size,
+            (MAX_TOPLEVEL_ICON_SIZE * MAX_TOPLEVEL_ICON_SIZE * 4) as i32
+        );
+        assert_eq!(
+            layout.byte_len,
+            (MAX_TOPLEVEL_ICON_SIZE * MAX_TOPLEVEL_ICON_SIZE * 4) as usize
+        );
+    }
+
+    #[test]
+    fn toplevel_icon_rgba_is_packed_as_native_endian_argb8888() {
+        let pixel = tiny_skia::PremultipliedColorU8::from_rgba(0x11, 0x22, 0x33, 0xff)
+            .expect("opaque RGBA is valid premultiplied data");
+        let mut bytes = [0_u8; 4];
+        write_toplevel_icon_argb8888(&[pixel], &mut bytes)
+            .expect("one pixel should fit the destination");
+        assert_eq!(u32::from_ne_bytes(bytes), 0xff11_2233);
+        #[cfg(target_endian = "little")]
+        assert_eq!(bytes, [0x33, 0x22, 0x11, 0xff]);
+    }
+
+    #[test]
+    fn toplevel_icon_argb8888_preserves_transparent_and_premultiplied_alpha() {
+        let transparent = tiny_skia::PremultipliedColorU8::TRANSPARENT;
+        let semi = tiny_skia::PremultipliedColorU8::from_rgba(64, 32, 16, 128)
+            .expect("channels are already premultiplied by alpha");
+        let mut bytes = [0_u8; 8];
+        write_toplevel_icon_argb8888(&[transparent, semi], &mut bytes)
+            .expect("two pixels should fit the destination");
+        assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+            0x8040_2010
+        );
+    }
+
+    #[test]
+    fn embedded_toplevel_icon_logo_decodes_without_filesystem_io() {
+        let logo = decode_toplevel_icon_logo().expect("embedded logo.png should decode");
+        assert_eq!((logo.width(), logo.height()), (1254, 1254));
+    }
+
+    #[test]
+    fn toplevel_icon_apply_state_handles_event_order_absence_fallback_and_global_remove() {
+        let mut manager_first = ToplevelIconState::default();
+        assert_eq!(
+            manager_first.apply_plan(false, true, true),
+            ToplevelIconApplyPlan::Wait
+        );
+        assert!(manager_first.manager_announced(7));
+        manager_first.finish_preferences();
+        assert_eq!(
+            manager_first.apply_plan(true, false, true),
+            ToplevelIconApplyPlan::Wait
+        );
+        assert_eq!(
+            manager_first.apply_plan(true, true, true),
+            ToplevelIconApplyPlan::Apply
+        );
+        assert!(manager_first.preferred_sizes.is_empty());
+        assert_eq!(
+            resolved_toplevel_icon_sizes(&manager_first.preferred_sizes),
+            FALLBACK_TOPLEVEL_ICON_SIZES
+        );
+
+        let mut toplevel_first = ToplevelIconState::default();
+        assert_eq!(
+            toplevel_first.apply_plan(false, true, true),
+            ToplevelIconApplyPlan::Wait
+        );
+        assert!(toplevel_first.manager_announced(9));
+        toplevel_first.push_preferred_size(64);
+        toplevel_first.finish_preferences();
+        assert_eq!(
+            toplevel_first.apply_plan(true, true, true),
+            ToplevelIconApplyPlan::Apply
+        );
+
+        assert!(toplevel_first.manager_removed(9));
+        assert!(toplevel_first.manager_global_name.is_none());
+        assert!(toplevel_first.preferred_sizes.is_empty());
+        assert!(!toplevel_first.preferences_done);
+        assert_eq!(
+            toplevel_first.apply_plan(false, true, true),
+            ToplevelIconApplyPlan::Wait
         );
     }
 
@@ -2839,6 +3378,23 @@ mod tests {
         assert!(!frame.take_ready());
         frame.callback_done();
         assert!(frame.take_ready());
+    }
+
+    #[test]
+    fn fps_accounting_remains_after_successful_swap_buffers() {
+        let source = include_str!("runtime.rs");
+        let render = source
+            .split("    pub fn render_terminal_and_present")
+            .nth(1)
+            .and_then(|tail| tail.split("    pub fn terminal_tab_hit_test").next())
+            .expect("terminal present function must remain present");
+        let swap = render
+            .find(".swap_buffers(&self.context)")
+            .expect("terminal present path must swap buffers");
+        let record = render
+            .find("record_presented_frame(Instant::now())")
+            .expect("FPS accounting must remain in terminal present path");
+        assert!(swap < record);
     }
 
     #[test]

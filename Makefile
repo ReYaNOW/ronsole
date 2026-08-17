@@ -162,6 +162,61 @@ test-time:
 	@echo "✅ Тесты завершены"
 
 
+PROF_DIR ?= $(CURDIR)/target/pgo-profiles/$(TARGET)
+PGO_GENERATE_TARGET_DIR ?= $(CURDIR)/target/pgo-generate/$(TARGET)
+PGO_USE_TARGET_DIR ?= $(CURDIR)/target/pgo-use/$(TARGET)
+PGO_TRAINING_DIR ?= $(CURDIR)/target/pgo-training/$(TARGET)
+PGO_AUTOMATION_TIMEOUT ?= 600
+PGO_FAST_EXECUTABLE ?= $(CURDIR)/target/$(TARGET)/release/$(BINARY_NAME)
+PGO_PIPELINE_RUN_ARGS = --target "$(TARGET)" --binary-name "$(BINARY_NAME)" --timeout-seconds "$(PGO_AUTOMATION_TIMEOUT)"
+PGO_PIPELINE_BUILD_ARGS = $(PGO_PIPELINE_RUN_ARGS) --rustflags="$(MAX_RUSTFLAGS)" --build-std-flags="$(BUILD_STD)" --env CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 --env CARGO_PROFILE_RELEASE_PANIC=immediate-abort
+
+pgo-gen:
+	@echo "🧬 Сборка изолированного instrumented Ronsole с MAX-флагами..."
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --build-only
+	@echo "✅ Instrumented Ronsole: $(PGO_GENERATE_TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)"
+
+pgo-run:
+	@echo "🏃 Автоматическая Wayland-тренировка существующего instrumented Ronsole..."
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --run-only
+
+pgo-merge:
+	@echo "🔗 Проверка report/.profraw, merge и запись compatibility manifest..."
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --merge-only
+	@echo "✅ Профиль: $(PROF_DIR)/merged.profdata"
+
+pgo-max:
+	@echo "🔥 Проверенная MAX-equivalent PGO-сборка..."
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode reuse
+	@echo "✅ PGO Ronsole: $(PGO_USE_TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)"
+
+pgo-auto:
+	@echo "🤖 Полный свежий PGO: instrumented MAX → Wayland training → verify/merge → MAX profile-use"
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh
+
+pgo-gen-fast:
+	@echo "⚡ Быстрый Ronsole для отладки PGO GUI-сценария (без instrumentation/LTO)..."
+	@CARGO_NET_OFFLINE=true $(MAKE) fast
+	@echo "✅ Тестовый бинарник: $(PGO_FAST_EXECUTABLE)"
+
+pgo-script:
+	@echo "🎬 Только GUI automation на быстром Ronsole — без instrumented/final PGO build"
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_RUN_ARGS) --mode fresh --run-only --run-executable "$(PGO_FAST_EXECUTABLE)"
+
+pgo-train:
+	@echo "🤖 Свежая instrumented сборка + Wayland training + проверенный merged profile, без final build"
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --train-only
+
+pgo-use:
+	@echo "♻️ Проверка compatibility manifest и использование только свежего PGO profile"
+	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode reuse
+
+pgo-clean:
+	@echo "🧹 Удаление только изолированных PGO-артефактов..."
+	rm -rf "$(PROF_DIR)" "$(PGO_GENERATE_TARGET_DIR)" "$(PGO_USE_TARGET_DIR)" "$(PGO_TRAINING_DIR)"
+
+pgo: pgo-auto
+
 clean:
 	@echo "🧹 Очистка..."
 	cargo +nightly clean

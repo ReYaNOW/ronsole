@@ -25,6 +25,11 @@ const TAB_STRIP_EDGE_FADE_WIDTH: f32 = 40.0;
 const SEARCH_MATCH: [f32; 4] = [0.60, 0.60, 0.60, 0.35];
 const SEARCH_ACTIVE: [f32; 4] = [1.0, 0.60, 0.0, 0.50];
 const SCROLLBAR: [f32; 4] = [0.70, 0.33, 0.54, 0.80];
+const FPS_OVERLAY_WIDTH: f32 = 90.0;
+const FPS_OVERLAY_HEIGHT: f32 = 25.0;
+const FPS_OVERLAY_TOP_GAP: f32 = 5.0;
+const FPS_OVERLAY_BACKGROUND: [f32; 4] = [0.1, 0.1, 0.1, 0.8];
+const FPS_OVERLAY_TEXT: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 
 #[derive(Clone, Copy)]
 enum SearchIcon {
@@ -80,6 +85,12 @@ pub(crate) struct TerminalUiLayout {
     pub search: Option<TerminalSearchGeometry>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FpsOverlayLayout {
+    rect: Rect,
+    baseline_y: f32,
+}
+
 #[inline]
 pub(crate) fn terminal_tab_body_top(scale: f32) -> f32 {
     let strip = terminal_tab_strip_rect(0.0, scale);
@@ -122,6 +133,43 @@ fn terminal_body_rect(width: f32, height: f32, scale: f32) -> Rect {
         w: width.max(0.0),
         h: (height.max(0.0) - y).max(0.0),
     }
+}
+
+#[inline]
+fn fps_overlay_layout(body: Rect, scale: f32) -> Option<FpsOverlayLayout> {
+    if ![body.x, body.y, body.w, body.h]
+        .into_iter()
+        .all(f32::is_finite)
+        || body.w <= 0.0
+        || body.h <= 0.0
+    {
+        return None;
+    }
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let gap = (FPS_OVERLAY_TOP_GAP * scale).round().max(0.0);
+    let available_h = (body.h - gap).max(0.0);
+    if available_h <= 0.0 {
+        return None;
+    }
+    let width = (FPS_OVERLAY_WIDTH * scale).round().max(1.0).min(body.w);
+    let height = (FPS_OVERLAY_HEIGHT * scale)
+        .round()
+        .max(1.0)
+        .min(available_h);
+    let rect = Rect {
+        x: (body.x + (body.w - width) * 0.5).round(),
+        y: (body.y + gap).round(),
+        w: width,
+        h: height,
+    };
+    Some(FpsOverlayLayout {
+        rect,
+        baseline_y: (rect.y + rect.h * 0.76).round(),
+    })
 }
 
 #[inline]
@@ -319,10 +367,14 @@ struct SettingsHelpEntry {
     description: &'static str,
 }
 
-const SETTINGS_HELP_ENTRIES: [SettingsHelpEntry; 5] = [
+const SETTINGS_HELP_ENTRIES: [SettingsHelpEntry; 6] = [
     SettingsHelpEntry {
         shortcut: "F1",
         description: "Открыть/закрыть настройки",
+    },
+    SettingsHelpEntry {
+        shortcut: "Ctrl + F8",
+        description: "Показать/скрыть FPS",
     },
     SettingsHelpEntry {
         shortcut: "Ctrl + Shift + T",
@@ -1470,6 +1522,37 @@ impl Renderer {
         width
     }
 
+    fn draw_fps_overlay(&mut self, body: Rect) {
+        let Some(layout) = fps_overlay_layout(body, self.scale_factor) else {
+            return;
+        };
+        self.push_rect(
+            layout.rect.x,
+            layout.rect.y,
+            layout.rect.w,
+            layout.rect.h,
+            FPS_OVERLAY_BACKGROUND,
+        );
+
+        let fps_text = std::mem::take(&mut self.presented_fps.cached_string);
+        if !fps_text.is_empty() {
+            let text_width = self.terminal_ui_text_width(&fps_text, 1.0);
+            let text_x = (layout.rect.x + (layout.rect.w - text_width) * 0.5)
+                .round()
+                .max(layout.rect.x);
+            self.draw_ui_text_clipped(
+                &fps_text,
+                text_x,
+                layout.rect.x + layout.rect.w,
+                layout.baseline_y,
+                FPS_OVERLAY_TEXT,
+                1.0,
+            );
+        }
+        self.presented_fps.cached_string = fps_text;
+        self.flush();
+    }
+
     fn draw_ui_text_clipped(
         &mut self,
         text: &str,
@@ -2270,6 +2353,7 @@ impl Renderer {
         active_terminal: usize,
         search: &mut TerminalSearchState,
         focused: bool,
+        show_fps: bool,
         tab_scroll_x: f32,
         drag: Option<&crate::tabs::TabDragState>,
         pointer_x: f32,
@@ -2314,6 +2398,9 @@ impl Renderer {
             settings_background_input,
             settings_background_editing,
         );
+        if show_fps {
+            self.draw_fps_overlay(layout.body);
+        }
         layout
     }
 
@@ -3152,6 +3239,47 @@ mod tests {
     }
 
     #[test]
+    fn fps_overlay_is_pixel_snapped_inside_terminal_body_without_changing_layout() {
+        for scale in [1.0, 1.25, 1.3333333, 1.5] {
+            let strip = terminal_tab_strip_rect(1280.0, scale);
+            let body_before = terminal_body_rect(1280.0, 720.0, scale);
+            let char_w = (10.0 * scale).round().max(1.0);
+            let char_h = (26.0 * scale).round().max(1.0);
+            let rows_before = terminal_visible_rows(body_before.h, char_h, scale);
+            let cols_before = ((body_before.w - 20.0 * scale) / char_w)
+                .floor()
+                .max(10.0) as usize;
+
+            let overlay = fps_overlay_layout(body_before, scale)
+                .expect("normal terminal body should fit the FPS overlay");
+            let body_after = terminal_body_rect(1280.0, 720.0, scale);
+            let rows_after = terminal_visible_rows(body_after.h, char_h, scale);
+            let cols_after = ((body_after.w - 20.0 * scale) / char_w)
+                .floor()
+                .max(10.0) as usize;
+
+            assert_eq!(body_before, body_after);
+            assert_eq!(rows_before, rows_after);
+            assert_eq!(cols_before, cols_after);
+            assert_eq!(body_before.y, strip.y + strip.h);
+            assert!(overlay.rect.y >= body_before.y);
+            assert!(overlay.rect.y + overlay.rect.h <= body_before.y + body_before.h);
+            assert!(overlay.rect.x >= body_before.x);
+            assert!(overlay.rect.x + overlay.rect.w <= body_before.x + body_before.w);
+            for value in [
+                overlay.rect.x,
+                overlay.rect.y,
+                overlay.rect.w,
+                overlay.rect.h,
+                overlay.baseline_y,
+            ] {
+                assert!(value.is_finite());
+                assert_eq!(value.fract(), 0.0);
+            }
+        }
+    }
+
+    #[test]
     fn terminal_focus_separator_matches_body_top_and_full_width_at_fractional_scale() {
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
             let body = terminal_body_rect(1280.0, 720.0, scale);
@@ -3635,6 +3763,10 @@ mod tests {
                 SettingsHelpEntry {
                     shortcut: "F1",
                     description: "Открыть/закрыть настройки",
+                },
+                SettingsHelpEntry {
+                    shortcut: "Ctrl + F8",
+                    description: "Показать/скрыть FPS",
                 },
                 SettingsHelpEntry {
                     shortcut: "Ctrl + Shift + T",

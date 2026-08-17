@@ -6,6 +6,7 @@ pub(crate) use terminal_ui::{
 use glow::HasContext;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use swash::FontRef;
 use swash::scale::{
     Render, ScaleContext, Source, StrikeWith,
@@ -27,6 +28,76 @@ const UI_FONT_LOGICAL_SIZE: f32 = 18.0;
 const LEGACY_TERMINAL_FONT_LOGICAL_SIZE: f32 = 18.0;
 const LEGACY_TERMINAL_LINE_HEIGHT: f32 = 26.0;
 const LEGACY_TERMINAL_BASELINE_OFFSET: f32 = 19.0;
+const FPS_SAMPLE_WINDOW_SECONDS: f32 = 0.5;
+
+#[derive(Debug)]
+struct PresentedFps {
+    last_present_time: Option<Instant>,
+    frame_count: u32,
+    accumulated_seconds: f32,
+    fps: f32,
+    cached_string: String,
+}
+
+impl Default for PresentedFps {
+    fn default() -> Self {
+        Self {
+            last_present_time: None,
+            frame_count: 0,
+            accumulated_seconds: 0.0,
+            fps: 0.0,
+            cached_string: String::with_capacity(16),
+        }
+    }
+}
+
+impl PresentedFps {
+    fn reset(&mut self) {
+        self.last_present_time = None;
+        self.frame_count = 0;
+        self.accumulated_seconds = 0.0;
+        self.fps = 0.0;
+        self.cached_string.clear();
+    }
+
+    fn record_interval(&mut self, dt: f32) -> bool {
+        if !dt.is_finite() || dt <= 0.0 {
+            return false;
+        }
+        self.frame_count = self.frame_count.saturating_add(1);
+        self.accumulated_seconds += dt;
+        if !self.accumulated_seconds.is_finite() || self.accumulated_seconds <= 0.0 {
+            self.frame_count = 0;
+            self.accumulated_seconds = 0.0;
+            return false;
+        }
+        if self.accumulated_seconds < FPS_SAMPLE_WINDOW_SECONDS {
+            return false;
+        }
+
+        let fps = self.frame_count as f32 / self.accumulated_seconds;
+        self.frame_count = 0;
+        self.accumulated_seconds = 0.0;
+        if !fps.is_finite() || fps <= 0.0 {
+            return false;
+        }
+
+        self.fps = fps;
+        use std::fmt::Write;
+        self.cached_string.clear();
+        let _ = write!(&mut self.cached_string, "FPS: {:.0}", self.fps);
+        true
+    }
+
+    fn record_presented_frame(&mut self, now: Instant) {
+        if let Some(last) = self.last_present_time
+            && let Some(dt) = now.checked_duration_since(last)
+        {
+            let _ = self.record_interval(dt.as_secs_f32());
+        }
+        self.last_present_time = Some(now);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalFontMetrics {
@@ -296,6 +367,7 @@ pub struct Renderer {
     terminal_tab_strip_layout: TerminalTabStripLayout,
     terminal_tab_base_x: f32,
     terminal_tab_animation_active: bool,
+    presented_fps: PresentedFps,
     palette: TerminalPalette,
 }
 
@@ -427,6 +499,7 @@ impl Renderer {
             terminal_tab_strip_layout: TerminalTabStripLayout::default(),
             terminal_tab_base_x: 0.0,
             terminal_tab_animation_active: false,
+            presented_fps: PresentedFps::default(),
             palette,
         };
         renderer.prewarm_ascii();
@@ -436,6 +509,14 @@ impl Renderer {
 
     pub fn graphics_diagnostics(&self) -> &GraphicsDiagnostics {
         &self.diagnostics
+    }
+
+    pub(crate) fn reset_fps_counter(&mut self) {
+        self.presented_fps.reset();
+    }
+
+    pub(crate) fn record_presented_frame(&mut self, now: Instant) {
+        self.presented_fps.record_presented_frame(now);
     }
 
     pub fn scale_factor(&self) -> f32 {
@@ -1460,6 +1541,57 @@ fn rounded_rect_vertices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presented_fps_reports_sixty_after_half_second_of_completed_intervals() {
+        let mut presented = PresentedFps::default();
+        for _ in 0..29 {
+            assert!(!presented.record_interval(1.0 / 60.0));
+            assert!(presented.cached_string.is_empty());
+        }
+        assert!(presented.record_interval(1.0 / 60.0));
+        assert!((presented.fps - 60.0).abs() < 0.01);
+        assert_eq!(presented.cached_string, "FPS: 60");
+        assert_eq!(presented.frame_count, 0);
+        assert_eq!(presented.accumulated_seconds, 0.0);
+    }
+
+    #[test]
+    fn presented_fps_ignores_invalid_intervals() {
+        let mut presented = PresentedFps::default();
+        for dt in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(!presented.record_interval(dt));
+        }
+        assert_eq!(presented.frame_count, 0);
+        assert_eq!(presented.accumulated_seconds, 0.0);
+        assert_eq!(presented.fps, 0.0);
+        assert!(presented.cached_string.is_empty());
+    }
+
+    #[test]
+    fn presented_fps_reset_drops_partial_and_cached_samples() {
+        let mut presented = PresentedFps::default();
+        for _ in 0..30 {
+            let _ = presented.record_interval(1.0 / 60.0);
+        }
+        assert_eq!(presented.cached_string, "FPS: 60");
+        for _ in 0..12 {
+            assert!(!presented.record_interval(1.0 / 60.0));
+        }
+        presented.last_present_time = Some(Instant::now());
+
+        presented.reset();
+        assert!(presented.last_present_time.is_none());
+        assert_eq!(presented.frame_count, 0);
+        assert_eq!(presented.accumulated_seconds, 0.0);
+        assert_eq!(presented.fps, 0.0);
+        assert!(presented.cached_string.is_empty());
+
+        for _ in 0..12 {
+            assert!(!presented.record_interval(1.0 / 60.0));
+        }
+        assert!(presented.cached_string.is_empty());
+    }
 
     #[test]
     fn quad_geometry_is_pixel_snapped() {

@@ -20,6 +20,7 @@ mod wayland_input;
 
 use std::env;
 use std::path::Path;
+use std::process::ExitCode;
 
 const EGL_VENDOR_ENV: &str = "__EGL_VENDOR_LIBRARY_FILENAMES";
 const RONSOLE_EGL_VENDOR_ENV: &str = "RONSOLE_EGL_VENDOR";
@@ -117,23 +118,68 @@ fn tune_glibc_allocator() {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
+    let automation_options: Option<app::AutomationOptions> =
+        match app::automation_options_from_env() {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("Ronsole: invalid PGO automation arguments: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let pgo_training = automation_options.is_some();
+
     let mut primary_instance = match platform::single_instance::acquire_single_instance() {
         Ok(platform::single_instance::SingleInstanceStatus::Primary(primary)) => primary,
-        Ok(platform::single_instance::SingleInstanceStatus::Secondary) => return,
+        Ok(platform::single_instance::SingleInstanceStatus::Secondary) => {
+            if let Some(options) = automation_options.as_ref() {
+                let error = "PGO training connected to an existing Ronsole single-instance socket";
+                if let Err(report_error) =
+                    app::write_automation_startup_failure(options, "single-instance", error)
+                {
+                    eprintln!("Ronsole: failed to write PGO startup report: {report_error}");
+                }
+                eprintln!("Ronsole: {error}");
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::SUCCESS;
+        }
         Err(error) => {
             eprintln!("Ronsole: single-instance startup failed: {error}");
-            return;
+            if let Some(options) = automation_options.as_ref() {
+                let message = format!("single-instance startup failed: {error}");
+                if let Err(report_error) =
+                    app::write_automation_startup_failure(options, "single-instance", &message)
+                {
+                    eprintln!("Ronsole: failed to write PGO startup report: {report_error}");
+                }
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::SUCCESS;
         }
     };
 
     prefer_egl_vendor();
     tune_glibc_allocator();
 
-    let mut app = app::App::load();
+    let mut app = if let Some(options) = automation_options {
+        match app::App::load_with_automation(options) {
+            Ok(app) => app,
+            Err(error) => {
+                eprintln!("Ronsole: PGO automation startup failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        app::App::load()
+    };
     if let Err(error) = app.run_direct_wayland(&mut primary_instance) {
         eprintln!("Ronsole: Wayland runtime failed: {error}");
+        if pgo_training {
+            return ExitCode::FAILURE;
+        }
     }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

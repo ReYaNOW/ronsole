@@ -21,7 +21,12 @@ use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess};
 use std::collections::VecDeque;
 use std::time::Instant;
 
+mod automation;
 mod direct_wayland;
+
+pub(crate) use automation::{
+    AutomationOptions, automation_options_from_env, write_automation_startup_failure,
+};
 
 const TERMINAL_CLEANUP_PENDING_CAPACITY: usize = 16;
 const PENDING_EXTERNAL_LAUNCH_CAPACITY: usize = 32;
@@ -49,6 +54,7 @@ struct FramePlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GlobalShortcut {
     ToggleSettings,
+    ToggleFps,
     NewTab,
     CloseTab,
     Search,
@@ -86,6 +92,16 @@ fn frame_plan(renderable: bool, dirty: bool, animation_active: bool) -> FramePla
     }
 }
 
+#[inline(always)]
+fn continuous_frame_reason(
+    focused: bool,
+    renderable: bool,
+    animation_active: bool,
+    show_fps: bool,
+) -> bool {
+    focused && renderable && (animation_active || show_fps)
+}
+
 #[inline]
 fn exact_global_modifiers(modifiers: Modifiers, shift: bool) -> bool {
     modifiers.control_key()
@@ -99,6 +115,9 @@ fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShort
         PhysicalKey::Code(KeyCode::F1) if modifiers.is_empty() => {
             Some(GlobalShortcut::ToggleSettings)
         }
+        PhysicalKey::Code(KeyCode::F8) if exact_global_modifiers(modifiers, false) => {
+            Some(GlobalShortcut::ToggleFps)
+        }
         PhysicalKey::Code(KeyCode::KeyT) if exact_global_modifiers(modifiers, true) => {
             Some(GlobalShortcut::NewTab)
         }
@@ -110,6 +129,14 @@ fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShort
         }
         _ => None,
     }
+}
+
+#[inline]
+fn global_shortcut_allowed_in_settings(shortcut: GlobalShortcut) -> bool {
+    matches!(
+        shortcut,
+        GlobalShortcut::ToggleSettings | GlobalShortcut::ToggleFps
+    )
 }
 
 const SETTINGS_BACKGROUND_MAX_CHARS: usize = 7;
@@ -358,6 +385,7 @@ pub struct App {
     settings_open: bool,
     settings_progress: f32,
     settings_active_tab: SettingsTab,
+    show_fps: bool,
     focused: bool,
     unfocused_redraw_pending: bool,
     pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
@@ -366,6 +394,7 @@ pub struct App {
     dirty: bool,
     animation_active: bool,
     last_frame: Instant,
+    automation: Option<automation::AutomationController>,
 }
 
 impl App {
@@ -413,6 +442,7 @@ impl App {
             settings_open: false,
             settings_progress: 0.0,
             settings_active_tab: SettingsTab::General,
+            show_fps: false,
             focused: true,
             unfocused_redraw_pending: false,
             pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
@@ -421,6 +451,7 @@ impl App {
             dirty: true,
             animation_active: false,
             last_frame: Instant::now(),
+            automation: None,
         }
     }
 
@@ -765,6 +796,11 @@ impl App {
             self.cancel_pointer_interactions();
             self.settings_background_dragging = false;
         }
+        if self.show_fps
+            && let Some(runtime) = self.runtime.as_mut()
+        {
+            runtime.reset_fps_counter();
+        }
         self.suspend_frame_clock();
         self.request_frame();
     }
@@ -782,6 +818,14 @@ impl App {
         }
         self.settings_open = !self.settings_open;
         self.refresh_cursor_icon();
+        self.request_frame();
+    }
+
+    fn toggle_fps(&mut self) {
+        self.show_fps = !self.show_fps;
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.reset_fps_counter();
+        }
         self.request_frame();
     }
 
@@ -1060,13 +1104,19 @@ impl App {
     }
 
     fn loop_control(&self) -> AppLoopControl {
+        let renderable = self.renderable();
         let plan = frame_plan(
-            self.renderable(),
+            renderable,
             self.dirty,
-            self.focused && self.animation_active,
+            continuous_frame_reason(
+                self.focused,
+                renderable,
+                self.animation_active,
+                self.show_fps,
+            ),
         );
         let now = Instant::now();
-        let search_deadline = (self.focused && self.renderable())
+        let search_deadline = (self.focused && renderable)
             .then(|| self.interaction.search_refresh_deadline())
             .flatten();
         let search_due = search_deadline.is_some_and(|deadline| deadline <= now);
@@ -1080,6 +1130,19 @@ impl App {
                 .filter(|deadline| *deadline > now)
                 .map_or(AppLoopControl::Wait, AppLoopControl::WaitUntil),
             LoopMode::Poll => AppLoopControl::Poll,
+        }
+    }
+
+    fn loop_control_with_automation_deadline(
+        &self,
+        automation_deadline: Instant,
+    ) -> AppLoopControl {
+        match self.loop_control() {
+            AppLoopControl::Wait => AppLoopControl::WaitUntil(automation_deadline),
+            AppLoopControl::WaitUntil(deadline) => {
+                AppLoopControl::WaitUntil(deadline.min(automation_deadline))
+            }
+            control => control,
         }
     }
 
@@ -1123,6 +1186,7 @@ impl App {
     fn handle_global_key(&mut self, shortcut: GlobalShortcut) -> bool {
         match shortcut {
             GlobalShortcut::ToggleSettings => self.toggle_settings(),
+            GlobalShortcut::ToggleFps => self.toggle_fps(),
             GlobalShortcut::NewTab => {
                 let _ = self.add_terminal();
             }
@@ -1246,7 +1310,7 @@ impl App {
         if key_input.state.is_pressed()
             && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
         {
-            if self.settings_modal_active() && shortcut != GlobalShortcut::ToggleSettings {
+            if self.settings_modal_active() && !global_shortcut_allowed_in_settings(shortcut) {
                 return false;
             }
             if self.handle_global_key(shortcut) {
@@ -1550,6 +1614,7 @@ impl App {
                 pointer_y: self.pointer_y,
                 settings_progress: self.settings_progress,
                 settings_tab: self.settings_active_tab,
+                show_fps: self.show_fps,
                 settings_font_value: &self.settings_font_value,
                 settings_scroll_value: &self.settings_scroll_value,
                 settings_background_input: &mut self.settings_background_input,
@@ -1595,6 +1660,7 @@ impl App {
     fn on_about_to_wait(&mut self) -> AppLoopControl {
         self.flush_pending_terminal_cleanup();
         if self.remove_closed_terminals() {
+            self.interrupt_automation("terminal process closed the final terminal");
             self.prepare_exit();
             return AppLoopControl::Exit;
         }
@@ -1605,7 +1671,20 @@ impl App {
             self.suspend_frame_clock();
         }
         self.sync_animation_state();
-        self.loop_control()
+        if self.automation.is_none() {
+            return self.loop_control();
+        }
+        let now = Instant::now();
+        match self.advance_automation(now) {
+            Some(automation::AutomationTick::Running { deadline }) => {
+                self.loop_control_with_automation_deadline(deadline)
+            }
+            Some(automation::AutomationTick::ExitOk | automation::AutomationTick::ExitFailed) => {
+                self.prepare_exit();
+                AppLoopControl::Exit
+            }
+            None => self.loop_control(),
+        }
     }
 
     fn on_exiting(&mut self) {
@@ -1642,6 +1721,36 @@ mod tests {
                 loop_mode: LoopMode::Wait,
             }
         );
+
+        let mut app = App::new();
+        app.dirty = false;
+        assert!(app.automation.is_none());
+        assert_eq!(app.loop_control(), AppLoopControl::Wait);
+        assert_eq!(app.on_about_to_wait(), AppLoopControl::Wait);
+        assert!(app.automation.is_none());
+
+        let source = include_str!("app.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let about_to_wait = production
+            .split("    fn on_about_to_wait")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn on_exiting").next())
+            .expect("about-to-wait routing must remain present");
+        let guard = about_to_wait
+            .find("if self.automation.is_none()")
+            .expect("normal path must check automation first");
+        let idle_return = about_to_wait
+            .find("return self.loop_control();")
+            .expect("disabled automation must return directly to normal loop control");
+        let clock = about_to_wait
+            .find("let now = Instant::now();")
+            .expect("enabled automation must take its clock only after the guard");
+        let advance = about_to_wait
+            .find("self.advance_automation(now)")
+            .expect("enabled automation must still advance");
+        assert!(guard < idle_return);
+        assert!(idle_return < clock);
+        assert!(clock < advance);
     }
 
     #[test]
@@ -1660,6 +1769,37 @@ mod tests {
                 loop_mode: LoopMode::Poll,
             }
         );
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "ronsole-pgo-about-to-wait-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("terminal_fixture.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+
+        let options = AutomationOptions {
+            workspace: workspace.clone(),
+            report: workspace.join("report.json"),
+            timeout: Duration::from_secs(30),
+        };
+        let mut app = App::new();
+        app.dirty = false;
+        app.automation = Some(automation::AutomationController::new(options).unwrap());
+
+        assert_eq!(app.loop_control(), AppLoopControl::Wait);
+        assert!(matches!(
+            app.on_about_to_wait(),
+            AppLoopControl::WaitUntil(_)
+        ));
+        assert!(app.automation.is_some());
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -1687,6 +1827,38 @@ mod tests {
                 (2, Intent::ActivateWhenReady, true, false),
             ]),
             Some((2, false))
+        );
+    }
+
+    #[test]
+    fn fps_continuous_frame_reason_requires_focus_and_renderability() {
+        assert!(continuous_frame_reason(true, true, false, true));
+        assert!(continuous_frame_reason(true, true, true, false));
+        assert!(!continuous_frame_reason(false, true, false, true));
+        assert!(!continuous_frame_reason(true, false, false, true));
+        assert!(!continuous_frame_reason(true, true, false, false));
+
+        assert_eq!(
+            frame_plan(
+                true,
+                false,
+                continuous_frame_reason(true, true, false, true),
+            ),
+            FramePlan {
+                request_frame: true,
+                loop_mode: LoopMode::Poll,
+            }
+        );
+        assert_eq!(
+            frame_plan(
+                false,
+                false,
+                continuous_frame_reason(true, false, false, true),
+            ),
+            FramePlan {
+                request_frame: false,
+                loop_mode: LoopMode::Wait,
+            }
         );
     }
 
@@ -1836,13 +2008,18 @@ mod tests {
     }
 
     #[test]
-    fn global_shortcuts_use_plain_f1_and_exact_application_modifiers() {
+    fn global_shortcuts_keep_plain_f8_for_terminal_and_use_exact_ctrl_f8_for_fps() {
         let none = Modifiers::empty();
         let ctrl = Modifiers::CONTROL;
         let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
         assert_eq!(
             global_shortcut(PhysicalKey::Code(KeyCode::F1), none),
             Some(GlobalShortcut::ToggleSettings)
+        );
+        assert_eq!(global_shortcut(PhysicalKey::Code(KeyCode::F8), none), None);
+        assert_eq!(
+            global_shortcut(PhysicalKey::Code(KeyCode::F8), ctrl),
+            Some(GlobalShortcut::ToggleFps)
         );
         assert_eq!(
             global_shortcut(PhysicalKey::Code(KeyCode::KeyT), ctrl_shift),
@@ -1871,6 +2048,19 @@ mod tests {
                 None
             );
         }
+        for modifiers in [
+            Modifiers::ALT,
+            Modifiers::SHIFT,
+            Modifiers::SUPER,
+            ctrl | Modifiers::ALT,
+            ctrl | Modifiers::SHIFT,
+            ctrl | Modifiers::SUPER,
+        ] {
+            assert_eq!(
+                global_shortcut(PhysicalKey::Code(KeyCode::F8), modifiers),
+                None
+            );
+        }
         for modifiers in [ctrl_shift | Modifiers::ALT, ctrl_shift | Modifiers::SUPER] {
             assert_eq!(
                 global_shortcut(PhysicalKey::Code(KeyCode::KeyT), modifiers),
@@ -1886,6 +2076,39 @@ mod tests {
             global_shortcut(PhysicalKey::Code(KeyCode::KeyT), ctrl),
             None
         );
+    }
+
+    #[test]
+    fn settings_modal_allows_only_settings_and_fps_global_shortcuts() {
+        assert!(global_shortcut_allowed_in_settings(
+            GlobalShortcut::ToggleSettings
+        ));
+        assert!(global_shortcut_allowed_in_settings(
+            GlobalShortcut::ToggleFps
+        ));
+        for shortcut in [
+            GlobalShortcut::NewTab,
+            GlobalShortcut::CloseTab,
+            GlobalShortcut::Search,
+        ] {
+            assert!(!global_shortcut_allowed_in_settings(shortcut));
+        }
+    }
+
+    #[test]
+    fn fps_toggle_is_opt_in_and_requests_the_cleanup_frame() {
+        let mut app = App::new();
+        app.dirty = false;
+        assert!(!app.show_fps);
+
+        app.toggle_fps();
+        assert!(app.show_fps);
+        assert!(app.dirty);
+
+        app.dirty = false;
+        app.toggle_fps();
+        assert!(!app.show_fps);
+        assert!(app.dirty);
     }
 
     #[test]
