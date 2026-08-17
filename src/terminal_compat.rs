@@ -181,6 +181,7 @@ impl Cell {
         self.flags & CELL_FLAG_INVERSE != 0
     }
 
+    #[cfg(test)]
     pub(crate) fn is_underlined(&self) -> bool {
         self.flags & CELL_FLAG_UNDERLINE != 0
     }

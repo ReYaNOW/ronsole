@@ -7,6 +7,7 @@ use crate::input_types::{
     CursorKind, KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton,
     PointerPosition, ScrollDelta,
 };
+use crate::platform::{KdeActivationWorker, kde_session_active};
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
@@ -53,10 +54,12 @@ enum GlobalShortcut {
     Search,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum ExternalLaunchAction {
     OpenDefaultTab,
-    ActivateExistingWindow { activation_token: Option<String> },
+    WaylandXdgActivation { activation_token: String },
+    KdeForceActivate,
+    WaylandBestEffort,
 }
 
 #[inline(always)]
@@ -251,14 +254,17 @@ fn cursor_icon_change(current: CursorKind, desired: CursorKind) -> Option<Cursor
 #[inline]
 fn external_launch_action(
     focused: bool,
+    kde_session: bool,
     request: crate::platform::single_instance::ExternalLaunchRequest,
 ) -> ExternalLaunchAction {
     if focused {
         ExternalLaunchAction::OpenDefaultTab
+    } else if let Some(activation_token) = request.activation_token {
+        ExternalLaunchAction::WaylandXdgActivation { activation_token }
+    } else if kde_session {
+        ExternalLaunchAction::KdeForceActivate
     } else {
-        ExternalLaunchAction::ActivateExistingWindow {
-            activation_token: request.activation_token,
-        }
+        ExternalLaunchAction::WaylandBestEffort
     }
 }
 
@@ -343,6 +349,7 @@ pub struct App {
     pending_tab_reveal: Option<bool>,
     interaction: TerminalInteraction,
     terminal_cleanup: TerminalCleanupWorker,
+    kde_activation_worker: Option<KdeActivationWorker>,
     pending_terminal_cleanup: VecDeque<TerminalProcess>,
     modifiers: Modifiers,
     pointer_x: f32,
@@ -397,6 +404,7 @@ impl App {
             pending_tab_reveal: None,
             interaction,
             terminal_cleanup: TerminalCleanupWorker::new(),
+            kde_activation_worker: None,
             pending_terminal_cleanup: VecDeque::with_capacity(TERMINAL_CLEANUP_PENDING_CAPACITY),
             modifiers: Modifiers::empty(),
             pointer_x: 0.0,
@@ -588,13 +596,26 @@ impl App {
             }
             return;
         }
-        match external_launch_action(self.focused, request) {
+        let kde_session =
+            !self.focused && request.activation_token.is_none() && kde_session_active();
+        match external_launch_action(self.focused, kde_session, request) {
             ExternalLaunchAction::OpenDefaultTab => {
                 let _ = self.add_terminal();
             }
-            ExternalLaunchAction::ActivateExistingWindow { activation_token } => {
+            ExternalLaunchAction::WaylandXdgActivation { activation_token } => {
                 if let Some(runtime) = self.runtime.as_mut() {
-                    runtime.activate_existing_window(activation_token);
+                    runtime.activate_existing_window(Some(activation_token));
+                }
+            }
+            ExternalLaunchAction::KdeForceActivate => {
+                let worker = self
+                    .kde_activation_worker
+                    .get_or_insert_with(KdeActivationWorker::new);
+                worker.try_activate(std::process::id());
+            }
+            ExternalLaunchAction::WaylandBestEffort => {
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.activate_existing_window(None);
                 }
             }
         }
@@ -1129,6 +1150,10 @@ impl App {
             process.shutdown();
         }
         self.terminal_cleanup.shutdown_and_join();
+        if let Some(worker) = self.kde_activation_worker.as_mut() {
+            worker.shutdown_and_join();
+        }
+        self.kde_activation_worker = None;
     }
 
     fn remove_closed_terminals(&mut self) -> bool {
@@ -1864,44 +1889,70 @@ mod tests {
     }
 
     #[test]
-    fn focused_external_launch_opens_tab_without_reusing_activation_token() {
-        assert_eq!(
+    fn focused_external_launch_with_token_opens_tab_without_using_token() {
+        assert!(matches!(
             external_launch_action(
+                true,
                 true,
                 crate::platform::single_instance::ExternalLaunchRequest {
                     activation_token: Some("one-shot-token".to_owned()),
                 },
             ),
             ExternalLaunchAction::OpenDefaultTab
-        );
+        ));
     }
 
     #[test]
-    fn unfocused_external_launch_consumes_activation_token_once() {
-        assert_eq!(
+    fn focused_external_launch_without_token_opens_tab() {
+        assert!(matches!(
+            external_launch_action(
+                true,
+                true,
+                crate::platform::single_instance::ExternalLaunchRequest::default(),
+            ),
+            ExternalLaunchAction::OpenDefaultTab
+        ));
+    }
+
+    #[test]
+    fn unfocused_external_launch_with_supplied_token_uses_only_xdg_activation() {
+        let action = external_launch_action(
+            false,
+            true,
+            crate::platform::single_instance::ExternalLaunchRequest {
+                activation_token: Some("one-shot-token".to_owned()),
+            },
+        );
+        assert!(matches!(
+            action,
+            ExternalLaunchAction::WaylandXdgActivation {
+                activation_token
+            } if activation_token == "one-shot-token"
+        ));
+    }
+
+    #[test]
+    fn unfocused_kde_launch_without_token_uses_force_activation_worker() {
+        assert!(matches!(
             external_launch_action(
                 false,
-                crate::platform::single_instance::ExternalLaunchRequest {
-                    activation_token: Some("one-shot-token".to_owned()),
-                },
+                true,
+                crate::platform::single_instance::ExternalLaunchRequest::default(),
             ),
-            ExternalLaunchAction::ActivateExistingWindow {
-                activation_token: Some("one-shot-token".to_owned()),
-            }
-        );
+            ExternalLaunchAction::KdeForceActivate
+        ));
     }
 
     #[test]
-    fn unfocused_external_launch_without_token_uses_runtime_fallback_path() {
-        assert_eq!(
+    fn unfocused_non_kde_launch_without_token_keeps_generic_wayland_best_effort() {
+        assert!(matches!(
             external_launch_action(
+                false,
                 false,
                 crate::platform::single_instance::ExternalLaunchRequest::default(),
             ),
-            ExternalLaunchAction::ActivateExistingWindow {
-                activation_token: None,
-            }
-        );
+            ExternalLaunchAction::WaylandBestEffort
+        ));
     }
 
     #[test]

@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
+mod kde_activation;
 mod process;
 pub(crate) mod single_instance;
 
-pub(crate) use process::{ProcessSnapshot, ProcessTree, foreground_process_snapshot};
+pub(crate) use kde_activation::{KdeActivationWorker, kde_session_active};
 pub use process::resolve_executable;
+pub(crate) use process::{ProcessSnapshot, ProcessTree, foreground_process_snapshot};
 
 #[inline]
 pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
