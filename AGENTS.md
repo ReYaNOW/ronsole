@@ -269,8 +269,7 @@ Do not hand-edit generated map contents. Fix the generator or source and regener
 - Existing changes belong to the user unless proven otherwise.
 - Inspect status before editing and preserve unrelated tracked/untracked files.
 - Never discard changes with `git reset --hard`, `git checkout --`, or similar destructive commands.
-- Do not commit or push from agent work.
-- Do not stage files unless the user explicitly asks.
+- Commit with explicit paths (`git add <file>…`, never `-A`/`.`); substantial work goes on a branch. Push only from the main session, once the task is finished and `make codex_test` is green.
 - Do not edit `.git/` or generated `.code-review-graph/` data.
 - Never run `cargo clean`.
 
