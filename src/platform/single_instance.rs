@@ -37,13 +37,26 @@ const TAB_INPUT_MIN_DELAY_MS: u16 = 100;
 const TAB_INPUT_MAX_DELAY_MS: u16 = 2000;
 const TAB_INPUT_MAX_LINE_BYTES: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TabInputRequest {
     pub(crate) token: String,
     pub(crate) delay_ms: u16,
     pub(crate) kind: TabInputKind,
     pub(crate) op: [u8; 16],
     pub(crate) line: String,
+}
+
+impl std::fmt::Debug for TabInputRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TabInputRequest")
+            .field("token", &"<redacted>")
+            .field("delay_ms", &self.delay_ms)
+            .field("kind", &self.kind)
+            .field("op", &self.op)
+            .field("line", &self.line)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,24 +254,30 @@ impl PrimaryInstance {
                 let Ok(peer) = peer_credentials(&stream) else { continue };
                 let _ = stream.set_read_timeout(Some(SERVER_CLIENT_IO_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(SERVER_CLIENT_IO_TIMEOUT));
-                match read_instance_message(&mut stream, peer) {
+                let mut prefix = [0_u8; 2];
+                if stream.read_exact(&mut prefix).is_err() {
+                    continue;
+                }
+                if prefix[1] == TAB_INPUT_MESSAGE && !peer_allowed(peer, effective_uid()) {
+                    let _ = write_tab_input_result(&mut stream, TabInputCode::PeerRejected);
+                    continue;
+                }
+                let mut framed = io::Cursor::new(prefix).chain(&mut stream);
+                let message = read_instance_message(&mut framed, peer);
+                drop(framed);
+                match message {
                     Ok(InstanceMessage::ExternalLaunch(request)) => {
                         if deliver(InstanceMessage::ExternalLaunch(request)) {
                             let _ = write_delivery_ack(&mut stream);
                         }
                     }
                     Ok(InstanceMessage::TabInput(mut envelope)) => {
-                        if !peer_allowed(peer, effective_uid()) {
-                            let _ = write_tab_input_result(&mut stream, TabInputCode::PeerRejected);
-                            continue;
-                        }
                         if !reserve_tab_input_reply(&active_replies) {
                             let _ = write_tab_input_result(&mut stream, TabInputCode::RateLimitedOrQueued);
                             continue;
                         }
                         let (reply_tx, reply_rx) = mpsc::channel();
-                        envelope.reply = reply_tx.clone();
-                        let reply_sender = reply_tx;
+                        envelope.reply = reply_tx;
                         let delay_ms = envelope.request.delay_ms;
                         if !deliver(InstanceMessage::TabInput(envelope)) {
                             release_tab_input_reply(&active_replies);
@@ -271,7 +290,6 @@ impl PrimaryInstance {
                         let spawned = std::thread::Builder::new()
                             .name("ronsole-tab-input-reply".to_owned())
                             .spawn(move || {
-                                let _reply_sender = reply_sender;
                                 let response = reply_rx.recv_timeout(
                                     Duration::from_millis(u64::from(delay_ms)) + Duration::from_secs(1),
                                 );
@@ -1340,13 +1358,19 @@ mod tests {
             bytes
         };
         let base = sample_tab_input(TabInputKind::Line, "/effort high");
-        for request in [
-            TabInputRequest { line: String::new(), ..base.clone() },
-            TabInputRequest { line: "x".repeat(4097), ..base.clone() },
-            TabInputRequest { delay_ms: 99, ..base.clone() },
-            TabInputRequest { delay_ms: 2001, ..base.clone() },
-        ] {
-            assert!(write_tab_input_request(&mut Vec::new(), &request).is_err());
+        let encoded = valid(&base);
+        let delay_offset = REQUEST_HEADER_LEN + 2 + base.token.len();
+        let line_length_offset = delay_offset + 2 + 1 + base.op.len();
+        for delay in [99_u16, 2001] {
+            let mut invalid = encoded.clone();
+            invalid[delay_offset..delay_offset + 2].copy_from_slice(&delay.to_be_bytes());
+            assert!(read_tab_input_request(&mut Cursor::new(invalid)).is_err());
+        }
+        for line_len in [0_u16, 4097] {
+            let mut invalid = encoded.clone();
+            invalid[line_length_offset..line_length_offset + 2]
+                .copy_from_slice(&line_len.to_be_bytes());
+            assert!(read_tab_input_request(&mut Cursor::new(invalid)).is_err());
         }
         let mut unknown_kind = valid(&base);
         let kind_offset = 6 + 2 + base.token.len() + 2;
@@ -1386,13 +1410,68 @@ mod tests {
     }
 
     #[test]
-    fn ninth_waiting_tab_input_gets_overloaded_result() {
-        let permits = Arc::new(AtomicUsize::new(0));
+    fn tab_input_request_debug_redacts_token() {
+        let request = sample_tab_input(TabInputKind::Line, "/effort high");
+        assert!(!format!("{:?}", request).contains(&request.token));
+    }
+
+    #[test]
+    fn listener_ninth_waiting_tab_input_gets_overloaded_result_and_releases_slot() {
+        let dir = TestDir::new();
+        let path = dir.socket_path();
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), effective_uid()).unwrap());
+        let (tx, rx) = mpsc::channel();
+        primary.start_listener(move |message| tx.send(message).is_ok()).unwrap();
+
+        let mut clients = Vec::new();
+        let mut envelopes = Vec::new();
         for _ in 0..TAB_INPUT_REPLY_LIMIT {
-            assert!(reserve_tab_input_reply(&permits));
+            let mut stream = UnixStream::connect(&path).unwrap();
+            write_tab_input_request(
+                &mut stream,
+                &sample_tab_input(TabInputKind::Line, "/effort high"),
+            )
+            .unwrap();
+            let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+                InstanceMessage::TabInput(envelope) => envelope,
+                InstanceMessage::ExternalLaunch(_) => panic!("unexpected external launch"),
+            };
+            clients.push(stream);
+            envelopes.push(envelope);
         }
-        assert!(!reserve_tab_input_reply(&permits));
-        assert_eq!(TabInputCode::RateLimitedOrQueued as u8, 5);
+
+        let mut ninth = UnixStream::connect(&path).unwrap();
+        write_tab_input_request(
+            &mut ninth,
+            &sample_tab_input(TabInputKind::Line, "/effort high"),
+        )
+        .unwrap();
+        let mut result = [0; 3];
+        ninth.read_exact(&mut result).unwrap();
+        assert_eq!(result, [2, 4, TabInputCode::RateLimitedOrQueued as u8]);
+
+        for envelope in envelopes {
+            envelope.reply.send(TabInputCode::InputDelivered).unwrap();
+        }
+        for client in &mut clients {
+            let mut result = [0; 3];
+            client.read_exact(&mut result).unwrap();
+            assert_eq!(result, [2, 4, TabInputCode::InputDelivered as u8]);
+        }
+
+        let mut released = UnixStream::connect(&path).unwrap();
+        write_tab_input_request(
+            &mut released,
+            &sample_tab_input(TabInputKind::Line, "/effort high"),
+        )
+        .unwrap();
+        let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            InstanceMessage::TabInput(envelope) => envelope,
+            InstanceMessage::ExternalLaunch(_) => panic!("unexpected external launch"),
+        };
+        envelope.reply.send(TabInputCode::InputDelivered).unwrap();
+        released.read_exact(&mut result).unwrap();
+        assert_eq!(result, [2, 4, TabInputCode::InputDelivered as u8]);
     }
 
     #[test]
@@ -1433,15 +1512,16 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         primary.start_listener(move |message| { tx.send(message).is_ok() }).unwrap();
         let mut request = sample_tab_input(TabInputKind::Line, "/effort low");
-        request.delay_ms = 100;
+        request.delay_ms = 2000;
         let started = std::time::Instant::now();
         let mut stream = UnixStream::connect(&path).unwrap();
         write_tab_input_request(&mut stream, &request).unwrap();
-        let _envelope = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let envelope = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(envelope);
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
         assert!(response.is_empty());
-        assert!(started.elapsed() <= Duration::from_millis(1200));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
