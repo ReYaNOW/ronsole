@@ -369,6 +369,21 @@ impl TerminalProcess {
         writer.flush()
     }
 
+    /// Replaces the PTY writer with one that always fails, to exercise write errors.
+    #[cfg(test)]
+    pub(crate) fn break_writer_for_test(&self) {
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        *platform::lock_recover(&self.writer) = Box::new(BrokenWriter);
+    }
+
     /// Foreground process group leader of the PTY (`tcgetpgrp` on the master).
     pub(crate) fn process_group_leader(&self) -> Option<u32> {
         platform::lock_recover(&self.master_pty)

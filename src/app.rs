@@ -25,6 +25,7 @@ use std::time::Instant;
 
 mod automation;
 mod direct_wayland;
+mod tab_delivery;
 
 pub(crate) use automation::{
     AutomationOptions, automation_options_from_args, write_automation_startup_failure,
@@ -414,6 +415,7 @@ pub struct App {
     focused: bool,
     unfocused_redraw_pending: bool,
     pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
+    tab_input: tab_delivery::TabInputState,
     occluded: bool,
     zero_sized: bool,
     dirty: bool,
@@ -471,6 +473,7 @@ impl App {
             focused: true,
             unfocused_redraw_pending: false,
             pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
+            tab_input: tab_delivery::TabInputState::default(),
             occluded: false,
             zero_sized: false,
             dirty: true,
@@ -681,12 +684,6 @@ impl App {
                 }
             }
         }
-    }
-
-    fn handle_tab_input(&mut self, envelope: crate::platform::single_instance::TabInputEnvelope) {
-        let _ = envelope
-            .reply
-            .send(crate::platform::single_instance::TabInputCode::NoTab);
     }
 
     fn flush_pending_external_launches(&mut self) {
@@ -1178,6 +1175,9 @@ impl App {
         match plan.loop_mode {
             LoopMode::Wait => search_deadline
                 .filter(|deadline| *deadline > now)
+                .into_iter()
+                .chain(self.tab_input.next_deadline())
+                .min()
                 .map_or(AppLoopControl::Wait, AppLoopControl::WaitUntil),
             LoopMode::Poll => AppLoopControl::Poll,
         }
@@ -1725,6 +1725,7 @@ impl App {
     }
 
     fn on_about_to_wait(&mut self) -> AppLoopControl {
+        self.advance_due_tab_deliveries();
         self.flush_pending_terminal_cleanup();
         if self.remove_closed_terminals() {
             self.interrupt_automation("terminal process closed the final terminal");

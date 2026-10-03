@@ -3765,6 +3765,23 @@ impl Terminal {
         self.last_user_input
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_last_user_input_for_test(&mut self, at: Option<Instant>) {
+        self.last_user_input = at;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn input_hold_active(&self) -> bool {
+        self.user_input_held
+    }
+
+    #[cfg(test)]
+    pub(crate) fn break_input_writer_for_test(&self) {
+        if let Some(process) = self.process.as_ref() {
+            process.break_writer_for_test();
+        }
+    }
+
     pub(crate) fn begin_input_hold(&mut self) {
         self.user_input_held = true;
     }
