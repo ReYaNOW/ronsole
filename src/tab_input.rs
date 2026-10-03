@@ -132,6 +132,12 @@ fn origin_allowed_with(
         if current == leader {
             return true;
         }
+        // A nested `claude` between the sender and the leader (e.g. `claude -p`
+        // launched by the outer session's Bash tool) must not type into the
+        // outer TUI.
+        if current != sender && comm == "claude" {
+            return false;
+        }
         if ppid == current {
             return false;
         }
@@ -407,6 +413,26 @@ mod tests {
         let leader = spawn_shell(&claude, &script);
         let sleeper = wait_for_descendant(leader.0.id(), "sleep");
         assert!(!origin_allowed(sleeper, leader.0.id()));
+    }
+
+    #[test]
+    fn nested_claude_between_sender_and_leader_is_refused() {
+        let outer_dir = TestDir::new("nested-outer");
+        let inner_dir = TestDir::new("nested-inner");
+        let claude = outer_dir.shell_named("claude");
+        let inner = inner_dir.shell_named("claude");
+        let script = format!("{} -c 'sleep 30; true'; true", inner.display());
+        let leader = spawn_shell(&claude, &script);
+        let sleeper = wait_for_descendant(leader.0.id(), "sleep");
+        assert!(!origin_allowed(sleeper, leader.0.id()));
+    }
+
+    #[test]
+    fn walk_refuses_nested_claude_but_allows_direct_chain() {
+        let nested = [(30, "sleep", 25), (25, "claude", 20), (20, "sh", 10), (10, "claude", 1)];
+        assert!(!origin_allowed_with(30, 10, table(&nested)));
+        let direct = [(30, "sleep", 20), (20, "sh", 10), (10, "claude", 1)];
+        assert!(origin_allowed_with(30, 10, table(&direct)));
     }
 
     #[test]

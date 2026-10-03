@@ -119,7 +119,16 @@ pub(crate) fn validate_tab_input_text(kind: TabInputKind, line: &str) -> bool {
     }
     if line.chars().any(|character| {
         character.is_control()
-            || matches!(character as u32, 0x202a..=0x202e | 0x2066..=0x2069)
+            || matches!(
+                character as u32,
+                0x00ad
+                    | 0x200b..=0x200f
+                    | 0x2028..=0x202e
+                    | 0x2060..=0x2064
+                    | 0x2066..=0x2069
+                    | 0xfeff
+                    | 0xfff9..=0xfffb
+            )
     }) {
         return false;
     }
@@ -1394,6 +1403,8 @@ mod tests {
         for line in ["hello\rworld", "hello\u{1b}world", "hello\u{7f}", "a\u{202e}b", "a\u{2066}b"] {
             assert!(!validate_tab_input_text(TabInputKind::PhraseAfterClear, line));
         }
+        assert!(!validate_tab_input_text(TabInputKind::Line, "\u{feff}/effort low"));
+        assert!(!validate_tab_input_text(TabInputKind::PhraseAfterClear, "\u{200d}x"));
         assert!(!validate_tab_input_text(TabInputKind::Clear, "/clear now"));
         assert!(!validate_tab_input_text(TabInputKind::Line, "hello"));
         assert!(!validate_tab_input_text(TabInputKind::PhraseAfterClear, " /x"));
