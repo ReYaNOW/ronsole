@@ -12,6 +12,7 @@ mod runtime;
 mod scroll;
 mod search;
 mod single_line_input;
+mod tab_input;
 mod tabs;
 pub mod terminal;
 mod terminal_compat;
