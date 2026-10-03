@@ -67,6 +67,9 @@ struct Delivery {
     op: [u8; 16],
     line: String,
     generation: ProcGen,
+    /// For a phrase: when the matched `/clear` was written; user input newer
+    /// than this refuses the phrase at the write step.
+    clear_at: Option<Instant>,
     reply: Sender<TabInputCode>,
     phase: Phase,
     deadline: Instant,
@@ -101,12 +104,13 @@ impl App {
             reply,
         } = envelope;
         match self.accept_tab_input(&request, peer, now) {
-            Ok(generation) => self.tab_input.deliveries.push(Delivery {
+            Ok((generation, clear_at)) => self.tab_input.deliveries.push(Delivery {
                 token: request.token,
                 kind: request.kind,
                 op: request.op,
                 line: request.line,
                 generation,
+                clear_at,
                 reply,
                 phase: Phase::Write,
                 deadline: now + Duration::from_millis(u64::from(request.delay_ms)),
@@ -125,7 +129,7 @@ impl App {
         request: &TabInputRequest,
         peer: PeerCred,
         now: Instant,
-    ) -> Result<ProcGen, TabInputCode> {
+    ) -> Result<(ProcGen, Option<Instant>), TabInputCode> {
         let index = self
             .find_tab_by_token(&request.token)
             .ok_or(TabInputCode::NoTab)?;
@@ -148,18 +152,27 @@ impl App {
                 .any(|terminal| terminal.tab_token() == record.token)
         });
         let record = tab_record(&mut self.tab_input.records, &request.token);
-        match request.kind {
-            TabInputKind::Line | TabInputKind::Clear => check_input_ready(terminal, now)?,
-            // A phrase request consumes the remembered /clear whatever the outcome.
-            TabInputKind::PhraseAfterClear => {
-                check_clear_cause(record.clear_op.take(), request.op, terminal, generation, now)?;
+        let clear_at = match request.kind {
+            TabInputKind::Line | TabInputKind::Clear => {
+                check_input_ready(terminal, now)?;
+                None
             }
-        }
+            // A phrase request consumes the remembered /clear whatever the outcome.
+            TabInputKind::PhraseAfterClear => Some(check_clear_cause(
+                record.clear_op.take(),
+                request.op,
+                terminal,
+                generation,
+                now,
+            )?),
+        };
+        // A delivery in its release phase has already replied and only waits to
+        // end the input hold, so it does not occupy the tab's queue slot.
         let queued = self
             .tab_input
             .deliveries
             .iter()
-            .any(|delivery| delivery.token == request.token);
+            .any(|delivery| delivery.token == request.token && delivery.phase != Phase::Release);
         let too_soon = record
             .last_accept
             .is_some_and(|at| now.saturating_duration_since(at) < ACCEPT_INTERVAL);
@@ -167,7 +180,7 @@ impl App {
             return Err(TabInputCode::RateLimitedOrQueued);
         }
         record.last_accept = Some(now);
-        Ok(generation)
+        Ok((generation, clear_at))
     }
 
     /// A tab is addressed only by a well-formed token; an empty tab token
@@ -225,7 +238,9 @@ impl App {
                 let checked = check_same_leader(probe, terminal, delivery.generation).and_then(|()| {
                     match delivery.kind {
                         TabInputKind::Line | TabInputKind::Clear => check_input_ready(terminal, now),
-                        TabInputKind::PhraseAfterClear => Ok(()),
+                        TabInputKind::PhraseAfterClear => {
+                            check_no_input_since(terminal, delivery.clear_at)
+                        }
                     }
                 });
                 if let Err(code) = checked {
@@ -328,18 +343,32 @@ fn check_clear_cause(
     terminal: &Terminal,
     generation: ProcGen,
     now: Instant,
-) -> Result<(), TabInputCode> {
+) -> Result<Instant, TabInputCode> {
     let Some(clear) = clear_op else {
         return Err(TabInputCode::ClearCauseMissing);
     };
-    let typed_since = terminal.last_user_input().is_some_and(|at| at > clear.at);
-    if clear.op != op || now.saturating_duration_since(clear.at) > CLEAR_CAUSALITY || typed_since {
+    check_no_input_since(terminal, Some(clear.at))?;
+    if clear.op != op || now.saturating_duration_since(clear.at) > CLEAR_CAUSALITY {
         return Err(TabInputCode::ClearCauseMissing);
     }
     if clear.generation != generation {
         return Err(TabInputCode::LeaderChanged);
     }
-    Ok(())
+    Ok(clear.at)
+}
+
+/// The user has not typed since the `/clear` was written, so a phrase cannot
+/// end up appended to their draft.
+fn check_no_input_since(terminal: &Terminal, since: Option<Instant>) -> Result<(), TabInputCode> {
+    let typed_since = match (terminal.last_user_input(), since) {
+        (Some(typed), Some(since)) => typed > since,
+        _ => false,
+    };
+    if typed_since {
+        Err(TabInputCode::ClearCauseMissing)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -520,13 +549,21 @@ mod tests {
         /// Runs a kind 1 delivery to the end: sent at 0, written at 100, `\r`
         /// at 250, released at 350 ms.
         fn deliver_clear(&mut self, op: [u8; 16]) {
+            self.deliver_clear_until_enter(op);
+            self.advance(350);
+            assert!(!self.held());
+            assert!(self.app.tab_input.deliveries.is_empty());
+        }
+    }
+
+    impl Fixture {
+        /// Runs a kind 1 delivery up to the reply `0` at 250 ms; the delivery
+        /// stays in the release phase until 350 ms.
+        fn deliver_clear_until_enter(&mut self, op: [u8; 16]) {
             let reply = self.send_own(TabInputKind::Clear, op, "/clear", 0);
             self.advance(100);
             self.advance(250);
             assert_eq!(reply.try_recv(), Ok(TabInputCode::InputDelivered));
-            self.advance(350);
-            assert!(!self.held());
-            assert!(self.app.tab_input.deliveries.is_empty());
         }
     }
 
@@ -818,6 +855,45 @@ mod tests {
         fx.set_user_input(Some(500));
         let reply = fx.send_own(TabInputKind::PhraseAfterClear, OP_A, PHRASE, 2000);
         assert_eq!(reply.try_recv(), Ok(TabInputCode::ClearCauseMissing));
+    }
+
+    #[test]
+    fn phrase_during_clear_release_phase_is_not_queued() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        fx.deliver_clear_until_enter(OP_A);
+        assert_eq!(fx.app.tab_input.deliveries.len(), 1);
+
+        // Past the 300 ms accept interval but inside the clear's 100 ms release phase.
+        let reply = fx.send_own(TabInputKind::PhraseAfterClear, OP_A, PHRASE, 320);
+        assert_eq!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        assert_eq!(fx.app.tab_input.deliveries.len(), 2);
+
+        fx.advance(350);
+        assert!(!fx.held());
+        fx.advance(420);
+        fx.advance(570);
+        assert_eq!(reply.try_recv(), Ok(TabInputCode::InputDelivered));
+        fx.advance(670);
+        fx.wait_out(b"/clear\rcontinue with the plan\r");
+    }
+
+    #[test]
+    fn phrase_refused_at_deadline_when_user_typed_while_waiting() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        fx.deliver_clear(OP_A);
+        let reply = fx.send_own(TabInputKind::PhraseAfterClear, OP_A, PHRASE, 2000);
+        assert_eq!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+
+        fx.app.terminals[0].write_user_input(b"k");
+        fx.set_user_input(Some(2050));
+        fx.advance(2100);
+        assert_eq!(reply.try_recv(), Ok(TabInputCode::ClearCauseMissing));
+        assert!(!fx.held());
+        assert!(fx.app.tab_input.deliveries.is_empty());
+        fx.wait_out(b"/clear\rk");
+
+        let again = fx.send_own(TabInputKind::PhraseAfterClear, OP_A, PHRASE, 4000);
+        assert_eq!(again.try_recv(), Ok(TabInputCode::ClearCauseMissing));
     }
 
     #[test]
