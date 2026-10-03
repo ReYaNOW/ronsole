@@ -25,19 +25,17 @@ const PROMPT: char = '❯';
 const RULE: char = '─';
 const MAX_WALK_STEPS: usize = 64;
 
-/// A rule row has only `─` besides whitespace, and at least half of the
+/// A rule row starts and ends with `─` and has `─` in at least half of the
 /// widest row's width (rows arrive right-trimmed, so the widest row stands in
-/// for the window width).
+/// for the window width). Text inside is allowed: Claude Code puts the session
+/// name into the top rule (`───── name ─`).
 fn is_rule(row: &str, width: usize) -> bool {
-    let mut count = 0usize;
-    for ch in row.chars() {
-        if ch == RULE {
-            count += 1;
-        } else if !ch.is_whitespace() {
-            return false;
-        }
+    let row = row.trim();
+    if !row.starts_with(RULE) || !row.ends_with(RULE) {
+        return false;
     }
-    count > 0 && count * 2 >= width
+    let count = row.chars().filter(|&ch| ch == RULE).count();
+    count * 2 >= width
 }
 
 /// Classify the input box from the tail rows of the visible screen
@@ -246,6 +244,16 @@ mod tests {
         let bottom = broken.iter().rposition(|row| row.starts_with(RULE)).unwrap();
         broken[bottom].push('x');
         assert_eq!(classify_input_box(&broken), InputBox::Unrecognized);
+    }
+
+    #[test]
+    fn session_name_in_top_rule_is_recognized() {
+        let mut named = screen(&["❯ "]);
+        let top = named.iter().position(|row| row.starts_with(RULE)).unwrap();
+        named[top] = format!("{} claude_harness_v2 {}", RULE.to_string().repeat(100), RULE);
+        assert_eq!(classify_input_box(&named), InputBox::EmptyBusy);
+        named[top + 1] = "❯ abc".to_owned();
+        assert_eq!(classify_input_box(&named), InputBox::NotEmpty);
     }
 
     #[test]

@@ -307,7 +307,11 @@ fn tab_record<'a>(records: &'a mut Vec<TabRecord>, token: &str) -> &'a mut TabRe
 
 /// The input box shows the empty busy prompt and the user has not typed recently.
 fn check_input_ready(terminal: &Terminal, now: Instant) -> Result<(), TabInputCode> {
-    if classify_input_box(&terminal.screen_tail_text(INPUT_BOX_ROWS)) != InputBox::EmptyBusy {
+    let rows = terminal.screen_tail_text(INPUT_BOX_ROWS);
+    let verdict = classify_input_box(&rows);
+    if verdict != InputBox::EmptyBusy {
+        #[cfg(not(test))]
+        dump_input_box(&rows, verdict);
         return Err(TabInputCode::InputBoxUnavailable);
     }
     let recent = terminal
@@ -317,6 +321,32 @@ fn check_input_ready(terminal: &Terminal, now: Instant) -> Result<(), TabInputCo
         return Err(TabInputCode::RecentUserInput);
     }
     Ok(())
+}
+
+/// Diagnostic: the rows the last code-6 refusal saw, in
+/// `$XDG_RUNTIME_DIR/cc-self/ronsole-input-box.txt` (overwritten each time).
+#[cfg(not(test))]
+fn dump_input_box(rows: &[String], verdict: InputBox) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join("cc-self").join("ronsole-input-box.txt");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+    else {
+        return;
+    };
+    let mut text = format!("===== {:?} {:?}\n", std::time::SystemTime::now(), verdict);
+    for (index, row) in rows.iter().enumerate() {
+        text.push_str(&format!("{index:02}|{row}|\n"));
+    }
+    let _ = file.write_all(text.as_bytes());
 }
 
 /// The leader must still be the same `claude` process generation.
