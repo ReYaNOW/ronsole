@@ -1,6 +1,7 @@
 use crate::launch::TerminalLaunchSpec;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use vte::{Params, Parser, Perform};
 
 pub(crate) use crate::terminal_compat::{
@@ -1449,6 +1450,10 @@ mod tests {
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
             title_cache,
+            tab_token: crate::terminal_process::TabToken::generate(),
+            last_user_input: None,
+            user_input_held: false,
+            held_user_input: Vec::new(),
         };
 
         assert!(!terminal.is_closed());
@@ -2943,6 +2948,33 @@ mod tests {
     }
 
     #[test]
+    fn tabs_get_distinct_tab_tokens() {
+        let first = Terminal::new_for_test(10, 4, 1);
+        let second = Terminal::new_for_test(10, 4, 2);
+        assert_eq!(first.tab_token().len(), 32);
+        assert_ne!(first.tab_token(), second.tab_token());
+    }
+
+    #[test]
+    fn screen_tail_text_reads_current_screen_including_alt_screen() {
+        let terminal = Terminal::new_for_test(10, 4, 1);
+        {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            Parser::new().advance(&mut *grid, b"zero\r\none\r\ntwo  \r\nthree");
+        }
+        assert_eq!(terminal.screen_tail_text(2), ["two", "three"]);
+        assert_eq!(terminal.screen_tail_text(9), ["zero", "one", "two", "three"]);
+        assert!(terminal.screen_tail_text(0).is_empty());
+
+        {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            Parser::new().advance(&mut *grid, b"\x1b[?1049h\x1b[Halt1\r\nalt2");
+            assert!(grid.is_alt);
+        }
+        assert_eq!(terminal.screen_tail_text(4), ["alt1", "alt2", "", ""]);
+    }
+
+    #[test]
     fn direct_pty_command_preserves_argv_cwd_relative_program_and_env() {
         use std::ffi::OsString;
         use std::os::unix::fs::PermissionsExt;
@@ -3610,7 +3642,14 @@ pub struct Terminal {
     pub(crate) presentation_intent: TerminalPresentationIntent,
     pub(crate) reveal_right_tail_when_presented: bool,
     title_cache: crate::terminal_process::TerminalTitleCache,
+    tab_token: crate::terminal_process::TabToken,
+    last_user_input: Option<Instant>,
+    user_input_held: bool,
+    held_user_input: Vec<u8>,
 }
+
+/// Upper bound for user input buffered by `Terminal::begin_input_hold`.
+const TERMINAL_HELD_INPUT_MAX_BYTES: usize = 256 * 1024;
 
 fn write_terminal_spawn_error(grid: &mut TermGrid, error: &io::Error) {
     let message = format!("Ronsole terminal error: {error}\r\n");
@@ -3640,6 +3679,10 @@ impl Terminal {
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
             title_cache,
+            tab_token: crate::terminal_process::TabToken::generate(),
+            last_user_input: None,
+            user_input_held: false,
+            held_user_input: Vec::new(),
         }
     }
 
@@ -3660,11 +3703,13 @@ impl Terminal {
             60,
             title_cache.clone(),
         )));
+        let tab_token = crate::terminal_process::TabToken::generate();
         let process = match crate::terminal_process::TerminalProcess::spawn(
             grid.clone(),
             title_cache.clone(),
             wake,
             launch,
+            &tab_token,
         ) {
             Ok(process) => Some(process),
             Err(error) => {
@@ -3684,7 +3729,77 @@ impl Terminal {
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
             title_cache,
+            tab_token,
+            last_user_input: None,
+            user_input_held: false,
+            held_user_input: Vec::new(),
         }
+    }
+
+    pub(crate) fn tab_token(&self) -> &str {
+        self.tab_token.as_str()
+    }
+
+    /// Writes keyboard/text/IME/paste input. Marks the time of user input and,
+    /// while `begin_input_hold` is active, buffers the bytes in arrival order.
+    pub(crate) fn write_user_input(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.last_user_input = Some(Instant::now());
+        if !self.user_input_held {
+            let _ = self.write_input(bytes);
+            return;
+        }
+        if self.held_user_input.len().saturating_add(bytes.len()) > TERMINAL_HELD_INPUT_MAX_BYTES {
+            // Over the bound: release everything now rather than drop or reorder bytes.
+            let held = std::mem::take(&mut self.held_user_input);
+            let _ = self.write_input(&held);
+            let _ = self.write_input(bytes);
+            return;
+        }
+        self.held_user_input.extend_from_slice(bytes);
+    }
+
+    pub(crate) fn last_user_input(&self) -> Option<Instant> {
+        self.last_user_input
+    }
+
+    pub(crate) fn begin_input_hold(&mut self) {
+        self.user_input_held = true;
+    }
+
+    /// Ends the hold and writes the buffered user input with one `write_input`.
+    pub(crate) fn end_input_hold(&mut self) {
+        self.user_input_held = false;
+        if self.held_user_input.is_empty() {
+            return;
+        }
+        let held = std::mem::take(&mut self.held_user_input);
+        let _ = self.write_input(&held);
+    }
+
+    pub(crate) fn process_group_leader(&self) -> Option<u32> {
+        self.process.as_ref()?.process_group_leader()
+    }
+
+    /// Text of the last `rows` lines of the current screen (alt grid while in
+    /// alt-screen), trailing spaces trimmed.
+    pub(crate) fn screen_tail_text(&self, rows: usize) -> Vec<String> {
+        let grid = crate::platform::lock_recover(&self.grid);
+        let start = grid.lines.len().saturating_sub(rows);
+        grid.lines
+            .iter()
+            .skip(start)
+            .map(|line| {
+                let mut text = String::with_capacity(line.len());
+                for cell in line.iter().take(grid.cols) {
+                    cell.append_text_to(&mut text);
+                }
+                text.truncate(text.trim_end_matches(' ').len());
+                text
+            })
+            .collect()
     }
 
     pub fn write_display_title(&self, output: &mut String) {

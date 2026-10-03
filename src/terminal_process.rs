@@ -48,6 +48,60 @@ pub(crate) struct TerminalTitleState {
 
 pub(crate) type TerminalTitleCache = Arc<Mutex<TerminalTitleState>>;
 
+pub(crate) const TERMINAL_TAB_TOKEN_ENV: &str = "RONSOLE_TAB_TOKEN";
+const TAB_TOKEN_BYTES: usize = 16;
+
+/// Per-tab secret exported to the child as `TERMINAL_TAB_TOKEN_ENV`.
+/// Empty when the OS refused randomness: the tab then has no input channel.
+pub(crate) struct TabToken(String);
+
+impl TabToken {
+    pub(crate) fn generate() -> Self {
+        let mut bytes = [0u8; TAB_TOKEN_BYTES];
+        if fill_os_random(&mut bytes).is_err() {
+            return Self(String::new());
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut token = String::with_capacity(TAB_TOKEN_BYTES * 2);
+        for byte in bytes {
+            token.push(char::from(HEX[usize::from(byte >> 4)]));
+            token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Self(token)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for TabToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("TabToken").field(&"<redacted>").finish()
+    }
+}
+
+fn fill_os_random(buffer: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let rest = &mut buffer[filled..];
+        // SAFETY: `rest` is a valid writable buffer of `rest.len()` bytes.
+        let written = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if written == 0 {
+            return Err(io::Error::other("getrandom returned no bytes"));
+        }
+        filled += written.unsigned_abs();
+    }
+    Ok(())
+}
+
 impl TerminalTitleState {
     pub(crate) fn new(fallback: String) -> Self {
         Self {
@@ -220,8 +274,10 @@ impl TerminalProcess {
         title_cache: TerminalTitleCache,
         wake: Option<WakeHandle>,
         launch: TerminalLaunchSpec,
+        tab_token: &TabToken,
     ) -> io::Result<Self> {
-        let (command, cwd, process_title, spawn_target) = terminal_launch_command(launch)?;
+        let (command, cwd, process_title, spawn_target) =
+            terminal_launch_command(launch, tab_token)?;
         let fallback = terminal_fallback_title(Some(&cwd), &process_title);
         platform::lock_recover(&title_cache).set_fallback(fallback);
 
@@ -311,6 +367,13 @@ impl TerminalProcess {
             .map_err(|_| io::Error::other("terminal writer lock is poisoned"))?;
         writer.write_all(bytes)?;
         writer.flush()
+    }
+
+    /// Foreground process group leader of the PTY (`tcgetpgrp` on the master).
+    pub(crate) fn process_group_leader(&self) -> Option<u32> {
+        platform::lock_recover(&self.master_pty)
+            .process_group_leader()
+            .and_then(|pid| u32::try_from(pid).ok())
     }
 
     pub(crate) fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -894,6 +957,7 @@ fn install_terminal_io_threads(
 
 fn terminal_launch_command(
     launch: TerminalLaunchSpec,
+    tab_token: &TabToken,
 ) -> io::Result<(CommandBuilder, PathBuf, String, &'static str)> {
     let cwd = match launch.working_directory {
         Some(cwd) => cwd,
@@ -917,6 +981,12 @@ fn terminal_launch_command(
     command.cwd(cwd.as_os_str());
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    // Never leak a token inherited from Ronsole's own environment.
+    if tab_token.as_str().is_empty() {
+        command.env_remove(TERMINAL_TAB_TOKEN_ENV);
+    } else {
+        command.env(TERMINAL_TAB_TOKEN_ENV, tab_token.as_str());
+    }
     Ok((command, cwd, process_title, spawn_target))
 }
 
@@ -1204,7 +1274,8 @@ mod tests {
             hold: true,
         };
 
-        let (command, resolved_cwd, title, spawn_target) = terminal_launch_command(launch).unwrap();
+        let (command, resolved_cwd, title, spawn_target) =
+            terminal_launch_command(launch, &TabToken::generate()).unwrap();
 
         assert_eq!(resolved_cwd, cwd);
         assert_eq!(command.get_argv(), &argv);
@@ -1216,6 +1287,37 @@ mod tests {
         assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
         assert_eq!(title, "example-tool");
         assert_eq!(spawn_target, "terminal command");
+    }
+
+    #[test]
+    fn tab_token_is_exported_unique_hex_and_redacted_in_debug() {
+        let first = TabToken::generate();
+        let second = TabToken::generate();
+        for token in [&first, &second] {
+            assert_eq!(token.as_str().len(), 32);
+            assert!(
+                token
+                    .as_str()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            let debug = format!("{token:?}");
+            assert!(!debug.contains(token.as_str()), "{debug}");
+            assert!(debug.contains("<redacted>"), "{debug}");
+        }
+        assert_ne!(first.as_str(), second.as_str());
+
+        let launch = TerminalLaunchSpec {
+            working_directory: Some(PathBuf::from("/tmp")),
+            command: vec![OsString::from("/bin/true")],
+            hold: false,
+        };
+        let (command, ..) = terminal_launch_command(launch, &first).unwrap();
+        assert_eq!(
+            command.get_env(TERMINAL_TAB_TOKEN_ENV),
+            Some(OsStr::new(first.as_str()))
+        );
+        assert_eq!(TERMINAL_TAB_TOKEN_ENV, "RONSOLE_TAB_TOKEN");
     }
 
     #[test]

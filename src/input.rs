@@ -410,7 +410,7 @@ impl TerminalInteraction {
             return true;
         }
         if !text.is_empty() {
-            let _ = terminal.write_input(text.as_bytes());
+            terminal.write_user_input(text.as_bytes());
             return true;
         }
         false
@@ -432,7 +432,6 @@ impl TerminalInteraction {
         let alt = self.modifiers.alt_key();
 
         if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV) {
-            let bracketed_paste = crate::platform::lock_recover(&terminal.grid).bracketed_paste;
             let file_list = self
                 .clipboard()
                 .and_then(|clipboard| clipboard.get_file_list().ok());
@@ -442,8 +441,7 @@ impl TerminalInteraction {
                     .and_then(|text| terminal_clipboard_paste_bytes(None, Some(&text)))
             });
             if let Some(bytes) = paste {
-                let bytes = terminal_bracketed_paste_bytes(bytes, bracketed_paste);
-                let _ = terminal.write_input(&bytes);
+                write_terminal_paste(terminal, bytes);
             }
             return true;
         }
@@ -463,7 +461,7 @@ impl TerminalInteraction {
                 }
                 TerminalCtrlCAction::SendInterrupt => {
                     drop(grid);
-                    let _ = terminal.write_input(&[0x03]);
+                    terminal.write_user_input(&[0x03]);
                 }
             }
             return true;
@@ -473,7 +471,7 @@ impl TerminalInteraction {
         if let Some(bytes) =
             terminal_key_sequence(key_event.physical_key, shift, ctrl, alt, app_cursor)
         {
-            let _ = terminal.write_input(&bytes);
+            terminal.write_user_input(&bytes);
             return true;
         }
         false
@@ -497,7 +495,7 @@ impl TerminalInteraction {
         let Some(bytes) = terminal_text_sequence(text, ctrl, alt, super_key) else {
             return false;
         };
-        let _ = terminal.write_input(&bytes);
+        terminal.write_user_input(&bytes);
         true
     }
 
@@ -723,7 +721,8 @@ impl TerminalInteraction {
                 } else if app_cursor { b"\x1bOB" } else { b"\x1b[B" };
                 for _ in 0..steps.min(3) { input.extend_from_slice(sequence); }
             }
-            let _ = terminal.write_input(&input);
+            // Alternate-scroll arrows act as cursor keys (history recall), so they are user input.
+            terminal.write_user_input(&input);
             return true;
         }
         terminal.scroll_y.anim_speed = 7.0;
@@ -1099,6 +1098,12 @@ fn terminal_clipboard_paste_bytes(
         return Some(out);
     }
     text.map(|text| text.as_bytes().to_vec())
+}
+
+/// Delivers a paste payload as user input, wrapped when bracketed paste is on.
+fn write_terminal_paste(terminal: &mut Terminal, payload: Vec<u8>) {
+    let bracketed_paste = crate::platform::lock_recover(&terminal.grid).bracketed_paste;
+    terminal.write_user_input(&terminal_bracketed_paste_bytes(payload, bracketed_paste));
 }
 
 fn terminal_bracketed_paste_bytes(payload: Vec<u8>, enabled: bool) -> Vec<u8> {
@@ -1647,6 +1652,119 @@ mod tests {
             terminal_bracketed_paste_bytes(payload, true),
             "\u{1b}[200~/tmp/a\\ b /tmp/界\u{1b}[201~".as_bytes()
         );
+    }
+
+    fn enter_key() -> KeyInput {
+        KeyInput {
+            state: KeyState::Pressed,
+            physical_key: PhysicalKey::Code(KeyCode::Enter),
+        }
+    }
+
+    #[test]
+    fn user_input_routes_set_mark_and_programmatic_writes_do_not() {
+        let mut interaction = TerminalInteraction::default();
+
+        let mut terminal = selection_test_terminal();
+        let _ = terminal.write_input(b"programmatic");
+        assert!(terminal.last_user_input().is_none());
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 25.0;
+        interaction.mouse_y = 400.0;
+        {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            grid.mouse_tracking_mode = MouseTrackingMode::Press;
+            grid.mouse_sgr = true;
+        }
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(terminal.last_user_input().is_none());
+
+        let mut terminal = selection_test_terminal();
+        assert!(interaction.handle_key_event(&enter_key(), &mut terminal));
+        assert!(terminal.last_user_input().is_some());
+
+        let mut terminal = selection_test_terminal();
+        assert!(interaction.handle_text("a", &mut terminal));
+        assert!(terminal.last_user_input().is_some());
+
+        let mut terminal = selection_test_terminal();
+        assert!(interaction.handle_ime_commit("б", &mut terminal));
+        assert!(terminal.last_user_input().is_some());
+
+        let mut terminal = selection_test_terminal();
+        write_terminal_paste(&mut terminal, b"xy".to_vec());
+        assert!(terminal.last_user_input().is_some());
+    }
+
+    #[test]
+    fn held_user_input_reaches_pty_only_after_hold_ends_in_order() {
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ronsole-input-hold-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let out = root.join("out");
+        let launch = crate::launch::TerminalLaunchSpec {
+            working_directory: Some(root.clone()),
+            command: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("stty raw -echo; printf __READY__; exec cat > out"),
+            ],
+            hold: false,
+        };
+        let mut terminal = Terminal::spawn(None, 1, launch);
+        let read_out = || std::fs::read(&out).unwrap_or_default();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let ready = crate::platform::lock_recover(&terminal.grid)
+                .lines
+                .iter()
+                .flat_map(|line| line.iter().map(|cell| cell.c))
+                .collect::<String>()
+                .contains("__READY__");
+            if ready && out.exists() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "PTY fixture did not become ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(terminal.process_group_leader().is_some());
+
+        let mut interaction = TerminalInteraction::default();
+        terminal.begin_input_hold();
+        assert!(interaction.handle_text("a", &mut terminal));
+        assert!(interaction.handle_ime_commit("б", &mut terminal));
+        write_terminal_paste(&mut terminal, b"xy".to_vec());
+        assert!(interaction.handle_key_event(&enter_key(), &mut terminal));
+        assert!(terminal.last_user_input().is_some());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(read_out().is_empty(), "held input leaked: {:?}", read_out());
+
+        terminal.end_input_hold();
+        let expected = "aбxy\r".as_bytes();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while read_out().len() < expected.len() {
+            assert!(Instant::now() < deadline, "held input not flushed: {:?}", read_out());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(read_out(), expected);
+
+        terminal.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
