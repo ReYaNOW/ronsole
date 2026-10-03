@@ -1,6 +1,6 @@
 use super::{App, AppLoopControl};
 use crate::launch::TerminalLaunchSpec;
-use crate::platform::single_instance::{ExternalLaunchRequest, PrimaryInstance};
+use crate::platform::single_instance::{InstanceMessage, PrimaryInstance};
 use crate::runtime::{WaylandRuntimeEvents, WindowRuntime, poll_timeout_millis};
 use crate::wayland_input::WaylandInputEvent;
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -52,8 +52,8 @@ impl App {
 
         let (launch_tx, launch_rx) = sync_channel(EXTERNAL_LAUNCH_QUEUE_CAPACITY);
         primary_instance
-            .start_listener(move |request| {
-                if launch_tx.try_send(request).is_err() {
+            .start_listener(move |message| {
+                if launch_tx.try_send(message).is_err() {
                     return false;
                 }
                 wake.wake();
@@ -64,10 +64,13 @@ impl App {
         self.direct_wayland_loop(&launch_rx)
     }
 
-    fn drain_external_launches(&mut self, receiver: &Receiver<ExternalLaunchRequest>) -> bool {
+    fn drain_external_launches(&mut self, receiver: &Receiver<InstanceMessage>) -> bool {
         let mut handled = false;
-        while let Ok(request) = receiver.try_recv() {
-            self.handle_external_launch(request);
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                InstanceMessage::ExternalLaunch(request) => self.handle_external_launch(request),
+                InstanceMessage::TabInput(envelope) => self.handle_tab_input(envelope),
+            }
             handled = true;
         }
         handled
@@ -134,7 +137,7 @@ impl App {
 
     fn direct_wayland_loop(
         &mut self,
-        external_launches: &Receiver<ExternalLaunchRequest>,
+        external_launches: &Receiver<InstanceMessage>,
     ) -> Result<(), String> {
         loop {
             let _ = self.drain_external_launches(external_launches);
@@ -215,25 +218,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::single_instance::ExternalLaunchRequest;
 
     #[test]
     fn rapid_external_launch_burst_preserves_requests_within_bound() {
         let (sender, receiver) =
-            sync_channel::<ExternalLaunchRequest>(EXTERNAL_LAUNCH_QUEUE_CAPACITY);
+            sync_channel::<InstanceMessage>(EXTERNAL_LAUNCH_QUEUE_CAPACITY);
         for index in 0..EXTERNAL_LAUNCH_QUEUE_CAPACITY {
             sender
-                .try_send(ExternalLaunchRequest {
+                .try_send(InstanceMessage::ExternalLaunch(ExternalLaunchRequest {
                     activation_token: Some(format!("token-{index}")),
                     launch: TerminalLaunchSpec {
                         working_directory: Some(format!("/tmp/session-{index}").into()),
                         command: vec![format!("command-{index}").into()],
                         hold: index % 2 == 0,
                     },
-                })
+                }))
                 .unwrap();
         }
         for index in 0..EXTERNAL_LAUNCH_QUEUE_CAPACITY {
-            let request = receiver.try_recv().unwrap();
+            let request = match receiver.try_recv().unwrap() {
+                InstanceMessage::ExternalLaunch(request) => request,
+                InstanceMessage::TabInput(_) => panic!("unexpected tab input"),
+            };
             let expected_token = format!("token-{index}");
             let expected_command = std::ffi::OsString::from(format!("command-{index}"));
             let expected_workdir = std::path::PathBuf::from(format!("/tmp/session-{index}"));
@@ -254,11 +261,11 @@ mod tests {
     fn external_launch_handoff_is_explicitly_bounded() {
         use std::sync::mpsc::TrySendError;
 
-        let (sender, _receiver) = sync_channel::<ExternalLaunchRequest>(2);
-        assert!(sender.try_send(ExternalLaunchRequest::default()).is_ok());
-        assert!(sender.try_send(ExternalLaunchRequest::default()).is_ok());
+        let (sender, _receiver) = sync_channel::<InstanceMessage>(2);
+        assert!(sender.try_send(InstanceMessage::ExternalLaunch(ExternalLaunchRequest::default())).is_ok());
+        assert!(sender.try_send(InstanceMessage::ExternalLaunch(ExternalLaunchRequest::default())).is_ok());
         assert!(matches!(
-            sender.try_send(ExternalLaunchRequest::default()),
+            sender.try_send(InstanceMessage::ExternalLaunch(ExternalLaunchRequest::default())),
             Err(TrySendError::Full(_))
         ));
     }

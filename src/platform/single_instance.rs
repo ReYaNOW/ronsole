@@ -8,7 +8,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -17,6 +18,8 @@ const XDG_ACTIVATION_TOKEN_ENV: &str = "XDG_ACTIVATION_TOKEN";
 const PROTOCOL_VERSION: u8 = 2;
 const EXTERNAL_LAUNCH_MESSAGE: u8 = 1;
 const DELIVERY_ACK_MESSAGE: u8 = 2;
+const TAB_INPUT_MESSAGE: u8 = 3;
+const TAB_INPUT_RESULT_MESSAGE: u8 = 4;
 const REQUEST_HEADER_LEN: usize = 6;
 const DELIVERY_ACK_LEN: usize = 2;
 const REQUEST_PAYLOAD_PREFIX_LEN: usize = 9;
@@ -28,6 +31,114 @@ const MAX_ACTIVATION_TOKEN_BYTES: usize = 4096;
 const CLAIM_RETRIES: usize = 8;
 const SERVER_CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(250);
 const SECONDARY_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+const TAB_INPUT_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const TAB_INPUT_REPLY_LIMIT: usize = 8;
+const TAB_INPUT_MIN_DELAY_MS: u16 = 100;
+const TAB_INPUT_MAX_DELAY_MS: u16 = 2000;
+const TAB_INPUT_MAX_LINE_BYTES: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabInputRequest {
+    pub(crate) token: String,
+    pub(crate) delay_ms: u16,
+    pub(crate) kind: TabInputKind,
+    pub(crate) op: [u8; 16],
+    pub(crate) line: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabInputKind {
+    Line,
+    Clear,
+    PhraseAfterClear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerCred {
+    pub(crate) uid: u32,
+    pub(crate) pid: u32,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabInputCode {
+    InputDelivered = 0,
+    NoTab = 1,
+    LeaderNotClaude = 2,
+    PeerRejected = 3,
+    InvalidInput = 4,
+    RateLimitedOrQueued = 5,
+    InputBoxUnavailable = 6,
+    RecentUserInput = 7,
+    LeaderChanged = 8,
+    PtyWriteFailed = 9,
+    ClearCauseMissing = 10,
+}
+
+impl TabInputCode {
+    const ALL: [Self; 11] = [
+        Self::InputDelivered, Self::NoTab, Self::LeaderNotClaude, Self::PeerRejected,
+        Self::InvalidInput, Self::RateLimitedOrQueued, Self::InputBoxUnavailable,
+        Self::RecentUserInput, Self::LeaderChanged, Self::PtyWriteFailed, Self::ClearCauseMissing,
+    ];
+}
+
+#[derive(Debug)]
+pub(crate) struct TabInputEnvelope {
+    pub(crate) request: TabInputRequest,
+    pub(crate) peer: PeerCred,
+    pub(crate) reply: mpsc::Sender<TabInputCode>,
+}
+
+#[derive(Debug)]
+pub(crate) enum InstanceMessage {
+    ExternalLaunch(ExternalLaunchRequest),
+    TabInput(TabInputEnvelope),
+}
+
+pub(crate) fn peer_allowed(peer: PeerCred, own_uid: u32) -> bool {
+    peer.uid == own_uid
+}
+
+pub(crate) fn validate_tab_input_text(kind: TabInputKind, line: &str) -> bool {
+    if line.is_empty() || line.len() > TAB_INPUT_MAX_LINE_BYTES {
+        return false;
+    }
+    if line.chars().any(|character| {
+        character.is_control()
+            || matches!(character as u32, 0x202a..=0x202e | 0x2066..=0x2069)
+    }) {
+        return false;
+    }
+    match kind {
+        TabInputKind::Line => line.starts_with("/effort "),
+        TabInputKind::Clear => line == "/clear",
+        TabInputKind::PhraseAfterClear => {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.chars().next().is_some_and(|character| {
+                    matches!(character, '/' | '!' | '#' | '@' | '&')
+                })
+        }
+    }
+}
+
+fn reserve_tab_input_reply(active: &AtomicUsize) -> bool {
+    let mut count = active.load(Ordering::Acquire);
+    loop {
+        if count >= TAB_INPUT_REPLY_LIMIT {
+            return false;
+        }
+        match active.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => count = actual,
+        }
+    }
+}
+
+fn release_tab_input_reply(active: &AtomicUsize) {
+    active.fetch_sub(1, Ordering::AcqRel);
+}
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct ExternalLaunchRequest {
@@ -96,9 +207,9 @@ pub(crate) struct PrimaryInstance {
 }
 
 impl PrimaryInstance {
-    pub(crate) fn start_listener<F>(&mut self, mut external_launch: F) -> io::Result<()>
+    pub(crate) fn start_listener<F>(&mut self, mut deliver: F) -> io::Result<()>
     where
-        F: FnMut(ExternalLaunchRequest) -> bool + Send + 'static,
+        F: FnMut(InstanceMessage) -> bool + Send + 'static,
     {
         if self.worker.is_some() {
             return Err(io::Error::new(
@@ -113,6 +224,7 @@ impl PrimaryInstance {
             )
         })?;
         let stop = Arc::clone(&self.stop);
+        let active_replies = Arc::new(AtomicUsize::new(0));
         let worker = match super::spawn_named("ronsole-single-instance", move || {
             loop {
                 if stop.load(Ordering::Acquire) {
@@ -126,13 +238,54 @@ impl PrimaryInstance {
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-
+                let Ok(peer) = peer_credentials(&stream) else { continue };
                 let _ = stream.set_read_timeout(Some(SERVER_CLIENT_IO_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(SERVER_CLIENT_IO_TIMEOUT));
-                if let Ok(request) = read_external_launch_request(&mut stream)
-                    && external_launch(request)
-                {
-                    let _ = write_delivery_ack(&mut stream);
+                match read_instance_message(&mut stream, peer) {
+                    Ok(InstanceMessage::ExternalLaunch(request)) => {
+                        if deliver(InstanceMessage::ExternalLaunch(request)) {
+                            let _ = write_delivery_ack(&mut stream);
+                        }
+                    }
+                    Ok(InstanceMessage::TabInput(mut envelope)) => {
+                        if !peer_allowed(peer, effective_uid()) {
+                            let _ = write_tab_input_result(&mut stream, TabInputCode::PeerRejected);
+                            continue;
+                        }
+                        if !reserve_tab_input_reply(&active_replies) {
+                            let _ = write_tab_input_result(&mut stream, TabInputCode::RateLimitedOrQueued);
+                            continue;
+                        }
+                        let (reply_tx, reply_rx) = mpsc::channel();
+                        envelope.reply = reply_tx.clone();
+                        let reply_sender = reply_tx;
+                        let delay_ms = envelope.request.delay_ms;
+                        if !deliver(InstanceMessage::TabInput(envelope)) {
+                            release_tab_input_reply(&active_replies);
+                            let _ = write_tab_input_result(&mut stream, TabInputCode::RateLimitedOrQueued);
+                            continue;
+                        }
+                        let _ = stream.set_read_timeout(Some(TAB_INPUT_IO_TIMEOUT));
+                        let _ = stream.set_write_timeout(Some(TAB_INPUT_IO_TIMEOUT));
+                        let active_for_thread = Arc::clone(&active_replies);
+                        let spawned = std::thread::Builder::new()
+                            .name("ronsole-tab-input-reply".to_owned())
+                            .spawn(move || {
+                                let _reply_sender = reply_sender;
+                                let response = reply_rx.recv_timeout(
+                                    Duration::from_millis(u64::from(delay_ms)) + Duration::from_secs(1),
+                                );
+                                if let Ok(code) = response {
+                                    let _ = write_tab_input_result(&mut stream, code);
+                                }
+                                release_tab_input_reply(&active_for_thread);
+                            });
+                        if spawned.is_err() {
+                            release_tab_input_reply(&active_replies);
+                            // The reply worker could not be created; the stream is closed below.
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
         }) {
@@ -642,6 +795,131 @@ fn read_delivery_ack(reader: &mut impl Read) -> io::Result<()> {
     Ok(())
 }
 
+fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCred> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt initializes the ucred structure when it succeeds.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if usize::try_from(length).ok() != Some(std::mem::size_of::<libc::ucred>()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SO_PEERCRED size"));
+    }
+    // SAFETY: successful getsockopt with the expected length initialized the structure.
+    let credentials = unsafe { credentials.assume_init() };
+    Ok(PeerCred { uid: credentials.uid, pid: u32::try_from(credentials.pid).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid peer process id")
+    })? })
+}
+
+fn read_instance_message(reader: &mut impl Read, peer: PeerCred) -> io::Result<InstanceMessage> {
+    let mut prefix = [0_u8; 2];
+    reader.read_exact(&mut prefix)?;
+    let mut framed = io::Cursor::new(prefix).chain(reader);
+    match prefix[1] {
+        EXTERNAL_LAUNCH_MESSAGE => read_external_launch_request(&mut framed)
+            .map(InstanceMessage::ExternalLaunch),
+        TAB_INPUT_MESSAGE => {
+            let request = read_tab_input_request(&mut framed)?;
+            let (reply, _receiver) = mpsc::channel();
+            Ok(InstanceMessage::TabInput(TabInputEnvelope { request, peer, reply }))
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported single-instance message type")),
+    }
+}
+
+fn write_tab_input_request(writer: &mut impl Write, request: &TabInputRequest) -> io::Result<()> {
+    let token = request.token.as_bytes();
+    let line = request.line.as_bytes();
+    if token.is_empty() || token.len() > 4096 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid tab token length"));
+    }
+    if !(TAB_INPUT_MIN_DELAY_MS..=TAB_INPUT_MAX_DELAY_MS).contains(&request.delay_ms) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid tab input delay"));
+    }
+    if !(1..=TAB_INPUT_MAX_LINE_BYTES).contains(&line.len()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid tab input line length"));
+    }
+    let payload_len = 2 + token.len() + 2 + 1 + request.op.len() + 2 + line.len();
+    writer.write_all(&[PROTOCOL_VERSION, TAB_INPUT_MESSAGE])?;
+    writer.write_all(&u32::try_from(payload_len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tab input frame too large"))?.to_be_bytes())?;
+    writer.write_all(&u16::try_from(token.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tab token too long"))?.to_be_bytes())?;
+    writer.write_all(token)?;
+    writer.write_all(&request.delay_ms.to_be_bytes())?;
+    writer.write_all(&[request.kind as u8])?;
+    writer.write_all(&request.op)?;
+    writer.write_all(&u16::try_from(line.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tab input line too long"))?.to_be_bytes())?;
+    writer.write_all(line)
+}
+
+fn read_tab_input_request(reader: &mut impl Read) -> io::Result<TabInputRequest> {
+    let mut header = [0_u8; REQUEST_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    if header[0] != PROTOCOL_VERSION || header[1] != TAB_INPUT_MESSAGE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab input frame header"));
+    }
+    let payload_len = usize::try_from(u32::from_be_bytes(header[2..6].try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid tab input frame length"))?))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "tab input frame length out of range"))?;
+    if payload_len > 2 + 4096 + 2 + 1 + 16 + 2 + TAB_INPUT_MAX_LINE_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "tab input frame too large"));
+    }
+    let mut payload = vec![0; payload_len];
+    reader.read_exact(&mut payload)?;
+    let mut payload = payload.as_slice();
+    let token_len = usize::from(take_payload_u16(&mut payload)?);
+    if !(1..=4096).contains(&token_len) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab token length"));
+    }
+    let token = std::str::from_utf8(take_payload_bytes(&mut payload, token_len)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "tab token is not UTF-8"))?.to_owned();
+    let delay_ms = take_payload_u16(&mut payload)?;
+    if !(TAB_INPUT_MIN_DELAY_MS..=TAB_INPUT_MAX_DELAY_MS).contains(&delay_ms) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab input delay"));
+    }
+    let kind = match take_payload_u8(&mut payload)? {
+        0 => TabInputKind::Line,
+        1 => TabInputKind::Clear,
+        2 => TabInputKind::PhraseAfterClear,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tab input kind")),
+    };
+    let mut op = [0; 16];
+    let op_bytes = take_payload_bytes(&mut payload, op.len())?;
+    op.copy_from_slice(op_bytes);
+    let line_len = usize::from(take_payload_u16(&mut payload)?);
+    if !(1..=TAB_INPUT_MAX_LINE_BYTES).contains(&line_len) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab input line length"));
+    }
+    let line = std::str::from_utf8(take_payload_bytes(&mut payload, line_len)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "tab input line is not UTF-8"))?.to_owned();
+    if !payload.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "tab input frame contains trailing bytes"));
+    }
+    Ok(TabInputRequest { token, delay_ms, kind, op, line })
+}
+
+fn write_tab_input_result(writer: &mut impl Write, code: TabInputCode) -> io::Result<()> {
+    writer.write_all(&[PROTOCOL_VERSION, TAB_INPUT_RESULT_MESSAGE, code as u8])
+}
+
+fn read_tab_input_result(reader: &mut impl Read) -> io::Result<TabInputCode> {
+    let mut result = [0_u8; 3];
+    reader.read_exact(&mut result)?;
+    if result[0] != PROTOCOL_VERSION || result[1] != TAB_INPUT_RESULT_MESSAGE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab input result header"));
+    }
+    TabInputCode::ALL.get(usize::from(result[2])).copied()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown tab input result code"))
+}
+
 fn remove_stale_socket(socket_path: &Path, uid: u32) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(socket_path) {
         Ok(metadata) => metadata,
@@ -720,6 +998,13 @@ mod tests {
         match status {
             SingleInstanceStatus::Primary(primary) => primary,
             SingleInstanceStatus::Secondary => panic!("expected primary instance"),
+        }
+    }
+
+    fn external_message(message: InstanceMessage) -> ExternalLaunchRequest {
+        match message {
+            InstanceMessage::ExternalLaunch(request) => request,
+            InstanceMessage::TabInput(_) => panic!("unexpected tab input"),
         }
     }
 
@@ -1017,6 +1302,148 @@ mod tests {
         );
     }
 
+    fn sample_tab_input(kind: TabInputKind, line: &str) -> TabInputRequest {
+        TabInputRequest {
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            delay_ms: 800,
+            kind,
+            op: [7; 16],
+            line: line.to_owned(),
+        }
+    }
+
+    #[test]
+    fn tab_input_request_and_result_round_trip_all_kinds() {
+        for (kind, line) in [
+            (TabInputKind::Line, "/effort high"),
+            (TabInputKind::Clear, "/clear"),
+            (TabInputKind::PhraseAfterClear, "continue with the plan"),
+        ] {
+            let request = sample_tab_input(kind, line);
+            let mut encoded = Vec::new();
+            write_tab_input_request(&mut encoded, &request).unwrap();
+            assert_eq!(read_tab_input_request(&mut Cursor::new(encoded)).unwrap(), request);
+        }
+        for code in TabInputCode::ALL {
+            let mut encoded = Vec::new();
+            write_tab_input_result(&mut encoded, code).unwrap();
+            assert_eq!(encoded, [2, 4, code as u8]);
+            assert_eq!(read_tab_input_result(&mut Cursor::new(encoded)).unwrap(), code);
+        }
+    }
+
+    #[test]
+    fn tab_input_rejects_invalid_frames() {
+        let valid = |request: &TabInputRequest| {
+            let mut bytes = Vec::new();
+            write_tab_input_request(&mut bytes, request).unwrap();
+            bytes
+        };
+        let base = sample_tab_input(TabInputKind::Line, "/effort high");
+        for request in [
+            TabInputRequest { line: String::new(), ..base.clone() },
+            TabInputRequest { line: "x".repeat(4097), ..base.clone() },
+            TabInputRequest { delay_ms: 99, ..base.clone() },
+            TabInputRequest { delay_ms: 2001, ..base.clone() },
+        ] {
+            assert!(write_tab_input_request(&mut Vec::new(), &request).is_err());
+        }
+        let mut unknown_kind = valid(&base);
+        let kind_offset = 6 + 2 + base.token.len() + 2;
+        unknown_kind[kind_offset] = 3;
+        assert!(read_tab_input_request(&mut Cursor::new(unknown_kind)).is_err());
+        let mut invalid_utf8 = valid(&base);
+        *invalid_utf8.last_mut().unwrap() = 0xff;
+        assert!(read_tab_input_request(&mut Cursor::new(invalid_utf8)).is_err());
+        let mut trailing = valid(&base);
+        trailing.push(0);
+        let payload_len = u32::from_be_bytes(trailing[2..6].try_into().unwrap()) + 1;
+        trailing[2..6].copy_from_slice(&payload_len.to_be_bytes());
+        assert!(read_tab_input_request(&mut Cursor::new(trailing)).is_err());
+        let mut truncated = valid(&base);
+        truncated.pop();
+        assert!(read_tab_input_request(&mut Cursor::new(truncated)).is_err());
+    }
+
+    #[test]
+    fn tab_input_text_validation_enforces_kind_and_unicode_rules() {
+        for line in ["hello\rworld", "hello\u{1b}world", "hello\u{7f}", "a\u{202e}b", "a\u{2066}b"] {
+            assert!(!validate_tab_input_text(TabInputKind::PhraseAfterClear, line));
+        }
+        assert!(!validate_tab_input_text(TabInputKind::Clear, "/clear now"));
+        assert!(!validate_tab_input_text(TabInputKind::Line, "hello"));
+        assert!(!validate_tab_input_text(TabInputKind::PhraseAfterClear, " /x"));
+        assert!(validate_tab_input_text(TabInputKind::PhraseAfterClear, " text /x"));
+        assert!(validate_tab_input_text(TabInputKind::Line, "/effort high"));
+        assert!(validate_tab_input_text(TabInputKind::Clear, "/clear"));
+        assert!(validate_tab_input_text(TabInputKind::PhraseAfterClear, "continue"));
+    }
+
+    #[test]
+    fn peer_allowed_rejects_different_uid() {
+        assert!(!peer_allowed(PeerCred { uid: 1001, pid: 7 }, 1000));
+        assert!(peer_allowed(PeerCred { uid: 1000, pid: 7 }, 1000));
+    }
+
+    #[test]
+    fn ninth_waiting_tab_input_gets_overloaded_result() {
+        let permits = Arc::new(AtomicUsize::new(0));
+        for _ in 0..TAB_INPUT_REPLY_LIMIT {
+            assert!(reserve_tab_input_reply(&permits));
+        }
+        assert!(!reserve_tab_input_reply(&permits));
+        assert_eq!(TabInputCode::RateLimitedOrQueued as u8, 5);
+    }
+
+    #[test]
+    fn listener_delivers_tab_input_peer_and_reply_while_serving_external_launch() {
+        let dir = TestDir::new();
+        let path = dir.socket_path();
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), effective_uid()).unwrap());
+        let (tx, rx) = mpsc::channel();
+        primary.start_listener(move |message| tx.send(message).is_ok()).unwrap();
+
+        let request = sample_tab_input(TabInputKind::PhraseAfterClear, "continue");
+        let mut stream = UnixStream::connect(&path).unwrap();
+        write_tab_input_request(&mut stream, &request).unwrap();
+        let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            InstanceMessage::TabInput(envelope) => envelope,
+            InstanceMessage::ExternalLaunch(_) => panic!("unexpected external launch"),
+        };
+        assert_eq!(envelope.request, request);
+        assert_eq!(envelope.peer.uid, effective_uid());
+        assert_eq!(envelope.peer.pid, std::process::id());
+
+        let external = ExternalLaunchRequest::default();
+        let mut external_stream = UnixStream::connect(&path).unwrap();
+        write_external_launch_request(&mut external_stream, &external).unwrap();
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), InstanceMessage::ExternalLaunch(_)));
+        read_delivery_ack(&mut external_stream).unwrap();
+        envelope.reply.send(TabInputCode::InputDelivered).unwrap();
+        let mut result = [0; 3];
+        stream.read_exact(&mut result).unwrap();
+        assert_eq!(result, [2, 4, TabInputCode::InputDelivered as u8]);
+    }
+
+    #[test]
+    fn listener_closes_tab_input_when_callback_does_not_reply() {
+        let dir = TestDir::new();
+        let path = dir.socket_path();
+        let mut primary = take_primary(claim_without_activation_token(path.clone(), effective_uid()).unwrap());
+        let (tx, rx) = mpsc::channel();
+        primary.start_listener(move |message| { tx.send(message).is_ok() }).unwrap();
+        let mut request = sample_tab_input(TabInputKind::Line, "/effort low");
+        request.delay_ms = 100;
+        let started = std::time::Instant::now();
+        let mut stream = UnixStream::connect(&path).unwrap();
+        write_tab_input_request(&mut stream, &request).unwrap();
+        let _envelope = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.is_empty());
+        assert!(started.elapsed() <= Duration::from_millis(1200));
+    }
+
     #[test]
     fn peer_close_without_ack_is_not_successful_delivery() {
         let dir = TestDir::new();
@@ -1109,11 +1536,7 @@ mod tests {
             claim_with_request(path, uid, &expected).unwrap(),
             SingleInstanceStatus::Secondary
         ));
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("external launch was not delivered"),
-            expected
-        );
+        assert_eq!(external_message(rx.recv_timeout(Duration::from_secs(1)).expect("external launch was not delivered")), expected);
     }
 
     #[test]
@@ -1146,8 +1569,8 @@ mod tests {
         send_request(&path, &first);
         send_request(&path, &second);
 
-        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), first);
-        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), second);
+        assert_eq!(external_message(rx.recv_timeout(Duration::from_secs(1)).unwrap()), first);
+        assert_eq!(external_message(rx.recv_timeout(Duration::from_secs(1)).unwrap()), second);
     }
 
     #[test]
@@ -1285,7 +1708,7 @@ mod tests {
         let request = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("listener stopped after malformed request");
-        assert_eq!(request, ExternalLaunchRequest::default());
+        assert_eq!(external_message(request), ExternalLaunchRequest::default());
     }
 
     #[test]

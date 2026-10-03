@@ -683,6 +683,12 @@ impl App {
         }
     }
 
+    fn handle_tab_input(&mut self, envelope: crate::platform::single_instance::TabInputEnvelope) {
+        let _ = envelope
+            .reply
+            .send(crate::platform::single_instance::TabInputCode::NoTab);
+    }
+
     fn flush_pending_external_launches(&mut self) {
         while let Some(request) = self.pending_external_launches.pop_front() {
             self.handle_external_launch(request);
