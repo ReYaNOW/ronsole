@@ -1445,6 +1445,7 @@ mod tests {
         let grid = Arc::new(Mutex::new(grid));
         let mut terminal = Terminal {
             grid: grid.clone(),
+            bridge_screen_lock: Arc::new(Mutex::new(())),
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -3047,18 +3048,27 @@ mod tests {
     #[test]
     fn manual_bridge_confirm_works_without_warning_and_failed_writes_remain_pending() {
         let now = Instant::now();
-        let screen = "ordinary screen";
         let mut terminal = Terminal::new_for_test(80, 8, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([11; 16], now));
+        vte::Parser::new().advance(
+            &mut *crate::platform::lock_recover(&terminal.grid),
+            b"ordinary screen",
+        );
+        let screen = terminal.screen_tail_text(usize::MAX).join("\n");
 
-        assert!(terminal.manually_confirm_bridge(now, screen, screen_hash(screen)));
-        assert!(!terminal.manually_confirm_bridge(now, screen, screen_hash(screen)));
+        assert!(terminal.manually_confirm_bridge(now, screen_hash(&screen)));
+        assert!(!terminal.manually_confirm_bridge(now, screen_hash(&screen)));
         assert_eq!(terminal.input_bytes_for_test(), b"\r");
 
         let mut failed = Terminal::new_for_test(80, 8, 1);
         failed.bridge_launch = Some(BridgeLaunchState::new([12; 16], now));
+        vte::Parser::new().advance(
+            &mut *crate::platform::lock_recover(&failed.grid),
+            b"ordinary screen",
+        );
+        let screen = failed.screen_tail_text(usize::MAX).join("\n");
         failed.test_input = None;
-        assert!(!failed.manually_confirm_bridge(now, screen, screen_hash(screen)));
+        assert!(!failed.manually_confirm_bridge(now, screen_hash(&screen)));
         assert!(!failed.bridge_launch_state().unwrap().enter_sent);
 
         let mut auto = Terminal::new_for_test(120, 8, 1);
@@ -3808,6 +3818,7 @@ pub(crate) fn screen_hash(screen: &str) -> [u8; 32] {
 
 pub struct Terminal {
     pub grid: Arc<Mutex<TermGrid>>,
+    bridge_screen_lock: Arc<Mutex<()>>,
     process: Option<crate::terminal_process::TerminalProcess>,
     hold: bool,
     pub scroll_y: crate::scroll::ScrollState,
@@ -3848,6 +3859,7 @@ impl Terminal {
                 rows,
                 title_cache.clone(),
             ))),
+            bridge_screen_lock: Arc::new(Mutex::new(())),
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -3895,9 +3907,11 @@ impl Terminal {
             60,
             title_cache.clone(),
         )));
+        let bridge_screen_lock = Arc::new(Mutex::new(()));
         let tab_token = crate::terminal_process::TabToken::generate();
         let process = match crate::terminal_process::TerminalProcess::spawn(
             grid.clone(),
+            bridge_screen_lock.clone(),
             title_cache.clone(),
             wake,
             launch,
@@ -3915,6 +3929,7 @@ impl Terminal {
 
         Self {
             grid,
+            bridge_screen_lock,
             process,
             hold,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -3976,14 +3991,17 @@ impl Terminal {
     pub(crate) fn manually_confirm_bridge(
         &mut self,
         now: Instant,
-        screen: &str,
         expected_hash: [u8; 32],
     ) -> bool {
-        if expected_hash != screen_hash(screen)
-            || !self
-                .bridge_launch
-                .as_ref()
-                .is_some_and(|state| state.active_at(now) && !state.enter_sent)
+        let _screen_guard = crate::platform::lock_recover(&self.bridge_screen_lock);
+        let screen = self.screen_tail_text(usize::MAX).join("\n");
+        if expected_hash != screen_hash(&screen) {
+            return false;
+        }
+        if !self
+            .bridge_launch
+            .as_ref()
+            .is_some_and(|state| state.active_at(now) && !state.enter_sent)
         {
             return false;
         }

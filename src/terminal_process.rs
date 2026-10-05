@@ -271,6 +271,7 @@ impl Drop for TerminalCleanupWorker {
 impl TerminalProcess {
     pub(crate) fn spawn(
         grid: Arc<Mutex<TermGrid>>,
+        bridge_screen_lock: Arc<Mutex<()>>,
         title_cache: TerminalTitleCache,
         wake: Option<WakeHandle>,
         launch: TerminalLaunchSpec,
@@ -339,7 +340,13 @@ impl TerminalProcess {
             }
         };
 
-        if let Err(error) = install_terminal_io_threads(&grid, reader, writer.clone(), wake) {
+        if let Err(error) = install_terminal_io_threads(
+            &grid,
+            bridge_screen_lock,
+            reader,
+            writer.clone(),
+            wake,
+        ) {
             let _ = title_stop_tx.send(());
             platform::reap_unit_thread(title_worker);
             let _ = tree.terminate_forcefully();
@@ -833,6 +840,7 @@ fn terminal_reply_channel() -> (
 
 fn install_terminal_io_threads(
     grid: &Arc<Mutex<TermGrid>>,
+    bridge_screen_lock: Arc<Mutex<()>>,
     reader: Box<dyn Read + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     wake: Option<WakeHandle>,
@@ -844,6 +852,7 @@ fn install_terminal_io_threads(
     let reader_finished = Arc::new(AtomicBool::new(false));
 
     let parser_grid = grid.clone();
+    let parser_bridge_screen_lock = bridge_screen_lock;
     let parser_reader_finished = reader_finished.clone();
     platform::spawn_named("ronsole-terminal-parser", move || {
         let mut parser = Parser::new();
@@ -875,6 +884,7 @@ fn install_terminal_io_threads(
                 };
 
                 {
+                    let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
                     let mut grid = platform::lock_recover(&parser_grid);
                     advance_terminal_output_batch(&mut parser, &mut grid, &batch);
                 }
@@ -907,6 +917,7 @@ fn install_terminal_io_threads(
         }
 
         if parser_reader_finished.load(Ordering::Acquire) {
+            let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
             let mut grid = platform::lock_recover(&parser_grid);
             if finish_terminal_output_stream(&mut parser, &mut grid) {
                 drop(grid);

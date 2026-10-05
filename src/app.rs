@@ -701,11 +701,9 @@ impl App {
                     {
                         BridgeResult::code(2)
                     } else {
-                        let screen = self.terminals[index].screen_tail_text(usize::MAX).join("\n");
                         if let Some(expected_hash) = request.screen_hash {
                             if self.terminals[index].manually_confirm_bridge(
                                 Instant::now(),
-                                &screen,
                                 expected_hash,
                             ) {
                                 self.request_frame();
@@ -1893,6 +1891,7 @@ mod tests {
         let (screen, hash) = snapshot.screen.unwrap();
         assert_eq!(hash, crate::terminal::screen_hash(&screen));
         assert_eq!(bridge_call(&mut app, 1, id, Some([0; 32])).code, 1);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
         assert_eq!(bridge_call(&mut app, 1, id, Some(hash)).code, 0);
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
         assert_eq!(bridge_call(&mut app, 1, id, Some(hash)).code, 2);
