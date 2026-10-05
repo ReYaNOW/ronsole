@@ -1456,6 +1456,7 @@ mod tests {
             user_input_held: false,
             held_user_input: Vec::new(),
             bridge_launch: None,
+            test_input: None,
         };
 
         assert!(!terminal.is_closed());
@@ -2999,12 +3000,6 @@ mod tests {
         let now = Instant::now();
         let warning = "Loading development channels --dangerously-load-development-channels ❯ 1. I am using this for local development";
         let mut writes = Vec::new();
-        let mut ordinary_tab: Option<BridgeLaunchState> = None;
-        if let Some(state) = ordinary_tab.as_mut()
-            && state.try_auto_confirm(now, warning)
-        {
-            writes.push(b"\r".to_vec());
-        }
         let mut bridge_tab = BridgeLaunchState::new([7; 16], now);
         let mut bridge_without_warning = BridgeLaunchState::new([6; 16], now);
         assert!(!bridge_without_warning.try_auto_confirm(now, "ordinary Claude prompt"));
@@ -3019,6 +3014,49 @@ mod tests {
         let mut expired = BridgeLaunchState::new([8; 16], now);
         assert!(!expired.try_auto_confirm(now + BRIDGE_LAUNCH_TTL, warning));
         assert!(!expired.enter_sent);
+    }
+
+    #[test]
+    fn ordinary_tab_does_not_auto_confirm_bridge_warning() {
+        let now = Instant::now();
+        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        feed_bridge_warning(&terminal, true);
+
+        assert!(!terminal.maybe_auto_confirm_bridge(now));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn bridge_tab_auto_confirms_warning_once_through_input_writer() {
+        let now = Instant::now();
+        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        terminal.bridge_launch = Some(BridgeLaunchState::new([9; 16], now));
+        feed_bridge_warning(&terminal, true);
+
+        assert!(terminal.maybe_auto_confirm_bridge(now));
+        assert!(!terminal.maybe_auto_confirm_bridge(now));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+    }
+
+    #[test]
+    fn bridge_tab_does_not_auto_confirm_without_warning() {
+        let now = Instant::now();
+        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        terminal.bridge_launch = Some(BridgeLaunchState::new([10; 16], now));
+        feed_bridge_warning(&terminal, false);
+
+        assert!(!terminal.maybe_auto_confirm_bridge(now));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    fn feed_bridge_warning(terminal: &Terminal, include_choice: bool) {
+        let screen = if include_choice {
+            "WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development"
+        } else {
+            "WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 2. Exit"
+        };
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        Parser::new().advance(&mut *grid, screen.as_bytes());
     }
 
     #[test]
@@ -3765,6 +3803,8 @@ pub struct Terminal {
     user_input_held: bool,
     held_user_input: Vec<u8>,
     bridge_launch: Option<BridgeLaunchState>,
+    #[cfg(test)]
+    test_input: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 /// Upper bound for user input buffered by `Terminal::begin_input_hold`.
@@ -3803,6 +3843,7 @@ impl Terminal {
             user_input_held: false,
             held_user_input: Vec::new(),
             bridge_launch: None,
+            test_input: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
 
@@ -3857,6 +3898,8 @@ impl Terminal {
             user_input_held: false,
             held_user_input: Vec::new(),
             bridge_launch,
+            #[cfg(test)]
+            test_input: None,
         }
     }
 
@@ -3866,6 +3909,14 @@ impl Terminal {
 
     pub(crate) fn bridge_launch_state_mut(&mut self) -> Option<&mut BridgeLaunchState> {
         self.bridge_launch.as_mut()
+    }
+
+    #[cfg(test)]
+    fn input_bytes_for_test(&self) -> Vec<u8> {
+        self.test_input
+            .as_ref()
+            .map(|input| crate::platform::lock_recover(input).clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn maybe_auto_confirm_bridge(&mut self, now: Instant) -> bool {
@@ -3981,6 +4032,11 @@ impl Terminal {
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(input) = self.test_input.as_ref() {
+            crate::platform::lock_recover(input).extend_from_slice(bytes);
+            return Ok(());
+        }
         self.process
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "terminal is not running"))?
