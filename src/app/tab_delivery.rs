@@ -4,10 +4,12 @@
 
 use super::App;
 use crate::platform::single_instance::{
-    PeerCred, TabInputCode, TabInputEnvelope, TabInputKind, TabInputRequest,
+    BRIDGE_CODE_PTY_WRITE_FAILED, PeerCred, TabInputCode, TabInputEnvelope, TabInputKind, TabInputRequest,
     validate_tab_input_text,
 };
-use crate::tab_input::{InputBox, ProcGen, claude_generation, classify_input_box, origin_allowed};
+use crate::tab_input::{
+    InputBox, ProcGen, claude_generation, claude_process_group, classify_input_box, origin_allowed,
+};
 use crate::terminal::Terminal;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -25,6 +27,7 @@ const CLEAR_CAUSALITY: Duration = Duration::from_secs(10);
 pub(super) struct TabInputProbe {
     claude_generation: fn(u32) -> Option<ProcGen>,
     origin_allowed: fn(u32, u32) -> bool,
+    claude_process_group: fn(u32, u64) -> Option<u32>,
 }
 
 impl Default for TabInputProbe {
@@ -32,6 +35,7 @@ impl Default for TabInputProbe {
         Self {
             claude_generation,
             origin_allowed,
+            claude_process_group,
         }
     }
 }
@@ -181,6 +185,30 @@ impl App {
         }
         record.last_accept = Some(now);
         Ok((generation, clear_at))
+    }
+
+    /// Bridge `BRIDGE_OP_ESCAPE`: writes exactly one ESC byte into the tab whose
+    /// PTY foreground process group is the group of the `claude` process
+    /// `(pid, starttime)`. Works for tabs without a bridge launch id; a
+    /// suspended or exited `claude` (not in the foreground) finds no tab.
+    /// Returns the bridge result code: 0 written, 3 no such tab, 5 write failed.
+    pub(super) fn send_bridge_escape(&mut self, pid: u32, starttime: u64) -> u8 {
+        let Some(pgrp) = (self.tab_input.probe.claude_process_group)(pid, starttime) else {
+            return 3;
+        };
+        // Process group ids are unique system-wide, so at most one PTY has it
+        // in the foreground.
+        let Some(index) = self
+            .terminals
+            .iter()
+            .position(|terminal| terminal.process_group_leader() == Some(pgrp))
+        else {
+            return 3;
+        };
+        match self.terminals[index].write_input(b"\x1b") {
+            Ok(()) => 0,
+            Err(_) => BRIDGE_CODE_PTY_WRITE_FAILED,
+        }
     }
 
     /// A tab is addressed only by a well-formed token; an empty tab token
@@ -422,6 +450,15 @@ mod tests {
     thread_local! {
         static LEADER_STARTTIME: Cell<Option<u64>> = const { Cell::new(Some(100)) };
         static ORIGIN_OK: Cell<bool> = const { Cell::new(true) };
+        /// `(pid, starttime, pgrp)` of the one fake `claude` process.
+        static CLAUDE_PROCESS: Cell<Option<(u32, u64, u32)>> = const { Cell::new(None) };
+    }
+
+    fn fake_claude_process_group(pid: u32, starttime: u64) -> Option<u32> {
+        CLAUDE_PROCESS
+            .with(Cell::get)
+            .filter(|&(fake_pid, fake_start, _)| fake_pid == pid && fake_start == starttime)
+            .map(|(_, _, pgrp)| pgrp)
     }
 
     fn fake_generation(pid: u32) -> Option<ProcGen> {
@@ -490,10 +527,12 @@ mod tests {
             }
             set_leader(Some(100));
             ORIGIN_OK.with(|cell| cell.set(true));
+            CLAUDE_PROCESS.with(|cell| cell.set(None));
             let mut app = App::new();
             app.tab_input.probe = TabInputProbe {
                 claude_generation: fake_generation,
                 origin_allowed: fake_origin,
+                claude_process_group: fake_claude_process_group,
             };
             app.terminals.push(terminal);
             Self {
@@ -945,5 +984,51 @@ mod tests {
         fx.advance(2100);
         assert_eq!(reply.try_recv(), Ok(TabInputCode::LeaderChanged));
         assert!(!fx.held());
+    }
+
+    fn escape_call(fx: &mut Fixture, pid: u32, starttime: u64, uid: u32) -> u8 {
+        use crate::platform::single_instance::{BRIDGE_OP_ESCAPE, BridgeRequest, BridgeRequestEnvelope};
+        let (reply, response) = channel();
+        fx.app.handle_bridge_request(BridgeRequestEnvelope {
+            request: BridgeRequest {
+                op: BRIDGE_OP_ESCAPE,
+                bridge_launch_id: [0; 16],
+                screen_hash: None,
+                claude_process: Some((pid, starttime)),
+            },
+            peer: PeerCred { uid, pid: 4242 },
+            reply,
+        });
+        response.recv().unwrap().code
+    }
+
+    #[test]
+    fn bridge_escape_writes_one_esc_into_the_tab_of_the_claude_process() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        let pgrp = fx.app.terminals[0].process_group_leader().unwrap();
+        // A second tab without a PTY never matches.
+        fx.app.terminals.insert(0, Terminal::new_for_test(80, 8, 2));
+        CLAUDE_PROCESS.with(|cell| cell.set(Some((4321, 777, pgrp))));
+        let uid = crate::platform::single_instance::effective_uid();
+
+        assert_eq!(escape_call(&mut fx, 4321, 777, uid.wrapping_add(1)), 4);
+        // Same pid, other start time (reused pid): no tab.
+        assert_eq!(escape_call(&mut fx, 4321, 778, uid), 3);
+        assert_eq!(escape_call(&mut fx, 9999, 777, uid), 3);
+        assert!(fx.out().is_empty());
+        assert_eq!(escape_call(&mut fx, 4321, 777, uid), 0);
+        fx.wait_out(b"\x1b");
+        assert!(fx.app.terminals[0].input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn bridge_escape_refuses_claude_outside_every_foreground_group() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        let pgrp = fx.app.terminals[0].process_group_leader().unwrap();
+        CLAUDE_PROCESS.with(|cell| cell.set(Some((4321, 777, pgrp + 100_000))));
+        let uid = crate::platform::single_instance::effective_uid();
+        assert_eq!(escape_call(&mut fx, 4321, 777, uid), 3);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(fx.out().is_empty());
     }
 }

@@ -723,6 +723,10 @@ impl App {
                     BridgeResult::code(0)
                 })
                 .unwrap_or_else(|| BridgeResult::code(3)),
+            crate::platform::single_instance::BRIDGE_OP_ESCAPE => match request.claude_process {
+                Some((pid, starttime)) => BridgeResult::code(self.send_bridge_escape(pid, starttime)),
+                None => BridgeResult::code(3),
+            },
             _ => BridgeResult::code(3),
         };
         let _ = envelope.reply.send(result);
@@ -1867,6 +1871,7 @@ mod tests {
                 op,
                 bridge_launch_id: id,
                 screen_hash: hash,
+                claude_process: None,
             },
             peer: crate::platform::single_instance::PeerCred { uid, pid: 7 },
             reply,

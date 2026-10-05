@@ -22,6 +22,12 @@ const TAB_INPUT_MESSAGE: u8 = 3;
 const TAB_INPUT_RESULT_MESSAGE: u8 = 4;
 pub(crate) const BRIDGE_REQUEST_MESSAGE: u8 = 5;
 pub(crate) const BRIDGE_RESULT_MESSAGE: u8 = 6;
+/// Bridge op: write one ESC byte into the tab whose foreground process group
+/// holds the addressed `claude` process.
+pub(crate) const BRIDGE_OP_ESCAPE: u8 = 3;
+/// Bridge result: the PTY write failed. Codes 0..=4 are documented at
+/// `read_bridge_request`.
+pub(crate) const BRIDGE_CODE_PTY_WRITE_FAILED: u8 = 5;
 const REQUEST_HEADER_LEN: usize = 6;
 const DELIVERY_ACK_LEN: usize = 2;
 const REQUEST_PAYLOAD_PREFIX_LEN: usize = 9;
@@ -112,6 +118,8 @@ pub(crate) struct BridgeRequest {
     pub(crate) op: u8,
     pub(crate) bridge_launch_id: [u8; 16],
     pub(crate) screen_hash: Option<[u8; 32]>,
+    /// `(pid, starttime)` of the `claude` process for `BRIDGE_OP_ESCAPE`.
+    pub(crate) claude_process: Option<(u32, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -940,8 +948,13 @@ fn read_instance_message(reader: &mut impl Read, peer: PeerCred) -> io::Result<I
 }
 
 // Bridge frames use the existing version/type/u32-length header. Requests carry op +
-// 32 ASCII hex id bytes and, for op=1, a raw 32-byte screen hash. Results carry a code;
-// op=0 success adds u32-length-prefixed UTF-8 screen text followed by its raw hash.
+// 32 ASCII hex id bytes and, for op=1, a raw 32-byte screen hash. Op=3
+// (`BRIDGE_OP_ESCAPE`) instead carries the `claude` pid as u32 BE and its
+// `/proc/<pid>/stat` starttime as u64 BE (payload exactly 13 bytes) and asks for
+// one ESC byte in the tab whose PTY foreground process group is that process's
+// group. Results carry a code (0 ok, 1 hash mismatch, 2 already confirmed,
+// 3 no such tab, 4 peer rejected, 5 PTY write failed); op=0 success adds
+// u32-length-prefixed UTF-8 screen text followed by its raw hash.
 fn read_bridge_request(reader: &mut impl Read) -> io::Result<BridgeRequest> {
     let mut header = [0_u8; REQUEST_HEADER_LEN];
     reader.read_exact(&mut header)?;
@@ -962,10 +975,22 @@ fn read_bridge_request(reader: &mut impl Read) -> io::Result<BridgeRequest> {
     let expected_len = match op {
         0 | 2 => 32,
         1 => 64,
+        BRIDGE_OP_ESCAPE => 12,
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown bridge operation")),
     };
     if payload.len() != expected_len {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bridge request payload length"));
+    }
+    if op == BRIDGE_OP_ESCAPE {
+        let pid = take_payload_u32(&mut payload)?;
+        let mut starttime = [0; 8];
+        starttime.copy_from_slice(take_payload_bytes(&mut payload, 8)?);
+        return Ok(BridgeRequest {
+            op,
+            bridge_launch_id: [0; 16],
+            screen_hash: None,
+            claude_process: Some((pid, u64::from_be_bytes(starttime))),
+        });
     }
     let id = take_payload_bytes(&mut payload, 32)?;
     let mut bridge_launch_id = [0; 16];
@@ -981,7 +1006,7 @@ fn read_bridge_request(reader: &mut impl Read) -> io::Result<BridgeRequest> {
     } else {
         None
     };
-    Ok(BridgeRequest { op, bridge_launch_id, screen_hash })
+    Ok(BridgeRequest { op, bridge_launch_id, screen_hash, claude_process: None })
 }
 
 fn bridge_hex_digit(byte: u8) -> io::Result<u8> {
@@ -994,6 +1019,16 @@ fn bridge_hex_digit(byte: u8) -> io::Result<u8> {
 }
 
 fn write_bridge_request(writer: &mut impl Write, request: &BridgeRequest) -> io::Result<()> {
+    if request.op == BRIDGE_OP_ESCAPE {
+        let Some((pid, starttime)) = request.claude_process else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing bridge claude process"));
+        };
+        writer.write_all(&[PROTOCOL_VERSION, BRIDGE_REQUEST_MESSAGE])?;
+        writer.write_all(&13_u32.to_be_bytes())?;
+        writer.write_all(&[request.op])?;
+        writer.write_all(&pid.to_be_bytes())?;
+        return writer.write_all(&starttime.to_be_bytes());
+    }
     let payload_len = if request.op == 1 { 65 } else if matches!(request.op, 0 | 2) { 33 } else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown bridge operation"));
     };
@@ -1052,7 +1087,7 @@ fn read_bridge_result(reader: &mut impl Read, op: u8) -> io::Result<BridgeResult
     reader.read_exact(&mut payload)?;
     let mut payload = payload.as_slice();
     let code = take_payload_u8(&mut payload)?;
-    if code > 4 {
+    if code > BRIDGE_CODE_PTY_WRITE_FAILED {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown bridge result code"));
     }
     let screen = if op == 0 && code == 0 {
@@ -1635,7 +1670,8 @@ mod tests {
     fn bridge_request_frames_match_wire_vectors() {
         let id = *b"00112233445566778899aabbccddeeff";
         let snapshot = BridgeRequest { op: 0, bridge_launch_id: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-            0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], screen_hash: None };
+            0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], screen_hash: None,
+            claude_process: None };
         let mut expected_snapshot = b"\x02\x05\x00\x00\x00\x21\x00".to_vec();
         expected_snapshot.extend_from_slice(b"00112233445566778899aabbccddeeff");
         let mut encoded = Vec::new();
@@ -1644,7 +1680,7 @@ mod tests {
         assert_eq!(read_bridge_request(&mut Cursor::new(encoded.as_slice())).unwrap(), snapshot);
 
         let confirm = BridgeRequest { op: 1, bridge_launch_id: snapshot.bridge_launch_id,
-            screen_hash: Some([0xa5; 32]) };
+            screen_hash: Some([0xa5; 32]), claude_process: None };
         let mut expected_confirm = b"\x02\x05\x00\x00\x00\x41\x01".to_vec();
         expected_confirm.extend_from_slice(b"00112233445566778899aabbccddeeff");
         expected_confirm.extend_from_slice(&[0xa5; 32]);
@@ -1653,6 +1689,37 @@ mod tests {
         assert_eq!(encoded, expected_confirm);
         assert_eq!(read_bridge_request(&mut Cursor::new(encoded.as_slice())).unwrap(), confirm);
         assert_eq!(&id[..], b"00112233445566778899aabbccddeeff");
+    }
+
+    #[test]
+    fn bridge_escape_request_matches_wire_vector_and_rejects_extra_bytes() {
+        let escape = BridgeRequest { op: BRIDGE_OP_ESCAPE, bridge_launch_id: [0; 16],
+            screen_hash: None, claude_process: Some((0x0102_0304, 0x1112_1314_1516_1718)) };
+        let expected: &[u8] = b"\x02\x05\x00\x00\x00\x0d\x03\x01\x02\x03\x04\x11\x12\x13\x14\x15\x16\x17\x18";
+        let mut encoded = Vec::new();
+        write_bridge_request(&mut encoded, &escape).unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(read_bridge_request(&mut Cursor::new(expected)).unwrap(), escape);
+
+        // One trailing byte (length 14) and one missing byte (length 12) are refused.
+        let mut extra = expected.to_vec();
+        extra[5] = 14;
+        extra.push(0x1b);
+        assert!(read_bridge_request(&mut Cursor::new(extra)).is_err());
+        let mut short = expected.to_vec();
+        short[5] = 12;
+        short.pop();
+        assert!(read_bridge_request(&mut Cursor::new(short)).is_err());
+        // The launch-id form of op 3 (33-byte payload) is not accepted either.
+        let mut id_form = b"\x02\x05\x00\x00\x00\x21\x03".to_vec();
+        id_form.extend_from_slice(b"00112233445566778899aabbccddeeff");
+        assert!(read_bridge_request(&mut Cursor::new(id_form)).is_err());
+
+        let mut result = Vec::new();
+        write_bridge_result(&mut result, &BridgeResult::code(BRIDGE_CODE_PTY_WRITE_FAILED)).unwrap();
+        assert_eq!(result, b"\x02\x06\x00\x00\x00\x01\x05");
+        assert_eq!(read_bridge_result(&mut Cursor::new(result.as_slice()), BRIDGE_OP_ESCAPE).unwrap(),
+            BridgeResult::code(BRIDGE_CODE_PTY_WRITE_FAILED));
     }
 
     #[test]
@@ -1677,7 +1744,7 @@ mod tests {
         valid.extend_from_slice(b"00112233445566778899aabbccddeeff");
         assert!(read_bridge_request(&mut Cursor::new(&valid[..5])).is_err());
         let mut unknown_op = valid.to_vec();
-        unknown_op[6] = 3;
+        unknown_op[6] = 4;
         assert!(read_bridge_request(&mut Cursor::new(unknown_op)).is_err());
         let mut invalid_id = valid.to_vec();
         invalid_id[7] = b'g';

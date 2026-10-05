@@ -85,6 +85,10 @@ fn parse_starttime(stat: &str) -> Option<u64> {
     stat_fields_after_comm(stat)?.nth(19)?.parse().ok()
 }
 
+fn parse_pgrp(stat: &str) -> Option<u32> {
+    stat_fields_after_comm(stat)?.nth(2)?.parse().ok()
+}
+
 fn read_stat(pid: u32) -> Option<String> {
     fs::read_to_string(format!("/proc/{pid}/stat")).ok()
 }
@@ -97,6 +101,25 @@ pub(crate) fn claude_generation(pid: u32) -> Option<ProcGen> {
     }
     let starttime = parse_starttime(&read_stat(pid)?)?;
     Some(ProcGen { pid, starttime })
+}
+
+/// Process group of the `claude` generation `(pid, starttime)` given its
+/// `comm` and `/proc/<pid>/stat` text; `None` when the comm or start time
+/// differ (the pid was reused or never was `claude`).
+fn claude_process_group_from(comm: &str, stat: &str, starttime: u64) -> Option<u32> {
+    if comm != "claude" || parse_starttime(stat)? != starttime {
+        return None;
+    }
+    parse_pgrp(stat).filter(|&pgrp| pgrp != 0)
+}
+
+/// Process group of the live `claude` process `pid` started at `starttime`
+/// (clock ticks, `/proc/<pid>/stat` field 22), or `None`.
+pub(crate) fn claude_process_group(pid: u32, starttime: u64) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    claude_process_group_from(&read_comm(pid)?, &read_stat(pid)?, starttime)
 }
 
 /// `comm` of a Codex process, or of a wrapper named after it (`codex-x`).
@@ -263,6 +286,18 @@ mod tests {
         assert_eq!(parse_starttime(stat), Some(987654));
         assert_eq!(parse_ppid("garbage"), None);
         assert_eq!(parse_starttime("1 (x) S 1"), None);
+        assert_eq!(parse_pgrp(stat), Some(1));
+    }
+
+    #[test]
+    fn claude_process_group_requires_claude_comm_and_same_starttime() {
+        let stat = "321 (claude) S 300 310 300 34816 310 4194560 1 2 3 4 5 6 7 8 20 0 1 0 5555 1 2";
+        assert_eq!(claude_process_group_from("claude", stat, 5555), Some(310));
+        // Reused pid: same comm, other generation.
+        assert_eq!(claude_process_group_from("claude", stat, 5556), None);
+        assert_eq!(claude_process_group_from("bash", stat, 5555), None);
+        assert_eq!(claude_process_group_from("claude", "321 (claude) S 1", 5555), None);
+        assert_eq!(claude_process_group(0, 5555), None);
     }
 
     fn table(nodes: &[(u32, &str, u32)]) -> impl Fn(u32) -> Option<(String, u32)> {
