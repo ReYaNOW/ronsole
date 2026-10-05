@@ -470,6 +470,7 @@ mod tests {
                     OsString::from(screen),
                 ],
                 hold: false,
+                bridge_launch_id: None,
             };
             let terminal = Terminal::spawn(None, 1, launch);
             let token = terminal.tab_token().to_owned();

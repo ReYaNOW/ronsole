@@ -7,6 +7,7 @@ pub(crate) struct TerminalLaunchSpec {
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) command: Vec<OsString>,
     pub(crate) hold: bool,
+    pub(crate) bridge_launch_id: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +22,10 @@ enum NormalCliToken<'a> {
         value: Option<&'a OsString>,
     },
     Hold,
+    BridgeLaunch {
+        option: &'a OsString,
+        value: Option<&'a OsString>,
+    },
     Execute(&'a [OsString]),
     Other(&'a OsString),
 }
@@ -38,6 +43,15 @@ fn normal_cli_token(args: &[OsString], index: usize) -> (NormalCliToken<'_>, usi
     }
     if arg == OsStr::new("--hold") || arg == OsStr::new("--noclose") {
         return (NormalCliToken::Hold, index + 1);
+    }
+    if arg == OsStr::new("--bridge-launch") {
+        return (
+            NormalCliToken::BridgeLaunch {
+                option: arg,
+                value: args.get(index + 1),
+            },
+            index.saturating_add(2).min(args.len()),
+        );
     }
     if arg == OsStr::new("-e") {
         return (
@@ -102,6 +116,18 @@ where
                 launch.working_directory = Some(path);
             }
             NormalCliToken::Hold => launch.hold = true,
+            NormalCliToken::BridgeLaunch { option, value } => {
+                if launch.bridge_launch_id.is_some() {
+                    return Err("duplicate --bridge-launch".to_string());
+                }
+                let value = value.ok_or_else(|| {
+                    format!(
+                        "{} requires a 32-character hex id",
+                        option.to_string_lossy()
+                    )
+                })?;
+                launch.bridge_launch_id = Some(parse_bridge_launch_id(value)?);
+            }
             NormalCliToken::Execute(command) => {
                 if command.is_empty() {
                     return Err("-e requires a command".to_string());
@@ -119,6 +145,22 @@ where
         index = next_index;
     }
     Ok(launch)
+}
+
+fn parse_bridge_launch_id(value: &OsStr) -> Result<[u8; 16], String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| "--bridge-launch id must be valid hex".to_string())?;
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("--bridge-launch id must be 32 hex characters".to_string());
+    }
+    let mut id = [0; 16];
+    for (index, byte) in id.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .map_err(|_| "--bridge-launch id must be 32 hex characters".to_string())?;
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -149,6 +191,7 @@ mod tests {
                 working_directory: None,
                 command: Vec::new(),
                 hold: false,
+                bridge_launch_id: None,
             }
         );
         let parsed = parse_terminal_launch_args_with_current_dir(&args(&["ronsole"]), || {
@@ -198,6 +241,31 @@ mod tests {
     }
 
     #[test]
+    fn bridge_launch_option_parses_id_before_execute_and_rejects_invalid_ids() {
+        let parsed = parse(&[
+            "ronsole",
+            "--bridge-launch",
+            "00112233445566778899aabbccddeeff",
+            "-e",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.bridge_launch_id,
+            Some([
+                0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ])
+        );
+        assert_eq!(parsed.command, args(&["claude"]));
+
+        for id in ["abc", "00112233445566778899aabbccddeefg"] {
+            assert!(parse(&["ronsole", "--bridge-launch", id]).is_err());
+        }
+        assert!(parse(&["ronsole", "--bridge-launch"]).is_err());
+    }
+
+    #[test]
     fn execute_option_takes_all_remaining_raw_arguments() {
         let parsed = parse(&["ronsole", "-e", "htop", "-d", "10"]).unwrap();
         assert_eq!(parsed.command, args(&["htop", "-d", "10"]));
@@ -216,6 +284,7 @@ mod tests {
                 working_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: false,
+                bridge_launch_id: None,
             })
         );
 
@@ -227,6 +296,7 @@ mod tests {
                 working_directory: None,
                 command: args(&["foo", "--pgo-workspace", "/tmp/x"]),
                 hold: false,
+                bridge_launch_id: None,
             })
         );
     }
@@ -240,6 +310,7 @@ mod tests {
                 working_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: true,
+                bridge_launch_id: None,
             })
         );
 
@@ -251,6 +322,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/tmp")),
                 command: args(&["foo", "--pgo-train"]),
                 hold: false,
+                bridge_launch_id: None,
             })
         );
     }
@@ -264,6 +336,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/launcher/cwd/--pgo-train")),
                 command: Vec::new(),
                 hold: false,
+                bridge_launch_id: None,
             })
         );
     }

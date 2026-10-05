@@ -1287,6 +1287,7 @@ mod tests {
             working_directory: Some(cwd.clone()),
             command: argv.clone(),
             hold: true,
+            bridge_launch_id: None,
         };
 
         let (command, resolved_cwd, title, spawn_target) =
@@ -1326,6 +1327,7 @@ mod tests {
             working_directory: Some(PathBuf::from("/tmp")),
             command: vec![OsString::from("/bin/true")],
             hold: false,
+            bridge_launch_id: None,
         };
         let (command, ..) = terminal_launch_command(launch, &first).unwrap();
         assert_eq!(

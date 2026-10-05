@@ -1723,6 +1723,7 @@ mod tests {
                 OsString::from("stty raw -echo; printf __READY__; exec cat > out"),
             ],
             hold: false,
+            bridge_launch_id: None,
         };
         let mut terminal = Terminal::spawn(None, 1, launch);
         let read_out = || std::fs::read(&out).unwrap_or_default();

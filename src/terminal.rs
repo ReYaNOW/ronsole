@@ -1,7 +1,8 @@
 use crate::launch::TerminalLaunchSpec;
+use sha2::{Digest, Sha256};
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use vte::{Params, Parser, Perform};
 
 pub(crate) use crate::terminal_compat::{
@@ -1454,6 +1455,7 @@ mod tests {
             last_user_input: None,
             user_input_held: false,
             held_user_input: Vec::new(),
+            bridge_launch: None,
         };
 
         assert!(!terminal.is_closed());
@@ -2975,6 +2977,66 @@ mod tests {
     }
 
     #[test]
+    fn bridge_warning_requires_all_fragments_and_survives_wrapped_rows() {
+        let screen = "  WARNING: Loading development channels\n\n  --dangerously-load-development-channels is for local channel development only.\n\n  ❯ 1. I am using this for local development\n    2. Exit\n";
+        assert!(bridge_warning_visible(screen));
+
+        let characters: Vec<char> = screen.chars().collect();
+        let wrapped = characters
+            .chunks(40)
+            .map(|chunk| chunk.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bridge_warning_visible(&wrapped));
+
+        assert!(!bridge_warning_visible(
+            "Loading development channels --dangerously-load-development-channels"
+        ));
+    }
+
+    #[test]
+    fn bridge_enter_is_bridge_only_single_use_and_expires_after_fifteen_minutes() {
+        let now = Instant::now();
+        let warning = "Loading development channels --dangerously-load-development-channels ❯ 1. I am using this for local development";
+        let mut writes = Vec::new();
+        let mut ordinary_tab: Option<BridgeLaunchState> = None;
+        if let Some(state) = ordinary_tab.as_mut()
+            && state.try_auto_confirm(now, warning)
+        {
+            writes.push(b"\r".to_vec());
+        }
+        let mut bridge_tab = BridgeLaunchState::new([7; 16], now);
+        let mut bridge_without_warning = BridgeLaunchState::new([6; 16], now);
+        assert!(!bridge_without_warning.try_auto_confirm(now, "ordinary Claude prompt"));
+        if bridge_tab.try_auto_confirm(now, warning) {
+            writes.push(b"\r".to_vec());
+        }
+        if bridge_tab.try_auto_confirm(now, warning) {
+            writes.push(b"\r".to_vec());
+        }
+        assert_eq!(writes, [b"\r".to_vec()]);
+
+        let mut expired = BridgeLaunchState::new([8; 16], now);
+        assert!(!expired.try_auto_confirm(now + BRIDGE_LAUNCH_TTL, warning));
+        assert!(!expired.enter_sent);
+    }
+
+    #[test]
+    fn manual_enter_marks_bridge_state_as_confirmed() {
+        let now = Instant::now();
+        let mut terminal = Terminal::new_for_test(10, 4, 1);
+        terminal.bridge_launch = Some(BridgeLaunchState::new([3; 16], now));
+        terminal.write_user_input(b"\r");
+        assert!(terminal.bridge_launch_state().unwrap().enter_sent);
+    }
+
+    #[test]
+    fn screen_hash_is_sha256_of_exact_text() {
+        let expected: [u8; 32] = Sha256::digest(b"screen").into();
+        assert_eq!(screen_hash("screen"), expected);
+    }
+
+    #[test]
     fn direct_pty_command_preserves_argv_cwd_relative_program_and_env() {
         use std::ffi::OsString;
         use std::os::unix::fs::PermissionsExt;
@@ -3006,6 +3068,7 @@ mod tests {
                 OsString::from("русский/utf8"),
             ],
             hold: false,
+            bridge_launch_id: None,
         };
         let mut terminal = Terminal::spawn(None, 1, launch);
 
@@ -3634,6 +3697,61 @@ pub(crate) enum TerminalPresentationIntent {
     ActivateWhenReady,
 }
 
+pub(crate) const BRIDGE_LAUNCH_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone, Debug)]
+pub(crate) struct BridgeLaunchState {
+    pub(crate) bridge_launch_id: [u8; 16],
+    pub(crate) created_at: Instant,
+    pub(crate) enter_sent: bool,
+}
+
+impl BridgeLaunchState {
+    pub(crate) fn new(bridge_launch_id: [u8; 16], created_at: Instant) -> Self {
+        Self {
+            bridge_launch_id,
+            created_at,
+            enter_sent: false,
+        }
+    }
+
+    pub(crate) fn active_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.created_at) < BRIDGE_LAUNCH_TTL
+    }
+
+    fn try_auto_confirm(&mut self, now: Instant, screen: &str) -> bool {
+        if !self.active_at(now) || self.enter_sent || !bridge_warning_visible(screen) {
+            return false;
+        }
+        self.enter_sent = true;
+        true
+    }
+}
+
+pub(crate) fn bridge_warning_visible(screen: &str) -> bool {
+    let compact_screen: String = screen
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    [
+        "Loading development channels",
+        "--dangerously-load-development-channels",
+        "❯ 1. I am using this for local development",
+    ]
+    .into_iter()
+    .all(|fragment| {
+        let compact_fragment: String = fragment
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        compact_screen.contains(&compact_fragment)
+    })
+}
+
+pub(crate) fn screen_hash(screen: &str) -> [u8; 32] {
+    Sha256::digest(screen.as_bytes()).into()
+}
+
 pub struct Terminal {
     pub grid: Arc<Mutex<TermGrid>>,
     process: Option<crate::terminal_process::TerminalProcess>,
@@ -3646,6 +3764,7 @@ pub struct Terminal {
     last_user_input: Option<Instant>,
     user_input_held: bool,
     held_user_input: Vec<u8>,
+    bridge_launch: Option<BridgeLaunchState>,
 }
 
 /// Upper bound for user input buffered by `Terminal::begin_input_hold`.
@@ -3683,6 +3802,7 @@ impl Terminal {
             last_user_input: None,
             user_input_held: false,
             held_user_input: Vec::new(),
+            bridge_launch: None,
         }
     }
 
@@ -3692,6 +3812,9 @@ impl Terminal {
         launch: TerminalLaunchSpec,
     ) -> Self {
         let hold = launch.hold;
+        let bridge_launch = launch
+            .bridge_launch_id
+            .map(|bridge_launch_id| BridgeLaunchState::new(bridge_launch_id, Instant::now()));
         let title_cache = Arc::new(Mutex::new(
             crate::terminal_process::TerminalTitleState::new_numbered(
                 "terminal".to_string(),
@@ -3733,7 +3856,32 @@ impl Terminal {
             last_user_input: None,
             user_input_held: false,
             held_user_input: Vec::new(),
+            bridge_launch,
         }
+    }
+
+    pub(crate) fn bridge_launch_state(&self) -> Option<&BridgeLaunchState> {
+        self.bridge_launch.as_ref()
+    }
+
+    pub(crate) fn bridge_launch_state_mut(&mut self) -> Option<&mut BridgeLaunchState> {
+        self.bridge_launch.as_mut()
+    }
+
+    pub(crate) fn maybe_auto_confirm_bridge(&mut self, now: Instant) -> bool {
+        if !self
+            .bridge_launch
+            .as_ref()
+            .is_some_and(|state| state.active_at(now) && !state.enter_sent)
+        {
+            return false;
+        }
+        let screen = self.screen_tail_text(usize::MAX).join("\n");
+        let should_send = self
+            .bridge_launch
+            .as_mut()
+            .is_some_and(|state| state.try_auto_confirm(now, &screen));
+        should_send && self.write_input(b"\r").is_ok()
     }
 
     pub(crate) fn tab_token(&self) -> &str {
@@ -3745,6 +3893,11 @@ impl Terminal {
     pub(crate) fn write_user_input(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
+        }
+        if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+            && let Some(state) = self.bridge_launch_state_mut()
+        {
+            state.enter_sent = true;
         }
         self.last_user_input = Some(Instant::now());
         if !self.user_input_held {

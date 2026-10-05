@@ -232,6 +232,7 @@ mod tests {
                         working_directory: Some(format!("/tmp/session-{index}").into()),
                         command: vec![format!("command-{index}").into()],
                         hold: index % 2 == 0,
+                        bridge_launch_id: None,
                     },
                 }))
                 .unwrap();

@@ -25,7 +25,9 @@ const DELIVERY_ACK_LEN: usize = 2;
 const REQUEST_PAYLOAD_PREFIX_LEN: usize = 9;
 const REQUEST_FLAG_HOLD: u8 = 1 << 0;
 const REQUEST_FLAG_WORKING_DIRECTORY: u8 = 1 << 1;
-const REQUEST_KNOWN_FLAGS: u8 = REQUEST_FLAG_HOLD | REQUEST_FLAG_WORKING_DIRECTORY;
+const REQUEST_FLAG_BRIDGE_LAUNCH: u8 = 1 << 2;
+const REQUEST_KNOWN_FLAGS: u8 =
+    REQUEST_FLAG_HOLD | REQUEST_FLAG_WORKING_DIRECTORY | REQUEST_FLAG_BRIDGE_LAUNCH;
 const MAX_REQUEST_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_ACTIVATION_TOKEN_BYTES: usize = 4096;
 const CLAIM_RETRIES: usize = 8;
@@ -541,6 +543,13 @@ fn request_payload_len(request: &ExternalLaunchRequest) -> io::Result<usize> {
     payload_len = payload_len
         .checked_add(token.len())
         .and_then(|len| len.checked_add(working_directory.len()))
+        .and_then(|len| {
+            len.checked_add(if request.launch.bridge_launch_id.is_some() {
+                16
+            } else {
+                0
+            })
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -603,6 +612,9 @@ fn write_external_launch_request(
     if request.launch.working_directory.is_some() {
         flags |= REQUEST_FLAG_WORKING_DIRECTORY;
     }
+    if request.launch.bridge_launch_id.is_some() {
+        flags |= REQUEST_FLAG_BRIDGE_LAUNCH;
+    }
 
     writer.write_all(&[PROTOCOL_VERSION, EXTERNAL_LAUNCH_MESSAGE])?;
     writer.write_all(&payload_len.to_be_bytes())?;
@@ -652,6 +664,9 @@ fn write_external_launch_request(
                 .to_be_bytes(),
         )?;
         writer.write_all(bytes)?;
+    }
+    if let Some(bridge_launch_id) = request.launch.bridge_launch_id {
+        writer.write_all(&bridge_launch_id)?;
     }
     Ok(())
 }
@@ -789,6 +804,17 @@ fn read_external_launch_request(reader: &mut impl Read) -> io::Result<ExternalLa
         let arg = take_payload_bytes(&mut payload, arg_len)?;
         command.push(OsString::from_vec(arg.to_vec()));
     }
+    let bridge_launch_id = if flags & REQUEST_FLAG_BRIDGE_LAUNCH != 0 {
+        let bytes = take_payload_bytes(&mut payload, 16)?;
+        Some(<[u8; 16]>::try_from(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid bridge launch id length",
+            )
+        })?)
+    } else {
+        None
+    };
     if !payload.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -802,6 +828,7 @@ fn read_external_launch_request(reader: &mut impl Read) -> io::Result<ExternalLa
             working_directory,
             command,
             hold: flags & REQUEST_FLAG_HOLD != 0,
+            bridge_launch_id,
         },
     })
 }
@@ -1094,7 +1121,13 @@ mod tests {
     #[test]
     fn external_launch_request_round_trips_default_request() {
         let request = ExternalLaunchRequest::default();
-        assert_eq!(round_trip_request(&request).unwrap(), request);
+        let mut encoded = Vec::new();
+        write_external_launch_request(&mut encoded, &request).unwrap();
+        assert_eq!(encoded[REQUEST_HEADER_LEN], 0);
+        assert_eq!(
+            read_external_launch_request(&mut Cursor::new(encoded)).unwrap(),
+            request
+        );
     }
 
     #[test]
@@ -1119,6 +1152,7 @@ mod tests {
                     OsString::from("русский/utf8"),
                 ],
                 hold: true,
+                bridge_launch_id: Some([0x11; 16]),
             },
         };
         assert_eq!(round_trip_request(&request).unwrap(), request);
@@ -1135,6 +1169,7 @@ mod tests {
                 working_directory: Some(PathBuf::from(raw_workdir.clone())),
                 command: vec![raw_program.clone(), raw_arg.clone()],
                 hold: false,
+                bridge_launch_id: None,
             },
         };
         let decoded = round_trip_request(&request).unwrap();
@@ -1167,6 +1202,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/secret/cwd")),
                 command: vec![OsString::from("secret-command")],
                 hold: true,
+                bridge_launch_id: None,
             },
         };
         let debug = format!("{request:?}");
@@ -1224,6 +1260,17 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
+
+        let mut missing_bridge_id = Vec::new();
+        write_external_launch_request(&mut missing_bridge_id, &ExternalLaunchRequest::default())
+            .unwrap();
+        missing_bridge_id[REQUEST_HEADER_LEN] |= REQUEST_FLAG_BRIDGE_LAUNCH;
+        assert_eq!(
+            read_external_launch_request(&mut Cursor::new(missing_bridge_id))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
@@ -1243,6 +1290,7 @@ mod tests {
                 working_directory: None,
                 command: vec![OsString::from_vec(vec![b'x'; MAX_REQUEST_PAYLOAD_BYTES])],
                 hold: false,
+                bridge_launch_id: None,
             },
         };
         assert_eq!(
@@ -1571,6 +1619,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/tmp")),
                 command: vec![OsString::from("htop")],
                 hold: true,
+                bridge_launch_id: None,
             },
         };
         let worker_expected = expected.clone();
@@ -1620,6 +1669,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/tmp/secondary")),
                 command: vec![OsString::from("program"), OsString::from("arg one")],
                 hold: true,
+                bridge_launch_id: None,
             },
         };
 
@@ -1646,6 +1696,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/tmp/first")),
                 command: vec![OsString::from("first"), OsString::from("arg one")],
                 hold: false,
+                bridge_launch_id: None,
             },
         };
         let second = ExternalLaunchRequest {
@@ -1654,6 +1705,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/tmp/second")),
                 command: vec![OsString::from("second"), OsString::from("--flag")],
                 hold: true,
+                bridge_launch_id: None,
             },
         };
 

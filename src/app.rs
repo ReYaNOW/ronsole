@@ -649,6 +649,28 @@ impl App {
         Some(index)
     }
 
+    pub(crate) fn find_terminal_by_bridge_launch_id(&self, id: [u8; 16]) -> Option<usize> {
+        let now = Instant::now();
+        self.terminals.iter().position(|terminal| {
+            terminal
+                .bridge_launch_state()
+                .is_some_and(|state| state.bridge_launch_id == id && state.active_at(now))
+        })
+    }
+
+    fn advance_bridge_launches(&mut self, now: Instant) {
+        let mut sent = false;
+        for terminal in &mut self.terminals {
+            let pending = terminal
+                .bridge_launch_state()
+                .is_some_and(|state| state.active_at(now) && !state.enter_sent);
+            sent |= pending && terminal.maybe_auto_confirm_bridge(now);
+        }
+        if sent {
+            self.request_frame();
+        }
+    }
+
     fn handle_external_launch(
         &mut self,
         request: crate::platform::single_instance::ExternalLaunchRequest,
@@ -1725,6 +1747,7 @@ impl App {
     }
 
     fn on_about_to_wait(&mut self) -> AppLoopControl {
+        self.advance_bridge_launches(Instant::now());
         self.advance_due_tab_deliveries();
         self.flush_pending_terminal_cleanup();
         if self.remove_closed_terminals() {
@@ -2114,6 +2137,7 @@ mod tests {
                 working_directory: None,
                 command: vec![OsString::from("/bin/true")],
                 hold: true,
+                bridge_launch_id: None,
             },
         );
         app.terminals.push(held);
@@ -2148,6 +2172,7 @@ mod tests {
                 working_directory: None,
                 command: vec![OsString::from("/bin/true")],
                 hold: false,
+                bridge_launch_id: None,
             },
         ));
         app.active_terminal = 0;
@@ -2177,6 +2202,7 @@ mod tests {
                 working_directory: Some("/tmp".into()),
                 command: vec!["/definitely/missing/ronsole-test-command".into()],
                 hold: false,
+                bridge_launch_id: None,
             },
         );
 
@@ -2392,6 +2418,7 @@ mod tests {
             working_directory: Some("/tmp/custom-cwd".into()),
             command: Vec::new(),
             hold: false,
+            bridge_launch_id: None,
         };
         assert_eq!(
             external_launch_plan(true, true, external_request(launch.clone(), None)),
@@ -2408,6 +2435,7 @@ mod tests {
             working_directory: None,
             command: vec!["htop".into(), "-d".into(), "10".into()],
             hold: false,
+            bridge_launch_id: None,
         };
         assert_eq!(
             external_launch_plan(true, false, external_request(launch.clone(), None)),
@@ -2424,6 +2452,7 @@ mod tests {
             working_directory: None,
             command: Vec::new(),
             hold: true,
+            bridge_launch_id: None,
         };
         assert_eq!(
             external_launch_plan(true, false, external_request(launch.clone(), None)),
@@ -2440,6 +2469,7 @@ mod tests {
             working_directory: None,
             command: vec!["htop".into()],
             hold: false,
+            bridge_launch_id: None,
         };
         assert_eq!(
             external_launch_plan(
@@ -2462,6 +2492,7 @@ mod tests {
             working_directory: Some("/tmp/custom-cwd".into()),
             command: Vec::new(),
             hold: false,
+            bridge_launch_id: None,
         };
         assert_eq!(
             external_launch_plan(false, true, external_request(launch.clone(), None)),
@@ -2478,6 +2509,7 @@ mod tests {
             working_directory: None,
             command: Vec::new(),
             hold: true,
+            bridge_launch_id: None,
         };
         assert_eq!(
             external_launch_plan(false, false, external_request(launch.clone(), None)),
@@ -2495,6 +2527,7 @@ mod tests {
                 working_directory: Some("/tmp/pending-cwd".into()),
                 command: vec!["program".into(), "arg one".into(), "--child-option".into()],
                 hold: true,
+                bridge_launch_id: None,
             },
             Some("pending-token"),
         );
