@@ -702,22 +702,26 @@ impl App {
                         BridgeResult::code(2)
                     } else {
                         let screen = self.terminals[index].screen_tail_text(usize::MAX).join("\n");
-                        if request.screen_hash != Some(screen_hash(&screen)) {
-                            BridgeResult::code(1)
-                        } else if self.terminals[index].maybe_auto_confirm_bridge(Instant::now()) {
-                            self.request_frame();
-                            BridgeResult::code(0)
+                        if let Some(expected_hash) = request.screen_hash {
+                            if self.terminals[index].manually_confirm_bridge(
+                                Instant::now(),
+                                &screen,
+                                expected_hash,
+                            ) {
+                                self.request_frame();
+                                BridgeResult::code(0)
+                            } else {
+                                BridgeResult::code(1)
+                            }
                         } else {
                             BridgeResult::code(1)
                         }
                     }
                 }
             },
-            2 => self.terminals.iter_mut()
-                .find(|terminal| terminal.bridge_launch_state()
-                    .is_some_and(|state| state.bridge_launch_id == request.bridge_launch_id))
-                .map(|terminal| {
-                    terminal.clear_bridge_launch_state();
+            2 => self.find_terminal_by_bridge_launch_id(request.bridge_launch_id)
+                .map(|index| {
+                    self.terminals[index].clear_bridge_launch_state();
                     BridgeResult::code(0)
                 })
                 .unwrap_or_else(|| BridgeResult::code(3)),
@@ -1878,7 +1882,7 @@ mod tests {
         let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
         vte::Parser::new().advance(
             &mut *crate::platform::lock_recover(&terminal.grid),
-            b"WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n\xe2\x9d\xaf 1. I am using this for local development",
+            b"ordinary screen without bridge warning",
         );
         let mut app = App::new();
         app.terminals.push(terminal);
@@ -1898,6 +1902,35 @@ mod tests {
         let mut ordinary = App::new();
         ordinary.terminals.push(Terminal::new_for_test(80, 24, 2));
         assert_eq!(bridge_call(&mut ordinary, 0, id, None).code, 3);
+    }
+
+    #[test]
+    fn bridge_manual_confirm_after_auto_confirm_returns_already_confirmed() {
+        let id = [10; 16];
+        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
+        vte::Parser::new().advance(
+            &mut *crate::platform::lock_recover(&terminal.grid),
+            b"WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n\xe2\x9d\xaf 1. I am using this for local development",
+        );
+        let mut app = App::new();
+        app.terminals.push(terminal);
+        assert!(app.terminals[0].maybe_auto_confirm_bridge(std::time::Instant::now()));
+        let screen = app.terminals[0].screen_tail_text(usize::MAX).join("\n");
+
+        assert_eq!(bridge_call(&mut app, 1, id, Some(screen_hash(&screen))).code, 2);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
+    }
+
+    #[test]
+    fn bridge_forget_rejects_expired_state() {
+        let id = [11; 16];
+        let mut terminal = Terminal::new_bridge_for_test(80, 8, 1, id);
+        terminal.bridge_launch_state_mut().unwrap().created_at =
+            std::time::Instant::now() - crate::terminal::BRIDGE_LAUNCH_TTL;
+        let mut app = App::new();
+        app.terminals.push(terminal);
+
+        assert_eq!(bridge_call(&mut app, 2, id, None).code, 3);
     }
 
     #[test]

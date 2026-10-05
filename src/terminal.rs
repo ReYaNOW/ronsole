@@ -2999,20 +2999,15 @@ mod tests {
     fn bridge_enter_is_bridge_only_single_use_and_expires_after_fifteen_minutes() {
         let now = Instant::now();
         let warning = "Loading development channels --dangerously-load-development-channels ❯ 1. I am using this for local development";
-        let mut writes = Vec::new();
         let mut bridge_tab = BridgeLaunchState::new([7; 16], now);
-        let mut bridge_without_warning = BridgeLaunchState::new([6; 16], now);
-        assert!(!bridge_without_warning.try_auto_confirm(now, "ordinary Claude prompt"));
-        if bridge_tab.try_auto_confirm(now, warning) {
-            writes.push(b"\r".to_vec());
-        }
-        if bridge_tab.try_auto_confirm(now, warning) {
-            writes.push(b"\r".to_vec());
-        }
-        assert_eq!(writes, [b"\r".to_vec()]);
+        let bridge_without_warning = BridgeLaunchState::new([6; 16], now);
+        assert!(!bridge_without_warning.should_auto_confirm(now, "ordinary Claude prompt"));
+        assert!(bridge_tab.should_auto_confirm(now, warning));
+        bridge_tab.enter_sent = true;
+        assert!(!bridge_tab.should_auto_confirm(now, warning));
 
-        let mut expired = BridgeLaunchState::new([8; 16], now);
-        assert!(!expired.try_auto_confirm(now + BRIDGE_LAUNCH_TTL, warning));
+        let expired = BridgeLaunchState::new([8; 16], now);
+        assert!(!expired.should_auto_confirm(now + BRIDGE_LAUNCH_TTL, warning));
         assert!(!expired.enter_sent);
     }
 
@@ -3047,6 +3042,31 @@ mod tests {
 
         assert!(!terminal.maybe_auto_confirm_bridge(now));
         assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn manual_bridge_confirm_works_without_warning_and_failed_writes_remain_pending() {
+        let now = Instant::now();
+        let screen = "ordinary screen";
+        let mut terminal = Terminal::new_for_test(80, 8, 1);
+        terminal.bridge_launch = Some(BridgeLaunchState::new([11; 16], now));
+
+        assert!(terminal.manually_confirm_bridge(now, screen, screen_hash(screen)));
+        assert!(!terminal.manually_confirm_bridge(now, screen, screen_hash(screen)));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        let mut failed = Terminal::new_for_test(80, 8, 1);
+        failed.bridge_launch = Some(BridgeLaunchState::new([12; 16], now));
+        failed.test_input = None;
+        assert!(!failed.manually_confirm_bridge(now, screen, screen_hash(screen)));
+        assert!(!failed.bridge_launch_state().unwrap().enter_sent);
+
+        let mut auto = Terminal::new_for_test(120, 8, 1);
+        auto.bridge_launch = Some(BridgeLaunchState::new([13; 16], now));
+        feed_bridge_warning(&auto, true);
+        auto.test_input = None;
+        assert!(!auto.maybe_auto_confirm_bridge(now));
+        assert!(!auto.bridge_launch_state().unwrap().enter_sent);
     }
 
     fn feed_bridge_warning(terminal: &Terminal, include_choice: bool) {
@@ -3757,12 +3777,8 @@ impl BridgeLaunchState {
         now.saturating_duration_since(self.created_at) < BRIDGE_LAUNCH_TTL
     }
 
-    fn try_auto_confirm(&mut self, now: Instant, screen: &str) -> bool {
-        if !self.active_at(now) || self.enter_sent || !bridge_warning_visible(screen) {
-            return false;
-        }
-        self.enter_sent = true;
-        true
+    fn should_auto_confirm(&self, now: Instant, screen: &str) -> bool {
+        self.active_at(now) && !self.enter_sent && bridge_warning_visible(screen)
     }
 }
 
@@ -3946,9 +3962,38 @@ impl Terminal {
         let screen = self.screen_tail_text(usize::MAX).join("\n");
         let should_send = self
             .bridge_launch
-            .as_mut()
-            .is_some_and(|state| state.try_auto_confirm(now, &screen));
-        should_send && self.write_input(b"\r").is_ok()
+            .as_ref()
+            .is_some_and(|state| state.should_auto_confirm(now, &screen));
+        if !should_send || self.write_input(b"\r").is_err() {
+            return false;
+        }
+        if let Some(state) = self.bridge_launch.as_mut() {
+            state.enter_sent = true;
+        }
+        true
+    }
+
+    pub(crate) fn manually_confirm_bridge(
+        &mut self,
+        now: Instant,
+        screen: &str,
+        expected_hash: [u8; 32],
+    ) -> bool {
+        if expected_hash != screen_hash(screen)
+            || !self
+                .bridge_launch
+                .as_ref()
+                .is_some_and(|state| state.active_at(now) && !state.enter_sent)
+        {
+            return false;
+        }
+        if self.write_input(b"\r").is_err() {
+            return false;
+        }
+        if let Some(state) = self.bridge_launch.as_mut() {
+            state.enter_sent = true;
+        }
+        true
     }
 
     pub(crate) fn tab_token(&self) -> &str {
