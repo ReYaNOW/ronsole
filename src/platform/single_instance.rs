@@ -20,6 +20,8 @@ const EXTERNAL_LAUNCH_MESSAGE: u8 = 1;
 const DELIVERY_ACK_MESSAGE: u8 = 2;
 const TAB_INPUT_MESSAGE: u8 = 3;
 const TAB_INPUT_RESULT_MESSAGE: u8 = 4;
+pub(crate) const BRIDGE_REQUEST_MESSAGE: u8 = 5;
+pub(crate) const BRIDGE_RESULT_MESSAGE: u8 = 6;
 const REQUEST_HEADER_LEN: usize = 6;
 const DELIVERY_ACK_LEN: usize = 2;
 const REQUEST_PAYLOAD_PREFIX_LEN: usize = 9;
@@ -105,10 +107,31 @@ pub(crate) struct TabInputEnvelope {
     pub(crate) reply: mpsc::Sender<TabInputCode>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BridgeRequest {
+    pub(crate) op: u8,
+    pub(crate) bridge_launch_id: [u8; 16],
+    pub(crate) screen_hash: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BridgeResult {
+    pub(crate) code: u8,
+    pub(crate) screen: Option<(String, [u8; 32])>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BridgeRequestEnvelope {
+    pub(crate) request: BridgeRequest,
+    pub(crate) peer: PeerCred,
+    pub(crate) reply: mpsc::Sender<BridgeResult>,
+}
+
 #[derive(Debug)]
 pub(crate) enum InstanceMessage {
     ExternalLaunch(ExternalLaunchRequest),
     TabInput(TabInputEnvelope),
+    BridgeRequest(BridgeRequestEnvelope),
 }
 
 pub(crate) fn peer_allowed(peer: PeerCred, own_uid: u32) -> bool {
@@ -269,8 +292,14 @@ impl PrimaryInstance {
                 if stream.read_exact(&mut prefix).is_err() {
                     continue;
                 }
-                if prefix[1] == TAB_INPUT_MESSAGE && !peer_allowed(peer, effective_uid()) {
-                    let _ = write_tab_input_result(&mut stream, TabInputCode::PeerRejected);
+                if matches!(prefix[1], TAB_INPUT_MESSAGE | BRIDGE_REQUEST_MESSAGE)
+                    && !peer_allowed(peer, effective_uid())
+                {
+                    if prefix[1] == TAB_INPUT_MESSAGE {
+                        let _ = write_tab_input_result(&mut stream, TabInputCode::PeerRejected);
+                    } else {
+                        let _ = write_bridge_result(&mut stream, &BridgeResult::code(4));
+                    }
                     continue;
                 }
                 let mut framed = io::Cursor::new(prefix).chain(&mut stream);
@@ -313,6 +342,20 @@ impl PrimaryInstance {
                             release_tab_input_reply(&active_replies);
                             // The reply worker could not be created; the stream is closed below.
                         }
+                    }
+                    Ok(InstanceMessage::BridgeRequest(mut envelope)) => {
+                        let (reply_tx, reply_rx) = mpsc::channel();
+                        envelope.reply = reply_tx;
+                        if !deliver(InstanceMessage::BridgeRequest(envelope)) {
+                            continue;
+                        }
+                        let _ = std::thread::Builder::new()
+                            .name("ronsole-bridge-reply".to_owned())
+                            .spawn(move || {
+                                if let Ok(result) = reply_rx.recv_timeout(SERVER_CLIENT_IO_TIMEOUT) {
+                                    let _ = write_bridge_result(&mut stream, &result);
+                                }
+                            });
                     }
                     Err(_) => {}
                 }
@@ -359,7 +402,7 @@ pub(crate) fn acquire_single_instance(
     claim_at(fallback.join(SOCKET_FILE_NAME), uid, initial_launch)
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
@@ -887,8 +930,150 @@ fn read_instance_message(reader: &mut impl Read, peer: PeerCred) -> io::Result<I
             let (reply, _receiver) = mpsc::channel();
             Ok(InstanceMessage::TabInput(TabInputEnvelope { request, peer, reply }))
         }
+        BRIDGE_REQUEST_MESSAGE => {
+            let request = read_bridge_request(&mut framed)?;
+            let (reply, _receiver) = mpsc::channel();
+            Ok(InstanceMessage::BridgeRequest(BridgeRequestEnvelope { request, peer, reply }))
+        }
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported single-instance message type")),
     }
+}
+
+// Bridge frames use the existing version/type/u32-length header. Requests carry op +
+// 32 ASCII hex id bytes and, for op=1, a raw 32-byte screen hash. Results carry a code;
+// op=0 success adds u32-length-prefixed UTF-8 screen text followed by its raw hash.
+fn read_bridge_request(reader: &mut impl Read) -> io::Result<BridgeRequest> {
+    let mut header = [0_u8; REQUEST_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    if header[0] != PROTOCOL_VERSION || header[1] != BRIDGE_REQUEST_MESSAGE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bridge request header"));
+    }
+    let payload_len = usize::try_from(u32::from_be_bytes(header[2..6].try_into().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid bridge request length")
+    })?))
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bridge request length out of range"))?;
+    if payload_len > 65 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bridge request too large"));
+    }
+    let mut payload = vec![0; payload_len];
+    reader.read_exact(&mut payload)?;
+    let mut payload = payload.as_slice();
+    let op = take_payload_u8(&mut payload)?;
+    let expected_len = match op {
+        0 | 2 => 32,
+        1 => 64,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown bridge operation")),
+    };
+    if payload.len() != expected_len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bridge request payload length"));
+    }
+    let id = take_payload_bytes(&mut payload, 32)?;
+    let mut bridge_launch_id = [0; 16];
+    for (index, pair) in id.chunks_exact(2).enumerate() {
+        let high = bridge_hex_digit(pair[0])?;
+        let low = bridge_hex_digit(pair[1])?;
+        bridge_launch_id[index] = high << 4 | low;
+    }
+    let screen_hash = if op == 1 {
+        let mut hash = [0; 32];
+        hash.copy_from_slice(take_payload_bytes(&mut payload, 32)?);
+        Some(hash)
+    } else {
+        None
+    };
+    Ok(BridgeRequest { op, bridge_launch_id, screen_hash })
+}
+
+fn bridge_hex_digit(byte: u8) -> io::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "bridge launch id is not hexadecimal")),
+    }
+}
+
+fn write_bridge_request(writer: &mut impl Write, request: &BridgeRequest) -> io::Result<()> {
+    let payload_len = if request.op == 1 { 65 } else if matches!(request.op, 0 | 2) { 33 } else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown bridge operation"));
+    };
+    if (request.op == 1) != request.screen_hash.is_some() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid bridge request hash"));
+    }
+    writer.write_all(&[PROTOCOL_VERSION, BRIDGE_REQUEST_MESSAGE])?;
+    writer.write_all(&(payload_len as u32).to_be_bytes())?;
+    writer.write_all(&[request.op])?;
+    for byte in request.bridge_launch_id {
+        writer.write_all(format!("{byte:02x}").as_bytes())?;
+    }
+    if let Some(hash) = request.screen_hash {
+        writer.write_all(&hash)?;
+    }
+    Ok(())
+}
+
+impl BridgeResult {
+    pub(crate) fn code(code: u8) -> Self {
+        Self { code, screen: None }
+    }
+}
+
+fn write_bridge_result(writer: &mut impl Write, result: &BridgeResult) -> io::Result<()> {
+    let screen = result.screen.as_ref();
+    let payload_len = screen.map_or(1, |(text, _)| 1 + 4 + text.len() + 32);
+    if payload_len > MAX_REQUEST_PAYLOAD_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bridge result too large"));
+    }
+    writer.write_all(&[PROTOCOL_VERSION, BRIDGE_RESULT_MESSAGE])?;
+    writer.write_all(&(payload_len as u32).to_be_bytes())?;
+    writer.write_all(&[result.code])?;
+    if let Some((text, hash)) = screen {
+        writer.write_all(&(text.len() as u32).to_be_bytes())?;
+        writer.write_all(text.as_bytes())?;
+        writer.write_all(hash)?;
+    }
+    Ok(())
+}
+
+fn read_bridge_result(reader: &mut impl Read, op: u8) -> io::Result<BridgeResult> {
+    let mut header = [0_u8; REQUEST_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    if header[0] != PROTOCOL_VERSION || header[1] != BRIDGE_RESULT_MESSAGE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bridge result header"));
+    }
+    let payload_len = usize::try_from(u32::from_be_bytes(header[2..6].try_into().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid bridge result length")
+    })?))
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bridge result length out of range"))?;
+    if payload_len > MAX_REQUEST_PAYLOAD_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bridge result too large"));
+    }
+    let mut payload = vec![0; payload_len];
+    reader.read_exact(&mut payload)?;
+    let mut payload = payload.as_slice();
+    let code = take_payload_u8(&mut payload)?;
+    if code > 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown bridge result code"));
+    }
+    let screen = if op == 0 && code == 0 {
+        let text_len = usize::try_from(take_payload_u32(&mut payload)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bridge screen length out of range"))?;
+        if payload.len() != text_len.saturating_add(32) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bridge screen result length"));
+        }
+        let text = std::str::from_utf8(take_payload_bytes(&mut payload, text_len)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bridge screen is not UTF-8"))?
+            .to_owned();
+        let mut hash = [0; 32];
+        hash.copy_from_slice(take_payload_bytes(&mut payload, 32)?);
+        Some((text, hash))
+    } else {
+        None
+    };
+    if !payload.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bridge result contains trailing bytes"));
+    }
+    Ok(BridgeResult { code, screen })
 }
 
 fn write_tab_input_request(writer: &mut impl Write, request: &TabInputRequest) -> io::Result<()> {
@@ -1058,7 +1243,7 @@ mod tests {
     fn external_message(message: InstanceMessage) -> ExternalLaunchRequest {
         match message {
             InstanceMessage::ExternalLaunch(request) => request,
-            InstanceMessage::TabInput(_) => panic!("unexpected tab input"),
+            InstanceMessage::TabInput(_) | InstanceMessage::BridgeRequest(_) => panic!("unexpected message"),
         }
     }
 
@@ -1447,6 +1632,72 @@ mod tests {
     }
 
     #[test]
+    fn bridge_request_frames_match_wire_vectors() {
+        let id = *b"00112233445566778899aabbccddeeff";
+        let snapshot = BridgeRequest { op: 0, bridge_launch_id: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], screen_hash: None };
+        let mut expected_snapshot = b"\x02\x05\x00\x00\x00\x21\x00".to_vec();
+        expected_snapshot.extend_from_slice(b"00112233445566778899aabbccddeeff");
+        let mut encoded = Vec::new();
+        write_bridge_request(&mut encoded, &snapshot).unwrap();
+        assert_eq!(encoded, expected_snapshot);
+        assert_eq!(read_bridge_request(&mut Cursor::new(encoded.as_slice())).unwrap(), snapshot);
+
+        let confirm = BridgeRequest { op: 1, bridge_launch_id: snapshot.bridge_launch_id,
+            screen_hash: Some([0xa5; 32]) };
+        let mut expected_confirm = b"\x02\x05\x00\x00\x00\x41\x01".to_vec();
+        expected_confirm.extend_from_slice(b"00112233445566778899aabbccddeeff");
+        expected_confirm.extend_from_slice(&[0xa5; 32]);
+        encoded.clear();
+        write_bridge_request(&mut encoded, &confirm).unwrap();
+        assert_eq!(encoded, expected_confirm);
+        assert_eq!(read_bridge_request(&mut Cursor::new(encoded.as_slice())).unwrap(), confirm);
+        assert_eq!(&id[..], b"00112233445566778899aabbccddeeff");
+    }
+
+    #[test]
+    fn bridge_result_frames_match_wire_vectors() {
+        let success = BridgeResult { code: 0, screen: Some(("hello".to_owned(), [0x11; 32])) };
+        let mut encoded = Vec::new();
+        write_bridge_result(&mut encoded, &success).unwrap();
+        let mut expected = b"\x02\x06\x00\x00\x00\x2a\x00\x00\x00\x00\x05hello".to_vec();
+        expected.extend_from_slice(&[0x11; 32]);
+        assert_eq!(encoded, expected);
+        assert_eq!(read_bridge_result(&mut Cursor::new(encoded.as_slice()), 0).unwrap(), success);
+
+        encoded.clear();
+        write_bridge_result(&mut encoded, &BridgeResult::code(4)).unwrap();
+        assert_eq!(encoded, b"\x02\x06\x00\x00\x00\x01\x04");
+        assert_eq!(read_bridge_result(&mut Cursor::new(encoded.as_slice()), 0).unwrap(), BridgeResult::code(4));
+    }
+
+    #[test]
+    fn bridge_request_parser_rejects_malformed_frames() {
+        let mut valid = b"\x02\x05\x00\x00\x00\x21\x00".to_vec();
+        valid.extend_from_slice(b"00112233445566778899aabbccddeeff");
+        assert!(read_bridge_request(&mut Cursor::new(&valid[..5])).is_err());
+        let mut unknown_op = valid.to_vec();
+        unknown_op[6] = 3;
+        assert!(read_bridge_request(&mut Cursor::new(unknown_op)).is_err());
+        let mut invalid_id = valid.to_vec();
+        invalid_id[7] = b'g';
+        assert!(read_bridge_request(&mut Cursor::new(invalid_id)).is_err());
+        let mut short_id = valid.to_vec();
+        short_id[5] = 32;
+        short_id.pop();
+        assert!(read_bridge_request(&mut Cursor::new(short_id)).is_err());
+
+        let mut missing_hash = b"\x02\x05\x00\x00\x00\x21\x01".to_vec();
+        missing_hash.extend_from_slice(b"00112233445566778899aabbccddeeff");
+        missing_hash[5] = 33;
+        assert!(read_bridge_request(&mut Cursor::new(missing_hash)).is_err());
+        let mut short_hash = b"\x02\x05\x00\x00\x00\x41\x01".to_vec();
+        short_hash.extend_from_slice(b"00112233445566778899aabbccddeeff");
+        short_hash.extend_from_slice(&[0; 31]);
+        assert!(read_bridge_request(&mut Cursor::new(short_hash)).is_err());
+    }
+
+    #[test]
     fn tab_input_text_validation_enforces_kind_and_unicode_rules() {
         for line in ["hello\rworld", "hello\u{1b}world", "hello\u{7f}", "a\u{202e}b", "a\u{2066}b"] {
             assert!(!validate_tab_input_text(TabInputKind::PhraseAfterClear, line));
@@ -1493,7 +1744,7 @@ mod tests {
             .unwrap();
             let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
                 InstanceMessage::TabInput(envelope) => envelope,
-                InstanceMessage::ExternalLaunch(_) => panic!("unexpected external launch"),
+                InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) => panic!("unexpected message"),
             };
             clients.push(stream);
             envelopes.push(envelope);
@@ -1526,7 +1777,7 @@ mod tests {
         .unwrap();
         let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             InstanceMessage::TabInput(envelope) => envelope,
-            InstanceMessage::ExternalLaunch(_) => panic!("unexpected external launch"),
+            InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) => panic!("unexpected message"),
         };
         envelope.reply.send(TabInputCode::InputDelivered).unwrap();
         released.read_exact(&mut result).unwrap();
@@ -1546,7 +1797,7 @@ mod tests {
         write_tab_input_request(&mut stream, &request).unwrap();
         let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             InstanceMessage::TabInput(envelope) => envelope,
-            InstanceMessage::ExternalLaunch(_) => panic!("unexpected external launch"),
+            InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) => panic!("unexpected message"),
         };
         assert_eq!(envelope.request, request);
         assert_eq!(envelope.peer.uid, effective_uid());

@@ -3847,6 +3847,18 @@ impl Terminal {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_bridge_for_test(
+        cols: usize,
+        rows: usize,
+        display_number: u64,
+        bridge_launch_id: [u8; 16],
+    ) -> Self {
+        let mut terminal = Self::new_for_test(cols, rows, display_number);
+        terminal.bridge_launch = Some(BridgeLaunchState::new(bridge_launch_id, Instant::now()));
+        terminal
+    }
+
     pub(crate) fn spawn(
         wake: Option<crate::wake::WakeHandle>,
         display_number: u64,
@@ -3911,8 +3923,12 @@ impl Terminal {
         self.bridge_launch.as_mut()
     }
 
+    pub(crate) fn clear_bridge_launch_state(&mut self) {
+        self.bridge_launch = None;
+    }
+
     #[cfg(test)]
-    fn input_bytes_for_test(&self) -> Vec<u8> {
+    pub(crate) fn input_bytes_for_test(&self) -> Vec<u8> {
         self.test_input
             .as_ref()
             .map(|input| crate::platform::lock_recover(input).clone())

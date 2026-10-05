@@ -9,6 +9,7 @@ use crate::input_types::{
 };
 use crate::launch::TerminalLaunchSpec;
 use crate::platform::{KdeActivationWorker, kde_session_active};
+use crate::platform::single_instance::BridgeResult;
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
@@ -18,7 +19,7 @@ use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
 };
-use crate::terminal::{Terminal, TerminalPresentationIntent};
+use crate::terminal::{Terminal, TerminalPresentationIntent, screen_hash};
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess};
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -669,6 +670,60 @@ impl App {
         if sent {
             self.request_frame();
         }
+    }
+
+    fn handle_bridge_request(
+        &mut self,
+        envelope: crate::platform::single_instance::BridgeRequestEnvelope,
+    ) {
+        if envelope.peer.uid != crate::platform::single_instance::effective_uid() {
+            let _ = envelope.reply.send(BridgeResult::code(4));
+            return;
+        }
+        let request = envelope.request;
+        let result = match request.op {
+            0 => self.find_terminal_by_bridge_launch_id(request.bridge_launch_id)
+                .map(|index| {
+                    let screen = self.terminals[index].screen_tail_text(usize::MAX).join("\n");
+                    let hash = screen_hash(&screen);
+                    BridgeResult {
+                        code: 0,
+                        screen: Some((screen, hash)),
+                    }
+                })
+                .unwrap_or_else(|| BridgeResult::code(3)),
+            1 => match self.find_terminal_by_bridge_launch_id(request.bridge_launch_id) {
+                None => BridgeResult::code(3),
+                Some(index) => {
+                    if self.terminals[index]
+                        .bridge_launch_state()
+                        .is_some_and(|state| state.enter_sent)
+                    {
+                        BridgeResult::code(2)
+                    } else {
+                        let screen = self.terminals[index].screen_tail_text(usize::MAX).join("\n");
+                        if request.screen_hash != Some(screen_hash(&screen)) {
+                            BridgeResult::code(1)
+                        } else if self.terminals[index].maybe_auto_confirm_bridge(Instant::now()) {
+                            self.request_frame();
+                            BridgeResult::code(0)
+                        } else {
+                            BridgeResult::code(1)
+                        }
+                    }
+                }
+            },
+            2 => self.terminals.iter_mut()
+                .find(|terminal| terminal.bridge_launch_state()
+                    .is_some_and(|state| state.bridge_launch_id == request.bridge_launch_id))
+                .map(|terminal| {
+                    terminal.clear_bridge_launch_state();
+                    BridgeResult::code(0)
+                })
+                .unwrap_or_else(|| BridgeResult::code(3)),
+            _ => BridgeResult::code(3),
+        };
+        let _ = envelope.reply.send(result);
     }
 
     fn handle_external_launch(
@@ -1787,6 +1842,63 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bridge_call(
+        app: &mut App,
+        op: u8,
+        id: [u8; 16],
+        hash: Option<[u8; 32]>,
+    ) -> crate::platform::single_instance::BridgeResult {
+        bridge_call_as(app, op, id, hash, crate::platform::single_instance::effective_uid())
+    }
+
+    fn bridge_call_as(
+        app: &mut App,
+        op: u8,
+        id: [u8; 16],
+        hash: Option<[u8; 32]>,
+        uid: u32,
+    ) -> crate::platform::single_instance::BridgeResult {
+        let (reply, response) = std::sync::mpsc::channel();
+        app.handle_bridge_request(crate::platform::single_instance::BridgeRequestEnvelope {
+            request: crate::platform::single_instance::BridgeRequest {
+                op,
+                bridge_launch_id: id,
+                screen_hash: hash,
+            },
+            peer: crate::platform::single_instance::PeerCred { uid, pid: 7 },
+            reply,
+        });
+        response.recv().unwrap()
+    }
+
+    #[test]
+    fn bridge_snapshot_confirm_forget_and_missing_tab_behave_as_specified() {
+        let id = [9; 16];
+        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
+        vte::Parser::new().advance(
+            &mut *crate::platform::lock_recover(&terminal.grid),
+            b"WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n\xe2\x9d\xaf 1. I am using this for local development",
+        );
+        let mut app = App::new();
+        app.terminals.push(terminal);
+
+        assert_eq!(bridge_call_as(&mut app, 0, id, None, u32::MAX).code, 4);
+        let snapshot = bridge_call(&mut app, 0, id, None);
+        assert_eq!(snapshot.code, 0);
+        let (screen, hash) = snapshot.screen.unwrap();
+        assert_eq!(hash, crate::terminal::screen_hash(&screen));
+        assert_eq!(bridge_call(&mut app, 1, id, Some([0; 32])).code, 1);
+        assert_eq!(bridge_call(&mut app, 1, id, Some(hash)).code, 0);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
+        assert_eq!(bridge_call(&mut app, 1, id, Some(hash)).code, 2);
+        assert_eq!(bridge_call(&mut app, 2, id, None).code, 0);
+        assert_eq!(bridge_call(&mut app, 0, id, None).code, 3);
+
+        let mut ordinary = App::new();
+        ordinary.terminals.push(Terminal::new_for_test(80, 24, 2));
+        assert_eq!(bridge_call(&mut ordinary, 0, id, None).code, 3);
+    }
 
     #[test]
     fn animation_dt_clamps_idle_gap_without_quantizing_high_refresh() {
