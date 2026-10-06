@@ -97,6 +97,9 @@ const CELL_FLAG_WIDE_SPACER: u8 = 1 << 1;
 const CELL_FLAG_INVERSE: u8 = 1 << 2;
 const CELL_FLAG_UNDERLINE: u8 = 1 << 3;
 const CELL_FLAG_DIM: u8 = 1 << 4;
+/// Drawn as blank; set only by `Terminal::observe_dev_channel_banner`. Any
+/// write to the cell clears it, so rewritten content is never hidden.
+const CELL_FLAG_HIDDEN: u8 = 1 << 5;
 pub(crate) const TERMINAL_CELL_EXTRA_MAX_CHARS: usize = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,6 +191,18 @@ impl Cell {
 
     pub(crate) fn is_dim(&self) -> bool {
         self.flags & CELL_FLAG_DIM != 0
+    }
+
+    pub(crate) fn is_hidden(&self) -> bool {
+        self.flags & CELL_FLAG_HIDDEN != 0
+    }
+
+    pub(crate) fn set_hidden(&mut self, hidden: bool) {
+        if hidden {
+            self.flags |= CELL_FLAG_HIDDEN;
+        } else {
+            self.flags &= !CELL_FLAG_HIDDEN;
+        }
     }
 
     pub(crate) fn push_zero_width(&mut self, c: char) {

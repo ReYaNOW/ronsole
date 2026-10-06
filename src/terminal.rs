@@ -1458,6 +1458,7 @@ mod tests {
             held_user_input: Vec::new(),
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
+            dev_banner: DevBannerState::default(),
             test_input: None,
         };
 
@@ -3239,6 +3240,185 @@ mod tests {
         assert_eq!(bridge_first.input_bytes_for_test(), b"\r");
     }
 
+    /// Word wrap like Claude Code's notice box: rows of at most `width`
+    /// columns, the space at a break dropped, overlong words split.
+    fn notice_wrap(text: &str, width: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut row = String::new();
+        for mut word in text.split(' ') {
+            loop {
+                let used = row.chars().count();
+                if used + usize::from(used > 0) + word.chars().count() <= width {
+                    if used > 0 {
+                        row.push(' ');
+                    }
+                    row.push_str(word);
+                    break;
+                }
+                if used > 0 {
+                    rows.push(std::mem::take(&mut row));
+                    continue;
+                }
+                let head: String = word.chars().take(width).collect();
+                word = &word[head.len()..];
+                rows.push(head);
+            }
+        }
+        rows.push(row);
+        rows
+    }
+
+    /// Screen with "above", both banner lines wrapped to `width` text columns
+    /// behind the quote bar, and "below".
+    fn banner_screen(lines: [&str; 2], width: usize) -> (String, usize) {
+        let rows: Vec<String> = lines
+            .iter()
+            .flat_map(|line| notice_wrap(line, width))
+            .map(|row| format!("\u{258e} {row}"))
+            .collect();
+        (
+            format!("\x1b[2J\x1b[Habove\r\n{}\r\nbelow \u{258e} x", rows.join("\r\n")),
+            rows.len(),
+        )
+    }
+
+    /// (hidden, non-blank) cell counts of screen row `row`.
+    fn hidden_cells(terminal: &Terminal, row: usize) -> (usize, usize) {
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        let cells = grid.lines[row].iter().filter(|cell| cell.c != ' ');
+        let (hidden, total) = cells.fold((0, 0), |(hidden, total), cell| {
+            (hidden + usize::from(cell.is_hidden()), total + 1)
+        });
+        (hidden, total)
+    }
+
+    fn assert_banner_rows(terminal: &Terminal, banner_rows: usize, hidden: bool) {
+        for row in 1..=banner_rows {
+            let (hidden_count, total) = hidden_cells(terminal, row);
+            assert!(total > 0);
+            assert_eq!(hidden_count, if hidden { total } else { 0 }, "row {row}");
+        }
+        for row in [0, banner_rows + 1] {
+            assert_eq!(hidden_cells(terminal, row).0, 0, "neighbour row {row}");
+        }
+    }
+
+    #[test]
+    fn dev_banner_rows_are_hidden_for_flagged_claude_only() {
+        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
+        assert_eq!(rows, 2);
+        feed_dev_screen(&terminal, &screen);
+        let cursor = {
+            let grid = crate::platform::lock_recover(&terminal.grid);
+            (grid.cur_x, grid.cur_y, grid.content_generation)
+        };
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+        assert_banner_rows(&terminal, rows, true);
+        // Only the draw flag changed: cursor, generation and text are intact.
+        {
+            let grid = crate::platform::lock_recover(&terminal.grid);
+            assert_eq!((grid.cur_x, grid.cur_y, grid.content_generation), cursor);
+        }
+        let text = terminal.screen_tail_text(usize::MAX);
+        assert_eq!(text[1], format!("\u{258e} {}", DEV_CHANNEL_BANNER_LINES[0]));
+        assert_eq!(text[2], format!("\u{258e} {}", DEV_CHANNEL_BANNER_LINES[1]));
+
+        // Another process in the tab: the same text stays visible.
+        let mut other = Terminal::new_for_test(200, 8, 1);
+        feed_dev_screen(&other, &screen);
+        other.observe_dev_channel_banner(|_| None);
+        assert_banner_rows(&other, rows, false);
+    }
+
+    #[test]
+    fn dev_banner_with_changed_text_is_not_hidden() {
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let second = DEV_CHANNEL_BANNER_LINES[1];
+        let changed_first = first.replace("server:cc-tg", "server:cc-tx");
+        let changed_second = format!("{second}s");
+        for (lines, screen) in [
+            ([changed_first.as_str(), second], None),
+            ([first, changed_second.as_str()], None),
+            ([first, "server:cc-tg"], None),
+            ([second, first], None),
+            // The first line alone, then a prompt.
+            ([first, second], Some(format!("\x1b[2J\x1b[Habove\r\n\u{258e} {first}\r\n> {second}"))),
+            // No quote bar.
+            ([first, second], Some(format!("\x1b[2J\x1b[Habove\r\n  {first}\r\n  {second}"))),
+        ] {
+            let mut terminal = Terminal::new_for_test(200, 8, 1);
+            let screen = screen.unwrap_or_else(|| banner_screen(lines, 190).0);
+            feed_dev_screen(&terminal, &screen);
+            terminal.observe_dev_channel_banner(|_| {
+                panic!("process lookup must wait for the exact banner")
+            });
+            for row in 0..4 {
+                assert_eq!(hidden_cells(&terminal, row).0, 0, "{screen:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dev_banner_wrapped_on_narrow_width_is_hidden() {
+        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
+        // The first line wraps over several rows, the flag word is split.
+        assert!(rows >= 6, "{screen:?}");
+        assert!(!screen.contains("--dangerously-load-development-channels"));
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+        assert_banner_rows(&terminal, rows, true);
+    }
+
+    #[test]
+    fn dev_banner_rewrite_reveals_changed_rows_and_reuses_the_lookup() {
+        let lookups = std::cell::Cell::new(0);
+        let find = |_| {
+            lookups.set(lookups.get() + 1);
+            Some(DEV_CLAUDE)
+        };
+        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(find);
+        assert_banner_rows(&terminal, rows, true);
+
+        // Output elsewhere keeps the block hidden without a new lookup.
+        feed_dev_screen(&terminal, "\x1b[6;1Hmore output");
+        terminal.observe_dev_channel_banner(find);
+        assert_banner_rows(&terminal, rows, true);
+        assert_eq!(hidden_cells(&terminal, 5).0, 0);
+
+        // The same text written again is hidden with the cached answer.
+        feed_dev_screen(&terminal, "\x1b[2;3HC");
+        assert_eq!(hidden_cells(&terminal, 1).0 + 1, hidden_cells(&terminal, 1).1);
+        terminal.observe_dev_channel_banner(find);
+        assert_banner_rows(&terminal, rows, true);
+        assert_eq!(lookups.get(), 1);
+
+        // One changed character: the block no longer matches and is shown.
+        feed_dev_screen(&terminal, "\x1b[2;3HX");
+        terminal.observe_dev_channel_banner(find);
+        assert_banner_rows(&terminal, rows, false);
+        feed_dev_screen(&terminal, "\x1b[2;3HC");
+        terminal.observe_dev_channel_banner(find);
+        assert_banner_rows(&terminal, rows, true);
+        assert_eq!(lookups.get(), 2);
+
+        // Scrolled into scrollback, the hidden cells keep their flag.
+        feed_dev_screen(&terminal, "\x1b[8;1H\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
+        terminal.observe_dev_channel_banner(find);
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        let hidden_in_scrollback = grid
+            .scrollback
+            .iter()
+            .flatten()
+            .filter(|cell| cell.is_hidden())
+            .count();
+        assert!(hidden_in_scrollback > 0);
+    }
+
     #[test]
     fn screen_hash_is_sha256_of_exact_text() {
         let expected: [u8; 32] = Sha256::digest(b"screen").into();
@@ -3989,6 +4169,126 @@ struct DevWarningState {
     confirmed: Option<crate::tab_input::ProcGen>,
 }
 
+/// Text of the two Claude Code notice lines shown for the cc-tg development
+/// channel, without the quote-border prefix (`DEV_CHANNEL_BANNER_BAR` and one
+/// space) that Claude Code draws on every row of the notice, wrapped rows
+/// included.
+const DEV_CHANNEL_BANNER_LINES: [&str; 2] = [
+    "Channels (experimental) messages from server:cc-tg inject directly in this session \u{b7} restart without --dangerously-load-development-channels to stop",
+    "server:cc-tg \u{b7} no MCP server configured with that name",
+];
+const DEV_CHANNEL_BANNER_BAR: char = '\u{258e}';
+
+/// Matches one screen row against `expected[pos..]`: optional leading blanks,
+/// the bar, one space, then a non-empty segment equal to the next part of
+/// `expected` (trailing blanks ignored). The space of `expected` at a wrap
+/// point may be dropped by the wrapper. Returns the byte position after the
+/// segment.
+fn match_banner_row(row: &[Cell], expected: &str, pos: usize) -> Option<usize> {
+    let end = row.iter().rposition(|cell| cell.c != ' ')? + 1;
+    let mut cells = row[..end].iter().filter(|cell| !cell.is_wide_spacer());
+    let plain = |cell: &Cell, c: char| cell.c == c && cell.zero_width().is_empty();
+    let bar = cells.find(|cell| cell.c != ' ')?;
+    if !plain(bar, DEV_CHANNEL_BANNER_BAR) || !cells.next().is_some_and(|cell| plain(cell, ' ')) {
+        return None;
+    }
+    let mut rest = expected.get(pos..)?;
+    let mut segment_empty = true;
+    for cell in cells {
+        if segment_empty && pos > 0 && cell.c != ' ' {
+            rest = rest.strip_prefix(' ').unwrap_or(rest);
+        }
+        let mut chars = rest.chars();
+        let expected_char = chars.next()?;
+        if !plain(cell, expected_char) {
+            return None;
+        }
+        rest = chars.as_str();
+        segment_empty = false;
+    }
+    (!segment_empty).then(|| expected.len() - rest.len())
+}
+
+/// Number of rows taken by both `DEV_CHANNEL_BANNER_LINES`, one after the
+/// other, starting at `lines[start]`, or `None` if the text differs.
+fn banner_rows_at(
+    lines: &std::collections::VecDeque<Vec<Cell>>,
+    cols: usize,
+    start: usize,
+) -> Option<usize> {
+    let mut row = start;
+    for expected in DEV_CHANNEL_BANNER_LINES {
+        let mut pos = 0;
+        while pos < expected.len() {
+            let line = lines.get(row)?;
+            pos = match_banner_row(&line[..cols.min(line.len())], expected, pos)?;
+            row += 1;
+        }
+    }
+    Some(row - start)
+}
+
+/// Whether the screen shows a banner block, and whether one of them still
+/// has a drawn (not hidden) cell.
+fn banner_blocks_state(grid: &TermGrid) -> (bool, bool) {
+    let (mut any, mut drawn) = (false, false);
+    let mut row = 0;
+    while row < grid.lines.len() {
+        let Some(rows) = banner_rows_at(&grid.lines, grid.cols, row) else {
+            row += 1;
+            continue;
+        };
+        any = true;
+        drawn |= grid
+            .lines
+            .range(row..row + rows)
+            .flat_map(|line| line.iter().take(grid.cols))
+            .any(|cell| cell.c != ' ' && !cell.is_hidden());
+        row += rows;
+    }
+    (any, drawn)
+}
+
+/// Hides the non-blank cells of every banner block on the screen when
+/// `hide_new` (already hidden blocks stay hidden either way) and clears the
+/// hidden flag on every other screen row.
+fn apply_banner_hiding(grid: &mut TermGrid, hide_new: bool) {
+    let cols = grid.cols;
+    let mut row = 0;
+    while row < grid.lines.len() {
+        match banner_rows_at(&grid.lines, cols, row) {
+            Some(rows) => {
+                if hide_new {
+                    for line in grid.lines.range_mut(row..row + rows) {
+                        for cell in line.iter_mut().take(cols).filter(|cell| cell.c != ' ') {
+                            cell.set_hidden(true);
+                        }
+                    }
+                }
+                row += rows;
+            }
+            None => {
+                for cell in grid.lines[row].iter_mut().take(cols) {
+                    cell.set_hidden(false);
+                }
+                row += 1;
+            }
+        }
+    }
+}
+
+/// Per-tab state of the development-channels banner hiding.
+#[derive(Debug, Default)]
+struct DevBannerState {
+    /// `TermGrid::content_generation` of the last applied scan.
+    scanned_generation: Option<u64>,
+    /// Some cell of this tab was hidden; until then no clearing pass runs.
+    hid_any: bool,
+    /// Foreground process group and whether it holds a flagged `claude`,
+    /// kept while a banner block stays on screen.
+    owner: Option<(Option<u32>, bool)>,
+}
+
 pub(crate) fn screen_hash(screen: &str) -> [u8; 32] {
     Sha256::digest(screen.as_bytes()).into()
 }
@@ -4008,6 +4308,7 @@ pub struct Terminal {
     held_user_input: Vec<u8>,
     bridge_launch: Option<BridgeLaunchState>,
     dev_warning: DevWarningState,
+    dev_banner: DevBannerState,
     #[cfg(test)]
     test_input: Option<Arc<Mutex<Vec<u8>>>>,
 }
@@ -4050,6 +4351,7 @@ impl Terminal {
             held_user_input: Vec::new(),
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
+            dev_banner: DevBannerState::default(),
             test_input: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
@@ -4121,6 +4423,7 @@ impl Terminal {
             held_user_input: Vec::new(),
             bridge_launch,
             dev_warning: DevWarningState::default(),
+            dev_banner: DevBannerState::default(),
             #[cfg(test)]
             test_input: None,
         }
@@ -4228,6 +4531,57 @@ impl Terminal {
     pub(crate) fn dev_warning_frame_hidden(&self, now: Instant) -> bool {
         self.dev_warning_hidden_until()
             .is_some_and(|until| now < until)
+    }
+
+    /// When the screen content changed, hides the cells of the exact
+    /// `DEV_CHANNEL_BANNER_LINES` rows if `find_claude` (given the PTY
+    /// foreground process group) finds a flagged `claude`; the answer is
+    /// cached per group while a banner stays on screen, and it is asked only
+    /// for a banner with drawn cells. Only the cell hidden flag changes: text,
+    /// cursor, scrollback and selection stay as the program wrote them.
+    pub(crate) fn observe_dev_channel_banner(
+        &mut self,
+        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
+    ) {
+        let generation = {
+            let mut grid = crate::platform::lock_recover(&self.grid);
+            let generation = grid.content_generation;
+            if self.dev_banner.scanned_generation == Some(generation) {
+                return;
+            }
+            let (any, drawn) = banner_blocks_state(&grid);
+            if !any {
+                self.dev_banner.owner = None;
+            }
+            if !drawn {
+                self.dev_banner.scanned_generation = Some(generation);
+                if self.dev_banner.hid_any {
+                    apply_banner_hiding(&mut grid, false);
+                }
+                return;
+            }
+            generation
+        };
+        // The process lookup runs without the grid lock.
+        let pgrp = self.process_group_leader();
+        let flagged = match self.dev_banner.owner {
+            Some((cached, flagged)) if cached == pgrp => flagged,
+            _ => {
+                let flagged = find_claude(pgrp).is_some();
+                self.dev_banner.owner = Some((pgrp, flagged));
+                flagged
+            }
+        };
+        let mut grid = crate::platform::lock_recover(&self.grid);
+        // New output arrived meanwhile: the next call scans it.
+        if grid.content_generation != generation {
+            return;
+        }
+        self.dev_banner.scanned_generation = Some(generation);
+        if flagged || self.dev_banner.hid_any {
+            apply_banner_hiding(&mut grid, flagged);
+            self.dev_banner.hid_any |= flagged;
+        }
     }
 
     pub(crate) fn manually_confirm_bridge(

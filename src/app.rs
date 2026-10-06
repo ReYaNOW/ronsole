@@ -674,6 +674,9 @@ impl App {
             terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
                 pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
             });
+            terminal.observe_dev_channel_banner(|pgrp| {
+                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
+            });
         }
         if self.frame_withheld && !self.active_dev_warning_hidden(now) {
             self.frame_withheld = false;
@@ -690,10 +693,14 @@ impl App {
     /// Whether to skip this frame because the active tab shows the warning that
     /// Enter was already sent for: the compositor keeps the last presented
     /// frame. Rescans the active tab first, since output may have arrived after
-    /// `on_about_to_wait`. Input is not affected.
+    /// `on_about_to_wait`. Input is not affected. Also applies the banner
+    /// hiding (`Terminal::observe_dev_channel_banner`) to the new content.
     fn withhold_active_frame(&mut self, now: Instant) -> bool {
         if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
             terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
+                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
+            });
+            terminal.observe_dev_channel_banner(|pgrp| {
                 pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
             });
         }

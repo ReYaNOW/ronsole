@@ -1075,7 +1075,7 @@ fn terminal_glyph_cell_geometry(
     cell: &Cell,
     char_w: f32,
 ) -> Option<(f32, f32)> {
-    if cell.c == ' ' || cell.is_wide_spacer() {
+    if cell.c == ' ' || cell.is_wide_spacer() || cell.is_hidden() {
         return None;
     }
     let (x, next_x) = terminal_cell_x_bounds(text_x, cell_index, char_w);
@@ -3150,6 +3150,10 @@ mod tests {
             TerminalColor::default_background(),
         );
         assert_eq!(terminal_glyph_cell_geometry(0.0, 1, &spacer, 7.4), None);
+
+        // A hidden cell keeps its text but draws no glyph.
+        ascii.set_hidden(true);
+        assert_eq!(terminal_glyph_cell_geometry(0.0, 1, &ascii, 7.4), None);
     }
 
     #[test]
