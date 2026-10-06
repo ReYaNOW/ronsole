@@ -1457,6 +1457,7 @@ mod tests {
             user_input_held: false,
             held_user_input: Vec::new(),
             bridge_launch: None,
+            dev_warning: DevWarningState::default(),
             test_input: None,
         };
 
@@ -3098,6 +3099,146 @@ mod tests {
         assert!(terminal.bridge_launch_state().unwrap().enter_sent);
     }
 
+    const DEV_WARNING_SCREEN: &str = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+    const DEV_CLAUDE: crate::tab_input::ProcGen = crate::tab_input::ProcGen {
+        pid: 42,
+        starttime: 7,
+    };
+
+    /// Feeds `bytes` as one PTY output batch (bumps `content_generation`).
+    fn feed_dev_screen(terminal: &Terminal, bytes: &str) {
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        Parser::new().advance(&mut *grid, bytes.as_bytes());
+        grid.content_generation = grid.content_generation.wrapping_add(1);
+    }
+
+    fn observe_dev(
+        terminal: &mut Terminal,
+        now: Instant,
+        claude: Option<crate::tab_input::ProcGen>,
+    ) -> bool {
+        let mut scratch = String::new();
+        terminal.observe_dev_channel_warning(now, &mut scratch, |_| claude)
+    }
+
+    #[test]
+    fn dev_warning_sends_one_enter_per_flagged_claude_generation() {
+        let now = Instant::now();
+        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        assert!(observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // Same frame again and a repainted warning frame: no second Enter.
+        assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // The same claude showing the warning again later is not confirmed twice.
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H> ready");
+        assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        assert!(!terminal.dev_warning_frame_hidden(now));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // A restarted claude (new start time) gets its own Enter.
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ ");
+        assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let restarted = crate::tab_input::ProcGen {
+            pid: 42,
+            starttime: 8,
+        };
+        assert!(observe_dev(&mut terminal, now, Some(restarted)));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r\r");
+    }
+
+    #[test]
+    fn dev_warning_needs_flagged_claude_and_the_exact_warning() {
+        let now = Instant::now();
+        // No flagged claude in the foreground group (other program, claude
+        // without the flag): nothing is sent and nothing is hidden.
+        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        assert!(!observe_dev(&mut terminal, now, None));
+        assert!(!terminal.dev_warning_frame_hidden(now));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // Changed text never reaches the process lookup.
+        for screen in [
+            "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 2. Exit",
+            "\x1b[2J\x1b[HLoading development channels\r\n❯ 1. I am using this for local development",
+            "\x1b[2J\x1b[Hordinary claude prompt",
+        ] {
+            let mut terminal = Terminal::new_for_test(120, 8, 1);
+            feed_dev_screen(&terminal, screen);
+            let mut scratch = String::new();
+            assert!(!terminal.observe_dev_channel_warning(now, &mut scratch, |_| {
+                panic!("process lookup must wait for a matching screen")
+            }));
+            assert!(terminal.input_bytes_for_test().is_empty());
+        }
+
+        // A failed write leaves the warning unconfirmed and visible.
+        let mut failed = Terminal::new_for_test(120, 8, 1);
+        failed.test_input = None;
+        feed_dev_screen(&failed, DEV_WARNING_SCREEN);
+        assert!(!observe_dev(&mut failed, now, Some(DEV_CLAUDE)));
+        assert!(!failed.dev_warning_frame_hidden(now));
+    }
+
+    #[test]
+    fn dev_warning_frames_stay_hidden_until_screen_changes_or_limit() {
+        let now = Instant::now();
+        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ claude");
+        assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        assert!(!terminal.dev_warning_frame_hidden(now));
+
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        assert!(observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        assert_eq!(
+            terminal.dev_warning_hidden_until(),
+            Some(now + DEV_WARNING_HIDE_LIMIT)
+        );
+        assert!(terminal.dev_warning_frame_hidden(now));
+        let almost = now + DEV_WARNING_HIDE_LIMIT - Duration::from_millis(1);
+        assert!(terminal.dev_warning_frame_hidden(almost));
+        // Safety limit: the stuck warning is shown so the user can answer.
+        assert!(!terminal.dev_warning_frame_hidden(now + DEV_WARNING_HIDE_LIMIT));
+
+        // The first frame without the warning ends hiding.
+        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        assert!(observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H> ready");
+        assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
+        assert!(!terminal.dev_warning_frame_hidden(now));
+        assert_eq!(terminal.dev_warning_hidden_until(), None);
+    }
+
+    #[test]
+    fn dev_warning_and_bridge_auto_confirm_send_one_enter_together() {
+        let now = Instant::now();
+        let mut generic_first = Terminal::new_for_test(120, 8, 1);
+        generic_first.bridge_launch = Some(BridgeLaunchState::new([21; 16], now));
+        feed_dev_screen(&generic_first, DEV_WARNING_SCREEN);
+        assert!(observe_dev(&mut generic_first, now, Some(DEV_CLAUDE)));
+        assert!(generic_first.bridge_launch_state().unwrap().enter_sent);
+        assert!(!generic_first.maybe_auto_confirm_bridge(now));
+        assert_eq!(generic_first.input_bytes_for_test(), b"\r");
+
+        let mut bridge_first = Terminal::new_for_test(120, 8, 1);
+        bridge_first.bridge_launch = Some(BridgeLaunchState::new([22; 16], now));
+        feed_dev_screen(&bridge_first, DEV_WARNING_SCREEN);
+        assert!(bridge_first.maybe_auto_confirm_bridge(now));
+        assert!(!observe_dev(&mut bridge_first, now, Some(DEV_CLAUDE)));
+        assert!(bridge_first.dev_warning_frame_hidden(now));
+        assert_eq!(bridge_first.input_bytes_for_test(), b"\r");
+    }
+
     #[test]
     fn screen_hash_is_sha256_of_exact_text() {
         let expected: [u8; 32] = Sha256::digest(b"screen").into();
@@ -3792,24 +3933,60 @@ impl BridgeLaunchState {
     }
 }
 
+/// Fragments of the Claude Code development-channels warning with whitespace
+/// removed ("Loading development channels", the flag, and the selected
+/// "❯ 1. I am using this for local development" choice).
+const BRIDGE_WARNING_COMPACT_FRAGMENTS: [&str; 3] = [
+    "Loadingdevelopmentchannels",
+    "--dangerously-load-development-channels",
+    "❯1.Iamusingthisforlocaldevelopment",
+];
+
 pub(crate) fn bridge_warning_visible(screen: &str) -> bool {
     let compact_screen: String = screen
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    [
-        "Loading development channels",
-        "--dangerously-load-development-channels",
-        "❯ 1. I am using this for local development",
-    ]
-    .into_iter()
-    .all(|fragment| {
-        let compact_fragment: String = fragment
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        compact_screen.contains(&compact_fragment)
-    })
+    compact_bridge_warning_visible(&compact_screen)
+}
+
+/// The warning matcher on screen text that already has no whitespace.
+fn compact_bridge_warning_visible(compact_screen: &str) -> bool {
+    BRIDGE_WARNING_COMPACT_FRAGMENTS
+        .into_iter()
+        .all(|fragment| compact_screen.contains(fragment))
+}
+
+/// Writes the current screen text without whitespace into `out`: the grid-side
+/// equivalent of compacting `Terminal::screen_tail_text(usize::MAX)`, without
+/// a per-call allocation once `out` has grown.
+fn write_compact_screen(grid: &TermGrid, out: &mut String) {
+    out.clear();
+    for line in &grid.lines {
+        for cell in line.iter().take(grid.cols) {
+            cell.append_text_to(out);
+        }
+    }
+    out.retain(|character| !character.is_whitespace());
+}
+
+/// How long frames of a tab stay withheld after Enter was sent while the
+/// development-channels warning is still on screen; after that the screen is
+/// shown as is so the user can answer.
+pub(crate) const DEV_WARNING_HIDE_LIMIT: Duration = Duration::from_millis(1500);
+
+/// Per-tab state of the development-channels warning auto-confirmation.
+#[derive(Debug, Default)]
+struct DevWarningState {
+    /// `TermGrid::content_generation` of the last scanned screen.
+    scanned_generation: Option<u64>,
+    /// The last scanned screen matched the warning.
+    visible: bool,
+    /// When Enter was sent for the warning now on screen; cleared by the first
+    /// scanned screen without the warning.
+    enter_at: Option<Instant>,
+    /// The `claude` process generation that got the automatic Enter.
+    confirmed: Option<crate::tab_input::ProcGen>,
 }
 
 pub(crate) fn screen_hash(screen: &str) -> [u8; 32] {
@@ -3830,6 +4007,7 @@ pub struct Terminal {
     user_input_held: bool,
     held_user_input: Vec<u8>,
     bridge_launch: Option<BridgeLaunchState>,
+    dev_warning: DevWarningState,
     #[cfg(test)]
     test_input: Option<Arc<Mutex<Vec<u8>>>>,
 }
@@ -3871,6 +4049,7 @@ impl Terminal {
             user_input_held: false,
             held_user_input: Vec::new(),
             bridge_launch: None,
+            dev_warning: DevWarningState::default(),
             test_input: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
@@ -3941,6 +4120,7 @@ impl Terminal {
             user_input_held: false,
             held_user_input: Vec::new(),
             bridge_launch,
+            dev_warning: DevWarningState::default(),
             #[cfg(test)]
             test_input: None,
         }
@@ -3985,7 +4165,69 @@ impl Terminal {
         if let Some(state) = self.bridge_launch.as_mut() {
             state.enter_sent = true;
         }
+        // The warning was matched just now: the generic path must not send a
+        // second Enter for it.
+        self.dev_warning.enter_at = Some(now);
         true
+    }
+
+    /// Scans the screen for the development-channels warning when its content
+    /// changed. On a matching screen with no Enter sent for it yet, writes one
+    /// Enter if `find_claude` (given the PTY foreground process group) finds a
+    /// `claude --dangerously-load-development-channels` generation that has
+    /// not been confirmed in this tab before. `scratch` is a reusable buffer.
+    /// Returns whether Enter was written.
+    pub(crate) fn observe_dev_channel_warning(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
+    ) -> bool {
+        {
+            let grid = crate::platform::lock_recover(&self.grid);
+            if self.dev_warning.scanned_generation == Some(grid.content_generation) {
+                return false;
+            }
+            self.dev_warning.scanned_generation = Some(grid.content_generation);
+            write_compact_screen(&grid, scratch);
+        }
+        self.dev_warning.visible = compact_bridge_warning_visible(scratch);
+        if !self.dev_warning.visible {
+            self.dev_warning.enter_at = None;
+            return false;
+        }
+        if self.dev_warning.enter_at.is_some() {
+            return false;
+        }
+        let Some(claude) = find_claude(self.process_group_leader()) else {
+            return false;
+        };
+        if self.dev_warning.confirmed == Some(claude) || self.write_input(b"\r").is_err() {
+            return false;
+        }
+        self.dev_warning.confirmed = Some(claude);
+        self.dev_warning.enter_at = Some(now);
+        if let Some(state) = self.bridge_launch.as_mut() {
+            state.enter_sent = true;
+        }
+        true
+    }
+
+    /// End of the frame hiding for this tab: `Some` while the last scanned
+    /// screen shows the warning that Enter was already sent for. Frames are
+    /// withheld until this instant (`DEV_WARNING_HIDE_LIMIT` after Enter).
+    pub(crate) fn dev_warning_hidden_until(&self) -> Option<Instant> {
+        if !self.dev_warning.visible {
+            return None;
+        }
+        self.dev_warning
+            .enter_at
+            .map(|at| at + DEV_WARNING_HIDE_LIMIT)
+    }
+
+    pub(crate) fn dev_warning_frame_hidden(&self, now: Instant) -> bool {
+        self.dev_warning_hidden_until()
+            .is_some_and(|until| now < until)
     }
 
     pub(crate) fn manually_confirm_bridge(
@@ -4010,6 +4252,9 @@ impl Terminal {
         }
         if let Some(state) = self.bridge_launch.as_mut() {
             state.enter_sent = true;
+        }
+        if bridge_warning_visible(&screen) {
+            self.dev_warning.enter_at = Some(now);
         }
         true
     }

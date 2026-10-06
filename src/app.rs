@@ -417,6 +417,10 @@ pub struct App {
     unfocused_redraw_pending: bool,
     pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
     tab_input: tab_delivery::TabInputState,
+    /// Reusable buffer for `Terminal::observe_dev_channel_warning`.
+    dev_warning_scratch: String,
+    /// A frame was skipped by `withhold_active_frame`; redraw once hiding ends.
+    frame_withheld: bool,
     occluded: bool,
     zero_sized: bool,
     dirty: bool,
@@ -475,6 +479,8 @@ impl App {
             unfocused_redraw_pending: false,
             pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
             tab_input: tab_delivery::TabInputState::default(),
+            dev_warning_scratch: String::new(),
+            frame_withheld: false,
             occluded: false,
             zero_sized: false,
             dirty: true,
@@ -657,6 +663,46 @@ impl App {
                 .bridge_launch_state()
                 .is_some_and(|state| state.bridge_launch_id == id && state.active_at(now))
         })
+    }
+
+    /// Development-channels warning check for every tab (see
+    /// `Terminal::observe_dev_channel_warning`); runs before
+    /// `advance_bridge_launches` so one warning gets one Enter. Requests the
+    /// frame that `withhold_active_frame` skipped once hiding has ended.
+    fn advance_dev_channel_warnings(&mut self, now: Instant) {
+        for terminal in &mut self.terminals {
+            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
+                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
+            });
+        }
+        if self.frame_withheld && !self.active_dev_warning_hidden(now) {
+            self.frame_withheld = false;
+            self.request_frame();
+        }
+    }
+
+    fn active_dev_warning_hidden(&self, now: Instant) -> bool {
+        self.terminals
+            .get(self.active_terminal)
+            .is_some_and(|terminal| terminal.dev_warning_frame_hidden(now))
+    }
+
+    /// Whether to skip this frame because the active tab shows the warning that
+    /// Enter was already sent for: the compositor keeps the last presented
+    /// frame. Rescans the active tab first, since output may have arrived after
+    /// `on_about_to_wait`. Input is not affected.
+    fn withhold_active_frame(&mut self, now: Instant) -> bool {
+        if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
+            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
+                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
+            });
+        }
+        if !self.active_dev_warning_hidden(now) {
+            return false;
+        }
+        self.frame_withheld = true;
+        self.dirty = false;
+        true
     }
 
     fn advance_bridge_launches(&mut self, now: Instant) {
@@ -1260,6 +1306,12 @@ impl App {
                 .filter(|deadline| *deadline > now)
                 .into_iter()
                 .chain(self.tab_input.next_deadline())
+                .chain(
+                    self.terminals
+                        .get(self.active_terminal)
+                        .and_then(Terminal::dev_warning_hidden_until)
+                        .filter(|deadline| *deadline > now),
+                )
                 .min()
                 .map_or(AppLoopControl::Wait, AppLoopControl::WaitUntil),
             LoopMode::Poll => AppLoopControl::Poll,
@@ -1721,6 +1773,9 @@ impl App {
 
         let _ = self.process_terminal_presentation_intents();
         let now = Instant::now();
+        if self.withhold_active_frame(now) {
+            return Ok(false);
+        }
         let dt = animation_dt((now - self.last_frame).as_secs_f32());
         self.last_frame = now;
 
@@ -1808,6 +1863,7 @@ impl App {
     }
 
     fn on_about_to_wait(&mut self) -> AppLoopControl {
+        self.advance_dev_channel_warnings(Instant::now());
         self.advance_bridge_launches(Instant::now());
         self.advance_due_tab_deliveries();
         self.flush_pending_terminal_cleanup();
@@ -1922,6 +1978,71 @@ mod tests {
         let screen = app.terminals[0].screen_tail_text(usize::MAX).join("\n");
 
         assert_eq!(bridge_call(&mut app, 1, id, Some(screen_hash(&screen))).code, 2);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
+    }
+
+    fn feed_batch(terminal: &Terminal, bytes: &str) {
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        vte::Parser::new().advance(&mut *grid, bytes.as_bytes());
+        grid.content_generation = grid.content_generation.wrapping_add(1);
+    }
+
+    #[test]
+    fn dev_warning_withholds_only_the_active_tab_until_it_clears_or_times_out() {
+        let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+        let claude = crate::tab_input::ProcGen {
+            pid: 42,
+            starttime: 7,
+        };
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(120, 8, 1));
+        app.terminals.push(Terminal::new_for_test(120, 8, 2));
+        app.active_terminal = 0;
+        feed_batch(&app.terminals[0], warning);
+        let sent_at = Instant::now();
+        let mut scratch = String::new();
+        assert!(app.terminals[0].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
+
+        // Hidden tab: the frame is skipped without a pending redraw loop, and the
+        // loop wakes at the safety limit.
+        app.dirty = true;
+        assert!(app.withhold_active_frame(sent_at));
+        assert!(app.frame_withheld);
+        assert!(!app.dirty);
+        assert_eq!(
+            app.loop_control(),
+            AppLoopControl::WaitUntil(sent_at + crate::terminal::DEV_WARNING_HIDE_LIMIT)
+        );
+        // User input still reaches the tab.
+        app.terminals[0].write_user_input(b"x");
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\rx");
+
+        // Another active tab renders normally.
+        app.active_terminal = 1;
+        assert!(!app.withhold_active_frame(sent_at));
+        app.active_terminal = 0;
+
+        // Safety limit passed: the screen is shown as is.
+        let late = sent_at + crate::terminal::DEV_WARNING_HIDE_LIMIT;
+        assert!(!app.withhold_active_frame(late));
+        app.frame_withheld = true;
+        app.dirty = false;
+        app.advance_dev_channel_warnings(late);
+        assert!(!app.frame_withheld);
+        assert!(app.dirty);
+
+        // The first frame without the warning ends hiding and redraws.
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(120, 8, 1));
+        feed_batch(&app.terminals[0], warning);
+        assert!(app.terminals[0].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
+        assert!(app.withhold_active_frame(sent_at));
+        feed_batch(&app.terminals[0], "\x1b[2J\x1b[H> ready");
+        app.dirty = false;
+        app.advance_dev_channel_warnings(sent_at);
+        assert!(!app.frame_withheld);
+        assert!(app.dirty);
+        assert!(!app.withhold_active_frame(sent_at));
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
     }
 

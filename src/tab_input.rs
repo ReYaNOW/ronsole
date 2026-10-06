@@ -122,6 +122,87 @@ pub(crate) fn claude_process_group(pid: u32, starttime: u64) -> Option<u32> {
     claude_process_group_from(&read_comm(pid)?, &read_stat(pid)?, starttime)
 }
 
+/// Claude Code flag that makes it show the development-channels warning.
+const DEV_CHANNELS_FLAG: &str = "--dangerously-load-development-channels";
+
+/// Whether a NUL-separated `/proc/<pid>/cmdline` holds `DEV_CHANNELS_FLAG` as
+/// a whole argument (`--flag value` or `--flag=value`).
+fn cmdline_has_dev_channels_flag(cmdline: &[u8]) -> bool {
+    let flag = DEV_CHANNELS_FLAG.as_bytes();
+    cmdline.split(|byte| *byte == 0).any(|arg| {
+        arg == flag || arg.strip_prefix(flag).is_some_and(|rest| rest.first() == Some(&b'='))
+    })
+}
+
+/// One process as seen by `dev_channel_claude_in_group_with`. `cmdline` is
+/// read only for `claude` processes.
+struct ProcEntry {
+    comm: String,
+    stat: String,
+    cmdline: Vec<u8>,
+    children: Vec<u32>,
+}
+
+fn read_proc_entry(pid: u32) -> Option<ProcEntry> {
+    let comm = read_comm(pid)?;
+    let stat = read_stat(pid)?;
+    let cmdline = if comm == "claude" {
+        fs::read(format!("/proc/{pid}/cmdline")).ok()?
+    } else {
+        Vec::new()
+    };
+    let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .filter_map(|child| child.parse().ok())
+        .collect();
+    Some(ProcEntry {
+        comm,
+        stat,
+        cmdline,
+        children,
+    })
+}
+
+/// Walk the leader `pgrp` and its descendants in the same process group (at
+/// most `MAX_WALK_STEPS` processes) for a `claude` started with
+/// `DEV_CHANNELS_FLAG`. Processes in other groups are skipped with their
+/// subtrees.
+fn dev_channel_claude_in_group_with(
+    pgrp: u32,
+    read: impl Fn(u32) -> Option<ProcEntry>,
+) -> Option<ProcGen> {
+    if pgrp == 0 {
+        return None;
+    }
+    let mut stack = vec![pgrp];
+    let mut steps = 0usize;
+    while let Some(pid) = stack.pop() {
+        steps += 1;
+        if steps > MAX_WALK_STEPS {
+            return None;
+        }
+        let Some(entry) = read(pid) else {
+            continue;
+        };
+        if parse_pgrp(&entry.stat) != Some(pgrp) {
+            continue;
+        }
+        if entry.comm == "claude" && cmdline_has_dev_channels_flag(&entry.cmdline) {
+            let starttime = parse_starttime(&entry.stat)?;
+            return Some(ProcGen { pid, starttime });
+        }
+        stack.extend(entry.children);
+    }
+    None
+}
+
+/// Generation of the `claude --dangerously-load-development-channels` process
+/// in the PTY foreground process group `pgrp`, or `None`.
+pub(crate) fn dev_channel_claude_in_group(pgrp: u32) -> Option<ProcGen> {
+    dev_channel_claude_in_group_with(pgrp, read_proc_entry)
+}
+
 /// `comm` of a Codex process, or of a wrapper named after it (`codex-x`).
 fn is_codex_comm(comm: &str) -> bool {
     comm.starts_with("codex")
@@ -490,6 +571,55 @@ mod tests {
         // Dead / non-existent pid and pid 0 fail closed.
         assert!(!origin_allowed(u32::MAX, leader.0.id()));
         assert!(!origin_allowed(0, leader.0.id()));
+    }
+
+    fn fake_entry(comm: &str, pgrp: u32, starttime: u64, args: &[&str], children: &[u32]) -> ProcEntry {
+        ProcEntry {
+            comm: comm.to_owned(),
+            stat: format!("1 ({comm}) S 1 {pgrp} {pgrp} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {starttime} 0"),
+            cmdline: args.iter().flat_map(|arg| arg.bytes().chain([0])).collect(),
+            children: children.to_vec(),
+        }
+    }
+
+    #[test]
+    fn dev_channel_claude_requires_claude_comm_flag_and_same_group() {
+        let flag = DEV_CHANNELS_FLAG;
+        // Wrapper leader 10 -> claude 11 with the flag -> MCP child 12.
+        let found = dev_channel_claude_in_group_with(10, |pid| match pid {
+            10 => Some(fake_entry("tg_cc", 10, 5, &["sh", "tg_cc"], &[11])),
+            11 => Some(fake_entry("claude", 10, 77, &["claude", flag, "server:cc-tg"], &[12])),
+            12 => Some(fake_entry("bun", 10, 80, &["bun", "server"], &[])),
+            _ => None,
+        });
+        assert_eq!(found, Some(ProcGen { pid: 11, starttime: 77 }));
+
+        let with_equals = format!("{flag}=server:cc-tg");
+        let found = dev_channel_claude_in_group_with(20, |pid| {
+            (pid == 20).then(|| fake_entry("claude", 20, 9, &["claude", &with_equals], &[]))
+        });
+        assert_eq!(found, Some(ProcGen { pid: 20, starttime: 9 }));
+
+        // claude without the flag, a flag-like prefix, and a non-claude
+        // process carrying the flag never match.
+        let rejected: [fn() -> ProcEntry; 4] = [
+            || fake_entry("claude", 30, 1, &["claude", "--resume"], &[]),
+            || fake_entry("claude", 30, 1, &["claude", "--dangerously-load-development-channelsX"], &[]),
+            || fake_entry("node", 30, 1, &["node", DEV_CHANNELS_FLAG], &[]),
+            || fake_entry("fish", 30, 1, &["fish", "-c", "claude --dangerously-load-development-channels"], &[]),
+        ];
+        for entry in rejected {
+            assert_eq!(dev_channel_claude_in_group_with(30, |_| Some(entry())), None);
+        }
+
+        // A flagged claude in another process group (background job) is skipped.
+        let found = dev_channel_claude_in_group_with(40, |pid| match pid {
+            40 => Some(fake_entry("fish", 40, 1, &["fish"], &[41])),
+            41 => Some(fake_entry("claude", 41, 2, &["claude", flag], &[])),
+            _ => None,
+        });
+        assert_eq!(found, None);
+        assert_eq!(dev_channel_claude_in_group_with(0, |_| None), None);
     }
 
     #[test]
