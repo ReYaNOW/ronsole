@@ -529,6 +529,9 @@ pub struct TermGrid {
     tab_stops: Vec<bool>,
     join_next: bool,
     scrollback_storage_cols: usize,
+    /// Rows ever appended to `scrollback` (wrapping); lets a scan find the
+    /// rows that entered it since an earlier scan.
+    scrollback_pushed: u64,
     pub pool: Vec<Vec<Cell>>,
     title_cache: Option<crate::terminal_process::TerminalTitleCache>,
 }
@@ -582,6 +585,7 @@ impl TermGrid {
             tab_stops: default_tab_stops(cols),
             join_next: false,
             scrollback_storage_cols: cols,
+            scrollback_pushed: 0,
             pool: Vec::with_capacity(128),
             title_cache: None,
         }
@@ -622,6 +626,7 @@ impl TermGrid {
 
     fn push_scrollback_row(&mut self, line: Vec<Cell>, state: LineMeta) {
         self.scrollback_storage_cols = self.scrollback_storage_cols.max(line.len());
+        self.scrollback_pushed = self.scrollback_pushed.wrapping_add(1);
         let index = self.scrollback.len();
         insert_line_with_meta(
             &mut self.scrollback,
@@ -3419,6 +3424,103 @@ mod tests {
         assert!(hidden_in_scrollback > 0);
     }
 
+    /// Asserts over every scrollback and screen row that the rows starting
+    /// with "above"/"below" and blank rows have no hidden cell, and every
+    /// other row is fully hidden: `banner_rows` rows (when given) that hold
+    /// exactly the text of both banner lines.
+    fn assert_only_banner_hidden(terminal: &Terminal, banner_rows: Option<usize>) {
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        let mut hidden_rows = 0;
+        let mut hidden_text = String::new();
+        for line in grid.scrollback.iter().chain(grid.lines.iter()) {
+            let cells = &line[..grid.cols.min(line.len())];
+            let text: String = cells.iter().map(|cell| cell.c).collect();
+            let drawn = cells.iter().filter(|cell| cell.c != ' ');
+            let (hidden, total) = drawn.fold((0, 0), |(hidden, total), cell| {
+                (hidden + usize::from(cell.is_hidden()), total + 1)
+            });
+            if total == 0 || text.starts_with("above") || text.starts_with("below") {
+                assert_eq!(hidden, 0, "{text:?}");
+            } else {
+                assert_eq!(hidden, total, "{text:?}");
+                hidden_rows += 1;
+                hidden_text.push_str(&text);
+            }
+        }
+        if let Some(banner_rows) = banner_rows {
+            assert_eq!(hidden_rows, banner_rows);
+        }
+        let squeeze = |text: &str| -> String {
+            text.chars()
+                .filter(|&c| c != ' ' && c != DEV_CHANNEL_BANNER_BAR)
+                .collect()
+        };
+        assert_eq!(
+            squeeze(&hidden_text),
+            squeeze(&DEV_CHANNEL_BANNER_LINES.concat())
+        );
+    }
+
+    #[test]
+    fn dev_banner_stays_hidden_while_scrolling_into_scrollback() {
+        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+        assert_only_banner_hidden(&terminal, Some(rows));
+        // One row per batch: the block straddles the scrollback boundary,
+        // its wrapped tail rows last on the screen, then leaves the screen.
+        for _ in 0..rows + 12 {
+            feed_dev_screen(&terminal, "\r\nbelow");
+            terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+            assert_only_banner_hidden(&terminal, Some(rows));
+        }
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        assert!(grid.lines.iter().flatten().all(|cell| !cell.is_hidden()));
+    }
+
+    #[test]
+    fn dev_banner_pushed_into_scrollback_before_a_scan_is_hidden() {
+        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
+        feed_dev_screen(&terminal, &format!("{screen}{}", "\r\nbelow".repeat(20)));
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+        assert_only_banner_hidden(&terminal, Some(rows));
+    }
+
+    #[test]
+    fn dev_banner_soft_wrapped_by_the_terminal_or_reflowed_is_hidden() {
+        // Notice rows wider than the terminal: autowrap continues each one
+        // on rows without the bar.
+        let mut terminal = Terminal::new_for_test(60, 12, 1);
+        let (screen, _) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+        assert_only_banner_hidden(&terminal, None);
+
+        // Hidden on a wide screen, scrolled half into the scrollback, then
+        // reflowed there and on the screen by resizes.
+        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+        assert_only_banner_hidden(&terminal, Some(2));
+        feed_dev_screen(&terminal, &"\r\nbelow".repeat(6));
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+        assert_only_banner_hidden(&terminal, Some(2));
+        {
+            let grid = crate::platform::lock_recover(&terminal.grid);
+            assert_eq!(grid.scrollback.len(), 2);
+        }
+        for cols in [60, 200, 30, 120, 30] {
+            crate::platform::lock_recover(&terminal.grid).resize(cols, 8);
+            terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+            assert_only_banner_hidden(&terminal, None);
+        }
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        let mut scrollback = grid.scrollback.iter().flatten();
+        assert!(scrollback.any(|cell| cell.is_hidden()));
+    }
+
     #[test]
     fn screen_hash_is_sha256_of_exact_text() {
         let expected: [u8; 32] = Sha256::digest(b"screen").into();
@@ -4179,101 +4281,117 @@ const DEV_CHANNEL_BANNER_LINES: [&str; 2] = [
 ];
 const DEV_CHANNEL_BANNER_BAR: char = '\u{258e}';
 
-/// Matches one screen row against `expected[pos..]`: optional leading blanks,
-/// the bar, one space, then a non-empty segment equal to the next part of
-/// `expected` (trailing blanks ignored). The space of `expected` at a wrap
-/// point may be dropped by the wrapper. Returns the byte position after the
-/// segment.
-fn match_banner_row(row: &[Cell], expected: &str, pos: usize) -> Option<usize> {
-    let end = row.iter().rposition(|cell| cell.c != ' ')? + 1;
-    let mut cells = row[..end].iter().filter(|cell| !cell.is_wide_spacer());
+/// Upper bound of the physical rows one banner block takes: every row holds
+/// at least one character, so at least one byte, of the text.
+const DEV_CHANNEL_BANNER_MAX_ROWS: usize =
+    DEV_CHANNEL_BANNER_LINES[0].len() + DEV_CHANNEL_BANNER_LINES[1].len();
+
+/// Matches one logical row (a row and its soft-wrapped continuations, as
+/// `cells`) against `expected[pos..]`: optional leading blanks, the bar, one
+/// space, then a non-empty segment equal to the next part of `expected`
+/// (trailing blanks ignored). The space of `expected` at a wrap point may be
+/// dropped by the wrapper. Returns the byte position after the segment.
+fn match_banner_row<'a>(
+    cells: impl Iterator<Item = &'a Cell>,
+    expected: &str,
+    pos: usize,
+) -> Option<usize> {
+    let mut cells = cells.filter(|cell| !cell.is_wide_spacer());
     let plain = |cell: &Cell, c: char| cell.c == c && cell.zero_width().is_empty();
     let bar = cells.find(|cell| cell.c != ' ')?;
     if !plain(bar, DEV_CHANNEL_BANNER_BAR) || !cells.next().is_some_and(|cell| plain(cell, ' ')) {
         return None;
     }
     let mut rest = expected.get(pos..)?;
-    let mut segment_empty = true;
-    for cell in cells {
-        if segment_empty && pos > 0 && cell.c != ' ' {
+    // Byte position in `expected` after the last matched non-blank cell.
+    let mut end = None;
+    while let Some(cell) = cells.next() {
+        if end.is_none() && pos > 0 && cell.c != ' ' {
             rest = rest.strip_prefix(' ').unwrap_or(rest);
         }
         let mut chars = rest.chars();
-        let expected_char = chars.next()?;
-        if !plain(cell, expected_char) {
-            return None;
+        if !chars.next().is_some_and(|c| plain(cell, c)) {
+            // The segment ended: only trailing blanks may follow.
+            if cell.c != ' ' || !cells.all(|cell| cell.c == ' ') {
+                return None;
+            }
+            break;
         }
         rest = chars.as_str();
-        segment_empty = false;
-    }
-    (!segment_empty).then(|| expected.len() - rest.len())
-}
-
-/// Number of rows taken by both `DEV_CHANNEL_BANNER_LINES`, one after the
-/// other, starting at `lines[start]`, or `None` if the text differs.
-fn banner_rows_at(
-    lines: &std::collections::VecDeque<Vec<Cell>>,
-    cols: usize,
-    start: usize,
-) -> Option<usize> {
-    let mut row = start;
-    for expected in DEV_CHANNEL_BANNER_LINES {
-        let mut pos = 0;
-        while pos < expected.len() {
-            let line = lines.get(row)?;
-            pos = match_banner_row(&line[..cols.min(line.len())], expected, pos)?;
-            row += 1;
+        if cell.c != ' ' {
+            end = Some(expected.len() - rest.len());
         }
     }
-    Some(row - start)
+    end
 }
 
-/// Whether the screen shows a banner block, and whether one of them still
-/// has a drawn (not hidden) cell.
-fn banner_blocks_state(grid: &TermGrid) -> (bool, bool) {
-    let (mut any, mut drawn) = (false, false);
-    let mut row = 0;
-    while row < grid.lines.len() {
-        let Some(rows) = banner_rows_at(&grid.lines, grid.cols, row) else {
-            row += 1;
-            continue;
+/// Rows scanned for banner blocks: the last `history` scrollback rows (none
+/// on the alternate screen), then the screen rows, as one sequence.
+#[derive(Clone, Copy)]
+struct BannerRows<'a> {
+    grid: &'a TermGrid,
+    history: usize,
+}
+
+impl<'a> BannerRows<'a> {
+    fn new(grid: &'a TermGrid, history: usize) -> Self {
+        let history = if grid.is_alt {
+            0
+        } else {
+            history.min(grid.scrollback.len())
         };
-        any = true;
-        drawn |= grid
-            .lines
-            .range(row..row + rows)
-            .flat_map(|line| line.iter().take(grid.cols))
-            .any(|cell| cell.c != ' ' && !cell.is_hidden());
-        row += rows;
+        Self { grid, history }
     }
-    (any, drawn)
-}
 
-/// Hides the non-blank cells of every banner block on the screen when
-/// `hide_new` (already hidden blocks stay hidden either way) and clears the
-/// hidden flag on every other screen row.
-fn apply_banner_hiding(grid: &mut TermGrid, hide_new: bool) {
-    let cols = grid.cols;
-    let mut row = 0;
-    while row < grid.lines.len() {
-        match banner_rows_at(&grid.lines, cols, row) {
-            Some(rows) => {
-                if hide_new {
-                    for line in grid.lines.range_mut(row..row + rows) {
-                        for cell in line.iter_mut().take(cols).filter(|cell| cell.c != ' ') {
-                            cell.set_hidden(true);
-                        }
-                    }
-                }
+    fn len(self) -> usize {
+        self.history + self.grid.lines.len()
+    }
+
+    /// Cells of row `index` (at most `cols`) and whether the row soft-wraps
+    /// into the next one.
+    fn row(self, index: usize) -> Option<(&'a [Cell], bool)> {
+        let grid = self.grid;
+        let (line, meta) = match index.checked_sub(self.history) {
+            Some(screen_row) => (grid.lines.get(screen_row)?, grid.line_meta.get(screen_row)),
+            None => {
+                let index = grid.scrollback.len() - self.history + index;
+                (grid.scrollback.get(index)?, grid.scrollback_meta.get(index))
+            }
+        };
+        let cells = &line[..grid.cols.min(line.len())];
+        Some((cells, meta.is_some_and(|state| state.soft_wrapped)))
+    }
+
+    /// Number of rows of the logical row starting at `start`.
+    fn logical_rows(self, start: usize) -> Option<usize> {
+        let mut rows = 1;
+        while self.row(start + rows - 1)?.1 && start + rows < self.len() {
+            rows += 1;
+        }
+        Some(rows)
+    }
+
+    fn cells(self, start: usize, rows: usize) -> impl Iterator<Item = &'a Cell> {
+        (start..start + rows).flat_map(move |index| self.row(index).map_or(&[][..], |row| row.0))
+    }
+
+    /// Number of rows taken by both `DEV_CHANNEL_BANNER_LINES`, one after the
+    /// other, from the logical row starting at `start`, or `None` if the text
+    /// differs.
+    fn block_at(self, start: usize) -> Option<usize> {
+        if start > 0 && self.row(start - 1)?.1 {
+            return None;
+        }
+        let mut row = start;
+        for expected in DEV_CHANNEL_BANNER_LINES {
+            let mut pos = 0;
+            while pos < expected.len() {
+                let rows = self.logical_rows(row)?;
+                pos = match_banner_row(self.cells(row, rows), expected, pos)?;
                 row += rows;
             }
-            None => {
-                for cell in grid.lines[row].iter_mut().take(cols) {
-                    cell.set_hidden(false);
-                }
-                row += 1;
-            }
         }
+        Some(row - start)
     }
 }
 
@@ -4282,11 +4400,95 @@ fn apply_banner_hiding(grid: &mut TermGrid, hide_new: bool) {
 struct DevBannerState {
     /// `TermGrid::content_generation` of the last applied scan.
     scanned_generation: Option<u64>,
+    /// `TermGrid::scrollback_pushed` and `TermGrid::cols` at the last applied
+    /// scan.
+    scanned_pushed: u64,
+    scanned_cols: usize,
     /// Some cell of this tab was hidden; until then no clearing pass runs.
     hid_any: bool,
     /// Foreground process group and whether it holds a flagged `claude`,
-    /// kept while a banner block stays on screen.
+    /// kept while a banner block stays in the scanned rows.
     owner: Option<(Option<u32>, bool)>,
+    /// Of the last `scan`: scrollback rows in the scanned rows, and the
+    /// first scanned row that was not in the scrollback at the last applied
+    /// scan.
+    window: (usize, usize),
+    /// Of the last `scan`: banner blocks as (first scanned row, rows).
+    blocks: Vec<(usize, usize)>,
+}
+
+impl DevBannerState {
+    /// Finds the banner blocks on the screen and in the scrollback rows that
+    /// entered it since the last applied scan, plus `DEV_CHANNEL_BANNER_MAX_ROWS`
+    /// rows above them, so a block that scrolled partly or wholly out of the
+    /// screen is still matched from its first row. After a width change the
+    /// whole scrollback is scanned, since the resize reflowed it. Returns
+    /// whether there is a block and whether one has a drawn (not hidden) cell.
+    fn scan(&mut self, grid: &TermGrid) -> (bool, bool) {
+        let pushed = usize::try_from(grid.scrollback_pushed.wrapping_sub(self.scanned_pushed))
+            .unwrap_or(usize::MAX);
+        let reach = if grid.cols == self.scanned_cols {
+            pushed.saturating_add(DEV_CHANNEL_BANNER_MAX_ROWS)
+        } else {
+            usize::MAX
+        };
+        let rows = BannerRows::new(grid, reach);
+        self.window = (rows.history, rows.history.saturating_sub(pushed));
+        self.blocks.clear();
+        let mut drawn = false;
+        let mut row = 0;
+        while row < rows.len() {
+            let Some(len) = rows.block_at(row) else {
+                row += 1;
+                continue;
+            };
+            drawn |= rows
+                .cells(row, len)
+                .any(|cell| cell.c != ' ' && !cell.is_hidden());
+            self.blocks.push((row, len));
+            row += len;
+        }
+        (!self.blocks.is_empty(), drawn)
+    }
+
+    /// Hides the non-blank cells of every block of the last `scan` when
+    /// `hide_new` (already hidden blocks stay hidden either way) and clears
+    /// the hidden flag on every other screen row and on every other row that
+    /// entered the scrollback since the last applied scan.
+    fn apply(&self, grid: &mut TermGrid, hide_new: bool) {
+        let (history, fresh) = self.window;
+        let first = grid.scrollback.len().saturating_sub(history);
+        let cols = grid.cols;
+        let mut blocks = self.blocks.iter().copied().peekable();
+        for index in 0..history + grid.lines.len() {
+            // Blocks are disjoint and `index` steps by one: at most one ends.
+            let _ = blocks.next_if(|&(start, len)| start + len <= index);
+            let in_block = blocks.peek().is_some_and(|&(start, _)| start <= index);
+            if (in_block && !hide_new) || (!in_block && index < fresh) {
+                continue;
+            }
+            let line = match index.checked_sub(history) {
+                Some(screen_row) => grid.lines.get_mut(screen_row),
+                None => grid.scrollback.get_mut(first + index),
+            };
+            let Some(line) = line else {
+                continue;
+            };
+            for cell in line.iter_mut().take(cols) {
+                if !in_block {
+                    cell.set_hidden(false);
+                } else if cell.c != ' ' {
+                    cell.set_hidden(true);
+                }
+            }
+        }
+    }
+
+    fn mark_scanned(&mut self, grid: &TermGrid) {
+        self.scanned_generation = Some(grid.content_generation);
+        self.scanned_pushed = grid.scrollback_pushed;
+        self.scanned_cols = grid.cols;
+    }
 }
 
 pub(crate) fn screen_hash(screen: &str) -> [u8; 32] {
@@ -4533,11 +4735,12 @@ impl Terminal {
             .is_some_and(|until| now < until)
     }
 
-    /// When the screen content changed, hides the cells of the exact
-    /// `DEV_CHANNEL_BANNER_LINES` rows if `find_claude` (given the PTY
-    /// foreground process group) finds a flagged `claude`; the answer is
-    /// cached per group while a banner stays on screen, and it is asked only
-    /// for a banner with drawn cells. Only the cell hidden flag changes: text,
+    /// When the grid content changed, hides the cells of the exact
+    /// `DEV_CHANNEL_BANNER_LINES` rows (on the screen and in the scrollback,
+    /// see `DevBannerState::scan`) if `find_claude` (given the PTY foreground
+    /// process group) finds a flagged `claude`; the answer is cached per group
+    /// while a banner stays in the scanned rows, and it is asked only for a
+    /// banner with drawn cells. Only the cell hidden flag changes: text,
     /// cursor, scrollback and selection stay as the program wrote them.
     pub(crate) fn observe_dev_channel_banner(
         &mut self,
@@ -4549,15 +4752,15 @@ impl Terminal {
             if self.dev_banner.scanned_generation == Some(generation) {
                 return;
             }
-            let (any, drawn) = banner_blocks_state(&grid);
+            let (any, drawn) = self.dev_banner.scan(&grid);
             if !any {
                 self.dev_banner.owner = None;
             }
             if !drawn {
-                self.dev_banner.scanned_generation = Some(generation);
                 if self.dev_banner.hid_any {
-                    apply_banner_hiding(&mut grid, false);
+                    self.dev_banner.apply(&mut grid, false);
                 }
+                self.dev_banner.mark_scanned(&grid);
                 return;
             }
             generation
@@ -4577,11 +4780,12 @@ impl Terminal {
         if grid.content_generation != generation {
             return;
         }
-        self.dev_banner.scanned_generation = Some(generation);
         if flagged || self.dev_banner.hid_any {
-            apply_banner_hiding(&mut grid, flagged);
+            self.dev_banner.scan(&grid);
+            self.dev_banner.apply(&mut grid, flagged);
             self.dev_banner.hid_any |= flagged;
         }
+        self.dev_banner.mark_scanned(&grid);
     }
 
     pub(crate) fn manually_confirm_bridge(
