@@ -3521,6 +3521,74 @@ mod tests {
         assert!(scrollback.any(|cell| cell.is_hidden()));
     }
 
+    /// Raw PTY output of `tg_cc` (Claude Code 2.1.284, fullscreen on the
+    /// alternate screen) up to its notice: the header rows.
+    const CLAUDE_HEADER: &str = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?25l\x1b[H\r\x1b[1B\x1b[38;2;215;119;87m ▐\x1b[48;2;0;0;0m▛███▛█\x1b[12G\x1b[39m\x1b[49m\x1b[1mClaude Code\x1b[24G\x1b[22m\x1b[38;2;153;153;153mv2.1.284\r\x1b[1B\x1b[38;2;215;119;87m▝▜\x1b[48;2;0;0;0m█████\x1b[49m█▀\x1b[12G\x1b[38;2;153;153;153mOpus 5.5 (1M context) with medium effort · Claude Pro\r\x1b[1B\x1b[38;2;215;119;87m ▝▝   ▝▝ \x1b[12G\x1b[38;2;153;153;153m~/projects/car-wash-api\r\x1b[2B";
+    /// The notice rows that follow `CLAUDE_HEADER` on a 120- and an 80-column
+    /// PTY, joined by "\r\x1b[1B" in the output: Claude Code wraps the notice
+    /// itself and draws the bar on every row.
+    const CLAUDE_NOTICE: [(usize, [&str; 3]); 2] = [
+        (120, [
+            "\x1b[39m\x1b[2m▎\x1b[3G\x1b[22m\x1b[38;2;153;153;153mChannels (experimental) messages from server:cc-tg inject directly in this session · restart without ",
+            "\x1b[39m\x1b[2m▎\x1b[3G\x1b[22m\x1b[38;2;153;153;153m--dangerously-load-development-channels to stop",
+            "\x1b[39m\x1b[2m▎\x1b[3G\x1b[22m\x1b[38;2;255;193;7mserver:cc-tg · no MCP server configured with that name",
+        ]),
+        (80, [
+            "\x1b[39m\x1b[2m▎\x1b[3G\x1b[22m\x1b[38;2;153;153;153mChannels (experimental) messages from server:cc-tg inject directly in this ",
+            "\x1b[39m\x1b[2m▎\x1b[3G\x1b[22m\x1b[38;2;153;153;153msession · restart without --dangerously-load-development-channels to stop",
+            "\x1b[39m\x1b[2m▎\x1b[3G\x1b[22m\x1b[38;2;255;193;7mserver:cc-tg · no MCP server configured with that name",
+        ]),
+    ];
+
+    /// Asserts that exactly the screen rows in `hidden` have hidden cells,
+    /// all of their non-blank cells.
+    fn assert_hidden_screen_rows(terminal: &Terminal, hidden: std::ops::Range<usize>) {
+        let rows = crate::platform::lock_recover(&terminal.grid).lines.len();
+        for row in 0..rows {
+            let (hidden_count, total) = hidden_cells(terminal, row);
+            let expected = if hidden.contains(&row) { total } else { 0 };
+            assert!(total > 0 || !hidden.contains(&row), "row {row}");
+            assert_eq!(hidden_count, expected, "row {row}");
+        }
+    }
+
+    #[test]
+    fn dev_banner_scrolled_out_at_the_top_of_claude_fullscreen_is_hidden() {
+        for (cols, notice) in CLAUDE_NOTICE {
+            let mut terminal = Terminal::new_for_test(cols, 30, 1);
+            let notice_rows = notice.join("\r\x1b[1B");
+            feed_dev_screen(&terminal, &format!("{CLAUDE_HEADER}{notice_rows}\r\x1b[100C"));
+            terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+            assert_hidden_screen_rows(&terminal, 5..8);
+            // A wheel step: Claude Code redraws its transcript from the top
+            // of the screen, the first notice rows scrolled out above it.
+            // Its diff output skips unchanged cells; erasing each row first
+            // gives the same screen.
+            for cut in 1..notice.len() {
+                let rows = &notice[cut..];
+                feed_dev_screen(
+                    &terminal,
+                    &format!(
+                        "\x1b[H\x1b[2K{}\r\x1b[1B\x1b[2K\r\x1b[1B\x1b[39m❯\u{a0}/clear\x1b[K\r\x1b[1B\x1b[J",
+                        rows.join("\r\x1b[1B\x1b[2K")
+                    ),
+                );
+                terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+                assert_hidden_screen_rows(&terminal, 0..rows.len());
+            }
+            // The same rows below other output are not a cut block.
+            feed_dev_screen(
+                &terminal,
+                &format!(
+                    "\x1b[H\x1b[2Kshown\r\x1b[1B\x1b[2K{}\r\x1b[1B\x1b[J",
+                    notice[1..].join("\r\x1b[1B\x1b[2K")
+                ),
+            );
+            terminal.observe_dev_channel_banner(|_| panic!("no banner block is on the screen"));
+            assert_hidden_screen_rows(&terminal, 0..0);
+        }
+    }
+
     #[test]
     fn screen_hash_is_sha256_of_exact_text() {
         let expected: [u8; 32] = Sha256::digest(b"screen").into();
@@ -4382,16 +4450,45 @@ impl<'a> BannerRows<'a> {
         if start > 0 && self.row(start - 1)?.1 {
             return None;
         }
+        self.rest_at(start, 0, 0)
+    }
+
+    /// Number of rows taken by the banner text from byte `pos` of
+    /// `DEV_CHANNEL_BANNER_LINES[line]` to the end of the last line, from the
+    /// logical row starting at `start`.
+    fn rest_at(self, start: usize, line: usize, mut pos: usize) -> Option<usize> {
         let mut row = start;
-        for expected in DEV_CHANNEL_BANNER_LINES {
-            let mut pos = 0;
+        for expected in DEV_CHANNEL_BANNER_LINES.get(line..)? {
             while pos < expected.len() {
                 let rows = self.logical_rows(row)?;
                 pos = match_banner_row(self.cells(row, rows), expected, pos)?;
                 row += rows;
             }
+            pos = 0;
         }
         Some(row - start)
+    }
+
+    /// Number of rows of a block cut at the top: the first scanned row is the
+    /// top of the content (alternate screen row 0, where Claude Code's
+    /// fullscreen view scrolls its transcript out, or the oldest kept row),
+    /// it starts a later part of the first banner line, or the second line,
+    /// and the banner follows to its end. The whole second line is required.
+    fn cut_block_at_top(self) -> Option<usize> {
+        if !self.grid.is_alt && self.history < self.grid.scrollback.len() {
+            return None;
+        }
+        let mut cells = self.row(0)?.0.iter().filter(|cell| !cell.is_wide_spacer());
+        if cells.find(|cell| cell.c != ' ')?.c != DEV_CHANNEL_BANNER_BAR {
+            return None;
+        }
+        let lead = cells.find(|cell| cell.c != ' ')?.c;
+        DEV_CHANNEL_BANNER_LINES[0]
+            .char_indices()
+            .skip(1)
+            .filter(|&(_, c)| c == lead)
+            .find_map(|(pos, _)| self.rest_at(0, 0, pos))
+            .or_else(|| self.rest_at(0, 1, 0))
     }
 }
 
@@ -4421,9 +4518,11 @@ impl DevBannerState {
     /// Finds the banner blocks on the screen and in the scrollback rows that
     /// entered it since the last applied scan, plus `DEV_CHANNEL_BANNER_MAX_ROWS`
     /// rows above them, so a block that scrolled partly or wholly out of the
-    /// screen is still matched from its first row. After a width change the
-    /// whole scrollback is scanned, since the resize reflowed it. Returns
-    /// whether there is a block and whether one has a drawn (not hidden) cell.
+    /// screen is still matched from its first row; a block whose first rows
+    /// are above the top of the content is matched from its first kept row
+    /// (`BannerRows::cut_block_at_top`). After a width change the whole
+    /// scrollback is scanned, since the resize reflowed it. Returns whether
+    /// there is a block and whether one has a drawn (not hidden) cell.
     fn scan(&mut self, grid: &TermGrid) -> (bool, bool) {
         let pushed = usize::try_from(grid.scrollback_pushed.wrapping_sub(self.scanned_pushed))
             .unwrap_or(usize::MAX);
@@ -4438,7 +4537,13 @@ impl DevBannerState {
         let mut drawn = false;
         let mut row = 0;
         while row < rows.len() {
-            let Some(len) = rows.block_at(row) else {
+            let block = rows.block_at(row);
+            let block = if row == 0 {
+                block.or_else(|| rows.cut_block_at_top())
+            } else {
+                block
+            };
+            let Some(len) = block else {
                 row += 1;
                 continue;
             };
