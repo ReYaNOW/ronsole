@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc::{SyncSender, TrySendError},
+    mpsc::{Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -17,7 +17,11 @@ use vte::Parser;
 
 const INITIAL_COLS: u16 = 200;
 const INITIAL_ROWS: u16 = 60;
-const TERMINAL_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+/// Time every process group of a closing tab session gets after SIGTERM before
+/// the remaining groups are SIGKILLed. Long enough for TUI programs (Claude Code
+/// CLI) to restore terminal state and clear their crash markers.
+const TERMINAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+const TERMINAL_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 const TERMINAL_TITLE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const TERMINAL_OUTPUT_BATCH_IDLE: Duration = Duration::from_millis(8);
 const TERMINAL_OUTPUT_BATCH_MAX: Duration = Duration::from_millis(32);
@@ -203,6 +207,7 @@ pub(crate) struct TerminalProcess {
     title_stop_tx: Option<std::sync::mpsc::Sender<()>>,
     title_worker: Option<JoinHandle<()>>,
     finished: bool,
+    shutdown_complete: bool,
 }
 
 struct TerminalCleanupJob {
@@ -221,14 +226,7 @@ impl TerminalCleanupWorker {
             std::sync::mpsc::sync_channel::<TerminalCleanupJob>(TERMINAL_CLEANUP_QUEUE_CAPACITY);
         let worker = std::thread::Builder::new()
             .name("ronsole-terminal-cleanup".to_string())
-            .spawn(move || {
-                while let Ok(mut job) = receiver.recv() {
-                    job.process.shutdown();
-                    if let Some(wake) = job.wake {
-                        wake.wake();
-                    }
-                }
-            })
+            .spawn(move || run_terminal_cleanup_worker(&receiver))
             .ok();
         Self {
             sender: worker.as_ref().map(|_| sender),
@@ -260,6 +258,55 @@ impl TerminalCleanupWorker {
             let _ = worker.join();
         }
     }
+}
+
+/// Closed tabs shut down concurrently off the UI thread: each job gets SIGTERM
+/// on arrival and its own `TERMINAL_SHUTDOWN_GRACE` deadline, so one stubborn
+/// session never delays the next. After the sender is dropped the worker still
+/// drains queued jobs and escalates every active one before returning, which
+/// makes `TerminalCleanupWorker::shutdown_and_join` a bounded kill barrier.
+fn run_terminal_cleanup_worker(receiver: &Receiver<TerminalCleanupJob>) {
+    let mut active: Vec<(TerminalCleanupJob, Instant)> = Vec::new();
+    let mut connected = true;
+    loop {
+        if active.is_empty() {
+            if !connected {
+                return;
+            }
+            match receiver.recv() {
+                Ok(job) => active.push(start_terminal_cleanup_job(job)),
+                Err(_) => return,
+            }
+        }
+        while connected {
+            match receiver.try_recv() {
+                Ok(job) => active.push(start_terminal_cleanup_job(job)),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => connected = false,
+            }
+        }
+
+        let now = Instant::now();
+        active.retain_mut(|(job, deadline)| {
+            if !job.process.poll_shutdown() && now < *deadline {
+                return true;
+            }
+            job.process.force_shutdown();
+            job.process.finish_shutdown();
+            if let Some(wake) = job.wake.take() {
+                wake.wake();
+            }
+            false
+        });
+        if !active.is_empty() {
+            std::thread::sleep(TERMINAL_SHUTDOWN_POLL);
+        }
+    }
+}
+
+fn start_terminal_cleanup_job(mut job: TerminalCleanupJob) -> (TerminalCleanupJob, Instant) {
+    job.process.begin_shutdown();
+    (job, Instant::now() + TERMINAL_SHUTDOWN_GRACE)
 }
 
 impl Drop for TerminalCleanupWorker {
@@ -364,6 +411,7 @@ impl TerminalProcess {
             title_stop_tx: Some(title_stop_tx),
             title_worker: Some(title_worker),
             finished: false,
+            shutdown_complete: false,
         })
     }
 
@@ -436,32 +484,87 @@ impl TerminalProcess {
         }
     }
 
+    /// Blocking session shutdown: SIGTERM to every session group, up to
+    /// `TERMINAL_SHUTDOWN_GRACE` for all of them to exit, then SIGKILL.
     pub(crate) fn shutdown(&mut self) {
-        self.stop_title_refresh();
-        if self.finished {
-            self.tree.finish_after_owner_exit();
+        shutdown_terminal_processes(std::slice::from_mut(self));
+    }
+
+    /// Phase 1: SIGTERM every live process group of the owned session, not
+    /// only the shell, so foreground TUI jobs can exit cleanly.
+    fn begin_shutdown(&mut self) {
+        if self.shutdown_complete {
             return;
         }
-
+        self.stop_title_refresh();
         let _ = self.tree.terminate_gracefully();
-        let deadline = Instant::now() + TERMINAL_SHUTDOWN_GRACE;
-        while Instant::now() < deadline {
+    }
+
+    /// Phase 2, non-blocking: reaps the shell and reports whether the whole
+    /// session is gone. The shell exiting first does not end the wait; the
+    /// `/proc` session scan runs only after the shell is reaped.
+    fn poll_shutdown(&mut self) -> bool {
+        if self.shutdown_complete {
+            return true;
+        }
+        if !self.finished {
             match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    self.finished = true;
-                    self.tree.finish_after_owner_exit();
-                    return;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(_) => break,
+                Ok(Some(_)) => self.finished = true,
+                Ok(None) | Err(_) => return false,
             }
         }
+        self.tree.session_exited()
+    }
 
+    /// Phase 3a: SIGKILL whatever is still alive after the grace period.
+    fn force_shutdown(&mut self) {
+        if self.shutdown_complete {
+            return;
+        }
+        // No-op without a `/proc` scan once `session_exited` saw it empty.
         let _ = self.tree.terminate_forcefully();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.finished = true;
+        if !self.finished {
+            let _ = self.child.kill();
+        }
+    }
+
+    /// Phase 3b: reap the shell and finish the bounded session cleanup.
+    fn finish_shutdown(&mut self) {
+        if self.shutdown_complete {
+            return;
+        }
+        if !self.finished {
+            let _ = self.child.wait();
+            self.finished = true;
+        }
         self.tree.finish_after_owner_exit();
+        self.shutdown_complete = true;
+    }
+}
+
+/// Shuts down several tab sessions concurrently: one SIGTERM wave, one shared
+/// wait bounded by `TERMINAL_SHUTDOWN_GRACE`, then SIGKILL for every survivor.
+/// Used for app exit so N tabs cost at most one grace period, not N.
+pub(crate) fn shutdown_terminal_processes(processes: &mut [TerminalProcess]) {
+    let deadline = Instant::now() + TERMINAL_SHUTDOWN_GRACE;
+    for process in processes.iter_mut() {
+        process.begin_shutdown();
+    }
+    loop {
+        let mut all_exited = true;
+        for process in processes.iter_mut() {
+            all_exited &= process.poll_shutdown();
+        }
+        if all_exited || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(TERMINAL_SHUTDOWN_POLL);
+    }
+    for process in processes.iter_mut() {
+        process.force_shutdown();
+    }
+    for process in processes.iter_mut() {
+        process.finish_shutdown();
     }
 }
 
@@ -1146,7 +1249,49 @@ mod tests {
         }
     }
 
-    fn spawn_test_bash_with_background_job() -> (TerminalProcess, u32, u32, TempPidPath) {
+    fn unique_temp_path(tag: &str) -> TempPidPath {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        TempPidPath(std::env::temp_dir().join(format!(
+            "ronsole-{tag}-{}-{unique}",
+            std::process::id()
+        )))
+    }
+
+    fn read_pid_file(path: &TempPidPath) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path.0)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "session job did not report its pid");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `bash -c` session leader that runs `job` as a background job in its own
+    /// process group of the same session, then exits on SIGTERM. The job writes
+    /// its pid to the returned path after installing its own traps.
+    fn spawn_test_session_with_job(job: &str) -> (TerminalProcess, u32, u32, TempPidPath) {
+        let pid_path = unique_temp_path("shutdown-job.pid");
+        let job = job.replace("PIDFILE", &pid_path.0.display().to_string());
+        let mut command = CommandBuilder::new("/bin/bash");
+        command.arg("-c");
+        command.arg(format!("trap 'exit 0' TERM; set -m; sh -c '{job}' & wait"));
+        let (process, shell_pid) = spawn_test_session(command);
+        let job_pid = read_pid_file(&pid_path);
+        let shell_stat = test_linux_stat(shell_pid).unwrap();
+        let job_stat = test_linux_stat(job_pid).unwrap();
+        assert_ne!(shell_stat.process_group, job_stat.process_group);
+        assert_eq!(shell_stat.session_id, job_stat.session_id);
+        (process, shell_pid, job_pid, pid_path)
+    }
+
+    fn spawn_test_session(command: CommandBuilder) -> (TerminalProcess, u32) {
         let pair = NativePtySystem::default()
             .openpty(PtySize {
                 rows: 24,
@@ -1155,11 +1300,6 @@ mod tests {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new("/bin/bash");
-        command.arg("--noprofile");
-        command.arg("--norc");
-        command.arg("-i");
-        command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
 
@@ -1175,7 +1315,18 @@ mod tests {
             title_stop_tx: None,
             title_worker: None,
             finished: false,
+            shutdown_complete: false,
         };
+        (process, shell_pid)
+    }
+
+    fn spawn_test_bash_with_background_job() -> (TerminalProcess, u32, u32, TempPidPath) {
+        let mut command = CommandBuilder::new("/bin/bash");
+        command.arg("--noprofile");
+        command.arg("--norc");
+        command.arg("-i");
+        command.env("TERM", "xterm-256color");
+        let (process, shell_pid) = spawn_test_session(command);
 
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1423,8 +1574,10 @@ mod tests {
             enqueue_elapsed < Duration::from_millis(150),
             "UI-facing cleanup enqueue took {enqueue_elapsed:?}"
         );
-        assert!(wait_for_process_gone(shell_pid, Duration::from_secs(2)));
-        assert!(wait_for_process_gone(job_pid, Duration::from_secs(2)));
+        // Interactive bash ignores SIGTERM, so the shell goes only at SIGKILL.
+        let kill_window = TERMINAL_SHUTDOWN_GRACE + Duration::from_secs(2);
+        assert!(wait_for_process_gone(shell_pid, kill_window));
+        assert!(wait_for_process_gone(job_pid, kill_window));
         worker.shutdown_and_join();
         println!(
             "async cleanup: enqueue={enqueue_elapsed:?} shell_pid={shell_pid} shell_pgid={} job_pid={job_pid} job_pgid={} sid={} shell_gone=true job_gone=true",
@@ -1471,6 +1624,60 @@ mod tests {
         assert!(!process_is_live(shell_pid));
         assert!(!process_is_live(job_pid));
         println!("final shutdown: shell_gone=true job_gone=true");
+    }
+
+    #[test]
+    fn shutdown_waits_for_slow_sigterm_handler_in_separate_group_after_shell_exit() {
+        let marker = unique_temp_path("shutdown-graceful.mark");
+        let job = format!(
+            "trap \"sleep 0.5; echo graceful > {}; exit 0\" TERM; echo $$ > PIDFILE; \
+             while :; do sleep 0.05; done",
+            marker.0.display()
+        );
+        let (mut process, shell_pid, job_pid, _pid_path) = spawn_test_session_with_job(&job);
+
+        let started = Instant::now();
+        process.shutdown();
+        let elapsed = started.elapsed();
+
+        assert!(!process_is_live(shell_pid));
+        assert!(!process_is_live(job_pid));
+        assert_eq!(
+            std::fs::read_to_string(&marker.0).unwrap_or_default().trim(),
+            "graceful",
+            "job was killed before its SIGTERM handler finished"
+        );
+        assert!(
+            elapsed < TERMINAL_SHUTDOWN_GRACE,
+            "graceful session waited for SIGKILL escalation: {elapsed:?}"
+        );
+        println!("graceful shutdown: elapsed={elapsed:?} job handled SIGTERM");
+    }
+
+    #[test]
+    fn concurrent_shutdown_kills_sigterm_ignoring_jobs_after_one_shared_grace() {
+        let job = "trap \"\" TERM; echo $$ > PIDFILE; while :; do sleep 0.05; done";
+        let (first, first_shell, first_job, _first_pid) = spawn_test_session_with_job(job);
+        let (second, second_shell, second_job, _second_pid) = spawn_test_session_with_job(job);
+        let mut processes = vec![first, second];
+
+        let started = Instant::now();
+        shutdown_terminal_processes(&mut processes);
+        let elapsed = started.elapsed();
+
+        for pid in [first_shell, first_job, second_shell, second_job] {
+            assert!(!process_is_live(pid), "pid {pid} survived shutdown");
+        }
+        assert!(
+            elapsed >= TERMINAL_SHUTDOWN_GRACE,
+            "SIGTERM-ignoring job was killed before the grace period: {elapsed:?}"
+        );
+        assert!(
+            elapsed < TERMINAL_SHUTDOWN_GRACE + Duration::from_millis(1500),
+            "sessions were not shut down concurrently: {elapsed:?}"
+        );
+        drop(processes);
+        println!("forced shutdown: two sessions elapsed={elapsed:?}");
     }
 
     #[test]

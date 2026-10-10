@@ -211,6 +211,23 @@ impl ProcessTree {
         self.terminate(true)
     }
 
+    /// Non-blocking check used during graceful shutdown: true once no live
+    /// process group remains in the owned session. A `/proc` read failure
+    /// reports "still live" so the caller keeps its bounded deadline and then
+    /// escalates through `finish_after_owner_exit`.
+    pub(crate) fn session_exited(&mut self) -> bool {
+        if !self.active {
+            return true;
+        }
+        match linux_session_process_groups(self.session_id) {
+            Ok(groups) if groups.is_empty() => {
+                self.active = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn finish_after_owner_exit(&mut self) {
         if !self.active {
             return;

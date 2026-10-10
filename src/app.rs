@@ -20,7 +20,7 @@ use crate::tabs::{
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
 };
 use crate::terminal::{Terminal, TerminalPresentationIntent, screen_hash};
-use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess};
+use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -1397,14 +1397,20 @@ impl App {
         false
     }
 
+    /// App-exit kill barrier: every tab session (open, pending, and already in
+    /// the cleanup worker) gets the same bounded SIGTERM grace concurrently and
+    /// is SIGKILLed and reaped before this returns, so no tab process outlives
+    /// Ronsole.
     fn shutdown_all(&mut self) {
-        for terminal in &mut self.terminals {
-            terminal.shutdown();
-        }
+        let mut processes: Vec<TerminalProcess> = self
+            .terminals
+            .iter_mut()
+            .filter_map(Terminal::take_process_for_cleanup)
+            .collect();
+        processes.extend(self.pending_terminal_cleanup.drain(..));
+        shutdown_terminal_processes(&mut processes);
+        drop(processes);
         self.terminals.clear();
-        while let Some(mut process) = self.pending_terminal_cleanup.pop_front() {
-            process.shutdown();
-        }
         self.terminal_cleanup.shutdown_and_join();
         if let Some(worker) = self.kde_activation_worker.as_mut() {
             worker.shutdown_and_join();
