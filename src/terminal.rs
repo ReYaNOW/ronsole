@@ -3377,6 +3377,33 @@ mod tests {
     }
 
     #[test]
+    fn dev_banner_in_chat_pane_is_hidden_without_hiding_side_panel() {
+        let mut terminal = Terminal::new_for_test(143, 8, 1);
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let split = 77;
+        let first_head: String = first.chars().take(split).collect();
+        let first_tail: String = first.chars().skip(split).collect();
+        let screen = format!(
+            "\x1b[2J\x1b[H▎ {first_head}\x1b[80G│ panel alpha\x1b[2;1H▎ {first_tail}\x1b[80G│ panel beta\x1b[3;1H▎ {}\x1b[80G│ panel gamma",
+            DEV_CHANNEL_BANNER_LINES[1]
+        );
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        for row in 0..3 {
+            assert!(grid.lines[row][..79]
+                .iter()
+                .filter(|cell| cell.c != ' ')
+                .all(|cell| cell.is_hidden()), "banner row {row}");
+            assert_eq!(grid.lines[row][79].c, '│');
+            assert!(!grid.lines[row][79].is_hidden(), "divider row {row}");
+            assert_eq!(grid.lines[row][81].c, 'p');
+            assert!(!grid.lines[row][81].is_hidden(), "panel row {row}");
+        }
+    }
+
+    #[test]
     fn dev_banner_rewrite_reveals_changed_rows_and_reuses_the_lookup() {
         let lookups = std::cell::Cell::new(0);
         let find = |_| {
@@ -4379,8 +4406,14 @@ fn match_banner_row<'a>(
         }
         let mut chars = rest.chars();
         if !chars.next().is_some_and(|c| plain(cell, c)) {
-            // The segment ended: only trailing blanks may follow.
-            if cell.c != ' ' || !cells.all(|cell| cell.c == ' ') {
+            // Claude Code's side panel begins after the chat column. Its
+            // divider and text share the terminal row with the banner.
+            if !rest.is_empty() && cell.c != '│' {
+                if cell.c != ' ' || !cells.all(|cell| cell.c == ' ') {
+                    return None;
+                }
+            }
+            if end.is_none() {
                 return None;
             }
             break;
@@ -4582,6 +4615,8 @@ impl DevBannerState {
             for cell in line.iter_mut().take(cols) {
                 if !in_block {
                     cell.set_hidden(false);
+                } else if cell.c == '│' {
+                    break;
                 } else if cell.c != ' ' {
                     cell.set_hidden(true);
                 }
