@@ -1322,20 +1322,52 @@ fn read_tab_status_result(reader: &mut impl Read) -> io::Result<TabStatusReply> 
     }
 }
 
-/// Queries the running instance. The exchange runs on a helper thread so that a
-/// silent or stalled peer cannot keep the caller past `TAB_STATUS_CLIENT_TIMEOUT`;
-/// the helper is abandoned and ends with the process.
-fn query_tab_status(socket_path: PathBuf, token: String) -> io::Result<TabStatus> {
+/// Runtime directories a tab-status client may query, in the order the server
+/// chooses them: the XDG directory when set, then the per-user fallback.
+fn tab_status_runtime_dirs(xdg_runtime_dir: Option<OsString>, uid: u32) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = preferred_runtime_dir(xdg_runtime_dir).into_iter().collect();
+    dirs.push(fallback_runtime_dir(uid));
+    dirs
+}
+
+/// Read-only counterpart of `prepare_private_runtime_dir`. The client never creates
+/// or re-permissions a runtime directory; it only skips one it would not trust.
+fn runtime_dir_trusted_for_client(path: &Path, uid: u32) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_dir() && metadata.uid() == uid && (metadata.mode() & 0o077) == 0
+    })
+}
+
+/// Queries the running instance. Candidate runtime directories are tried in order
+/// inside one shared `TAB_STATUS_CLIENT_TIMEOUT` budget and the first answer wins.
+/// The exchange runs on a helper thread so that a silent or stalled peer cannot keep
+/// the caller past that budget; the helper is abandoned and ends with the process.
+fn query_tab_status(runtime_dirs: Vec<PathBuf>, uid: u32, token: String) -> io::Result<TabStatus> {
     if token.len() != TAB_STATUS_TOKEN_LEN {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid tab status token length"));
     }
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = sender.send(query_tab_status_blocking(&socket_path, &token));
+        let _ = sender.send(query_tab_status_candidates(&runtime_dirs, uid, &token));
     });
     receiver
         .recv_timeout(TAB_STATUS_CLIENT_TIMEOUT)
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tab status query timed out"))?
+}
+
+fn query_tab_status_candidates(runtime_dirs: &[PathBuf], uid: u32, token: &str) -> io::Result<TabStatus> {
+    let mut last_error =
+        io::Error::new(io::ErrorKind::NotFound, "no trusted tab status runtime directory");
+    for dir in runtime_dirs {
+        if !runtime_dir_trusted_for_client(dir, uid) {
+            continue;
+        }
+        match query_tab_status_blocking(&dir.join(SOCKET_FILE_NAME), token) {
+            Ok(status) => return Ok(status),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 fn query_tab_status_blocking(socket_path: &Path, token: &str) -> io::Result<TabStatus> {
@@ -1361,9 +1393,9 @@ pub(crate) fn run_tab_status_command() -> std::process::ExitCode {
     else {
         return std::process::ExitCode::FAILURE;
     };
-    let runtime_dir = preferred_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR"))
-        .unwrap_or_else(|| fallback_runtime_dir(effective_uid()));
-    match query_tab_status(runtime_dir.join(SOCKET_FILE_NAME), token) {
+    let uid = effective_uid();
+    let runtime_dirs = tab_status_runtime_dirs(std::env::var_os("XDG_RUNTIME_DIR"), uid);
+    match query_tab_status(runtime_dirs, uid, token) {
         Ok(status) => {
             println!("focused={} active={}", u8::from(status.focused), u8::from(status.active));
             std::process::ExitCode::SUCCESS
@@ -1432,6 +1464,8 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&path).expect("create single-instance test directory");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("make single-instance test directory private");
             Self(path)
         }
 
@@ -2060,9 +2094,10 @@ mod tests {
             }
         });
 
-        let status = query_tab_status(path.clone(), token.to_owned()).unwrap();
+        let uid = effective_uid();
+        let status = query_tab_status(vec![dir.0.clone()], uid, token.to_owned()).unwrap();
         assert_eq!(status, TabStatus { focused: true, active: false });
-        let missing = query_tab_status(path, token.to_owned()).unwrap_err();
+        let missing = query_tab_status(vec![dir.0.clone()], uid, token.to_owned()).unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         responder.join().unwrap();
     }
@@ -2070,16 +2105,64 @@ mod tests {
     #[test]
     fn tab_status_query_fails_within_budget_when_peer_closes_or_stays_silent() {
         let token = "0123456789abcdef0123456789abcdef";
-        let dir = TestDir::new();
-        let closing = dir.0.join("closing.sock");
-        let _closing_peer = spawn_raw_tab_status_peer(closing.clone(), Duration::ZERO);
-        assert!(query_tab_status(closing, token.to_owned()).is_err());
+        let uid = effective_uid();
+        let closing_dir = TestDir::new();
+        let _closing_peer = spawn_raw_tab_status_peer(closing_dir.socket_path(), Duration::ZERO);
+        assert!(query_tab_status(vec![closing_dir.0.clone()], uid, token.to_owned()).is_err());
 
-        let silent = dir.0.join("silent.sock");
-        let _silent_peer = spawn_raw_tab_status_peer(silent.clone(), Duration::from_secs(2));
+        let silent_dir = TestDir::new();
+        let _silent_peer = spawn_raw_tab_status_peer(silent_dir.socket_path(), Duration::from_secs(2));
         let started = std::time::Instant::now();
-        assert!(query_tab_status(silent, token.to_owned()).is_err());
+        assert!(query_tab_status(vec![silent_dir.0.clone()], uid, token.to_owned()).is_err());
         assert!(started.elapsed() < Duration::from_millis(900));
+    }
+
+    #[test]
+    fn tab_status_runtime_dirs_prefer_xdg_then_fallback() {
+        assert_eq!(
+            tab_status_runtime_dirs(Some(OsString::from("/run/user/1000")), 1000),
+            vec![PathBuf::from("/run/user/1000/ronsole"), PathBuf::from("/tmp/ronsole-runtime-1000")]
+        );
+        assert_eq!(
+            tab_status_runtime_dirs(None, 1000),
+            vec![PathBuf::from("/tmp/ronsole-runtime-1000")]
+        );
+    }
+
+    #[test]
+    fn tab_status_query_falls_back_to_next_runtime_dir_when_first_has_no_socket() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let uid = effective_uid();
+        let missing = TestDir::new();
+        let answering = TestDir::new();
+        let mut primary =
+            take_primary(claim_without_activation_token(answering.socket_path(), uid).unwrap());
+        let (tx, rx) = mpsc::channel();
+        primary.start_listener(move |message| tx.send(message).is_ok()).unwrap();
+        let responder = std::thread::spawn(move || {
+            let InstanceMessage::TabStatus(envelope) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                panic!("unexpected message")
+            };
+            envelope
+                .reply
+                .send(TabStatusReply::Status(TabStatus { focused: true, active: true }))
+                .unwrap();
+        });
+
+        let status =
+            query_tab_status(vec![missing.0.clone(), answering.0.clone()], uid, token.to_owned()).unwrap();
+        assert_eq!(status, TabStatus { focused: true, active: true });
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn tab_status_query_fails_when_no_runtime_dir_has_an_answering_peer() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let first = TestDir::new();
+        let second = TestDir::new();
+        let error = query_tab_status(vec![first.0.clone(), second.0.clone()], effective_uid(), token.to_owned())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
