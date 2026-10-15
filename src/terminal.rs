@@ -2925,7 +2925,7 @@ mod tests {
     fn real_pty_shell_emits_output_and_observes_resize() {
         use std::time::{Duration, Instant};
 
-        let mut terminal = Terminal::spawn(None, 1, TerminalLaunchSpec::default());
+        let mut terminal = Terminal::spawn(None, 1, TerminalLaunchSpec::hermetic_shell_for_test());
         terminal.resize_pty(120, 40);
         terminal
             .write_input(b"printf '__RONS_PTY__\\n'; stty size; exit\r")
@@ -4408,8 +4408,15 @@ fn match_banner_row<'a>(
         if !chars.next().is_some_and(|c| plain(cell, c)) {
             // Claude Code's side panel begins after the chat column. Its
             // divider and text share the terminal row with the banner.
-            if !rest.is_empty() && cell.c != '│' {
-                if cell.c != ' ' || !cells.all(|cell| cell.c == ' ') {
+            if cell.c != '│' {
+                // Past the end of `expected` the text must end at a word
+                // boundary: "names" is not the line "name".
+                let continues = if rest.is_empty() {
+                    cell.c != ' '
+                } else {
+                    cell.c != ' ' || !cells.all(|cell| cell.c == ' ')
+                };
+                if continues {
                     return None;
                 }
             }
