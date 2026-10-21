@@ -16,6 +16,7 @@ mod queries;
 mod sgr;
 mod sync;
 mod term;
+mod url;
 #[cfg(test)]
 mod tests;
 

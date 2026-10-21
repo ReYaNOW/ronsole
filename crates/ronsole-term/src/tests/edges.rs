@@ -97,7 +97,7 @@ fn terminal_osc_insert_delete_and_truecolor_edges_end_to_end() {
     let mut grid = Term::new(test_config(8, 4));
     let mut sink = RecordingSink::new();
     feed(&mut grid, &mut sink, b"\x1b]10;?\x1b\\");
-    assert_eq!(sink.bytes, b"\x1B]10;rgb:ffff/ffff/ffff\x1B\\".to_vec());
+    assert_eq!(sink.bytes, b"\x1B]10;rgb:e5e5/e5e5/e5e5\x1B\\".to_vec());
 
     feed(&mut grid, &mut sink, b"\x1b[2;1Habcdefgh\x1b[2;3H\x1b[2P");
     let row1: String = grid.lines[1].iter().map(|cell| cell.ch()).collect();
@@ -227,13 +227,13 @@ fn terminal_csi_more_erase_cursor_and_reply_edges() {
     assert_eq!((grid.cur_x, grid.cur_y), (2, 1));
 
     feed(&mut grid, &mut sink, b"\x1b]11;?\x1b\\");
-    assert_eq!(sink.bytes, b"\x1B]11;rgb:ffff/ffff/ffff\x1B\\".to_vec());
+    assert_eq!(sink.bytes, b"\x1B]11;rgb:0000/0000/0000\x1B\\".to_vec());
 
     // The sink accumulates every reply, so the second check covers both.
     feed(&mut grid, &mut sink, b"\x1b]10;?\x07");
     assert_eq!(
         sink.bytes,
-        b"\x1B]11;rgb:ffff/ffff/ffff\x1B\\\x1B]10;rgb:ffff/ffff/ffff\x1B\\".to_vec()
+        b"\x1B]11;rgb:0000/0000/0000\x1B\\\x1B]10;rgb:e5e5/e5e5/e5e5\x07".to_vec()
     );
 
     feed(&mut grid, &mut sink, b"\x1b[38;5;123m\x1b[48;2;9;8;7mQ\x1b[999m");

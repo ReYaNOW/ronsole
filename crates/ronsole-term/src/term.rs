@@ -97,6 +97,9 @@ pub struct Term {
     /// Replies queued during the current `advance` call; flushed to the sink
     /// as one `reply` at its end and cleared, keeping the capacity.
     pub(crate) reply_buf: Vec<u8>,
+    /// Scratch for OSC payloads whose `;`-split parts are glued back together;
+    /// empty between sequences, see `osc::with_joined`.
+    pub(crate) osc_join: Vec<u8>,
     /// Bytes held back while synchronized output is on; empty and unallocated otherwise.
     pub(crate) sync_buf: Vec<u8>,
     /// Replay deadline of the held bytes; `None` while synchronized output is off.
@@ -176,6 +179,7 @@ impl Term {
             identity,
             palette,
             reply_buf: Vec::new(),
+            osc_join: Vec::new(),
             sync_buf: Vec::new(),
             sync_until: None,
             replaying: false,

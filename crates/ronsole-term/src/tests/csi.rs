@@ -83,7 +83,7 @@ fn terminal_csi_cursor_modes_colors_and_replies_end_to_end() {
     let replies = String::from_utf8(sink.bytes.clone()).unwrap();
     let (reply_pos, rest) = replies.split_once("\x1B[?62c").unwrap();
     assert!(reply_pos.starts_with("\x1B[1;6R"));
-    assert_eq!(rest, "\x1B]10;rgb:ffff/ffff/ffff\x1B\\");
+    assert_eq!(rest, "\x1B]10;rgb:e5e5/e5e5/e5e5\x1B\\");
 
     feed(&mut grid, &mut sink, b"\x1b[?1049hALT\x1b[?1049l");
     assert!(!grid.is_alt);
