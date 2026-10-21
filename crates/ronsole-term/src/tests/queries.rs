@@ -145,8 +145,9 @@ fn reply_buffer_capped_at_64kib() {
 fn malformed_queries_are_bounded() {
     let mut term = Term::new(test_config(10, 3));
     let mut sink = RecordingSink::new();
-    // Not specified by the spec: a DECRQM without a mode number gets no reply.
-    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?$p"), b"");
+    // A DECRQM without a mode number asks for mode 0, which is unknown: `;0$y`.
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?$p"), b"\x1b[?0;0$y");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[$p"), b"\x1b[0;0$y");
     // XTVERSION is answered only for the parameter-less or `0` form.
     assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[>999q"), b"");
     // Oversized mode number: the reply echoes the parsed value and reports 0.

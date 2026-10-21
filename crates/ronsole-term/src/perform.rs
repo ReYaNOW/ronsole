@@ -22,6 +22,7 @@ impl Perform for Performer<'_> {
     }
 
     fn print(&mut self, c: char) {
+        self.applied = true;
         if let Some(presentation) = terminal_presentation_selector(c) {
             self.term.apply_presentation_selector(presentation, c);
             return;
@@ -50,6 +51,7 @@ impl Perform for Performer<'_> {
         }
     }
     fn execute(&mut self, byte: u8) {
+        self.applied = true;
         match byte {
             b'\n' | b'\x0B' | b'\x0C' => {
                 self.term.wrap_pending = false;
@@ -82,6 +84,7 @@ impl Perform for Performer<'_> {
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.applied = true;
         if params.first().is_some_and(|selector| *selector == b"104") {
             // Ronsole does not expose a mutable OSC 4 palette; reset is therefore a no-op.
             return;
@@ -103,6 +106,7 @@ impl Perform for Performer<'_> {
         }
     }
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.applied = true;
         self.term.wrap_pending = false;
         self.term.join_next = false;
         match byte {
@@ -135,6 +139,13 @@ impl Perform for Performer<'_> {
         }
     }
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        // A `CSI ? 2026 h` on its own is the set that starts holding output.
+        let sync_only = action == 'h'
+            && intermediates == b"?"
+            && params.iter().all(|param| param.first() == Some(&2026));
+        if !sync_only {
+            self.applied = true;
+        }
         // Queries do not move the cursor, so they keep a pending wrap.
         let query = match action {
             'c' | 'q' => intermediates == b">",
@@ -278,12 +289,11 @@ impl Perform for Performer<'_> {
                 }
             }
             'p' => {
-                // vte reads an omitted parameter as 0, and mode 0 is never a
-                // real mode, so a DECRQM without a mode number gets no reply.
-                let mode = params.iter().next().map(|p| p[0]).filter(|&mode| mode != 0);
+                // vte reads an omitted parameter as 0; mode 0 is unknown and gets `;0$y`.
+                let mode = params.iter().next().map_or(0, |p| p[0]);
                 match (intermediates, mode) {
-                    ([b'?', b'$'], Some(mode)) => self.term.queue_decrqm_private(mode),
-                    ([b'$'], Some(mode)) => self.term.queue_decrqm_ansi(mode),
+                    ([b'?', b'$'], mode) => self.term.queue_decrqm_private(mode),
+                    ([b'$'], mode) => self.term.queue_decrqm_ansi(mode),
                     _ => {}
                 }
             }

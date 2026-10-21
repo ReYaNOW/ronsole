@@ -5,8 +5,6 @@ use crate::term::{Performer, Term, TermSink};
 use std::time::{Duration, Instant};
 use vte::Parser;
 
-/// Set sequence; the parser stops right after it and holds the rest.
-const SYNC_SET: &[u8] = b"\x1b[?2026h";
 /// Reset sequence; its end is the replay boundary.
 const SYNC_RESET: &[u8] = b"\x1b[?2026l";
 /// How long a set may hold the grid before the buffer is replayed.
@@ -31,46 +29,38 @@ impl Term {
             if self.sync_until.is_some() {
                 // Hold bytes until a reset arrives or the buffer is full.
                 let take = bytes.len().min(SYNC_BUF_LIMIT - self.sync_buf.len());
-                // A reset may straddle the previous batch: search from the
-                // last bytes already held.
-                let from = self.sync_buf.len().saturating_sub(SYNC_RESET.len() - 1);
-                self.sync_buf.extend_from_slice(&bytes[..take]);
-                let reset_end = self.sync_buf[from..]
-                    .windows(SYNC_RESET.len())
-                    .position(|window| window == SYNC_RESET)
-                    .map(|pos| from + pos + SYNC_RESET.len());
-                if let Some(end) = reset_end {
-                    // Bytes after the reset came from `bytes`; parse them normally.
-                    let held_after = self.sync_buf.len() - end;
-                    bytes = &bytes[take - held_after..];
-                    grid_changed |= self.replay_sync(parser, end, sink);
-                } else if self.sync_buf.len() >= SYNC_BUF_LIMIT {
+                // Search before copying, so each held byte is copied once even
+                // when a batch holds many set/reset pairs.
+                if let Some(end) = reset_end_in(&self.sync_buf, &bytes[..take]) {
+                    self.sync_buf.extend_from_slice(&bytes[..end]);
+                    let sync_end = self.sync_buf.len();
+                    // Bytes after the reset are parsed normally.
+                    bytes = &bytes[end..];
+                    grid_changed |= self.replay_sync(parser, sync_end, sink);
+                } else {
+                    self.sync_buf.extend_from_slice(&bytes[..take]);
+                    if self.sync_buf.len() < SYNC_BUF_LIMIT {
+                        return grid_changed;
+                    }
                     bytes = &bytes[take..];
                     let end = self.sync_buf.len();
                     grid_changed |= self.replay_sync(parser, end, sink);
-                } else {
-                    return grid_changed;
                 }
             } else {
-                let (consumed, sync_set) = {
+                let (consumed, applied, sync_set) = {
                     let mut performer = Performer {
                         term: self,
                         sink: &mut *sink,
                         sync_set: false,
+                        applied: false,
                     };
                     let consumed = parser.advance_until_terminated(&mut performer, bytes);
-                    (consumed, performer.sync_set)
+                    (consumed, performer.applied, performer.sync_set)
                 };
                 if sync_set {
                     self.sync_until = Some(now + SYNC_TIMEOUT);
                 }
-                // The set sequence that starts holding is not a grid change.
-                let set_len = if sync_set && bytes[..consumed].ends_with(SYNC_SET) {
-                    SYNC_SET.len()
-                } else {
-                    0
-                };
-                grid_changed |= consumed > set_len;
+                grid_changed |= applied;
                 bytes = &bytes[consumed..];
             }
         }
@@ -93,6 +83,7 @@ impl Term {
                 term: self,
                 sink,
                 sync_set: false,
+                applied: false,
             };
             parser.advance(&mut performer, &held[..end]);
         }
@@ -104,4 +95,21 @@ impl Term {
         self.sync_buf = held;
         end > 0
     }
+}
+
+/// Finds the first reset that completes in `bytes`, given the already held
+/// bytes `held`, which contain no complete reset. Returns how many bytes of
+/// `bytes` belong to that reset, counting from the first one.
+fn reset_end_in(held: &[u8], bytes: &[u8]) -> Option<usize> {
+    // A reset straddling the boundary starts in `held` and ends in `bytes`.
+    // Only the first byte of the reset is ESC, so at most one split matches.
+    for split in 1..SYNC_RESET.len() {
+        if held.ends_with(&SYNC_RESET[..split]) && bytes.starts_with(&SYNC_RESET[split..]) {
+            return Some(SYNC_RESET.len() - split);
+        }
+    }
+    bytes
+        .windows(SYNC_RESET.len())
+        .position(|window| window == SYNC_RESET)
+        .map(|pos| pos + SYNC_RESET.len())
 }

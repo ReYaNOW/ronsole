@@ -119,6 +119,9 @@ pub(crate) struct Performer<'a> {
     pub(crate) sink: &'a mut dyn TermSink,
     /// Set by a `CSI ? 2026 h` that starts holding output; read by `terminated`.
     pub(crate) sync_set: bool,
+    /// Set by each callback that applies output to the grid; the bytes of a
+    /// `CSI ? 2026 h` that starts holding output do not set it.
+    pub(crate) applied: bool,
 }
 
 impl Term {
