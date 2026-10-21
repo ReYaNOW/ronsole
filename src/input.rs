@@ -1143,8 +1143,9 @@ fn terminal_key_sequence(
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
     let seq = match physical_key {
+        // Shift+Enter sends ESC CR like Alt+Enter, so TUIs (Claude Code, fish) insert a newline instead of submitting.
         PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
-            terminal_alt_prefixed(b"\r", alt)
+            terminal_alt_prefixed(b"\r", alt || shift)
         }
         PhysicalKey::Code(KeyCode::Backspace) if ctrl => terminal_alt_prefixed(b"\x17", alt),
         PhysicalKey::Code(KeyCode::Backspace) if shift => terminal_alt_prefixed(b"\x08", alt),
@@ -1280,6 +1281,12 @@ mod tests {
     fn terminal_encoder_keeps_plain_f1_and_ctrl_t_sequences() {
         assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F1), false, false, false, false), Some(b"\x1bOP".to_vec()));
         assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyT), false, true, false, false), Some(vec![0x14]));
+    }
+
+    #[test]
+    fn terminal_encoder_sends_esc_cr_for_shift_enter() {
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Enter), false, false, false, false), Some(b"\r".to_vec()));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Enter), true, false, false, false), Some(b"\x1b\r".to_vec()));
     }
 
     #[test]
