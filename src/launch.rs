@@ -164,6 +164,22 @@ fn parse_bridge_launch_id(value: &OsStr) -> Result<[u8; 16], String> {
 }
 
 #[cfg(test)]
+impl TerminalLaunchSpec {
+    /// Interactive bash without startup files, for tests that script a real
+    /// PTY shell: the user's `$SHELL` config (prompt wizards, plugins) must
+    /// not read or delay the scripted input.
+    pub(crate) fn hermetic_shell_for_test() -> Self {
+        Self {
+            command: ["/bin/bash", "--noprofile", "--norc", "-i"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;

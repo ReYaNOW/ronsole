@@ -2377,7 +2377,7 @@ mod tests {
             std::process::id()
         ));
         let mut app = App::new();
-        let terminal = Terminal::spawn(None, 1, TerminalLaunchSpec::default());
+        let terminal = Terminal::spawn(None, 1, TerminalLaunchSpec::hermetic_shell_for_test());
         terminal
             .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
             .unwrap();

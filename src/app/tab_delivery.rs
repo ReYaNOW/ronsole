@@ -5,7 +5,7 @@
 use super::App;
 use crate::platform::single_instance::{
     BRIDGE_CODE_PTY_WRITE_FAILED, PeerCred, TabInputCode, TabInputEnvelope, TabInputKind, TabInputRequest,
-    validate_tab_input_text,
+    TabStatus, TabStatusEnvelope, TabStatusReply, effective_uid, validate_tab_input_text,
 };
 use crate::tab_input::{
     InputBox, ProcGen, claude_generation, claude_process_group, classify_input_box, origin_allowed,
@@ -99,6 +99,23 @@ impl TabInputState {
 impl App {
     pub(super) fn handle_tab_input(&mut self, envelope: TabInputEnvelope) {
         self.handle_tab_input_at(envelope, Instant::now());
+    }
+
+    /// Read-only `TAB_STATUS_REQUEST` answer. `focused` is the focus of the
+    /// application window; `active` means the tab is the active tab and is presented.
+    pub(super) fn handle_tab_status(&mut self, envelope: TabStatusEnvelope) {
+        if envelope.peer.uid != effective_uid() {
+            let _ = envelope.reply.send(TabStatusReply::PeerRejected);
+            return;
+        }
+        let reply = match self.find_tab_by_token(&envelope.token) {
+            None => TabStatusReply::NoTab,
+            Some(index) => TabStatusReply::Status(TabStatus {
+                focused: self.focused,
+                active: index == self.active_terminal && self.active_terminal_presented,
+            }),
+        };
+        let _ = envelope.reply.send(reply);
     }
 
     fn handle_tab_input_at(&mut self, envelope: TabInputEnvelope, now: Instant) {
@@ -1029,6 +1046,54 @@ mod tests {
         let uid = crate::platform::single_instance::effective_uid();
         assert_eq!(escape_call(&mut fx, 4321, 777, uid), 3);
         std::thread::sleep(Duration::from_millis(40));
+        assert!(fx.out().is_empty());
+    }
+
+    fn tab_status_call(fx: &mut Fixture, token: &str, uid: u32) -> TabStatusReply {
+        let (reply, response) = channel();
+        fx.app.handle_tab_status(TabStatusEnvelope {
+            token: token.to_owned(),
+            peer: PeerCred { uid, pid: 4242 },
+            reply,
+        });
+        response.recv().unwrap()
+    }
+
+    #[test]
+    fn tab_status_reports_window_focus_and_presented_active_tab() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        let token = fx.app.terminals[0].tab_token().to_owned();
+        assert_eq!(token.len(), 32);
+        fx.app.terminals.push(Terminal::new_for_test(80, 8, 2));
+        let uid = crate::platform::single_instance::effective_uid();
+        let status = |focused: bool, active: bool| TabStatusReply::Status(TabStatus { focused, active });
+
+        fx.app.active_terminal = 0;
+        fx.app.active_terminal_presented = true;
+        fx.app.focused = true;
+        assert_eq!(tab_status_call(&mut fx, &token, uid), status(true, true));
+        fx.app.focused = false;
+        assert_eq!(tab_status_call(&mut fx, &token, uid), status(false, true));
+        // Presented, but the addressed tab is not the active one.
+        fx.app.focused = true;
+        fx.app.active_terminal = 1;
+        assert_eq!(tab_status_call(&mut fx, &token, uid), status(true, false));
+        // Active index without presentation is not active.
+        fx.app.active_terminal = 0;
+        fx.app.active_terminal_presented = false;
+        assert_eq!(tab_status_call(&mut fx, &token, uid), status(true, false));
+    }
+
+    #[test]
+    fn tab_status_rejects_unknown_malformed_and_foreign_requests() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        let token = fx.app.terminals[0].tab_token().to_owned();
+        let uid = crate::platform::single_instance::effective_uid();
+        assert_eq!(tab_status_call(&mut fx, "", uid), TabStatusReply::NoTab);
+        assert_eq!(tab_status_call(&mut fx, &"z".repeat(32), uid), TabStatusReply::NoTab);
+        assert_eq!(tab_status_call(&mut fx, &"A".repeat(32), uid), TabStatusReply::NoTab);
+        assert_eq!(tab_status_call(&mut fx, &token[..31], uid), TabStatusReply::NoTab);
+        assert_eq!(tab_status_call(&mut fx, &token, uid.wrapping_add(1)), TabStatusReply::PeerRejected);
         assert!(fx.out().is_empty());
     }
 }

@@ -122,6 +122,11 @@ fn tune_glibc_allocator() {
 
 fn main() -> ExitCode {
     let args = env::args_os().collect::<Vec<_>>();
+    // Answered by querying the running instance; must not start the GUI or
+    // take part in single-instance external launch.
+    if args.get(1).is_some_and(|arg| arg == "tab-status") {
+        return platform::single_instance::run_tab_status_command();
+    }
     let (automation_options, initial_launch): (Option<app::AutomationOptions>, _) =
         match launch::parse_startup_args_with_current_dir(&args, env::current_dir) {
             Ok(launch::StartupMode::Normal(launch)) => (None, launch),
