@@ -69,7 +69,7 @@ pub struct Hyperlink {
 }
 
 /// Maximum number of zero-width characters stored in one cell's extra data;
-/// further ones are dropped by [`Cell::push_zero_width`].
+/// further ones are dropped by `Cell::push_zero_width`.
 pub const TERMINAL_CELL_EXTRA_MAX_CHARS: usize = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
