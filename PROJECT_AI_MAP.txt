@@ -311,8 +311,9 @@ F mods@151
 F enc@156
 F set_flags@163>6r
 F kitty_reference_examples@171>6y,6z,70,71,8h
+M crates/ronsole-term/src/tests/keys_legacy.rs
 M crates/ronsole-term/src/tests/mod.rs
-F advance_prints_text_and_replies_to_da1@15>8h
+F advance_prints_text_and_replies_to_da1@16>8h
 M crates/ronsole-term/src/tests/osc.rs
 F osc_titles_are_control_safe_and_bounded@6>44,8h
 M crates/ronsole-term/src/tests/queries.rs

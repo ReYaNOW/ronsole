@@ -3,7 +3,7 @@ use crate::term::Term;
 use crate::{KeyEvent, KeyKind, KeyMods, KeyOutcome, TermKey};
 
 /// Sends `bytes` and returns exactly the reply bytes they produced.
-fn reply_to(term: &mut Term, sink: &mut RecordingSink, bytes: &[u8]) -> Vec<u8> {
+pub(super) fn reply_to(term: &mut Term, sink: &mut RecordingSink, bytes: &[u8]) -> Vec<u8> {
     sink.bytes.clear();
     feed(term, sink, bytes);
     std::mem::take(&mut sink.bytes)
@@ -144,23 +144,23 @@ fn csi_question_u_does_not_restore_cursor() {
 }
 
 /// Builds a key event; `physical` is fixed so press, repeat and release match.
-fn ev<'a>(key: TermKey, base: Option<char>, mods: KeyMods, kind: KeyKind, text: Option<&'a str>) -> KeyEvent<'a> {
+pub(super) fn ev<'a>(key: TermKey, base: Option<char>, mods: KeyMods, kind: KeyKind, text: Option<&'a str>) -> KeyEvent<'a> {
     KeyEvent { physical: 1, key, base, mods, kind, text }
 }
 
-fn mods(shift: bool, ctrl: bool, alt: bool) -> KeyMods {
+pub(super) fn mods(shift: bool, ctrl: bool, alt: bool) -> KeyMods {
     KeyMods { shift, ctrl, alt, super_key: false }
 }
 
 /// Encodes one event and returns the outcome and the bytes written.
-fn enc(term: &mut Term, event: &KeyEvent<'_>) -> (KeyOutcome, Vec<u8>) {
+pub(super) fn enc(term: &mut Term, event: &KeyEvent<'_>) -> (KeyOutcome, Vec<u8>) {
     let mut out = Vec::new();
     let outcome = term.encode_key(event, &mut out);
     (outcome, out)
 }
 
 /// Sets Kitty flags with `CSI = flags u` (replace mode).
-fn set_flags(term: &mut Term, sink: &mut RecordingSink, flags: u8) {
+pub(super) fn set_flags(term: &mut Term, sink: &mut RecordingSink, flags: u8) {
     let bytes = format!("\x1b[={flags}u");
     assert_eq!(reply_to(term, sink, bytes.as_bytes()), b"");
 }

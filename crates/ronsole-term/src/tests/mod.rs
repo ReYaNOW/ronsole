@@ -1,6 +1,7 @@
 mod csi;
 mod edges;
 mod keys;
+mod keys_legacy;
 mod osc;
 mod queries;
 mod reflow;
