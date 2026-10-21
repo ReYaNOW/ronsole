@@ -13,6 +13,7 @@ mod input;
 mod osc;
 mod perform;
 mod queries;
+mod sync;
 mod term;
 #[cfg(test)]
 mod tests;

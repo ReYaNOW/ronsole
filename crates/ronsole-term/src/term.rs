@@ -102,6 +102,12 @@ pub struct Term {
     /// Replies queued during the current `advance` call; flushed to the sink
     /// as one `reply` at its end and cleared, keeping the capacity.
     pub(crate) reply_buf: Vec<u8>,
+    /// Bytes held back while synchronized output is on; empty and unallocated otherwise.
+    pub(crate) sync_buf: Vec<u8>,
+    /// Replay deadline of the held bytes; `None` while synchronized output is off.
+    pub(crate) sync_until: Option<Instant>,
+    /// Set while held bytes are replayed, so a nested set is a no-op.
+    pub(crate) replaying: bool,
 }
 
 /// Upper bound on the bytes of replies queued by one `advance` call.
@@ -111,6 +117,8 @@ const REPLY_BUF_LIMIT: usize = 65_536;
 pub(crate) struct Performer<'a> {
     pub(crate) term: &'a mut Term,
     pub(crate) sink: &'a mut dyn TermSink,
+    /// Set by a `CSI ? 2026 h` that starts holding output; read by `terminated`.
+    pub(crate) sync_set: bool,
 }
 
 impl Term {
@@ -175,33 +183,62 @@ impl Term {
             identity,
             palette,
             reply_buf: Vec::new(),
+            sync_buf: Vec::new(),
+            sync_until: None,
+            replaying: false,
         }
     }
 
-    /// Parses `bytes` and applies them to the grid.
-    ///
-    /// `_now` is reserved for the synchronized-output deadline (Task 6).
+    /// Parses `bytes` and applies them to the grid. While synchronized output
+    /// (mode 2026) is on, the bytes are held until its reset or deadline.
     pub fn advance(
         &mut self,
         bytes: &[u8],
-        _now: Instant,
+        now: Instant,
         sink: &mut dyn TermSink,
     ) -> AdvanceOutcome {
+        let held_before = self.sync_until.is_some();
         // Take the parser out so the performer can borrow the rest of `self`;
         // it is put back below, so no parser is built per batch.
         let mut parser = self.parser.take().unwrap_or_default();
-        {
-            let mut performer = Performer { term: self, sink };
-            parser.advance(&mut performer, bytes);
-        }
+        let grid_changed = self.apply_bytes(&mut parser, bytes, now, sink);
         self.parser = Some(parser);
+        self.flush_replies(sink);
+        AdvanceOutcome {
+            grid_changed,
+            new_deadline: !held_before && self.sync_until.is_some(),
+        }
+    }
+
+    /// Replays held bytes whose synchronized-output deadline has passed.
+    pub fn flush_expired(&mut self, now: Instant, sink: &mut dyn TermSink) -> AdvanceOutcome {
+        let expired = self.sync_until.is_some_and(|deadline| now >= deadline);
+        let mut grid_changed = false;
+        if expired {
+            let end = self.sync_buf.len();
+            let mut parser = self.parser.take().unwrap_or_default();
+            grid_changed = self.replay_sync(&mut parser, end, sink);
+            self.parser = Some(parser);
+        }
+        self.flush_replies(sink);
+        AdvanceOutcome {
+            grid_changed,
+            new_deadline: false,
+        }
+    }
+
+    /// Deadline after which the held bytes are replayed; `None` when
+    /// synchronized output is off.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.sync_until
+    }
+
+    /// Sends the queued replies to the sink as one `reply` call and clears
+    /// the buffer, keeping its capacity.
+    fn flush_replies(&mut self, sink: &mut dyn TermSink) {
         if !self.reply_buf.is_empty() {
             sink.reply(&self.reply_buf);
             self.reply_buf.clear();
-        }
-        AdvanceOutcome {
-            grid_changed: !bytes.is_empty(),
-            new_deadline: false,
         }
     }
 

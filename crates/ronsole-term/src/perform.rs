@@ -15,6 +15,12 @@ use crate::term::Performer;
 use vte::{Params, Perform};
 
 impl Perform for Performer<'_> {
+    /// Stops the parser right after a set that starts holding output, so the
+    /// rest of the batch can be held instead of applied.
+    fn terminated(&self) -> bool {
+        self.sync_set
+    }
+
     fn print(&mut self, c: char) {
         if let Some(presentation) = terminal_presentation_selector(c) {
             self.term.apply_presentation_selector(presentation, c);
@@ -213,6 +219,15 @@ impl Perform for Performer<'_> {
                                 1004 => self.term.focus_reporting = enable,
                                 1006 => self.term.mouse_sgr = enable,
                                 2004 => self.term.bracketed_paste = enable,
+                                2026 => {
+                                    // A set during replay or while already holding is a no-op.
+                                    if enable
+                                        && !self.term.replaying
+                                        && self.term.sync_until.is_none()
+                                    {
+                                        self.sync_set = true;
+                                    }
+                                }
                                 _ => {}
                             }
                         }

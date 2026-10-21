@@ -4,6 +4,7 @@ mod osc;
 mod queries;
 mod reflow;
 mod support;
+mod sync;
 
 use crate::term::Term;
 use support::{RecordingSink, feed, test_config};

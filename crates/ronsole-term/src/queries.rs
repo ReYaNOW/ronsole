@@ -48,7 +48,8 @@ impl Term {
             1004 => self.focus_reporting,
             1006 => self.mouse_sgr,
             2004 => self.bracketed_paste,
-            // Synchronized output (2026) is not implemented yet, so it reads as reset.
+            // While the parser runs, 2026 is never on: a set stops the parse and
+            // holds the rest, and replay runs with the mode off.
             2026 => false,
             _ => return 0,
         };
