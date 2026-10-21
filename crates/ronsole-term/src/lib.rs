@@ -8,7 +8,17 @@ pub use vte;
 
 mod cell;
 mod color;
+mod grid;
 mod input;
+mod osc;
+mod perform;
+mod term;
+#[cfg(test)]
+mod tests;
+
+pub use grid::normalized_selection_bounds;
+pub use osc::TERMINAL_TITLE_MAX_BYTES;
+pub use term::{AdvanceOutcome, Term, TermConfig, TermIdentity, TermSink};
 
 pub use cell::{
     CELL_PRESENTATION_AUTO, CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT,

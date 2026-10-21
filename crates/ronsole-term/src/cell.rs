@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(blank.bg(), TerminalColor::indexed(1));
         assert!(blank.fg().is_default_foreground());
         assert!(!blank.is_inverse());
-        assert!(blank.underline() != UnderlineStyle::Single);
+        assert!(blank.underline() == UnderlineStyle::None);
         assert!(!blank.is_dim());
     }
 
@@ -666,6 +666,7 @@ mod tests {
     #[test]
     fn ordinary_cells_keep_rare_unicode_storage_out_of_line() {
         let cell = Cell::default();
+        assert!(cell.extra.is_none());
         assert!(cell.zero_width().is_empty());
         assert!(std::mem::size_of::<Cell>() <= 24);
     }
