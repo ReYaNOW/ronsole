@@ -10,6 +10,7 @@ mod cell;
 mod color;
 mod grid;
 mod input;
+mod links;
 mod osc;
 mod perform;
 mod queries;
@@ -21,8 +22,10 @@ mod url;
 mod tests;
 
 pub use grid::normalized_selection_bounds;
+pub use links::LinkTarget;
 pub use osc::TERMINAL_TITLE_MAX_BYTES;
 pub use term::{AdvanceOutcome, Term, TermConfig, TermIdentity, TermSink};
+pub use url::find_url;
 
 pub use cell::{
     CELL_PRESENTATION_AUTO, CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT,

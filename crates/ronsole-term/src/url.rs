@@ -1,4 +1,106 @@
-//! Decoders for OSC payloads: RFC 4648 base64 (OSC 52) and percent-encoding (OSC 7).
+//! Decoders for OSC payloads: RFC 4648 base64 (OSC 52) and percent-encoding (OSC 7),
+//! and the plain-URL finder used for Ctrl+click.
+
+use crate::cell::Cell;
+use std::ops::Range;
+
+/// Schemes that start a plain URL.
+const URL_SCHEMES: [&str; 3] = ["http://", "https://", "file://"];
+
+/// Cell range of the plain URL around `col` in a logical line, or `None`.
+///
+/// The token is the run of cells around `col` up to a space or control
+/// character. Within it, the last scheme starting at or before `col` wins;
+/// trailing punctuation and unbalanced closing brackets are cut. Wide-character
+/// spacers belong to the wide character before them, and the range includes them.
+pub fn find_url(line: &[Cell], col: usize) -> Option<Range<usize>> {
+    if col >= line.len() {
+        return None;
+    }
+    let col = if line[col].is_wide_spacer() {
+        col.checked_sub(1)?
+    } else {
+        col
+    };
+    if is_separator(&line[col]) {
+        return None;
+    }
+    let start = line[..col]
+        .iter()
+        .rposition(is_separator)
+        .map_or(0, |index| index + 1);
+    let end = line[col..]
+        .iter()
+        .position(is_separator)
+        .map_or(line.len(), |offset| col + offset);
+
+    // Characters of the token with their cell index; spacers carry no character.
+    let token: Vec<(char, usize)> = (start..end)
+        .filter(|&index| !line[index].is_wide_spacer())
+        .map(|index| (line[index].ch(), index))
+        .collect();
+
+    let mut matched = None;
+    for (position, &(_, index)) in token.iter().enumerate() {
+        if index > col {
+            break;
+        }
+        for scheme in URL_SCHEMES {
+            if starts_with_scheme(&token, position, scheme) {
+                matched = Some((position, scheme.len()));
+            }
+        }
+    }
+    let (scheme_position, scheme_len) = matched?;
+    let body_start = scheme_position + scheme_len;
+
+    let mut token_end = token.len();
+    while token_end > body_start && is_cuttable(&token[scheme_position..token_end]) {
+        token_end -= 1;
+    }
+    if token_end <= body_start {
+        return None;
+    }
+
+    let first_cell = token[scheme_position].1;
+    let mut end_cell = token[token_end - 1].1 + 1;
+    while end_cell < line.len() && line[end_cell].is_wide_spacer() {
+        end_cell += 1;
+    }
+    (first_cell <= col && col < end_cell).then_some(first_cell..end_cell)
+}
+
+/// Space and control characters end a URL token; wide-character spacers never do.
+fn is_separator(cell: &Cell) -> bool {
+    !cell.is_wide_spacer() && (cell.ch().is_whitespace() || cell.ch().is_control())
+}
+
+/// Whether the token at `position` begins with the ASCII `scheme`.
+fn starts_with_scheme(token: &[(char, usize)], position: usize, scheme: &str) -> bool {
+    scheme.chars().enumerate().all(|(offset, expected)| {
+        token
+            .get(position + offset)
+            .is_some_and(|&(ch, _)| ch == expected)
+    })
+}
+
+/// Whether the last character of `candidate` must be cut from the URL: trailing
+/// sentence punctuation, or a closing bracket with no opening bracket before it.
+fn is_cuttable(candidate: &[(char, usize)]) -> bool {
+    let Some(&(last, _)) = candidate.last() else {
+        return false;
+    };
+    let opening = match last {
+        '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => return true,
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        '>' => '<',
+        _ => return false,
+    };
+    let count = |wanted: char| candidate.iter().filter(|&&(ch, _)| ch == wanted).count();
+    count(last) > count(opening)
+}
 
 /// Decodes standard base64. Trailing `=` padding is optional; when present it
 /// may only close the input, at most two signs, and the whole input must be a

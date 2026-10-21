@@ -11,8 +11,8 @@ use crate::grid::{
 };
 use crate::input::MouseTrackingMode;
 use crate::osc::{
-    parse_osc52_text, parse_osc7_uri, queue_dynamic_color_query, queue_palette_queries,
-    terminal_programmed_title, with_joined,
+    parse_osc8_link, parse_osc52_text, parse_osc7_uri, queue_dynamic_color_query,
+    queue_palette_queries, terminal_programmed_title, with_joined,
 };
 use crate::sgr::apply_sgr;
 use crate::term::Performer;
@@ -117,6 +117,11 @@ impl Perform for Performer<'_> {
                 {
                     self.sink.working_directory(&host, &path);
                 }
+            }
+            b"8" => {
+                // A `None` link closes the open hyperlink, as an empty or invalid URI does.
+                let link = with_joined(self.term, |joined| parse_osc8_link(params, joined));
+                self.term.pen.set_hyperlink(link);
             }
             _ => {}
         }
