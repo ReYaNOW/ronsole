@@ -18,6 +18,8 @@ MAX_RUSTFLAGS = $(COMMON_RUSTFLAGS) -C lto=fat -C symbol-mangling-version=v0 -C 
 # Настройки тестов
 TEST_FILTER ?=
 TEST ?=
+# Package selection for cargo test; narrow crate run: make test TEST_PKG='-p ronsole-term'
+TEST_PKG ?= --workspace
 TEST_THREADS ?= 1
 BUILD_STD_TEST = $(BUILD_STD)
 
@@ -88,6 +90,7 @@ test:
 	-Z panic-abort-tests \
 	--target $(TARGET) \
 	--release \
+	$(TEST_PKG) \
 	$(TEST_FILTER) \
 	-- \
 	--color always \
@@ -118,6 +121,7 @@ test-one:
 	-Z panic-abort-tests \
 	--target $(TARGET) \
 	--release \
+	$(TEST_PKG) \
 	-- \
 	--color always \
 	--nocapture \
@@ -136,6 +140,7 @@ test-list:
 	-Z panic-abort-tests \
 	--target $(TARGET) \
 	--release \
+	$(TEST_PKG) \
 	-- \
 	--list
 
@@ -152,6 +157,7 @@ test-time:
 	-Z panic-abort-tests \
 	--target $(TARGET) \
 	--release \
+	$(TEST_PKG) \
 	$(TEST_FILTER) \
 	-- \
 	-Z unstable-options \

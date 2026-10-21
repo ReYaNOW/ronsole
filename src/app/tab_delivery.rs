@@ -526,16 +526,23 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             };
-            let terminal = Terminal::spawn(None, 1, launch);
+            let terminal = Terminal::spawn(
+                None,
+                1,
+                launch,
+                crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            );
             let token = terminal.tab_token().to_owned();
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
-                let ready = crate::platform::lock_recover(&terminal.grid)
-                    .lines
-                    .iter()
-                    .flat_map(|line| line.iter().map(|cell| cell.c))
-                    .collect::<String>()
-                    .contains("__READY__");
+                let ready = {
+                    let grid = crate::platform::lock_recover(&terminal.grid);
+                    (0..grid.rows())
+                        .filter_map(|y| grid.visible_row(y))
+                        .flat_map(|line| line.iter().map(|cell| cell.ch()))
+                        .collect::<String>()
+                        .contains("__READY__")
+                };
                 if ready && root.join("out").exists() {
                     break;
                 }
@@ -724,8 +731,15 @@ mod tests {
         let reply = fx.send_own(TabInputKind::Line, [0; 16], LINE, 0);
         {
             let mut grid = crate::platform::lock_recover(&fx.app.terminals[0].grid);
-            let row = grid.lines.len() - 3;
-            grid.lines[row][2].c = 'x';
+            let row = grid.scrollback_len() + grid.rows() - 3;
+            let cell = ronsole_term::Cell::new_for_test(
+                'x',
+                ronsole_term::TerminalColor::default_foreground(),
+                ronsole_term::TerminalColor::default_background(),
+                ronsole_term::CellFlags::empty(),
+                ronsole_term::UnderlineStyle::None,
+            );
+            grid.set_cell_for_test(row, 2, cell);
         }
         fx.advance(100);
         assert_eq!(reply.try_recv(), Ok(TabInputCode::InputBoxUnavailable));

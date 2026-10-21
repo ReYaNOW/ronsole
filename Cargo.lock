@@ -876,16 +876,24 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "resvg",
+ "ronsole-term",
  "rustc-hash",
  "sha2",
  "swash",
  "tiny-skia",
  "unicode-width",
- "vte",
  "wayland-client",
  "wayland-cursor",
  "wayland-protocols",
  "xkbcommon-dl",
+]
+
+[[package]]
+name = "ronsole-term"
+version = "0.1.0"
+dependencies = [
+ "unicode-width",
+ "vte",
 ]
 
 [[package]]

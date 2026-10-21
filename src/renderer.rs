@@ -1,7 +1,7 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
     SettingsHit, SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
-    terminal_scrollbar_drag_target,
+    terminal_palette, terminal_scrollbar_drag_target,
 };
 use glow::HasContext;
 use rustc_hash::FxHashMap;
@@ -1410,11 +1410,6 @@ fn default_emoji_presentation(c: char) -> bool {
             | 0x1F000..=0x1FAFF
             | 0x1FC00..=0x1FFFF
     )
-}
-
-#[inline(always)]
-pub(crate) fn terminal_force_text_presentation(c: char) -> bool {
-    matches!(c, '✔' | '✓')
 }
 
 fn parse_graphics_version(version: &str) -> Option<(u8, u8)> {

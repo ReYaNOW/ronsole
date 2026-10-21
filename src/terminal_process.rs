@@ -1,6 +1,6 @@
 use crate::launch::TerminalLaunchSpec;
 use crate::platform::{self, ProcessTree};
-use crate::terminal::TermGrid;
+use ronsole_term::{TERMINAL_TITLE_MAX_BYTES, Term, TermSink};
 use crate::wake::WakeHandle;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::ffi::{OsStr, OsString};
@@ -13,7 +13,6 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use vte::Parser;
 
 const INITIAL_COLS: u16 = 200;
 const INITIAL_ROWS: u16 = 60;
@@ -31,7 +30,6 @@ pub(crate) const TERMINAL_REPLY_QUEUE_CAPACITY: usize = 32;
 pub(crate) const TERMINAL_CLEANUP_QUEUE_CAPACITY: usize = 16;
 const TERMINAL_READ_BUFFER_SIZE: usize = 65_536;
 const TERMINAL_EXIT_BEFORE_OUTPUT: &[u8] = b"Ronsole terminal exited before producing output\r\n";
-pub(crate) const TERMINAL_TITLE_MAX_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProgrammedTerminalTitle {
@@ -317,7 +315,7 @@ impl Drop for TerminalCleanupWorker {
 
 impl TerminalProcess {
     pub(crate) fn spawn(
-        grid: Arc<Mutex<TermGrid>>,
+        grid: Arc<Mutex<Term>>,
         bridge_screen_lock: Arc<Mutex<()>>,
         title_cache: TerminalTitleCache,
         wake: Option<WakeHandle>,
@@ -372,7 +370,7 @@ impl TerminalProcess {
 
         let (title_stop_tx, title_worker) = match install_terminal_title_refresh(
             master_pty.clone(),
-            title_cache,
+            title_cache.clone(),
             process_title,
             cwd,
             wake.clone(),
@@ -393,6 +391,7 @@ impl TerminalProcess {
             reader,
             writer.clone(),
             wake,
+            title_cache,
         ) {
             let _ = title_stop_tx.send(());
             platform::reap_unit_thread(title_worker);
@@ -572,45 +571,6 @@ impl Drop for TerminalProcess {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-pub(crate) fn terminal_programmed_title(parts: &[&[u8]]) -> Option<String> {
-    let capacity = parts
-        .iter()
-        .fold(parts.len().saturating_sub(1), |total, part| {
-            total.saturating_add(part.len())
-        })
-        .min(TERMINAL_TITLE_MAX_BYTES);
-    let mut title = String::with_capacity(capacity);
-
-    'parts: for (index, part) in parts.iter().enumerate() {
-        if index != 0 {
-            if title.len() == TERMINAL_TITLE_MAX_BYTES {
-                break;
-            }
-            title.push(';');
-        }
-        let part = std::str::from_utf8(part).ok()?;
-        for ch in part.chars() {
-            if ch.is_control() {
-                continue;
-            }
-            if title.len() + ch.len_utf8() > TERMINAL_TITLE_MAX_BYTES {
-                break 'parts;
-            }
-            title.push(ch);
-        }
-    }
-
-    let first_non_whitespace = title
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))?;
-    let trimmed_len = title.trim_end().len();
-    title.truncate(trimmed_len);
-    if first_non_whitespace != 0 {
-        title.drain(..first_non_whitespace);
-    }
-    (!title.is_empty()).then_some(title)
 }
 
 fn bounded_terminal_title(text: &str) -> String {
@@ -877,16 +837,41 @@ fn install_terminal_title_refresh(
     Ok((stop_tx, worker))
 }
 
+/// Host side of the [`Term`] events: replies go to the PTY writer queue and
+/// programmed titles go to the shared title cache.
+pub(crate) struct SessionSink<'a> {
+    pub(crate) reply_tx: Option<&'a SyncSender<Vec<u8>>>,
+    pub(crate) title_cache: Option<&'a TerminalTitleCache>,
+}
+
+impl TermSink for SessionSink<'_> {
+    fn reply(&mut self, bytes: &[u8]) {
+        if let Some(tx) = self.reply_tx {
+            let _ = tx.try_send(bytes.to_vec());
+        }
+    }
+
+    fn title(&mut self, title: &str) {
+        if let Some(cache) = self.title_cache {
+            platform::lock_recover(cache).set_programmed(title.to_owned());
+        }
+    }
+
+    fn clipboard_set(&mut self, _text: String) {}
+
+    fn working_directory(&mut self, _host: &str, _path: &[u8]) {}
+}
+
 fn advance_terminal_output_batch(
-    parser: &mut Parser,
-    grid: &mut TermGrid,
+    grid: &mut Term,
+    sink: &mut SessionSink<'_>,
     chunks: &[OutputChunk],
+    now: Instant,
 ) {
     for chunk in chunks {
-        parser.advance(grid, &chunk.bytes[..chunk.len]);
+        grid.advance(&chunk.bytes[..chunk.len], now, sink);
     }
-    grid.content_generation = grid.content_generation.wrapping_add(1);
-    grid.dirty = true;
+    grid.mark_changed();
 }
 
 #[inline]
@@ -911,13 +896,22 @@ fn terminal_output_batch_receive_timeout(elapsed: Duration) -> Option<Duration> 
         .map(|remaining| remaining.min(TERMINAL_OUTPUT_BATCH_IDLE))
 }
 
-fn finish_terminal_output_stream(parser: &mut Parser, grid: &mut TermGrid) -> bool {
-    if grid.presentation_ready {
+fn finish_terminal_output_stream(
+    grid: &mut Term,
+    sink: &mut SessionSink<'_>,
+    now: Instant,
+) -> bool {
+    if grid.presentation_ready() {
         return false;
     }
 
-    parser.advance(grid, TERMINAL_EXIT_BEFORE_OUTPUT);
-    grid.content_generation = grid.content_generation.wrapping_add(1);
+    grid.advance(TERMINAL_EXIT_BEFORE_OUTPUT, now, sink);
+    // Only the content generation moves here; `dirty` keeps its prior value.
+    let was_dirty = grid.dirty();
+    grid.mark_changed();
+    if !was_dirty {
+        grid.set_dirty(false);
+    }
     true
 }
 
@@ -942,11 +936,12 @@ fn terminal_reply_channel() -> (
 }
 
 fn install_terminal_io_threads(
-    grid: &Arc<Mutex<TermGrid>>,
+    grid: &Arc<Mutex<Term>>,
     bridge_screen_lock: Arc<Mutex<()>>,
     reader: Box<dyn Read + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     wake: Option<WakeHandle>,
+    title_cache: TerminalTitleCache,
 ) -> io::Result<()> {
     let (reply_tx, reply_rx) = terminal_reply_channel();
     let (tx, rx) = std::sync::mpsc::sync_channel::<OutputChunk>(TERMINAL_OUTPUT_QUEUE_CAPACITY);
@@ -958,7 +953,6 @@ fn install_terminal_io_threads(
     let parser_bridge_screen_lock = bridge_screen_lock;
     let parser_reader_finished = reader_finished.clone();
     platform::spawn_named("ronsole-terminal-parser", move || {
-        let mut parser = Parser::new();
         let wake_main_loop = || {
             if let Some(wake) = wake.as_ref() {
                 wake.wake();
@@ -989,7 +983,11 @@ fn install_terminal_io_threads(
                 {
                     let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
                     let mut grid = platform::lock_recover(&parser_grid);
-                    advance_terminal_output_batch(&mut parser, &mut grid, &batch);
+                    let mut sink = SessionSink {
+                        reply_tx: Some(&reply_tx),
+                        title_cache: Some(&title_cache),
+                    };
+                    advance_terminal_output_batch(&mut grid, &mut sink, &batch, Instant::now());
                 }
                 recycle_output_chunks(&mut batch, &recycle_tx);
 
@@ -1022,7 +1020,11 @@ fn install_terminal_io_threads(
         if parser_reader_finished.load(Ordering::Acquire) {
             let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
             let mut grid = platform::lock_recover(&parser_grid);
-            if finish_terminal_output_stream(&mut parser, &mut grid) {
+            let mut sink = SessionSink {
+                reply_tx: Some(&reply_tx),
+                title_cache: Some(&title_cache),
+            };
+            if finish_terminal_output_stream(&mut grid, &mut sink, Instant::now()) {
                 drop(grid);
                 wake_main_loop();
             }
@@ -1080,7 +1082,6 @@ fn install_terminal_io_threads(
         )
     })?;
 
-    platform::lock_recover(grid).reply_tx = Some(reply_tx);
     Ok(())
 }
 
@@ -1368,12 +1369,35 @@ mod tests {
         }
     }
 
-    fn parser_grid() -> (TermGrid, TerminalTitleCache) {
+    fn test_term(cols: usize, rows: usize) -> Term {
+        Term::new(ronsole_term::TermConfig {
+            cols,
+            rows,
+            scrollback_lines: 10_000,
+            identity: ronsole_term::TermIdentity {
+                name: "ronsole-test",
+                version: "0",
+            },
+            palette: ronsole_term::TermPalette {
+                foreground: ronsole_term::Rgb {
+                    r: 0xe5,
+                    g: 0xe5,
+                    b: 0xe5,
+                },
+                background: ronsole_term::Rgb { r: 0, g: 0, b: 0 },
+                cursor: ronsole_term::Rgb {
+                    r: 0xe5,
+                    g: 0xe5,
+                    b: 0xe5,
+                },
+                ansi: [ronsole_term::Rgb { r: 0, g: 0, b: 0 }; 16],
+            },
+        })
+    }
+
+    fn parser_grid() -> (Term, TerminalTitleCache) {
         let cache = Arc::new(Mutex::new(TerminalTitleState::new("fallback".to_string())));
-        (
-            TermGrid::new_with_title_cache(8, 2, cache.clone()),
-            cache,
-        )
+        (test_term(8, 2), cache)
     }
 
     fn process_snapshot(program: &str, cwd: &str, args: &[&str]) -> platform::ProcessSnapshot {
@@ -1682,23 +1706,29 @@ mod tests {
 
     #[test]
     fn terminal_presentation_waits_for_displayable_output_without_timeout_fallback() {
-        let mut grid = TermGrid::new(24, 3);
-        let mut parser = Parser::new();
+        let mut grid = test_term(24, 3);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        let now = Instant::now();
 
-        assert!(!grid.presentation_ready);
+        assert!(!grid.presentation_ready());
         advance_terminal_output_batch(
-            &mut parser,
             &mut grid,
+            &mut sink,
             &[output_chunk(b"\x1b[?25l\x1b[2J\r\n\t   \x1b[?25h")],
+            now,
         );
-        assert!(!grid.presentation_ready);
+        assert!(!grid.presentation_ready());
 
         advance_terminal_output_batch(
-            &mut parser,
             &mut grid,
+            &mut sink,
             &[output_chunk(b"\x1b[32muser@host> \x1b[0m")],
+            now,
         );
-        assert!(grid.presentation_ready);
+        assert!(grid.presentation_ready());
 
         let source = include_str!("terminal_process.rs");
         let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
@@ -1708,27 +1738,36 @@ mod tests {
 
     #[test]
     fn terminal_stream_end_before_displayable_output_shows_explicit_state_once() {
-        let mut grid = TermGrid::new(64, 3);
-        let mut parser = Parser::new();
+        let mut grid = test_term(64, 3);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        let now = Instant::now();
         advance_terminal_output_batch(
-            &mut parser,
             &mut grid,
+            &mut sink,
             &[output_chunk(b"\x1b[?25l\x1b[2J\r\n")],
+            now,
         );
-        assert!(!grid.presentation_ready);
+        assert!(!grid.presentation_ready());
 
-        assert!(finish_terminal_output_stream(&mut parser, &mut grid));
-        assert!(grid.presentation_ready);
-        let text = grid
-            .lines
-            .iter()
-            .flat_map(|line| line.iter().map(|cell| cell.c))
+        assert!(finish_terminal_output_stream(&mut grid, &mut sink, now));
+        assert!(grid.presentation_ready());
+        let text = (0..grid.total_rows())
+            .filter_map(|row| grid.row(row))
+            .flat_map(|line| line.iter().map(|cell| cell.ch()))
             .collect::<String>();
         assert!(text.contains("Ronsole terminal exited before producing output"));
 
-        let lines = grid.lines.clone();
-        assert!(!finish_terminal_output_stream(&mut parser, &mut grid));
-        assert!(grid.lines == lines);
+        let rows_snapshot = |term: &Term| {
+            (0..term.total_rows())
+                .filter_map(|row| term.row(row).map(|line| line.to_vec()))
+                .collect::<Vec<_>>()
+        };
+        let lines = rows_snapshot(&grid);
+        assert!(!finish_terminal_output_stream(&mut grid, &mut sink, now));
+        assert!(rows_snapshot(&grid) == lines);
     }
 
     #[test]
@@ -1804,27 +1843,35 @@ mod tests {
     }
 
     #[test]
-    fn osc_titles_are_control_safe_bounded_and_shared_with_grid() {
+    fn osc_title_reaches_shared_cache_through_sink() {
         let (mut grid, cache) = parser_grid();
-        let mut parser = Parser::new();
-        parser.advance(&mut grid, b"\x1b]0;~ : htop\x07");
+        let now = Instant::now();
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: Some(&cache),
+        };
+        grid.advance(b"\x1b]0;~ : htop\x07", now, &mut sink);
         assert_eq!(resolved_title(&platform::lock_recover(&cache)), "~ : htop");
 
-        parser.advance(&mut grid, b"\x1b]2;bin : sleep\x1b\\");
+        grid.advance(b"\x1b]2;bin : sleep\x1b\\", now, &mut sink);
         assert_eq!(resolved_title(&platform::lock_recover(&cache)), "bin : sleep");
+    }
 
-        assert_eq!(terminal_programmed_title(&[b"\xff"]), None);
-        assert_eq!(
-            terminal_programmed_title(&[b"  safe\n\0title  "]).as_deref(),
-            Some("safetitle")
+    #[test]
+    fn reply_from_sink_reaches_writer_while_writer_drains() {
+        let mut grid = test_term(8, 2);
+        let (reply_tx, reply_rx) = terminal_reply_channel();
+        let mut sink = SessionSink {
+            reply_tx: Some(&reply_tx),
+            title_cache: None,
+        };
+        advance_terminal_output_batch(
+            &mut grid,
+            &mut sink,
+            &[output_chunk(b"\x1b[c")],
+            Instant::now(),
         );
-        let huge = "x".repeat(TERMINAL_TITLE_MAX_BYTES * 8);
-        let sequence = format!("\x1b]2;{huge}\x07");
-        parser.advance(&mut grid, sequence.as_bytes());
-        assert_eq!(
-            resolved_title(&platform::lock_recover(&cache)).len(),
-            TERMINAL_TITLE_MAX_BYTES
-        );
+        assert_eq!(reply_rx.try_recv().unwrap(), b"\x1b[?62c".to_vec());
     }
 
     #[test]

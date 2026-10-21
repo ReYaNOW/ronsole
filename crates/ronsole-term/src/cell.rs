@@ -3,104 +3,74 @@ use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 use vte::Params;
 
-pub(crate) const ANSI_16_COLORS: [[f32; 4]; 16] = [
-    [0.10, 0.10, 0.10, 1.0],
-    [0.95, 0.30, 0.30, 1.0],
-    [0.30, 0.85, 0.30, 1.0],
-    [0.90, 0.85, 0.20, 1.0],
-    [0.30, 0.60, 1.00, 1.0],
-    [0.90, 0.35, 0.90, 1.0],
-    [0.20, 0.85, 0.85, 1.0],
-    [0.90, 0.90, 0.90, 1.0],
-    [0.45, 0.45, 0.45, 1.0],
-    [1.00, 0.40, 0.40, 1.0],
-    [0.40, 1.00, 0.40, 1.0],
-    [1.00, 1.00, 0.40, 1.0],
-    [0.50, 0.70, 1.00, 1.0],
-    [1.00, 0.50, 1.00, 1.0],
-    [0.40, 1.00, 1.00, 1.0],
-    [1.00, 1.00, 1.00, 1.0],
-];
+use crate::color::TerminalColor;
 
-const TRUECOLOR_TAG: u32 = 1 << 24;
-const DEFAULT_FOREGROUND_TAG: u32 = 1 << 25;
-const DEFAULT_BACKGROUND_TAG: u32 = 1 << 26;
+pub const CELL_PRESENTATION_AUTO: u8 = 0;
+pub const CELL_PRESENTATION_TEXT: u8 = 1;
+pub const CELL_PRESENTATION_EMOJI: u8 = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub(crate) struct TerminalColor(u32);
+/// Style flags of a [`Cell`]. The underline style is kept in a separate
+/// 3-bit field and is read through [`Cell::underline`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellFlags(u16);
 
-impl TerminalColor {
-    pub(crate) const fn indexed(index: u8) -> Self {
-        Self(index as u32)
+impl CellFlags {
+    pub const WIDE: CellFlags = CellFlags(1 << 0);
+    pub const WIDE_SPACER: CellFlags = CellFlags(1 << 1);
+    pub const INVERSE: CellFlags = CellFlags(1 << 2);
+    pub const BOLD: CellFlags = CellFlags(1 << 3);
+    pub const DIM: CellFlags = CellFlags(1 << 4);
+    /// Drawn as blank; set only by the host. Any write to the cell clears it,
+    /// so rewritten content is never hidden.
+    pub const HOST_HIDDEN: CellFlags = CellFlags(1 << 5);
+    pub const ITALIC: CellFlags = CellFlags(1 << 6);
+    pub const STRIKE: CellFlags = CellFlags(1 << 7);
+    pub const CONCEAL: CellFlags = CellFlags(1 << 8);
+
+    pub const fn empty() -> Self {
+        Self(0)
     }
 
-    pub(crate) const fn rgb(red: u8, green: u8, blue: u8) -> Self {
-        Self(TRUECOLOR_TAG | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32)
-    }
-
-    pub(crate) const fn default_foreground() -> Self {
-        Self(DEFAULT_FOREGROUND_TAG)
-    }
-
-    pub(crate) const fn default_background() -> Self {
-        Self(DEFAULT_BACKGROUND_TAG)
-    }
-
-    pub(crate) const fn indexed_value(self) -> Option<u8> {
-        if self.0 <= u8::MAX as u32 {
-            Some(self.0 as u8)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) const fn rgb_value(self) -> Option<(u8, u8, u8)> {
-        if self.0 & TRUECOLOR_TAG == 0 {
-            None
-        } else {
-            Some((
-                ((self.0 >> 16) & 0xff) as u8,
-                ((self.0 >> 8) & 0xff) as u8,
-                (self.0 & 0xff) as u8,
-            ))
-        }
-    }
-
-    pub(crate) const fn is_default_foreground(self) -> bool {
-        self.0 == DEFAULT_FOREGROUND_TAG
-    }
-
-    pub(crate) const fn is_default_background(self) -> bool {
-        self.0 == DEFAULT_BACKGROUND_TAG
+    pub const fn contains(self, other: CellFlags) -> bool {
+        self.0 & other.0 == other.0
     }
 }
 
-impl Default for TerminalColor {
-    fn default() -> Self {
-        Self::indexed(0)
+impl std::ops::BitOr for CellFlags {
+    type Output = CellFlags;
+
+    fn bitor(self, rhs: CellFlags) -> CellFlags {
+        CellFlags(self.0 | rhs.0)
     }
 }
 
-impl PartialEq<u8> for TerminalColor {
-    fn eq(&self, other: &u8) -> bool {
-        self.indexed_value() == Some(*other)
-    }
+const UNDERLINE_SHIFT: u16 = 9;
+const UNDERLINE_MASK: u16 = 0b111 << UNDERLINE_SHIFT;
+const WIDE_FLAGS: u16 = CellFlags::WIDE.0 | CellFlags::WIDE_SPACER.0;
+
+/// Underline style of a cell, set by SGR 4 and cleared by SGR 24.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UnderlineStyle {
+    #[default]
+    None = 0,
+    Single = 1,
+    Double = 2,
+    Curly = 3,
+    Dotted = 4,
+    Dashed = 5,
 }
 
-pub(crate) const CELL_PRESENTATION_AUTO: u8 = 0;
-pub(crate) const CELL_PRESENTATION_TEXT: u8 = 1;
-pub(crate) const CELL_PRESENTATION_EMOJI: u8 = 2;
+/// OSC 8 hyperlink target attached to a cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hyperlink {
+    pub id: Option<Box<str>>,
+    pub uri: Box<str>,
+}
 
-const CELL_FLAG_WIDE: u8 = 1 << 0;
-const CELL_FLAG_WIDE_SPACER: u8 = 1 << 1;
-const CELL_FLAG_INVERSE: u8 = 1 << 2;
-const CELL_FLAG_UNDERLINE: u8 = 1 << 3;
-const CELL_FLAG_DIM: u8 = 1 << 4;
-/// Drawn as blank; set only by `Terminal::observe_dev_channel_banner`. Any
-/// write to the cell clears it, so rewritten content is never hidden.
-const CELL_FLAG_HIDDEN: u8 = 1 << 5;
-pub(crate) const TERMINAL_CELL_EXTRA_MAX_CHARS: usize = 24;
+/// Maximum number of zero-width characters stored in one cell's extra data;
+/// further ones are dropped by `Cell::push_zero_width`.
+pub const TERMINAL_CELL_EXTRA_MAX_CHARS: usize = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CellExtra {
@@ -109,11 +79,11 @@ struct CellExtra {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
-    pub c: char,
-    pub(crate) fg: TerminalColor,
-    pub(crate) bg: TerminalColor,
-    pub presentation: u8,
-    flags: u8,
+    c: char,
+    fg: TerminalColor,
+    bg: TerminalColor,
+    presentation: u8,
+    flags: CellFlags,
     extra: Option<Arc<CellExtra>>,
 }
 
@@ -124,29 +94,117 @@ impl Default for Cell {
             fg: TerminalColor::default_foreground(),
             bg: TerminalColor::default_background(),
             presentation: CELL_PRESENTATION_AUTO,
-            flags: 0,
+            flags: CellFlags::empty(),
             extra: None,
         }
     }
 }
 
+fn underline_bits(style: UnderlineStyle) -> u16 {
+    (style as u16) << UNDERLINE_SHIFT
+}
+
 impl Cell {
+    /// Test constructor; the `test-support` feature exposes it to dependent crates.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test(
+        c: char,
+        fg: TerminalColor,
+        bg: TerminalColor,
+        flags: CellFlags,
+        underline: UnderlineStyle,
+    ) -> Self {
+        Self {
+            c,
+            fg,
+            bg,
+            presentation: CELL_PRESENTATION_AUTO,
+            flags: CellFlags(flags.0 | underline_bits(underline)),
+            extra: None,
+        }
+    }
+
+    pub fn ch(&self) -> char {
+        self.c
+    }
+
+    pub fn fg(&self) -> TerminalColor {
+        self.fg
+    }
+
+    pub fn bg(&self) -> TerminalColor {
+        self.bg
+    }
+
+    pub fn presentation(&self) -> u8 {
+        self.presentation
+    }
+
+    pub fn flags(&self) -> CellFlags {
+        self.flags
+    }
+
+    pub fn underline(&self) -> UnderlineStyle {
+        match (self.flags.0 & UNDERLINE_MASK) >> UNDERLINE_SHIFT {
+            1 => UnderlineStyle::Single,
+            2 => UnderlineStyle::Double,
+            3 => UnderlineStyle::Curly,
+            4 => UnderlineStyle::Dotted,
+            5 => UnderlineStyle::Dashed,
+            _ => UnderlineStyle::None,
+        }
+    }
+
+    /// Underline colour is not stored yet; it is added with SGR 58 support.
+    pub fn underline_color(&self) -> Option<TerminalColor> {
+        None
+    }
+
+    /// Hyperlinks are not stored yet; OSC 8 support adds the storage.
+    pub fn hyperlink(&self) -> Option<&Arc<Hyperlink>> {
+        None
+    }
+
+    pub fn is_wide(&self) -> bool {
+        self.flags.contains(CellFlags::WIDE)
+    }
+
+    pub fn is_wide_spacer(&self) -> bool {
+        self.flags.contains(CellFlags::WIDE_SPACER)
+    }
+
+    pub fn is_inverse(&self) -> bool {
+        self.flags.contains(CellFlags::INVERSE)
+    }
+
+    pub fn is_dim(&self) -> bool {
+        self.flags.contains(CellFlags::DIM)
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.flags.contains(CellFlags::HOST_HIDDEN)
+    }
+
+    pub fn zero_width(&self) -> &[char] {
+        self.extra
+            .as_deref()
+            .map_or(&[], |extra| extra.zero_width.as_slice())
+    }
+
     pub(crate) fn blank_with_background(bg: TerminalColor) -> Self {
         Self { bg, ..Self::default() }
     }
 
-    pub(crate) fn set_char(
-        &mut self,
-        c: char,
-        fg: TerminalColor,
-        bg: TerminalColor,
-        wide: bool,
-    ) {
+    pub(crate) fn set_ch(&mut self, c: char) {
+        self.c = c;
+    }
+
+    pub(crate) fn set_char(&mut self, c: char, fg: TerminalColor, bg: TerminalColor, wide: bool) {
         self.c = c;
         self.fg = fg;
         self.bg = bg;
         self.presentation = CELL_PRESENTATION_AUTO;
-        self.flags = if wide { CELL_FLAG_WIDE } else { 0 };
+        self.flags = if wide { CellFlags::WIDE } else { CellFlags::empty() };
         self.extra = None;
     }
 
@@ -155,53 +213,31 @@ impl Cell {
         self.fg = fg;
         self.bg = bg;
         self.presentation = CELL_PRESENTATION_AUTO;
-        self.flags = CELL_FLAG_WIDE_SPACER;
+        self.flags = CellFlags::WIDE_SPACER;
         self.extra = None;
     }
 
-    pub(crate) fn is_wide(&self) -> bool {
-        self.flags & CELL_FLAG_WIDE != 0
+    pub(crate) fn set_presentation(&mut self, presentation: u8) {
+        self.presentation = presentation;
     }
 
-    pub(crate) fn is_wide_spacer(&self) -> bool {
-        self.flags & CELL_FLAG_WIDE_SPACER != 0
-    }
-
-    pub(crate) fn set_sgr_style(&mut self, inverse: bool, underline: bool, dim: bool) {
-        self.flags &= CELL_FLAG_WIDE | CELL_FLAG_WIDE_SPACER;
+    pub(crate) fn set_sgr_style(&mut self, inverse: bool, underline: UnderlineStyle, dim: bool) {
+        let mut bits = self.flags.0 & WIDE_FLAGS;
         if inverse {
-            self.flags |= CELL_FLAG_INVERSE;
+            bits |= CellFlags::INVERSE.0;
         }
-        if underline {
-            self.flags |= CELL_FLAG_UNDERLINE;
-        }
+        bits |= underline_bits(underline);
         if dim {
-            self.flags |= CELL_FLAG_DIM;
+            bits |= CellFlags::DIM.0;
         }
-    }
-
-    pub(crate) fn is_inverse(&self) -> bool {
-        self.flags & CELL_FLAG_INVERSE != 0
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_underlined(&self) -> bool {
-        self.flags & CELL_FLAG_UNDERLINE != 0
-    }
-
-    pub(crate) fn is_dim(&self) -> bool {
-        self.flags & CELL_FLAG_DIM != 0
-    }
-
-    pub(crate) fn is_hidden(&self) -> bool {
-        self.flags & CELL_FLAG_HIDDEN != 0
+        self.flags = CellFlags(bits);
     }
 
     pub(crate) fn set_hidden(&mut self, hidden: bool) {
         if hidden {
-            self.flags |= CELL_FLAG_HIDDEN;
+            self.flags = CellFlags(self.flags.0 | CellFlags::HOST_HIDDEN.0);
         } else {
-            self.flags &= !CELL_FLAG_HIDDEN;
+            self.flags = CellFlags(self.flags.0 & !CellFlags::HOST_HIDDEN.0);
         }
     }
 
@@ -217,13 +253,7 @@ impl Cell {
         Arc::make_mut(extra).zero_width.push(c);
     }
 
-    pub(crate) fn zero_width(&self) -> &[char] {
-        self.extra
-            .as_deref()
-            .map_or(&[], |extra| extra.zero_width.as_slice())
-    }
-
-    pub(crate) fn append_text_to(&self, output: &mut String) {
+    pub fn append_text_to(&self, output: &mut String) {
         if self.is_wide_spacer() {
             return;
         }
@@ -232,19 +262,10 @@ impl Cell {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum MouseTrackingMode {
-    #[default]
-    None,
-    Press,
-    ButtonMotion,
-    AnyMotion,
-}
-
-impl MouseTrackingMode {
-    pub(crate) const fn enabled(self) -> bool {
-        !matches!(self, Self::None)
-    }
+/// Glyphs the renderer always draws with text presentation (check marks).
+#[inline(always)]
+pub fn terminal_force_text_presentation(c: char) -> bool {
+    matches!(c, '✔' | '✓')
 }
 
 #[inline(always)]
@@ -277,53 +298,10 @@ pub(crate) fn terminal_char_width(c: char) -> usize {
 }
 
 #[inline(always)]
-pub(crate) fn terminal_should_render_zero_width(c: char) -> bool {
+pub fn terminal_should_render_zero_width(c: char) -> bool {
     !is_terminal_zero_width_format(c)
         && !terminal_is_emoji_modifier(c)
         && UnicodeWidthChar::width(c) == Some(0)
-}
-
-pub(crate) fn terminal_color_rgba(color: TerminalColor) -> [f32; 4] {
-    if color.is_default_foreground() {
-        return ANSI_16_COLORS[7];
-    }
-    if color.is_default_background() {
-        return ANSI_16_COLORS[0];
-    }
-    if let Some(index) = color.indexed_value() {
-        if index < 16 {
-            return ANSI_16_COLORS[index as usize];
-        }
-        if index < 232 {
-            let cube = index - 16;
-            let red = cube / 36;
-            let green = (cube % 36) / 6;
-            let blue = cube % 6;
-            let level = |component: u8| {
-                if component == 0 {
-                    0
-                } else {
-                    55 + component * 40
-                }
-            };
-            return rgb_rgba(level(red), level(green), level(blue));
-        }
-        let gray = 8 + (index - 232) * 10;
-        return rgb_rgba(gray, gray, gray);
-    }
-    let (red, green, blue) = color.rgb_value().unwrap_or((255, 255, 255));
-    rgb_rgba(red, green, blue)
-}
-
-#[inline]
-fn rgb_rgba(red: u8, green: u8, blue: u8) -> [f32; 4] {
-    const DENOMINATOR: f32 = 255.0;
-    [
-        red as f32 / DENOMINATOR,
-        green as f32 / DENOMINATOR,
-        blue as f32 / DENOMINATOR,
-        1.0,
-    ]
 }
 
 pub(crate) fn terminal_effective_foreground(
@@ -346,7 +324,7 @@ pub(crate) fn apply_ansi_sgr(
     bg: &mut TerminalColor,
     bold: &mut bool,
     dim: &mut bool,
-    underline: &mut bool,
+    underline: &mut UnderlineStyle,
     inverse: &mut bool,
 ) {
     if params.is_empty() {
@@ -354,7 +332,7 @@ pub(crate) fn apply_ansi_sgr(
         *bg = TerminalColor::default_background();
         *bold = false;
         *dim = false;
-        *underline = false;
+        *underline = UnderlineStyle::None;
         *inverse = false;
         return;
     }
@@ -370,18 +348,24 @@ pub(crate) fn apply_ansi_sgr(
                 *bg = TerminalColor::default_background();
                 *bold = false;
                 *dim = false;
-                *underline = false;
+                *underline = UnderlineStyle::None;
                 *inverse = false;
             }
             1 => *bold = true,
             2 => *dim = true,
-            4 => *underline = param.get(1).copied() != Some(0),
+            4 => {
+                *underline = if param.get(1).copied() == Some(0) {
+                    UnderlineStyle::None
+                } else {
+                    UnderlineStyle::Single
+                }
+            }
             7 => *inverse = true,
             22 => {
                 *bold = false;
                 *dim = false;
             }
-            24 => *underline = false,
+            24 => *underline = UnderlineStyle::None,
             27 => *inverse = false,
             30..=37 => *fg = TerminalColor::indexed((value - 30) as u8),
             40..=47 => *bg = TerminalColor::indexed((value - 40) as u8),
@@ -474,15 +458,22 @@ mod tests {
             action: char,
         ) {
             if action == 'm' {
+                // The probe keeps a bool; the style is mapped in and out around the call.
+                let mut underline = if self.underline {
+                    UnderlineStyle::Single
+                } else {
+                    UnderlineStyle::None
+                };
                 apply_ansi_sgr(
                     params,
                     &mut self.fg,
                     &mut self.bg,
                     &mut self.bold,
                     &mut self.dim,
-                    &mut self.underline,
+                    &mut underline,
                     &mut self.inverse,
                 );
+                self.underline = underline != UnderlineStyle::None;
             }
         }
     }
@@ -580,45 +571,72 @@ mod tests {
             TerminalColor::indexed(4),
             true,
         );
-        cell.set_sgr_style(true, true, true);
+        cell.set_sgr_style(true, UnderlineStyle::Single, true);
         assert!(cell.is_wide());
         assert!(cell.is_inverse());
-        assert!(cell.is_underlined());
+        assert!(cell.underline() == UnderlineStyle::Single);
         assert!(cell.is_dim());
         assert!(std::mem::size_of::<Cell>() <= 24);
 
         let blank = Cell::blank_with_background(TerminalColor::indexed(1));
-        assert_eq!(blank.c, ' ');
-        assert_eq!(blank.bg, TerminalColor::indexed(1));
-        assert!(blank.fg.is_default_foreground());
+        assert_eq!(blank.ch(), ' ');
+        assert_eq!(blank.bg(), TerminalColor::indexed(1));
+        assert!(blank.fg().is_default_foreground());
         assert!(!blank.is_inverse());
-        assert!(!blank.is_underlined());
+        assert!(blank.underline() == UnderlineStyle::None);
         assert!(!blank.is_dim());
     }
 
     #[test]
-    fn xterm_palette_mapping_covers_cube_and_grayscale() {
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(16)), [0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(231)), [1.0, 1.0, 1.0, 1.0]);
-        let gray = terminal_color_rgba(TerminalColor::indexed(232));
-        assert!((gray[0] - 8.0 / 255.0).abs() < f32::EPSILON);
-        assert_eq!(gray[0], gray[1]);
-        assert_eq!(gray[1], gray[2]);
+    fn cell_size_fits_24_bytes() {
+        assert!(std::mem::size_of::<Cell>() <= 24);
+    }
+
+    struct UnderlineProbe {
+        underline: UnderlineStyle,
+    }
+
+    impl Perform for UnderlineProbe {
+        fn csi_dispatch(
+            &mut self,
+            params: &Params,
+            _intermediates: &[u8],
+            _ignore: bool,
+            action: char,
+        ) {
+            if action == 'm' {
+                let mut fg = TerminalColor::default_foreground();
+                let mut bg = TerminalColor::default_background();
+                let (mut bold, mut dim, mut inverse) = (false, false, false);
+                apply_ansi_sgr(
+                    params,
+                    &mut fg,
+                    &mut bg,
+                    &mut bold,
+                    &mut dim,
+                    &mut self.underline,
+                    &mut inverse,
+                );
+            }
+        }
     }
 
     #[test]
-    fn default_background_is_distinct_from_explicit_ansi_black() {
-        let cell = Cell::default();
-        assert!(cell.bg.is_default_background());
-        assert!(!TerminalColor::indexed(0).is_default_background());
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(0)), ANSI_16_COLORS[0]);
+    fn sgr_underline_sets_single_style() {
+        let mut probe = UnderlineProbe {
+            underline: UnderlineStyle::None,
+        };
+        Parser::new().advance(&mut probe, b"\x1b[4m");
+        assert_eq!(probe.underline, UnderlineStyle::Single);
+        Parser::new().advance(&mut probe, b"\x1b[24m");
+        assert_eq!(probe.underline, UnderlineStyle::None);
     }
 
     #[test]
     fn ordinary_cells_keep_rare_unicode_storage_out_of_line() {
         let cell = Cell::default();
-        assert!(cell.zero_width().is_empty());
         assert!(cell.extra.is_none());
+        assert!(cell.zero_width().is_empty());
         assert!(std::mem::size_of::<Cell>() <= 24);
     }
 

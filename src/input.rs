@@ -5,6 +5,9 @@ use crate::platform::Clipboard;
 use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target};
 use crate::search::{SearchRefreshCause, TerminalSearchHit, TerminalSearchState};
 use crate::terminal::{MouseTrackingMode, Terminal};
+use ronsole_term::{
+    MouseButton, MouseEventKind, Term, bracketed_paste_bytes, mouse_report,
+};
 use std::path::{Path, PathBuf};
 
 pub(crate) struct TerminalInteraction {
@@ -129,10 +132,10 @@ impl TerminalInteraction {
         if self.search.owns_grid_selection() {
             return false;
         }
-        crate::platform::lock_recover(&terminal.grid)
-            .selection
-            .take()
-            .is_some()
+        let mut term = crate::platform::lock_recover(&terminal.grid);
+        let had_selection = term.selection().is_some();
+        term.set_selection(None);
+        had_selection
     }
 
     pub(crate) fn terminal_selection_active(&self) -> bool {
@@ -229,11 +232,12 @@ impl TerminalInteraction {
             return false;
         };
         let next = (anchor_x, anchor_y, cell_x, cell_y);
-        if grid.selection.is_none() && (cell_x, cell_y) == (anchor_x, anchor_y) {
+        let selection = grid.selection();
+        if selection.is_none() && (cell_x, cell_y) == (anchor_x, anchor_y) {
             return false;
         }
-        if grid.selection != Some(next) {
-            grid.selection = Some(next);
+        if selection != Some(next) {
+            grid.set_selection(Some(next));
             return true;
         }
         false
@@ -245,10 +249,10 @@ impl TerminalInteraction {
         }
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         if grid
-            .selection
+            .selection()
             .is_some_and(|(sx, sy, ex, ey)| sx == ex && sy == ey)
         {
-            grid.selection = None;
+            grid.set_selection(None);
         }
         self.terminal_selection_anchor = None;
     }
@@ -298,11 +302,7 @@ impl TerminalInteraction {
         let Some(found) = self.search.set_active_grid_selection(&mut grid) else {
             return;
         };
-        let total_lines = if grid.is_alt {
-            grid.lines.len()
-        } else {
-            grid.scrollback.len() + grid.lines.len()
-        };
+        let total_lines = grid.total_rows();
         let offset_from_bottom = total_lines.saturating_sub(1).saturating_sub(found.y);
         let target = offset_from_bottom as f32 * self.layout.char_h;
         drop(grid);
@@ -313,7 +313,7 @@ impl TerminalInteraction {
 
     fn close_search(&mut self, terminal: &mut Terminal) {
         self.search.close();
-        crate::platform::lock_recover(&terminal.grid).selection = None;
+        crate::platform::lock_recover(&terminal.grid).set_selection(None);
     }
 
     fn handle_search_key(&mut self, key_event: &KeyInput, terminal: &mut Terminal) -> bool {
@@ -448,10 +448,10 @@ impl TerminalInteraction {
 
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyC) {
-            match terminal_ctrl_c_action(grid.selection.is_some()) {
+            match terminal_ctrl_c_action(grid.selection().is_some()) {
                 TerminalCtrlCAction::CopySelection => {
-                    let text = grid.get_selection_text();
-                    grid.selection = None;
+                    let text = grid.selection_text();
+                    grid.set_selection(None);
                     drop(grid);
                     if !text.is_empty()
                         && let Some(clipboard) = self.clipboard()
@@ -466,7 +466,7 @@ impl TerminalInteraction {
             }
             return true;
         }
-        let app_cursor = grid.app_cursor_keys;
+        let app_cursor = grid.app_cursor_keys();
         drop(grid);
         if let Some(bytes) =
             terminal_key_sequence(key_event.physical_key, shift, ctrl, alt, app_cursor)
@@ -551,7 +551,7 @@ impl TerminalInteraction {
         if self.pointer_capture == PointerCapture::None {
             let (mode, sgr) = {
                 let grid = crate::platform::lock_recover(&terminal.grid);
-                (grid.mouse_tracking_mode, grid.mouse_sgr)
+                (grid.mouse_tracking(), grid.mouse_sgr())
             };
             if let Some(sequence) = terminal_mouse_motion_sequence(
                 self.layout,
@@ -661,7 +661,7 @@ impl TerminalInteraction {
 
         let (tracking_mode, mouse_sgr) = {
             let grid = crate::platform::lock_recover(&terminal.grid);
-            (grid.mouse_tracking_mode, grid.mouse_sgr)
+            (grid.mouse_tracking(), grid.mouse_sgr())
         };
         let tracking = tracking_mode.enabled();
         if let Some(sequence) = terminal_mouse_event_sequence(
@@ -694,10 +694,10 @@ impl TerminalInteraction {
         if !self.layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
         let dy = terminal_wheel_delta(delta, self.layout.char_h, self.scroll_sensitivity);
         let grid = crate::platform::lock_recover(&terminal.grid);
-        let is_alt = grid.is_alt;
-        let tracking_mode = grid.mouse_tracking_mode;
-        let mouse_sgr = grid.mouse_sgr;
-        let app_cursor = grid.app_cursor_keys;
+        let is_alt = grid.is_alt_screen();
+        let tracking_mode = grid.mouse_tracking();
+        let mouse_sgr = grid.mouse_sgr();
+        let app_cursor = grid.app_cursor_keys();
         drop(grid);
         if tracking_mode.enabled() {
             if let Some(input) = terminal_mouse_wheel_sequence(
@@ -744,7 +744,7 @@ fn terminal_cell_at(
 
 fn terminal_cell_from_grid(
     layout: TerminalUiLayout,
-    grid: &crate::terminal::TermGrid,
+    grid: &Term,
     x: f32,
     y: f32,
     scroll_offset: f32,
@@ -771,11 +771,7 @@ fn terminal_cell_from_grid(
     } else {
         y
     };
-    let total_lines = if grid.is_alt {
-        grid.lines.len()
-    } else {
-        grid.scrollback.len() + grid.lines.len()
-    };
+    let total_lines = grid.total_rows();
     if total_lines == 0 {
         return None;
     }
@@ -786,15 +782,9 @@ fn terminal_cell_from_grid(
         .saturating_sub(1)
         .saturating_sub(offset_from_bottom.max(0.0).floor() as usize);
     let mut col = ((x - layout.text_x).max(0.0) / layout.char_w).floor() as usize;
-    col = col.min(grid.cols.saturating_sub(1));
+    col = col.min(grid.cols().saturating_sub(1));
     let row = row.min(total_lines.saturating_sub(1));
-    let row_cells = if grid.is_alt {
-        grid.lines.get(row)
-    } else if row < grid.scrollback.len() {
-        grid.scrollback.get(row)
-    } else {
-        grid.lines.get(row - grid.scrollback.len())
-    };
+    let row_cells = grid.row(row);
     if row_cells
         .and_then(|cells| cells.get(col))
         .is_some_and(crate::terminal::Cell::is_wide_spacer)
@@ -970,18 +960,18 @@ fn terminal_mouse_event_sequence(
     x: f32,
     y: f32,
 ) -> Option<Vec<u8>> {
-    if capture != PointerCapture::None || !tracking.enabled() {
+    if capture != PointerCapture::None {
         return None;
     }
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
-    let code = terminal_mouse_button_code(button)?;
-    Some(terminal_mouse_protocol_sequence(
-        code,
-        cell_x,
-        cell_y,
-        state == KeyState::Pressed,
-        sgr,
-    ))
+    let button = terminal_mouse_button(button)?;
+    let kind = if state == KeyState::Pressed {
+        MouseEventKind::Press(button)
+    } else {
+        MouseEventKind::Release(button)
+    };
+    // Protocol cells are one-based; the crate takes zero-based coordinates.
+    mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)
 }
 
 fn terminal_mouse_motion_sequence(
@@ -992,21 +982,11 @@ fn terminal_mouse_motion_sequence(
     x: f32,
     y: f32,
 ) -> Option<Vec<u8>> {
-    let base_code = match tracking {
-        MouseTrackingMode::AnyMotion if pressed_buttons == 0 => 3,
-        MouseTrackingMode::AnyMotion | MouseTrackingMode::ButtonMotion => {
-            terminal_first_pressed_button_code(pressed_buttons)?
-        }
-        MouseTrackingMode::None | MouseTrackingMode::Press => return None,
-    };
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
-    Some(terminal_mouse_protocol_sequence(
-        base_code + 32,
-        cell_x,
-        cell_y,
-        true,
-        sgr,
-    ))
+    let kind = MouseEventKind::Motion {
+        held: terminal_first_pressed_button(pressed_buttons),
+    };
+    mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)
 }
 
 fn terminal_mouse_wheel_sequence(
@@ -1017,13 +997,14 @@ fn terminal_mouse_wheel_sequence(
     y: f32,
     dy: f32,
 ) -> Option<Vec<u8>> {
-    if !tracking.enabled() {
-        return None;
-    }
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
     let steps = (dy.abs() / 20.0).max(1.0) as usize;
-    let button = if dy > 0.0 { 64 } else { 65 };
-    let sequence = terminal_mouse_protocol_sequence(button, cell_x, cell_y, true, sgr);
+    let kind = if dy > 0.0 {
+        MouseEventKind::WheelUp
+    } else {
+        MouseEventKind::WheelDown
+    };
+    let sequence = mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)?;
     let mut input = Vec::with_capacity(sequence.len().saturating_mul(steps.min(3)));
     for _ in 0..steps.min(3) {
         input.extend_from_slice(&sequence);
@@ -1031,41 +1012,23 @@ fn terminal_mouse_wheel_sequence(
     Some(input)
 }
 
-fn terminal_mouse_button_code(button: PointerButton) -> Option<u8> {
+fn terminal_mouse_button(button: PointerButton) -> Option<MouseButton> {
     match button {
-        PointerButton::Left => Some(0),
-        PointerButton::Middle => Some(1),
-        PointerButton::Right => Some(2),
+        PointerButton::Left => Some(MouseButton::Left),
+        PointerButton::Middle => Some(MouseButton::Middle),
+        PointerButton::Right => Some(MouseButton::Right),
         PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => None,
     }
 }
 
-fn terminal_mouse_protocol_sequence(
-    code: u8,
-    x: usize,
-    y: usize,
-    pressed: bool,
-    sgr: bool,
-) -> Vec<u8> {
-    if sgr {
-        return format!("\x1b[<{code};{x};{y}{}", if pressed { 'M' } else { 'm' }).into_bytes();
-    }
-    let legacy_code = if pressed { code } else { 3 };
-    vec![
-        0x1b,
-        b'[',
-        b'M',
-        legacy_code.saturating_add(32),
-        (x.min(223) as u8).saturating_add(32),
-        (y.min(223) as u8).saturating_add(32),
-    ]
-}
-
 fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: KeyState) {
-    let Some(code) = terminal_mouse_button_code(button) else {
-        return;
+    // Bit per button: left 1, middle 2, right 4.
+    let bit = match button {
+        PointerButton::Left => 1u8,
+        PointerButton::Middle => 2,
+        PointerButton::Right => 4,
+        PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => return,
     };
-    let bit = 1u8 << code;
     if state == KeyState::Pressed {
         *buttons |= bit;
     } else {
@@ -1073,13 +1036,13 @@ fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: 
     }
 }
 
-fn terminal_first_pressed_button_code(buttons: u8) -> Option<u8> {
+fn terminal_first_pressed_button(buttons: u8) -> Option<MouseButton> {
     if buttons & 1 != 0 {
-        Some(0)
+        Some(MouseButton::Left)
     } else if buttons & 2 != 0 {
-        Some(1)
+        Some(MouseButton::Middle)
     } else if buttons & 4 != 0 {
-        Some(2)
+        Some(MouseButton::Right)
     } else {
         None
     }
@@ -1102,21 +1065,8 @@ fn terminal_clipboard_paste_bytes(
 
 /// Delivers a paste payload as user input, wrapped when bracketed paste is on.
 fn write_terminal_paste(terminal: &mut Terminal, payload: Vec<u8>) {
-    let bracketed_paste = crate::platform::lock_recover(&terminal.grid).bracketed_paste;
-    terminal.write_user_input(&terminal_bracketed_paste_bytes(payload, bracketed_paste));
-}
-
-fn terminal_bracketed_paste_bytes(payload: Vec<u8>, enabled: bool) -> Vec<u8> {
-    if !enabled {
-        return payload;
-    }
-    const START: &[u8] = b"\x1b[200~";
-    const END: &[u8] = b"\x1b[201~";
-    let mut out = Vec::with_capacity(START.len() + payload.len() + END.len());
-    out.extend_from_slice(START);
-    out.extend_from_slice(&payload);
-    out.extend_from_slice(END);
-    out
+    let bracketed_paste = crate::platform::lock_recover(&terminal.grid).bracketed_paste();
+    terminal.write_user_input(&bracketed_paste_bytes(payload, bracketed_paste));
 }
 
 fn terminal_shell_escape_path(path: &Path, out: &mut Vec<u8>) {
@@ -1143,8 +1093,9 @@ fn terminal_key_sequence(
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
     let seq = match physical_key {
+        // Shift+Enter sends ESC CR like Alt+Enter, so TUIs (Claude Code, fish) insert a newline instead of submitting.
         PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
-            terminal_alt_prefixed(b"\r", alt)
+            terminal_alt_prefixed(b"\r", alt || shift)
         }
         PhysicalKey::Code(KeyCode::Backspace) if ctrl => terminal_alt_prefixed(b"\x17", alt),
         PhysicalKey::Code(KeyCode::Backspace) if shift => terminal_alt_prefixed(b"\x08", alt),
@@ -1280,6 +1231,12 @@ mod tests {
     fn terminal_encoder_keeps_plain_f1_and_ctrl_t_sequences() {
         assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F1), false, false, false, false), Some(b"\x1bOP".to_vec()));
         assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyT), false, true, false, false), Some(vec![0x14]));
+    }
+
+    #[test]
+    fn terminal_encoder_sends_esc_cr_for_shift_enter() {
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Enter), false, false, false, false), Some(b"\r".to_vec()));
+        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Enter), true, false, false, false), Some(b"\x1b\r".to_vec()));
     }
 
     #[test]
@@ -1638,18 +1595,18 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_text_and_shell_escaped_file_lists_through_one_path() {
         assert_eq!(
-            terminal_bracketed_paste_bytes(b"plain".to_vec(), false),
+            bracketed_paste_bytes(b"plain".to_vec(), false),
             b"plain"
         );
         assert_eq!(
-            terminal_bracketed_paste_bytes(b"plain".to_vec(), true),
+            bracketed_paste_bytes(b"plain".to_vec(), true),
             b"\x1b[200~plain\x1b[201~"
         );
 
         let paths = [PathBuf::from("/tmp/a b"), PathBuf::from("/tmp/界")];
         let payload = terminal_clipboard_paste_bytes(Some(&paths), Some("ignored")).unwrap();
         assert_eq!(
-            terminal_bracketed_paste_bytes(payload, true),
+            bracketed_paste_bytes(payload, true),
             "\u{1b}[200~/tmp/a\\ b /tmp/界\u{1b}[201~".as_bytes()
         );
     }
@@ -1672,9 +1629,15 @@ mod tests {
         interaction.mouse_x = 25.0;
         interaction.mouse_y = 400.0;
         {
-            let mut grid = crate::platform::lock_recover(&terminal.grid);
-            grid.mouse_tracking_mode = MouseTrackingMode::Press;
-            grid.mouse_sgr = true;
+            let mut term = crate::platform::lock_recover(&terminal.grid);
+            term.advance(
+                b"\x1b[?1000h\x1b[?1006h",
+                std::time::Instant::now(),
+                &mut crate::terminal_process::SessionSink {
+                    reply_tx: None,
+                    title_cache: None,
+                },
+            );
         }
         assert!(interaction.mouse_input(
             KeyState::Pressed,
@@ -1725,17 +1688,24 @@ mod tests {
             hold: false,
             bridge_launch_id: None,
         };
-        let mut terminal = Terminal::spawn(None, 1, launch);
+        let mut terminal = Terminal::spawn(
+            None,
+            1,
+            launch,
+            crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+        );
         let read_out = || std::fs::read(&out).unwrap_or_default();
 
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let ready = crate::platform::lock_recover(&terminal.grid)
-                .lines
-                .iter()
-                .flat_map(|line| line.iter().map(|cell| cell.c))
+            let term = crate::platform::lock_recover(&terminal.grid);
+            let ready = (0..term.rows())
+                .filter_map(|row| term.visible_row(row))
+                .flatten()
+                .map(|cell| cell.ch())
                 .collect::<String>()
                 .contains("__READY__");
+            drop(term);
             if ready && out.exists() {
                 break;
             }
@@ -1812,16 +1782,16 @@ mod tests {
     #[test]
     fn sgr_mouse_protocol_uses_one_based_cells_and_release_marker() {
         assert_eq!(
-            terminal_mouse_protocol_sequence(0, 3, 4, true, true),
-            b"\x1b[<0;3;4M"
+            mouse_report(MouseTrackingMode::Press, true, MouseEventKind::Press(MouseButton::Left), 2, 3),
+            Some(b"\x1b[<0;3;4M".to_vec())
         );
         assert_eq!(
-            terminal_mouse_protocol_sequence(2, 1, 1, false, true),
-            b"\x1b[<2;1;1m"
+            mouse_report(MouseTrackingMode::Press, true, MouseEventKind::Release(MouseButton::Right), 0, 0),
+            Some(b"\x1b[<2;1;1m".to_vec())
         );
         assert_eq!(
-            terminal_mouse_protocol_sequence(0, 3, 4, true, false),
-            vec![0x1b, b'[', b'M', 32, 35, 36]
+            mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 2, 3),
+            Some(vec![0x1b, b'[', b'M', 32, 35, 36])
         );
     }
 
@@ -1977,13 +1947,13 @@ mod tests {
     fn single_click_clears_selection_while_drag_keeps_nonempty_selection() {
         let mut interaction = TerminalInteraction::default();
         let mut terminal = selection_test_terminal();
-        crate::platform::lock_recover(&terminal.grid).selection = Some((1, 1, 4, 1));
+        crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1, 4, 1)));
         assert!(interaction.clear_text_selection(&mut terminal));
 
         begin_terminal_selection(&mut interaction, &mut terminal, 25.0, 400.0);
         assert!(
             crate::platform::lock_recover(&terminal.grid)
-                .selection
+                .selection()
                 .is_none()
         );
         assert!(interaction.mouse_input(
@@ -1994,7 +1964,7 @@ mod tests {
         ));
         assert!(
             crate::platform::lock_recover(&terminal.grid)
-                .selection
+                .selection()
                 .is_none()
         );
 
@@ -2006,7 +1976,7 @@ mod tests {
             &mut terminal,
             |_, _, _| 0,
         ));
-        let selection = crate::platform::lock_recover(&terminal.grid).selection;
+        let selection = crate::platform::lock_recover(&terminal.grid).selection();
         assert!(selection.is_some_and(|(sx, sy, ex, ey)| sx != ex || sy != ey));
     }
 
@@ -2029,7 +1999,7 @@ mod tests {
         assert!(terminal.scroll_y.target > 500.0);
         assert!(
             crate::platform::lock_recover(&terminal.grid)
-                .selection
+                .selection()
                 .is_some()
         );
 
@@ -2053,7 +2023,7 @@ mod tests {
         assert!(terminal.scroll_y.target < 500.0);
         assert!(
             crate::platform::lock_recover(&terminal.grid)
-                .selection
+                .selection()
                 .is_some()
         );
     }
@@ -2095,10 +2065,16 @@ mod tests {
         interaction.mouse_x = 25.0;
         interaction.mouse_y = 400.0;
         {
-            let mut grid = crate::platform::lock_recover(&terminal.grid);
-            grid.selection = Some((1, 1, 4, 1));
-            grid.mouse_tracking_mode = MouseTrackingMode::Press;
-            grid.mouse_sgr = true;
+            let mut term = crate::platform::lock_recover(&terminal.grid);
+            term.set_selection(Some((1, 1, 4, 1)));
+            term.advance(
+                b"\x1b[?1000h\x1b[?1006h",
+                std::time::Instant::now(),
+                &mut crate::terminal_process::SessionSink {
+                    reply_tx: None,
+                    title_cache: None,
+                },
+            );
         }
         assert!(interaction.clear_text_selection(&mut terminal));
         assert!(interaction.mouse_input(
@@ -2107,9 +2083,9 @@ mod tests {
             &mut terminal,
             |_, _, _| 0,
         ));
-        let grid = crate::platform::lock_recover(&terminal.grid);
-        assert!(grid.selection.is_none());
-        assert_eq!(grid.mouse_tracking_mode, MouseTrackingMode::Press);
+        let term = crate::platform::lock_recover(&terminal.grid);
+        assert!(term.selection().is_none());
+        assert_eq!(term.mouse_tracking(), MouseTrackingMode::Press);
     }
 
     #[test]
@@ -2247,7 +2223,7 @@ mod tests {
         let x = layout.text_x + 5.0;
         let y = layout.body.y + 100.0;
         for button in [PointerButton::Back, PointerButton::Forward, PointerButton::Other(9)] {
-            assert_eq!(terminal_mouse_button_code(button), None);
+            assert_eq!(terminal_mouse_button(button), None);
             assert!(terminal_mouse_event_sequence(
                 layout,
                 PointerCapture::None,

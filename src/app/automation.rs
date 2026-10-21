@@ -1114,16 +1114,12 @@ impl AutomationController {
             return false;
         };
         let grid = crate::platform::lock_recover(&terminal.grid);
-        let total = grid.scrollback.len() + grid.lines.len();
+        let total = grid.total_rows();
         let first = total.saturating_sub(96);
         for row_index in first..total {
-            let row = if row_index < grid.scrollback.len() {
-                &grid.scrollback[row_index]
-            } else {
-                &grid.lines[row_index - grid.scrollback.len()]
-            };
+            let row = grid.row(row_index).unwrap_or(&[]);
             self.line_scratch.clear();
-            for cell in row.iter().take(grid.cols) {
+            for cell in row.iter().take(grid.cols()) {
                 cell.append_text_to(&mut self.line_scratch);
             }
             if self.line_scratch.contains(needle) {
@@ -1159,7 +1155,7 @@ impl AutomationController {
             .get(app.active_terminal)
             .is_some_and(|terminal| {
                 crate::platform::lock_recover(&terminal.grid)
-                    .selection
+                    .selection()
                     .is_some()
             });
         Ok(if selected {
@@ -1187,7 +1183,7 @@ impl AutomationController {
             .get(app.active_terminal)
             .is_some_and(|terminal| {
                 crate::platform::lock_recover(&terminal.grid)
-                    .selection
+                    .selection()
                     .is_some()
             });
         Ok(if selection_active {
@@ -1415,7 +1411,7 @@ fn active_terminal_ready(app: &App) -> bool {
 fn active_is_alt(app: &App) -> bool {
     app.terminals
         .get(app.active_terminal)
-        .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).is_alt)
+        .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).is_alt_screen())
 }
 
 fn visible_tab_target(app: &App, exclude: Option<usize>) -> Option<(usize, PointerPosition)> {
