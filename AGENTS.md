@@ -2,7 +2,7 @@
 
 Strict mode. Small patches. Fast terminal first. Always prefer the most performant and resource-efficient solution that fits the request, but do not broaden a bug fix into unrelated optimization work.
 
-Ronsole is a Linux-only, Wayland-only terminal emulator extracted from RRiter. RRiter is the read-only donor/source-of-truth for matching terminal behavior. Keep Ronsole standalone. Do not reintroduce editor, Git, LSP, database, project/workspace, HTTP, X11, Windows, or macOS code.
+Ronsole is a Linux-only, Wayland-only terminal emulator extracted from RRiter. Terminal behavior changes in the platform-neutral crate `crates/ronsole-term`; RRiter is its consumer by git revision, and RRiter is not edited from Ronsole sessions. Keep Ronsole standalone. Do not reintroduce editor, Git, LSP, database, project/workspace, HTTP, X11, Windows, or macOS code.
 
 ## 0. Required context order
 
@@ -13,13 +13,13 @@ Read and investigate in this order:
 3. Use the map to select the smallest relevant set of symbols and files.
 4. Read the exact source files and direct call sites before proposing or applying a patch.
 5. Read `README.md`, `Cargo.toml`, and `Makefile` only when their contracts matter to the task.
-6. Read exact RRiter donor files only when Ronsole behavior must be compared with or restored from the donor.
+6. Read exact RRiter files (the consumer of `crates/ronsole-term` at its git revision) only when Ronsole behavior must be compared with RRiter.
 
 Do not infer exact code from a map, summary, test name, or donor description. `PROJECT_AI_MAP.txt` is an index, not source code. Always verify exact implementation and callers in the current Ronsole source.
 
 ## 0.1. Mandatory `PROJECT_AI_MAP.txt` workflow
 
-`PROJECT_AI_MAP.txt` is the primary source index and project call map. It is a required repository artifact, not optional documentation.
+`PROJECT_AI_MAP.txt` is the primary source index and project call map. It is a required repository artifact, not optional documentation. It indexes `src/` and every workspace crate under `crates/*/src`.
 
 For every non-trivial edit, review, or debugging task:
 
@@ -73,7 +73,7 @@ No speculative features. No broad refactors unless explicitly requested. Reuse e
 2. Read the exact implementation, its direct callers/callees, and nearby tests.
 3. Reproduce or identify the concrete failure contract.
 4. Distinguish the root cause from visible symptoms.
-5. Check whether RRiter already has the desired terminal behavior when donor parity is relevant.
+5. Check whether the desired terminal behavior is already in `crates/ronsole-term` or in the RRiter revision it consumes, when parity is relevant.
 6. Define the smallest patch and validation set.
 
 Prefer exact `rg` searches over broad repository dumps. Read only files needed for the current behavior, but inspect every direct call site whose contract changes.
@@ -87,8 +87,8 @@ Prefer exact `rg` searches over broad repository dumps. Read only files needed f
 - Do not hide transitional code with `#[allow(dead_code)]`.
 - Do not duplicate behavior. Extract a shared helper only when the task exposes real duplication.
 - Keep user changes and unrelated dirty-worktree files intact.
-- Never edit RRiter. It is a read-only donor.
-- Never copy a large RRiter module blindly. Port only the terminal-specific behavior and remove dependencies on forbidden subsystems.
+- Put terminal behavior changes in the crate `crates/ronsole-term`. RRiter is its consumer by git revision; do not edit RRiter from Ronsole sessions.
+- Never copy a large RRiter module blindly. Port only the terminal-specific behavior into the crate and remove dependencies on forbidden subsystems.
 
 ### Planning risky work
 
@@ -191,11 +191,11 @@ In render, frame, glyph, input, PTY-output, and animation paths:
 
 ## 8. Donor rules
 
-RRiter is useful only as a read-only reference for terminal behavior and proven performance patterns.
+Terminal behavior is owned by the crate `crates/ronsole-term`. RRiter is its consumer by git revision, and RRiter is not edited from Ronsole sessions. RRiter is useful only as a reference for how the consumed terminal behavior is used, and for proven performance patterns.
 
 When consulting RRiter:
 
-1. Locate the exact donor symbol/file.
+1. Locate the exact symbol/file at the git revision RRiter consumes.
 2. Read its current implementation and tests.
 3. Identify dependencies that belong to editor/project/Git/LSP/database/cross-platform code.
 4. Port only the minimal terminal-specific contract.
@@ -212,7 +212,8 @@ During development:
 
 - Run the narrowest relevant test first when practical.
 - Use `make test-one TEST='module::test_name'` for one exact test.
-- Use `make test` for the project test profile.
+- Use `make test` for the project test profile. It runs the whole workspace (`TEST_PKG ?= --workspace`).
+- For a narrow run of the terminal crate: `make test TEST_PKG='-p ronsole-term' TEST_FILTER=<filter>`. Without `TEST_PKG`, a `tests::` filter also matches `mod tests` of the whole workspace.
 - Do not run `make fast` separately as a substitute for the required gate.
 
 After any Ronsole-related file changes, the primary final gate is:
@@ -228,7 +229,7 @@ Additional checks when applicable to the changed files or requested by CI/task:
 - `cargo fmt --all -- --check`
 - `cargo check --all-targets`
 - `cargo test --all-targets`
-- `cargo clippy --all-targets -- -D warnings` when Clippy is available
+- `cargo clippy --workspace --all-targets -- -D warnings` when Clippy is available
 - `git diff --check`
 - conflict-marker scan
 

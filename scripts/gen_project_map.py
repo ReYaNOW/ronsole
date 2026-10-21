@@ -114,6 +114,9 @@ def base36(value):
 
 
 def module_name(path_text):
+    if path_text.startswith("crates/"):
+        _, crate_dir, _, rest = path_text.split("/", 3)
+        return crate_dir.replace("-", "_") + "::" + rest.removesuffix(".rs").replace("/", "::")
     return path_text.removeprefix("src/").removesuffix(".rs").replace("/", "::")
 
 
@@ -502,11 +505,21 @@ def analyze_calls(current_fn, local_fns_by_name, global_fns_by_name, module_by_p
     return sorted(call_ids)
 
 
+def source_roots(src_dir):
+    # The app crate's src plus every workspace crate under crates/*/src.
+    roots = [src_dir]
+    crates_dir = src_dir.parent / "crates"
+    if crates_dir.is_dir():
+        roots.extend(sorted(p for p in crates_dir.glob("*/src") if p.is_dir()))
+    return roots
+
+
 def build(src_dir, include_tests):
+    all_files = [p for root in source_roots(src_dir) for p in root.rglob("*.rs")]
     if include_tests:
-        files = sorted(p for p in src_dir.rglob("*.rs"))
+        files = sorted(all_files)
     else:
-        files = sorted(p for p in src_dir.rglob("*.rs") if "test" not in p.name)
+        files = sorted(p for p in all_files if "test" not in p.name)
 
     file_data = []
     module_by_path = {}

@@ -5,7 +5,11 @@ name = "ronsole"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "crates/ronsole-term"]
+
 [dependencies]
+ronsole-term = { path = "crates/ronsole-term" }
 bytemuck = "1.25.1"
 glow = "0.18.0"
 libc = "0.2"
@@ -26,6 +30,9 @@ wayland-client = { version = "0.31.14", default-features = false, features = ["s
 wayland-cursor = "0.31.14"
 wayland-protocols = { version = "0.32.12", default-features = false, features = ["client", "staging", "unstable"] }
 xkbcommon-dl = "0.4.2"
+
+[dev-dependencies]
+ronsole-term = { path = "crates/ronsole-term", features = ["test-support"] }
 
 [profile.release]
 opt-level = 3
