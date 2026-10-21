@@ -3158,20 +3158,24 @@ mod tests {
             crate::config::DEFAULT_TERMINAL_BACKGROUND,
             [0.2, 0.3, 0.4, 1.0],
         );
-        let mut default_cell = Cell::default();
-        default_cell.set_sgr_style(true, UnderlineStyle::None, false);
+        let default_cell = Cell::new_for_test(
+            ' ',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            ronsole_term::CellFlags::INVERSE,
+            UnderlineStyle::None,
+        );
         let (default_fg, default_bg) = terminal_cell_render_colors(&default_cell, palette);
         assert_eq!(default_fg, palette.bg);
         assert_eq!(default_bg, Some(terminal_color_rgba(TerminalColor::default_foreground())));
 
-        let mut explicit = Cell::default();
-        explicit.set_char(
+        let explicit = Cell::new_for_test(
             'X',
             TerminalColor::indexed(1),
             TerminalColor::indexed(4),
-            false,
+            ronsole_term::CellFlags::INVERSE,
+            UnderlineStyle::None,
         );
-        explicit.set_sgr_style(true, UnderlineStyle::None, false);
         let (fg, bg) = terminal_cell_render_colors(&explicit, palette);
         assert_eq!(fg, terminal_color_rgba(TerminalColor::indexed(4)));
         assert_eq!(bg, Some(terminal_color_rgba(TerminalColor::indexed(1))));
@@ -3202,14 +3206,13 @@ mod tests {
             crate::config::DEFAULT_TERMINAL_BACKGROUND,
             [0.2, 0.3, 0.4, 1.0],
         );
-        let mut cell = Cell::default();
-        cell.set_char(
+        let cell = Cell::new_for_test(
             'X',
             TerminalColor::rgb(150, 120, 90),
             TerminalColor::indexed(4),
-            false,
+            ronsole_term::CellFlags::DIM,
+            UnderlineStyle::None,
         );
-        cell.set_sgr_style(false, UnderlineStyle::None, true);
         let (fg, bg) = terminal_cell_render_colors(&cell, palette);
         let source = terminal_color_rgba(TerminalColor::rgb(150, 120, 90));
         assert!((fg[0] - source[0] * 0.66).abs() < 0.0001);
@@ -3221,14 +3224,13 @@ mod tests {
 
     #[test]
     fn terminal_renderer_matches_rriter_by_not_emitting_an_underline_layer() {
-        let mut cell = Cell::default();
-        cell.set_char(
+        let cell = Cell::new_for_test(
             'x',
             TerminalColor::default_foreground(),
             TerminalColor::default_background(),
-            false,
+            ronsole_term::CellFlags::empty(),
+            UnderlineStyle::Single,
         );
-        cell.set_sgr_style(false, UnderlineStyle::Single, false);
 
         assert!(cell.underline() == UnderlineStyle::Single);
         assert_eq!(
@@ -3286,22 +3288,24 @@ mod tests {
             Some((7.0, 8.0))
         );
 
-        let mut wide = Cell::default();
-        wide.set_char(
+        let wide = Cell::new_for_test(
             '界',
             TerminalColor::default_foreground(),
             TerminalColor::default_background(),
-            true,
+            ronsole_term::CellFlags::WIDE,
+            UnderlineStyle::None,
         );
         assert_eq!(
             terminal_glyph_cell_geometry(0.0, 0, &wide, 7.4),
             Some((0.0, 15.0))
         );
 
-        let mut spacer = Cell::default();
-        spacer.set_wide_spacer(
+        let spacer = Cell::new_for_test(
+            ' ',
             TerminalColor::default_foreground(),
             TerminalColor::default_background(),
+            ronsole_term::CellFlags::WIDE_SPACER,
+            UnderlineStyle::None,
         );
         assert_eq!(terminal_glyph_cell_geometry(0.0, 1, &spacer, 7.4), None);
 

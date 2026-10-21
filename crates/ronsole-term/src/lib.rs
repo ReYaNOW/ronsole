@@ -22,9 +22,7 @@ pub use term::{AdvanceOutcome, Term, TermConfig, TermIdentity, TermSink};
 
 pub use cell::{
     CELL_PRESENTATION_AUTO, CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT,
-    TERMINAL_CELL_EXTRA_MAX_CHARS, apply_ansi_sgr, is_terminal_zero_width_format,
-    terminal_char_width, terminal_effective_foreground, terminal_force_text_presentation,
-    terminal_is_emoji_modifier, terminal_presentation_selector,
+    TERMINAL_CELL_EXTRA_MAX_CHARS, terminal_force_text_presentation,
     terminal_should_render_zero_width, Cell, CellFlags, Hyperlink, UnderlineStyle,
 };
 pub use color::{CellColors, ColorKind, Rgb, TermPalette, TerminalColor, xterm_256_rgb};

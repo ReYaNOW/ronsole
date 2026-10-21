@@ -68,8 +68,8 @@ pub struct Hyperlink {
     pub uri: Box<str>,
 }
 
-// pub until Task 3 moves the grid
-#[doc(hidden)]
+/// Maximum number of zero-width characters stored in one cell's extra data;
+/// further ones are dropped by [`Cell::push_zero_width`].
 pub const TERMINAL_CELL_EXTRA_MAX_CHARS: usize = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,24 +191,15 @@ impl Cell {
             .map_or(&[], |extra| extra.zero_width.as_slice())
     }
 
-    // Write methods below are pub until Task 3 moves the grid into the crate;
-    // Task 3 narrows them to pub(crate).
-
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
     pub(crate) fn blank_with_background(bg: TerminalColor) -> Self {
         Self { bg, ..Self::default() }
     }
 
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
     pub(crate) fn set_ch(&mut self, c: char) {
         self.c = c;
     }
 
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
-    pub fn set_char(&mut self, c: char, fg: TerminalColor, bg: TerminalColor, wide: bool) {
+    pub(crate) fn set_char(&mut self, c: char, fg: TerminalColor, bg: TerminalColor, wide: bool) {
         self.c = c;
         self.fg = fg;
         self.bg = bg;
@@ -217,9 +208,7 @@ impl Cell {
         self.extra = None;
     }
 
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
-    pub fn set_wide_spacer(&mut self, fg: TerminalColor, bg: TerminalColor) {
+    pub(crate) fn set_wide_spacer(&mut self, fg: TerminalColor, bg: TerminalColor) {
         self.c = ' ';
         self.fg = fg;
         self.bg = bg;
@@ -228,15 +217,11 @@ impl Cell {
         self.extra = None;
     }
 
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
     pub(crate) fn set_presentation(&mut self, presentation: u8) {
         self.presentation = presentation;
     }
 
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
-    pub fn set_sgr_style(&mut self, inverse: bool, underline: UnderlineStyle, dim: bool) {
+    pub(crate) fn set_sgr_style(&mut self, inverse: bool, underline: UnderlineStyle, dim: bool) {
         let mut bits = self.flags.0 & WIDE_FLAGS;
         if inverse {
             bits |= CellFlags::INVERSE.0;
@@ -248,8 +233,6 @@ impl Cell {
         self.flags = CellFlags(bits);
     }
 
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
     pub(crate) fn set_hidden(&mut self, hidden: bool) {
         if hidden {
             self.flags = CellFlags(self.flags.0 | CellFlags::HOST_HIDDEN.0);
@@ -258,9 +241,7 @@ impl Cell {
         }
     }
 
-    // pub until Task 3 moves the grid
-    #[doc(hidden)]
-    pub fn push_zero_width(&mut self, c: char) {
+    pub(crate) fn push_zero_width(&mut self, c: char) {
         if self.zero_width().len() >= TERMINAL_CELL_EXTRA_MAX_CHARS {
             return;
         }
@@ -287,10 +268,8 @@ pub fn terminal_force_text_presentation(c: char) -> bool {
     matches!(c, '✔' | '✓')
 }
 
-// pub until Task 3 moves the grid
-#[doc(hidden)]
 #[inline(always)]
-pub fn terminal_presentation_selector(c: char) -> Option<u8> {
+pub(crate) fn terminal_presentation_selector(c: char) -> Option<u8> {
     match c {
         '\u{FE0E}' => Some(CELL_PRESENTATION_TEXT),
         '\u{FE0F}' => Some(CELL_PRESENTATION_EMOJI),
@@ -298,25 +277,19 @@ pub fn terminal_presentation_selector(c: char) -> Option<u8> {
     }
 }
 
-// pub until Task 3 moves the grid
-#[doc(hidden)]
 #[inline(always)]
-pub fn is_terminal_zero_width_format(c: char) -> bool {
+pub(crate) fn is_terminal_zero_width_format(c: char) -> bool {
     let u = c as u32;
     c == '\u{200D}' || (0xFE00..=0xFE0F).contains(&u) || (0xE0100..=0xE01EF).contains(&u)
 }
 
-// pub until Task 3 moves the grid
-#[doc(hidden)]
 #[inline(always)]
-pub fn terminal_is_emoji_modifier(c: char) -> bool {
+pub(crate) fn terminal_is_emoji_modifier(c: char) -> bool {
     matches!(c as u32, 0x1F3FB..=0x1F3FF)
 }
 
-// pub until Task 3 moves the grid
-#[doc(hidden)]
 #[inline(always)]
-pub fn terminal_char_width(c: char) -> usize {
+pub(crate) fn terminal_char_width(c: char) -> usize {
     if is_terminal_zero_width_format(c) || terminal_is_emoji_modifier(c) {
         0
     } else {
@@ -331,9 +304,7 @@ pub fn terminal_should_render_zero_width(c: char) -> bool {
         && UnicodeWidthChar::width(c) == Some(0)
 }
 
-// pub until Task 3 moves the grid
-#[doc(hidden)]
-pub fn terminal_effective_foreground(
+pub(crate) fn terminal_effective_foreground(
     foreground: TerminalColor,
     bold: bool,
 ) -> TerminalColor {
@@ -347,9 +318,7 @@ pub fn terminal_effective_foreground(
     }
 }
 
-// pub until Task 3 moves the grid
-#[doc(hidden)]
-pub fn apply_ansi_sgr(
+pub(crate) fn apply_ansi_sgr(
     params: &Params,
     fg: &mut TerminalColor,
     bg: &mut TerminalColor,

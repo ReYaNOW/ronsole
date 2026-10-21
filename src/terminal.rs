@@ -1311,14 +1311,15 @@ impl DevBannerState {
                 .iter()
                 .position(|cell| cell.ch() == '│')
                 .unwrap_or(end);
-            let drawn: Vec<usize> = line[..stop]
-                .iter()
-                .enumerate()
-                .filter(|(_, cell)| cell.ch() != ' ')
-                .map(|(x, _)| x)
-                .collect();
-            for x in drawn {
-                grid.set_host_hidden(absolute, x..x + 1, true);
+            // `line` ends its borrow here, so each cell is re-read through a
+            // short borrow before the mutable `set_host_hidden` call.
+            for x in 0..stop {
+                let drawn = grid
+                    .row(absolute)
+                    .is_some_and(|row_cells| row_cells[x].ch() != ' ');
+                if drawn {
+                    grid.set_host_hidden(absolute, x..x + 1, true);
+                }
             }
         }
     }

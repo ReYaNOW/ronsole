@@ -882,7 +882,6 @@ dependencies = [
  "swash",
  "tiny-skia",
  "unicode-width",
- "vte",
  "wayland-client",
  "wayland-cursor",
  "wayland-protocols",
