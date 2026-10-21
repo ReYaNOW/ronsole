@@ -78,18 +78,12 @@ fn terminal_csi_cursor_modes_colors_and_replies_end_to_end() {
     assert!(grid.mouse_tracking_mode.enabled());
 
     feed(&mut grid, &mut sink, b"\x1b[6n\x1b[c\x1b]10;?\x1b\\");
-    // One `reply` call per query, in the order the queries were fed.
-    assert_eq!(sink.calls.len(), 3);
-    let reply_pos = sink.calls[0].clone();
-    let reply_device = sink.calls[1].clone();
-    let reply_color = sink.calls[2].clone();
-    assert!(
-        String::from_utf8(reply_pos)
-            .unwrap()
-            .starts_with("\x1B[1;6R")
-    );
-    assert_eq!(reply_device, b"\x1B[?62c");
-    assert_eq!(reply_color, b"\x1B]10;rgb:ffff/ffff/ffff\x1B\\");
+    // The batch yields one `reply` holding the replies in the order the queries were fed.
+    assert_eq!(sink.calls.len(), 1);
+    let replies = String::from_utf8(sink.bytes.clone()).unwrap();
+    let (reply_pos, rest) = replies.split_once("\x1B[?62c").unwrap();
+    assert!(reply_pos.starts_with("\x1B[1;6R"));
+    assert_eq!(rest, "\x1B]10;rgb:ffff/ffff/ffff\x1B\\");
 
     feed(&mut grid, &mut sink, b"\x1b[?1049hALT\x1b[?1049l");
     assert!(!grid.is_alt);

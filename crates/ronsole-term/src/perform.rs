@@ -92,7 +92,7 @@ impl Perform for Performer<'_> {
             if params[0] == b"10" || params[0] == b"11" {
                 let prefix = std::str::from_utf8(params[0]).unwrap_or("10");
                 let msg = format!("\x1B]{};rgb:ffff/ffff/ffff\x1B\\", prefix);
-                self.term.try_queue_reply(self.sink, msg.into_bytes());
+                self.term.queue_reply(msg.as_bytes());
             }
         }
     }
@@ -129,7 +129,13 @@ impl Perform for Performer<'_> {
         }
     }
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        if action != 'm' {
+        // Queries do not move the cursor, so they keep a pending wrap.
+        let query = match action {
+            'c' | 'q' => intermediates == b">",
+            'p' => intermediates.contains(&b'$'),
+            _ => false,
+        };
+        if action != 'm' && !query {
             self.term.wrap_pending = false;
             self.term.join_next = false;
         }
@@ -234,15 +240,17 @@ impl Perform for Performer<'_> {
             }
             'c' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
-                if param == 0 {
-                    self.term.try_queue_reply(self.sink, b"\x1B[?62c".to_vec());
+                match intermediates {
+                    [] if param == 0 => self.term.queue_reply(b"\x1B[?62c"),
+                    [b'>'] if param == 0 => self.term.queue_da2(),
+                    _ => {}
                 }
             }
             'n' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
                 let private = intermediates.contains(&b'?');
                 if param == 5 && !private {
-                    self.term.try_queue_reply(self.sink, b"\x1B[0n".to_vec());
+                    self.term.queue_reply(b"\x1B[0n");
                 } else if param == 6 {
                     let row = if self.term.origin_mode {
                         self.term.cur_y.saturating_sub(self.term.scroll_region.0) + 1
@@ -251,7 +259,23 @@ impl Perform for Performer<'_> {
                     };
                     let prefix = if private { "?" } else { "" };
                     let msg = format!("\x1B[{prefix}{row};{}R", self.term.cur_x + 1);
-                    self.term.try_queue_reply(self.sink, msg.into_bytes());
+                    self.term.queue_reply(msg.as_bytes());
+                }
+            }
+            'p' => {
+                // vte reads an omitted parameter as 0, and mode 0 is never a
+                // real mode, so a DECRQM without a mode number gets no reply.
+                let mode = params.iter().next().map(|p| p[0]).filter(|&mode| mode != 0);
+                match (intermediates, mode) {
+                    ([b'?', b'$'], Some(mode)) => self.term.queue_decrqm_private(mode),
+                    ([b'$'], Some(mode)) => self.term.queue_decrqm_ansi(mode),
+                    _ => {}
+                }
+            }
+            'q' => {
+                let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                if intermediates == b">" && param == 0 {
+                    self.term.queue_xtversion();
                 }
             }
             'H' | 'f' => {

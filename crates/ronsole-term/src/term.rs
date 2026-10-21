@@ -99,7 +99,13 @@ pub struct Term {
     pub(crate) scrollback_limit: usize,
     pub(crate) identity: TermIdentity,
     pub(crate) palette: TermPalette,
+    /// Replies queued during the current `advance` call; flushed to the sink
+    /// as one `reply` at its end and cleared, keeping the capacity.
+    pub(crate) reply_buf: Vec<u8>,
 }
+
+/// Upper bound on the bytes of replies queued by one `advance` call.
+const REPLY_BUF_LIMIT: usize = 65_536;
 
 /// Drives the vte parser over a [`Term`] and forwards events to a sink.
 pub(crate) struct Performer<'a> {
@@ -168,6 +174,7 @@ impl Term {
             scrollback_limit: scrollback_lines,
             identity,
             palette,
+            reply_buf: Vec::new(),
         }
     }
 
@@ -188,15 +195,23 @@ impl Term {
             parser.advance(&mut performer, bytes);
         }
         self.parser = Some(parser);
+        if !self.reply_buf.is_empty() {
+            sink.reply(&self.reply_buf);
+            self.reply_buf.clear();
+        }
         AdvanceOutcome {
             grid_changed: !bytes.is_empty(),
             new_deadline: false,
         }
     }
 
+    /// Appends one reply to the batch buffer; a reply that would take the
+    /// buffer past `REPLY_BUF_LIMIT` is dropped whole.
     #[inline]
-    pub(crate) fn try_queue_reply(&self, sink: &mut dyn TermSink, reply: Vec<u8>) {
-        sink.reply(&reply);
+    pub(crate) fn queue_reply(&mut self, reply: &[u8]) {
+        if self.reply_buf.len() + reply.len() <= REPLY_BUF_LIMIT {
+            self.reply_buf.extend_from_slice(reply);
+        }
     }
 
     pub fn cols(&self) -> usize {
