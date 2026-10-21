@@ -3,6 +3,7 @@ mod edges;
 mod osc;
 mod queries;
 mod reflow;
+mod sgr;
 mod support;
 mod sync;
 
