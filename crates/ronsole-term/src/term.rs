@@ -4,7 +4,7 @@ use crate::cell::{Cell, Pen};
 use crate::color::TermPalette;
 use crate::grid::LineMeta;
 use crate::input::{MouseTrackingMode, focus_report_sequence};
-use crate::keys::KeyProtocol;
+use crate::keys::{self, KeyEvent, KeyOutcome, KeyProtocol};
 use std::ops::Range;
 use std::time::Instant;
 use vte::Parser;
@@ -327,6 +327,13 @@ impl Term {
     /// Kitty keyboard flags of the active screen, limited to the supported bits.
     pub fn kitty_flags(&self) -> u8 {
         self.key_protocol.flags(self.is_alt)
+    }
+
+    /// Encodes a key event into `out` using the active DECCKM and Kitty flags,
+    /// and tells the host whether to send the bytes, the text, or nothing.
+    pub fn encode_key(&mut self, event: &KeyEvent<'_>, out: &mut Vec<u8>) -> KeyOutcome {
+        let flags = self.kitty_flags();
+        keys::encode_key(&mut self.key_protocol, flags, self.app_cursor_keys, event, out)
     }
 
     /// Reports a focus change from the host. Returns `CSI I` or `CSI O` when

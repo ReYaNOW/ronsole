@@ -1,5 +1,6 @@
 use super::support::{RecordingSink, feed, test_config};
 use crate::term::Term;
+use crate::{KeyEvent, KeyKind, KeyMods, KeyOutcome, TermKey};
 
 /// Sends `bytes` and returns exactly the reply bytes they produced.
 fn reply_to(term: &mut Term, sink: &mut RecordingSink, bytes: &[u8]) -> Vec<u8> {
@@ -140,4 +141,54 @@ fn csi_question_u_does_not_restore_cursor() {
     // Plain `CSI u` is still DECRC and restores the saved cursor.
     feed(&mut term, &mut sink, b"\x1b[u");
     assert_eq!(term.cursor(), (2, 0));
+}
+
+/// Builds a key event; `physical` is fixed so press, repeat and release match.
+fn ev<'a>(key: TermKey, base: Option<char>, mods: KeyMods, kind: KeyKind, text: Option<&'a str>) -> KeyEvent<'a> {
+    KeyEvent { physical: 1, key, base, mods, kind, text }
+}
+
+fn mods(shift: bool, ctrl: bool, alt: bool) -> KeyMods {
+    KeyMods { shift, ctrl, alt, super_key: false }
+}
+
+/// Encodes one event and returns the outcome and the bytes written.
+fn enc(term: &mut Term, event: &KeyEvent<'_>) -> (KeyOutcome, Vec<u8>) {
+    let mut out = Vec::new();
+    let outcome = term.encode_key(event, &mut out);
+    (outcome, out)
+}
+
+/// Sets Kitty flags with `CSI = flags u` (replace mode).
+fn set_flags(term: &mut Term, sink: &mut RecordingSink, flags: u8) {
+    let bytes = format!("\x1b[={flags}u");
+    assert_eq!(reply_to(term, sink, bytes.as_bytes()), b"");
+}
+
+/// Expected bytes come from the Kitty reference, "Worked byte examples"
+/// (`docs/superpowers/specs/2026-10-21-terminal-protocol-ref.md`), not from the implementation.
+#[test]
+fn kitty_reference_examples() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let press = KeyKind::Press;
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, none, press, None)), (KeyOutcome::Sent, b"\r".to_vec()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, mods(true, false, false), press, None)).1, b"\x1b[13;2u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, mods(false, true, false), press, None)).1, b"\x1b[13;5u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), mods(false, false, true), press, None)).1, b"\x1b[97;3u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), mods(true, true, false), press, Some("A"))).1, b"\x1b[97;6u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, press, None)).1, b"\x1b[27u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), mods(false, true, false), press, None)).1, b"\x1b[99;5u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Up, None, mods(true, false, false), press, None)).1, b"\x1b[1;2A");
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, press, None)).1, b"\x1b[27u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, KeyKind::Release, None)).1, b"\x1b[27;1:3u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+
+    set_flags(&mut term, &mut sink, 8);
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, mods(true, false, false), press, None)).1, b"\x1b[13;2u");
 }

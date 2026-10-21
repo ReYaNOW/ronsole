@@ -325,3 +325,453 @@ impl KeyProtocol {
         &mut self.sent
     }
 }
+
+/// Kitty flag bits read by the encoder.
+const FLAG_DISAMBIGUATE: u8 = 0b1;
+const FLAG_REPORT_EVENTS: u8 = 0b10;
+const FLAG_REPORT_ALL: u8 = 0b1000;
+const FLAG_REPORT_TEXT: u8 = 0b1_0000;
+
+/// Modifier bits of the Kitty modifier field, before the `+ 1` offset.
+const BIT_SHIFT: u8 = 1;
+const BIT_ALT: u8 = 2;
+const BIT_CTRL: u8 = 4;
+const BIT_SUPER: u8 = 8;
+
+/// CSI form of a key that is not sent as text.
+#[derive(Clone, Copy)]
+enum CsiForm {
+    /// `CSI A` style: a final byte only; code 1 is written when a field follows.
+    Letter(u8),
+    /// `CSI code u` or `CSI code ~`.
+    Number(u32, u8),
+}
+
+/// Encodes one key event into `out` and reports what the host must do with it.
+/// `flags` are the active Kitty flags and `app_cursor` is the DECCKM mode.
+pub(crate) fn encode_key(
+    protocol: &mut KeyProtocol,
+    flags: u8,
+    app_cursor: bool,
+    event: &KeyEvent<'_>,
+    out: &mut Vec<u8>,
+) -> KeyOutcome {
+    let all = flags & FLAG_REPORT_ALL != 0;
+    let events = flags & FLAG_REPORT_EVENTS != 0;
+    let disambiguate = all || flags & FLAG_DISAMBIGUATE != 0;
+    let release = event.kind == KeyKind::Release;
+    let bits = modifier_bits(event.mods);
+
+    if let TermKey::Modifier(modifier) = event.key {
+        if !all || (release && !events) {
+            return KeyOutcome::Ignore;
+        }
+        let own = own_bit(modifier);
+        let bits = if release { bits & !own } else { bits | own };
+        write_csi(out, modifier_code(modifier), 1 + bits, event_field(event.kind, events), None, b'u');
+        return KeyOutcome::Sent;
+    }
+
+    let mod_field = 1 + bits;
+    if release {
+        if !events {
+            return KeyOutcome::Ignore;
+        }
+        let pair = protocol.sent_mut().remove(event.physical);
+        let key = legacy_equivalent(event.key);
+        if !all && matches!(key, TermKey::Enter | TermKey::Tab | TermKey::Backspace) {
+            return KeyOutcome::Ignore;
+        }
+        let Some(pair) = pair else {
+            return KeyOutcome::Ignore;
+        };
+        write_sent(out, pair, mod_field, 3);
+        return KeyOutcome::Sent;
+    }
+
+    let repeat = event.kind == KeyKind::Repeat && events;
+    let key = if disambiguate { event.key } else { legacy_equivalent(event.key) };
+    let plain = !event.mods.ctrl && !event.mods.alt && !event.mods.super_key;
+    if !all && plain && is_text_key(key) {
+        protocol.sent_mut().remove(event.physical);
+        return KeyOutcome::Text;
+    }
+
+    // Unmodified Enter, Tab and Backspace keep their legacy bytes under flag 1 and
+    // on repeat; every other legacy key needs flags 0 or 2 only.
+    let legacy_control = mod_field == 1 && matches!(key, TermKey::Enter | TermKey::Tab | TermKey::Backspace);
+    if !all && ((!disambiguate && !repeat) || legacy_control) {
+        if let Some(outcome) = write_legacy(out, key, event, flags, app_cursor) {
+            if outcome == KeyOutcome::Sent && events && event.kind == KeyKind::Press {
+                if let Some((code, form)) = legacy_pair(key, event.base) {
+                    protocol.sent_mut().insert(SentKey { physical: event.physical, code, form });
+                }
+            }
+            return outcome;
+        }
+    }
+
+    if repeat {
+        if let Some(pair) = protocol.sent().get(event.physical) {
+            write_sent(out, pair, mod_field, 2);
+            return KeyOutcome::Sent;
+        }
+    }
+
+    let Some(form) = csi_form(key, event.base) else {
+        return KeyOutcome::Ignore;
+    };
+    let event_code = event_field(event.kind, events);
+    let text = if all && flags & FLAG_REPORT_TEXT != 0 { event.text } else { None };
+    match form {
+        CsiForm::Letter(final_byte) => {
+            let code = if mod_field == 1 && event_code == 1 { 0 } else { 1 };
+            write_csi(out, code, mod_field, event_code, None, final_byte);
+        }
+        CsiForm::Number(code, final_byte) => write_csi(out, code, mod_field, event_code, text, final_byte),
+    }
+    if events {
+        let (code, form) = match form {
+            CsiForm::Letter(final_byte) => (1, SentForm::Letter(final_byte)),
+            CsiForm::Number(code, b'~') => (code, SentForm::Tilde),
+            CsiForm::Number(code, _) => (code, SentForm::Unicode),
+        };
+        protocol.sent_mut().insert(SentKey { physical: event.physical, code, form });
+    }
+    KeyOutcome::Sent
+}
+
+/// Legacy bytes for keys without Kitty flags 1 or 8. Returns `None` when the
+/// key must take the CSI path instead.
+fn write_legacy(
+    out: &mut Vec<u8>,
+    key: TermKey,
+    event: &KeyEvent<'_>,
+    flags: u8,
+    app_cursor: bool,
+) -> Option<KeyOutcome> {
+    let mods = event.mods;
+    let alt = mods.alt;
+    match key {
+        TermKey::Char(c) => {
+            if mods.ctrl {
+                let Some(byte) = control_byte(event.base.unwrap_or(c)) else {
+                    return Some(KeyOutcome::Ignore);
+                };
+                alt_prefixed(out, alt, &[byte]);
+            } else {
+                let mut buf = [0u8; 4];
+                let text = event.text.unwrap_or_else(|| &*c.encode_utf8(&mut buf));
+                alt_prefixed(out, alt, text.as_bytes());
+            }
+        }
+        TermKey::Enter => alt_prefixed(out, alt || mods.shift, b"\r"),
+        TermKey::Tab if mods.shift => out.extend_from_slice(b"\x1b[Z"),
+        TermKey::Tab => alt_prefixed(out, alt, b"\t"),
+        TermKey::Backspace => {
+            let byte = if mods.ctrl {
+                0x17
+            } else if mods.shift {
+                0x08
+            } else {
+                0x7f
+            };
+            alt_prefixed(out, alt, &[byte]);
+        }
+        TermKey::Escape => out.push(0x1b),
+        _ => {
+            // Unmodified cursor keys in cursor-key mode and F1-F4 use SS3.
+            let final_byte = ss3_final(key)?;
+            if flags & (FLAG_DISAMBIGUATE | FLAG_REPORT_EVENTS | FLAG_REPORT_ALL) != 0 || modifier_bits(mods) != 0 {
+                return None;
+            }
+            let cursor = matches!(key, TermKey::Up | TermKey::Down | TermKey::Left | TermKey::Right | TermKey::Home | TermKey::End);
+            if cursor && !app_cursor {
+                return None;
+            }
+            out.extend_from_slice(&[0x1b, b'O', final_byte]);
+        }
+    }
+    Some(KeyOutcome::Sent)
+}
+
+/// Writes `CSI code ; mods:event ; text final`. Default fields are omitted;
+/// a code of 0 is omitted.
+fn write_csi(out: &mut Vec<u8>, code: u32, mods: u8, event: u8, text: Option<&str>, final_byte: u8) {
+    out.extend_from_slice(b"\x1b[");
+    if code != 0 {
+        push_decimal(out, code);
+    }
+    if mods != 1 || event != 1 || text.is_some() {
+        out.push(b';');
+        if mods != 1 || event != 1 {
+            push_decimal(out, u32::from(mods));
+        }
+        if event != 1 {
+            out.push(b':');
+            push_decimal(out, u32::from(event));
+        }
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            out.push(b';');
+            for (index, ch) in text.chars().enumerate() {
+                if index > 0 {
+                    out.push(b':');
+                }
+                push_decimal(out, u32::from(ch));
+            }
+        }
+    }
+    out.push(final_byte);
+}
+
+/// Writes a sent key again with the form it was pressed in.
+fn write_sent(out: &mut Vec<u8>, pair: SentKey, mod_field: u8, event: u8) {
+    match pair.form {
+        SentForm::Unicode => write_csi(out, pair.code, mod_field, event, None, b'u'),
+        SentForm::Letter(final_byte) => write_csi(out, 1, mod_field, event, None, final_byte),
+        SentForm::Tilde => write_csi(out, pair.code, mod_field, event, None, b'~'),
+    }
+}
+
+/// Code and form under which a legacy press is remembered for its release.
+fn legacy_pair(key: TermKey, base: Option<char>) -> Option<(u32, SentForm)> {
+    match key {
+        TermKey::Char(c) => Some((unicode_code(c, base), SentForm::Unicode)),
+        TermKey::Enter => Some((13, SentForm::Unicode)),
+        TermKey::Tab => Some((9, SentForm::Unicode)),
+        TermKey::Backspace => Some((127, SentForm::Unicode)),
+        TermKey::Escape => Some((27, SentForm::Unicode)),
+        _ => None,
+    }
+}
+
+fn csi_form(key: TermKey, base: Option<char>) -> Option<CsiForm> {
+    Some(match key {
+        TermKey::Char(c) => CsiForm::Number(unicode_code(c, base), b'u'),
+        TermKey::Enter => CsiForm::Number(13, b'u'),
+        TermKey::Tab => CsiForm::Number(9, b'u'),
+        TermKey::Backspace => CsiForm::Number(127, b'u'),
+        TermKey::Escape => CsiForm::Number(27, b'u'),
+        TermKey::Up => CsiForm::Letter(b'A'),
+        TermKey::Down => CsiForm::Letter(b'B'),
+        TermKey::Right => CsiForm::Letter(b'C'),
+        TermKey::Left => CsiForm::Letter(b'D'),
+        TermKey::Home => CsiForm::Letter(b'H'),
+        TermKey::End => CsiForm::Letter(b'F'),
+        TermKey::PageUp => CsiForm::Number(5, b'~'),
+        TermKey::PageDown => CsiForm::Number(6, b'~'),
+        TermKey::Insert => CsiForm::Number(2, b'~'),
+        TermKey::Delete => CsiForm::Number(3, b'~'),
+        TermKey::F(1) => CsiForm::Letter(b'P'),
+        TermKey::F(2) => CsiForm::Letter(b'Q'),
+        TermKey::F(4) => CsiForm::Letter(b'S'),
+        TermKey::F(n @ (3 | 5..=12)) => CsiForm::Number(tilde_code(n), b'~'),
+        TermKey::F(_) => return None,
+        TermKey::Kp(key) => CsiForm::Number(kp_code(key), b'u'),
+        TermKey::Modifier(_) => return None,
+    })
+}
+
+/// Final byte of the SS3 form of a key, if it has one.
+fn ss3_final(key: TermKey) -> Option<u8> {
+    Some(match key {
+        TermKey::Up => b'A',
+        TermKey::Down => b'B',
+        TermKey::Right => b'C',
+        TermKey::Left => b'D',
+        TermKey::Home => b'H',
+        TermKey::End => b'F',
+        TermKey::F(1) => b'P',
+        TermKey::F(2) => b'Q',
+        TermKey::F(3) => b'R',
+        TermKey::F(4) => b'S',
+        _ => return None,
+    })
+}
+
+/// Keypad keys that produce text, as opposed to keys like KP_Enter.
+fn is_text_key(key: TermKey) -> bool {
+    match key {
+        TermKey::Char(_) => true,
+        TermKey::Kp(key) => matches!(
+            key,
+            KpKey::Kp0
+                | KpKey::Kp1
+                | KpKey::Kp2
+                | KpKey::Kp3
+                | KpKey::Kp4
+                | KpKey::Kp5
+                | KpKey::Kp6
+                | KpKey::Kp7
+                | KpKey::Kp8
+                | KpKey::Kp9
+                | KpKey::Decimal
+                | KpKey::Divide
+                | KpKey::Multiply
+                | KpKey::Subtract
+                | KpKey::Add
+                | KpKey::Equal
+                | KpKey::Separator
+        ),
+        _ => false,
+    }
+}
+
+/// Non-keypad key that a keypad key stands for when Kitty flag 1 and flag 8 are off.
+fn legacy_equivalent(key: TermKey) -> TermKey {
+    match key {
+        TermKey::Kp(KpKey::Enter) => TermKey::Enter,
+        TermKey::Kp(KpKey::Left) => TermKey::Left,
+        TermKey::Kp(KpKey::Right) => TermKey::Right,
+        TermKey::Kp(KpKey::Up) => TermKey::Up,
+        TermKey::Kp(KpKey::Down) => TermKey::Down,
+        TermKey::Kp(KpKey::PageUp) => TermKey::PageUp,
+        TermKey::Kp(KpKey::PageDown) => TermKey::PageDown,
+        TermKey::Kp(KpKey::Home) => TermKey::Home,
+        TermKey::Kp(KpKey::End) => TermKey::End,
+        TermKey::Kp(KpKey::Insert) => TermKey::Insert,
+        TermKey::Kp(KpKey::Delete) => TermKey::Delete,
+        other => other,
+    }
+}
+
+/// Code point of a text key: the lowercase character for ASCII, otherwise the
+/// US base character when there is one.
+fn unicode_code(c: char, base: Option<char>) -> u32 {
+    if c.is_ascii() {
+        u32::from(c.to_ascii_lowercase())
+    } else {
+        u32::from(base.unwrap_or(c))
+    }
+}
+
+/// C0 byte for Ctrl plus the unshifted character `c`.
+fn control_byte(c: char) -> Option<u8> {
+    let c = c.to_ascii_lowercase();
+    Some(match c {
+        'a'..='z' => c as u8 - b'a' + 1,
+        ' ' | '2' | '@' => 0x00,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' | '6' => 0x1e,
+        '/' | '-' | '_' => 0x1f,
+        _ => return None,
+    })
+}
+
+fn kp_code(key: KpKey) -> u32 {
+    match key {
+        KpKey::Kp0 => 57399,
+        KpKey::Kp1 => 57400,
+        KpKey::Kp2 => 57401,
+        KpKey::Kp3 => 57402,
+        KpKey::Kp4 => 57403,
+        KpKey::Kp5 => 57404,
+        KpKey::Kp6 => 57405,
+        KpKey::Kp7 => 57406,
+        KpKey::Kp8 => 57407,
+        KpKey::Kp9 => 57408,
+        KpKey::Decimal => 57409,
+        KpKey::Divide => 57410,
+        KpKey::Multiply => 57411,
+        KpKey::Subtract => 57412,
+        KpKey::Add => 57413,
+        KpKey::Enter => 57414,
+        KpKey::Equal => 57415,
+        KpKey::Separator => 57416,
+        KpKey::Left => 57417,
+        KpKey::Right => 57418,
+        KpKey::Up => 57419,
+        KpKey::Down => 57420,
+        KpKey::PageUp => 57421,
+        KpKey::PageDown => 57422,
+        KpKey::Home => 57423,
+        KpKey::End => 57424,
+        KpKey::Insert => 57425,
+        KpKey::Delete => 57426,
+        KpKey::Begin => 57427,
+    }
+}
+
+/// Tilde code of F3 and F5 to F12.
+fn tilde_code(n: u8) -> u32 {
+    match n {
+        3 => 13,
+        5 => 15,
+        6 => 17,
+        7 => 18,
+        8 => 19,
+        9 => 20,
+        10 => 21,
+        11 => 23,
+        _ => 24,
+    }
+}
+
+/// PUA code point of a modifier key, from the Kitty functional key table.
+fn modifier_code(key: ModKey) -> u32 {
+    match key {
+        ModKey::LeftShift => 57441,
+        ModKey::LeftCtrl => 57442,
+        ModKey::LeftAlt => 57443,
+        ModKey::LeftSuper => 57444,
+        ModKey::RightShift => 57447,
+        ModKey::RightCtrl => 57448,
+        ModKey::RightAlt => 57449,
+        ModKey::RightSuper => 57450,
+        ModKey::CapsLock => 57358,
+        ModKey::NumLock => 57360,
+        ModKey::IsoLevel3Shift => 57453,
+    }
+}
+
+/// Modifier bit that a modifier key sets on its own press and clears on release.
+fn own_bit(key: ModKey) -> u8 {
+    match key {
+        ModKey::LeftShift | ModKey::RightShift => BIT_SHIFT,
+        ModKey::LeftAlt | ModKey::RightAlt => BIT_ALT,
+        ModKey::LeftCtrl | ModKey::RightCtrl => BIT_CTRL,
+        ModKey::LeftSuper | ModKey::RightSuper => BIT_SUPER,
+        ModKey::CapsLock | ModKey::NumLock | ModKey::IsoLevel3Shift => 0,
+    }
+}
+
+fn modifier_bits(mods: KeyMods) -> u8 {
+    u8::from(mods.shift) * BIT_SHIFT
+        | u8::from(mods.alt) * BIT_ALT
+        | u8::from(mods.ctrl) * BIT_CTRL
+        | u8::from(mods.super_key) * BIT_SUPER
+}
+
+/// Event-type field: 1 when events are not reported, otherwise press 1, repeat 2, release 3.
+fn event_field(kind: KeyKind, events: bool) -> u8 {
+    match (events, kind) {
+        (false, _) | (true, KeyKind::Press) => 1,
+        (true, KeyKind::Repeat) => 2,
+        (true, KeyKind::Release) => 3,
+    }
+}
+
+/// Writes `ESC` before `bytes` when `alt` is set.
+fn alt_prefixed(out: &mut Vec<u8>, alt: bool, bytes: &[u8]) {
+    if alt {
+        out.push(0x1b);
+    }
+    out.extend_from_slice(bytes);
+}
+
+/// Writes a decimal number without allocating.
+fn push_decimal(out: &mut Vec<u8>, mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend(digits[..len].iter().rev());
+}
