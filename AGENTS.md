@@ -174,7 +174,7 @@ In render, frame, glyph, input, PTY-output, and animation paths:
 ### Terminal backend
 
 - `src/terminal.rs` — parser, grid state, scrollback, escape-sequence behavior, and small session facade. Keep rendering, tabs, search, and settings out.
-- `src/terminal_compat.rs` — compact cell/color representation, Unicode width/combining, SGR helpers. Keep PTY/process/render ownership out.
+- `crates/ronsole-term/src/cell.rs`, `color.rs`, `input.rs` — compact cell/color representation, Unicode width/combining, SGR helpers, and mouse/paste/focus encoders. Keep PTY/process/render ownership out.
 - `src/terminal_process.rs` — PTY spawn/I/O batching, shell startup, cached dynamic titles, and bounded shutdown.
 - `src/platform/process.rs` — Linux-only `/proc` process/session helper.
 - Dynamic-title discovery must stay bounded to the foreground process group.
@@ -295,7 +295,7 @@ Core source:
 - `src/renderer/terminal_ui.rs` — terminal UI rendering and geometry.
 - `src/input.rs` — input, selection, protocol, clipboard routing.
 - `src/terminal.rs` — parser/grid/scrollback.
-- `src/terminal_compat.rs` — compact terminal representation and Unicode/SGR helpers.
+- `crates/ronsole-term/src/cell.rs`, `color.rs`, `input.rs` — compact terminal representation, Unicode/SGR helpers, and mouse/paste/focus encoders.
 - `src/terminal_process.rs` — PTY/process/title/shutdown behavior.
 - `src/platform.rs` / `src/platform/process.rs` — Linux platform and process helpers.
 - `src/search.rs` — cached terminal search.

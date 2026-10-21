@@ -5,6 +5,7 @@ use crate::platform::Clipboard;
 use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target};
 use crate::search::{SearchRefreshCause, TerminalSearchHit, TerminalSearchState};
 use crate::terminal::{MouseTrackingMode, Terminal};
+use ronsole_term::{MouseButton, MouseEventKind, bracketed_paste_bytes, mouse_report};
 use std::path::{Path, PathBuf};
 
 pub(crate) struct TerminalInteraction {
@@ -970,18 +971,18 @@ fn terminal_mouse_event_sequence(
     x: f32,
     y: f32,
 ) -> Option<Vec<u8>> {
-    if capture != PointerCapture::None || !tracking.enabled() {
+    if capture != PointerCapture::None {
         return None;
     }
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
-    let code = terminal_mouse_button_code(button)?;
-    Some(terminal_mouse_protocol_sequence(
-        code,
-        cell_x,
-        cell_y,
-        state == KeyState::Pressed,
-        sgr,
-    ))
+    let button = terminal_mouse_button(button)?;
+    let kind = if state == KeyState::Pressed {
+        MouseEventKind::Press(button)
+    } else {
+        MouseEventKind::Release(button)
+    };
+    // Protocol cells are one-based; the crate takes zero-based coordinates.
+    mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)
 }
 
 fn terminal_mouse_motion_sequence(
@@ -992,21 +993,11 @@ fn terminal_mouse_motion_sequence(
     x: f32,
     y: f32,
 ) -> Option<Vec<u8>> {
-    let base_code = match tracking {
-        MouseTrackingMode::AnyMotion if pressed_buttons == 0 => 3,
-        MouseTrackingMode::AnyMotion | MouseTrackingMode::ButtonMotion => {
-            terminal_first_pressed_button_code(pressed_buttons)?
-        }
-        MouseTrackingMode::None | MouseTrackingMode::Press => return None,
-    };
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
-    Some(terminal_mouse_protocol_sequence(
-        base_code + 32,
-        cell_x,
-        cell_y,
-        true,
-        sgr,
-    ))
+    let kind = MouseEventKind::Motion {
+        held: terminal_first_pressed_button(pressed_buttons),
+    };
+    mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)
 }
 
 fn terminal_mouse_wheel_sequence(
@@ -1017,13 +1008,14 @@ fn terminal_mouse_wheel_sequence(
     y: f32,
     dy: f32,
 ) -> Option<Vec<u8>> {
-    if !tracking.enabled() {
-        return None;
-    }
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
     let steps = (dy.abs() / 20.0).max(1.0) as usize;
-    let button = if dy > 0.0 { 64 } else { 65 };
-    let sequence = terminal_mouse_protocol_sequence(button, cell_x, cell_y, true, sgr);
+    let kind = if dy > 0.0 {
+        MouseEventKind::WheelUp
+    } else {
+        MouseEventKind::WheelDown
+    };
+    let sequence = mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)?;
     let mut input = Vec::with_capacity(sequence.len().saturating_mul(steps.min(3)));
     for _ in 0..steps.min(3) {
         input.extend_from_slice(&sequence);
@@ -1031,41 +1023,23 @@ fn terminal_mouse_wheel_sequence(
     Some(input)
 }
 
-fn terminal_mouse_button_code(button: PointerButton) -> Option<u8> {
+fn terminal_mouse_button(button: PointerButton) -> Option<MouseButton> {
     match button {
-        PointerButton::Left => Some(0),
-        PointerButton::Middle => Some(1),
-        PointerButton::Right => Some(2),
+        PointerButton::Left => Some(MouseButton::Left),
+        PointerButton::Middle => Some(MouseButton::Middle),
+        PointerButton::Right => Some(MouseButton::Right),
         PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => None,
     }
 }
 
-fn terminal_mouse_protocol_sequence(
-    code: u8,
-    x: usize,
-    y: usize,
-    pressed: bool,
-    sgr: bool,
-) -> Vec<u8> {
-    if sgr {
-        return format!("\x1b[<{code};{x};{y}{}", if pressed { 'M' } else { 'm' }).into_bytes();
-    }
-    let legacy_code = if pressed { code } else { 3 };
-    vec![
-        0x1b,
-        b'[',
-        b'M',
-        legacy_code.saturating_add(32),
-        (x.min(223) as u8).saturating_add(32),
-        (y.min(223) as u8).saturating_add(32),
-    ]
-}
-
 fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: KeyState) {
-    let Some(code) = terminal_mouse_button_code(button) else {
-        return;
+    // Bit per button: left 1, middle 2, right 4.
+    let bit = match button {
+        PointerButton::Left => 1u8,
+        PointerButton::Middle => 2,
+        PointerButton::Right => 4,
+        PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => return,
     };
-    let bit = 1u8 << code;
     if state == KeyState::Pressed {
         *buttons |= bit;
     } else {
@@ -1073,13 +1047,13 @@ fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: 
     }
 }
 
-fn terminal_first_pressed_button_code(buttons: u8) -> Option<u8> {
+fn terminal_first_pressed_button(buttons: u8) -> Option<MouseButton> {
     if buttons & 1 != 0 {
-        Some(0)
+        Some(MouseButton::Left)
     } else if buttons & 2 != 0 {
-        Some(1)
+        Some(MouseButton::Middle)
     } else if buttons & 4 != 0 {
-        Some(2)
+        Some(MouseButton::Right)
     } else {
         None
     }
@@ -1103,20 +1077,7 @@ fn terminal_clipboard_paste_bytes(
 /// Delivers a paste payload as user input, wrapped when bracketed paste is on.
 fn write_terminal_paste(terminal: &mut Terminal, payload: Vec<u8>) {
     let bracketed_paste = crate::platform::lock_recover(&terminal.grid).bracketed_paste;
-    terminal.write_user_input(&terminal_bracketed_paste_bytes(payload, bracketed_paste));
-}
-
-fn terminal_bracketed_paste_bytes(payload: Vec<u8>, enabled: bool) -> Vec<u8> {
-    if !enabled {
-        return payload;
-    }
-    const START: &[u8] = b"\x1b[200~";
-    const END: &[u8] = b"\x1b[201~";
-    let mut out = Vec::with_capacity(START.len() + payload.len() + END.len());
-    out.extend_from_slice(START);
-    out.extend_from_slice(&payload);
-    out.extend_from_slice(END);
-    out
+    terminal.write_user_input(&bracketed_paste_bytes(payload, bracketed_paste));
 }
 
 fn terminal_shell_escape_path(path: &Path, out: &mut Vec<u8>) {
@@ -1645,18 +1606,18 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_text_and_shell_escaped_file_lists_through_one_path() {
         assert_eq!(
-            terminal_bracketed_paste_bytes(b"plain".to_vec(), false),
+            bracketed_paste_bytes(b"plain".to_vec(), false),
             b"plain"
         );
         assert_eq!(
-            terminal_bracketed_paste_bytes(b"plain".to_vec(), true),
+            bracketed_paste_bytes(b"plain".to_vec(), true),
             b"\x1b[200~plain\x1b[201~"
         );
 
         let paths = [PathBuf::from("/tmp/a b"), PathBuf::from("/tmp/界")];
         let payload = terminal_clipboard_paste_bytes(Some(&paths), Some("ignored")).unwrap();
         assert_eq!(
-            terminal_bracketed_paste_bytes(payload, true),
+            bracketed_paste_bytes(payload, true),
             "\u{1b}[200~/tmp/a\\ b /tmp/界\u{1b}[201~".as_bytes()
         );
     }
@@ -1819,16 +1780,16 @@ mod tests {
     #[test]
     fn sgr_mouse_protocol_uses_one_based_cells_and_release_marker() {
         assert_eq!(
-            terminal_mouse_protocol_sequence(0, 3, 4, true, true),
-            b"\x1b[<0;3;4M"
+            mouse_report(MouseTrackingMode::Press, true, MouseEventKind::Press(MouseButton::Left), 2, 3),
+            Some(b"\x1b[<0;3;4M".to_vec())
         );
         assert_eq!(
-            terminal_mouse_protocol_sequence(2, 1, 1, false, true),
-            b"\x1b[<2;1;1m"
+            mouse_report(MouseTrackingMode::Press, true, MouseEventKind::Release(MouseButton::Right), 0, 0),
+            Some(b"\x1b[<2;1;1m".to_vec())
         );
         assert_eq!(
-            terminal_mouse_protocol_sequence(0, 3, 4, true, false),
-            vec![0x1b, b'[', b'M', 32, 35, 36]
+            mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 2, 3),
+            Some(vec![0x1b, b'[', b'M', 32, 35, 36])
         );
     }
 
@@ -2254,7 +2215,7 @@ mod tests {
         let x = layout.text_x + 5.0;
         let y = layout.body.y + 100.0;
         for button in [PointerButton::Back, PointerButton::Forward, PointerButton::Other(9)] {
-            assert_eq!(terminal_mouse_button_code(button), None);
+            assert_eq!(terminal_mouse_button(button), None);
             assert!(terminal_mouse_event_sequence(
                 layout,
                 PointerCapture::None,

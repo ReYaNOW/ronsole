@@ -51,8 +51,8 @@ const fn button_code(button: MouseButton) -> u8 {
 
 /// Encodes a mouse event for the given tracking mode. `col` and `row` are
 /// zero-based; the report uses one-based coordinates. Returns `None` when the
-/// mode does not report this event, or when the legacy encoding cannot carry
-/// the coordinates.
+/// mode does not report this event. Legacy (non-SGR) coordinates saturate at
+/// `LEGACY_COORDINATE_LIMIT`; SGR coordinates are not limited.
 pub fn mouse_report(
     mode: MouseTrackingMode,
     sgr: bool,
@@ -85,18 +85,16 @@ pub fn mouse_report(
         let final_byte = if pressed { 'M' } else { 'm' };
         return Some(format!("\x1b[<{code};{x};{y}{final_byte}").into_bytes());
     }
-    if x > LEGACY_COORDINATE_LIMIT || y > LEGACY_COORDINATE_LIMIT {
-        return None;
-    }
     // Legacy encoding has no separate release code per button; release is code 3.
     let legacy_code = if pressed { code } else { 3 };
+    // Coordinates past the limit clamp to it, matching the original encoder.
     Some(vec![
         0x1b,
         b'[',
         b'M',
         legacy_code + 32,
-        x as u8 + 32,
-        y as u8 + 32,
+        x.min(LEGACY_COORDINATE_LIMIT) as u8 + 32,
+        y.min(LEGACY_COORDINATE_LIMIT) as u8 + 32,
     ])
 }
 
@@ -179,20 +177,21 @@ mod tests {
     }
 
     #[test]
-    fn mouse_report_legacy_coordinate_beyond_limit_is_none() {
-        // 1-based 223 is the last encodable column: 223 + 32 = 255.
-        assert!(
-            mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 222, 0)
-                .is_some()
-        );
+    fn mouse_report_legacy_coordinate_clamps_to_limit() {
+        // 1-based 223 is the last unclamped column: 223 + 32 = 255.
         assert_eq!(
-            mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 223, 0),
-            None
+            mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 222, 0),
+            Some(vec![0x1b, b'[', b'M', 32, 255, 33])
+        );
+        // 1-based 224 and beyond clamp to 223, so the byte is 255 as well.
+        assert_eq!(
+            mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 223, 299),
+            Some(vec![0x1b, b'[', b'M', 32, 255, 255])
         );
         // SGR has no such limit.
-        assert!(
-            mouse_report(MouseTrackingMode::Press, true, MouseEventKind::Press(MouseButton::Left), 223, 0)
-                .is_some()
+        assert_eq!(
+            mouse_report(MouseTrackingMode::Press, true, MouseEventKind::Press(MouseButton::Left), 223, 0),
+            Some(b"\x1b[<0;224;1M".to_vec())
         );
     }
 

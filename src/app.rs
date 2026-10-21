@@ -21,6 +21,7 @@ use crate::tabs::{
 };
 use crate::terminal::{Terminal, TerminalPresentationIntent, screen_hash};
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
+use ronsole_term::focus_report_sequence;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -323,11 +324,6 @@ fn external_launch_plan(
 }
 
 #[inline]
-fn terminal_focus_report_sequence(enabled: bool, focused: bool) -> Option<&'static [u8]> {
-    enabled.then_some(if focused { b"\x1b[I" } else { b"\x1b[O" })
-}
-
-#[inline]
 fn terminal_focus_transition_plan(
     window_focused: bool,
     identity_changed: bool,
@@ -338,8 +334,8 @@ fn terminal_focus_transition_plan(
         return (None, None);
     }
     (
-        terminal_focus_report_sequence(old_reporting, false),
-        terminal_focus_report_sequence(new_reporting, true),
+        focus_report_sequence(old_reporting, false),
+        focus_report_sequence(new_reporting, true),
     )
 }
 
@@ -551,7 +547,7 @@ impl App {
             return;
         };
         let reporting = crate::platform::lock_recover(&terminal.grid).focus_reporting;
-        if let Some(sequence) = terminal_focus_report_sequence(reporting, focused) {
+        if let Some(sequence) = focus_report_sequence(reporting, focused) {
             let _ = terminal.write_input(sequence);
         }
     }
@@ -2823,14 +2819,14 @@ mod tests {
 
     #[test]
     fn focus_reporting_uses_xterm_sequences_only_when_enabled() {
-        assert_eq!(terminal_focus_report_sequence(false, true), None);
-        assert_eq!(terminal_focus_report_sequence(false, false), None);
+        assert_eq!(focus_report_sequence(false, true), None);
+        assert_eq!(focus_report_sequence(false, false), None);
         assert_eq!(
-            terminal_focus_report_sequence(true, true),
+            focus_report_sequence(true, true),
             Some(b"\x1b[I".as_slice())
         );
         assert_eq!(
-            terminal_focus_report_sequence(true, false),
+            focus_report_sequence(true, false),
             Some(b"\x1b[O".as_slice())
         );
     }
