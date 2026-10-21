@@ -1,5 +1,5 @@
 use crate::single_line_input::SingleLineInput;
-use crate::terminal::TermGrid;
+use ronsole_term::Term;
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use unicode_width::UnicodeWidthChar;
@@ -350,19 +350,19 @@ impl TerminalSearchState {
 
     pub(crate) fn recompute_if_needed(
         &mut self,
-        grid: &TermGrid,
+        grid: &Term,
         cause: SearchRefreshCause,
     ) -> bool {
         if !self.shown
             || (self.scanned_query_revision == self.query_revision
-                && self.scanned_grid_generation == grid.content_generation)
+                && self.scanned_grid_generation == grid.content_generation())
         {
             return false;
         }
         let previous_active = self.active_match();
         let previous_index = self.current;
         self.scanned_query_revision = self.query_revision;
-        self.scanned_grid_generation = grid.content_generation;
+        self.scanned_grid_generation = grid.content_generation();
         self.results.clear();
         self.current = None;
         if self.input.text.is_empty() {
@@ -376,17 +376,12 @@ impl TerminalSearchState {
             return true;
         };
 
-        let scrollback_len = if grid.is_alt { 0 } else { grid.scrollback.len() };
-        let total_lines = scrollback_len + grid.lines.len();
+        let total_lines = grid.total_rows();
         'rows: for y in 0..total_lines {
-            let row = if y < scrollback_len {
-                &grid.scrollback[y]
-            } else {
-                &grid.lines[y - scrollback_len]
-            };
+            let row = grid.row(y).unwrap_or(&[]);
             self.line_scratch.clear();
             self.line_byte_cells.clear();
-            for (cell_index, cell) in row.iter().take(grid.cols).enumerate() {
+            for (cell_index, cell) in row.iter().take(grid.cols()).enumerate() {
                 let before = self.line_scratch.len();
                 cell.append_text_to(&mut self.line_scratch);
                 self.line_byte_cells
@@ -421,7 +416,7 @@ impl TerminalSearchState {
 
     pub(crate) fn refresh_for_grid(
         &mut self,
-        grid: &mut TermGrid,
+        grid: &mut Term,
         cause: SearchRefreshCause,
     ) -> bool {
         self.refresh_for_grid_at(grid, cause, Instant::now())
@@ -429,12 +424,12 @@ impl TerminalSearchState {
 
     fn refresh_for_grid_at(
         &mut self,
-        grid: &mut TermGrid,
+        grid: &mut Term,
         cause: SearchRefreshCause,
         now: Instant,
     ) -> bool {
         let stale_query = self.scanned_query_revision != self.query_revision;
-        let stale_grid = self.scanned_grid_generation != grid.content_generation;
+        let stale_grid = self.scanned_grid_generation != grid.content_generation();
         if !self.shown || (!stale_query && !stale_grid) {
             self.pending_passive_refresh_at = None;
             return false;
@@ -459,9 +454,9 @@ impl TerminalSearchState {
         }
         if changed && self.grid_selection_owned {
             if let Some(found) = self.active_match() {
-                grid.selection = Some((found.start_x, found.y, found.end_x, found.y));
+                grid.set_selection(Some((found.start_x, found.y, found.end_x, found.y)));
             } else {
-                grid.selection = None;
+                grid.set_selection(None);
                 self.grid_selection_owned = false;
             }
         }
@@ -474,14 +469,14 @@ impl TerminalSearchState {
 
     pub(crate) fn set_active_grid_selection(
         &mut self,
-        grid: &mut TermGrid,
+        grid: &mut Term,
     ) -> Option<TerminalSearchMatch> {
         let found = self.active_match();
         if let Some(found) = found {
-            grid.selection = Some((found.start_x, found.y, found.end_x, found.y));
+            grid.set_selection(Some((found.start_x, found.y, found.end_x, found.y)));
             self.grid_selection_owned = true;
         } else if self.grid_selection_owned {
-            grid.selection = None;
+            grid.set_selection(None);
             self.grid_selection_owned = false;
         }
         found
@@ -531,13 +526,39 @@ impl TerminalSearchState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::TermGrid;
+    use ronsole_term::{Cell, TermConfig, TermIdentity};
 
-    fn set_row(grid: &mut TermGrid, row: usize, text: &str) {
-        for (x, c) in text.chars().enumerate() {
-            grid.lines[row][x].set_ch(c);
+    fn new_grid(cols: usize, rows: usize) -> Term {
+        Term::new(TermConfig {
+            cols,
+            rows,
+            scrollback_lines: 10_000,
+            identity: TermIdentity {
+                name: "ronsole",
+                version: "test",
+            },
+            palette: crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+        })
+    }
+
+    fn clear_row(grid: &mut Term, row: usize) {
+        for col in 0..grid.cols() {
+            grid.set_cell_for_test(row, col, Cell::default());
         }
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+    }
+
+    fn set_row(grid: &mut Term, row: usize, text: &str) {
+        for (x, c) in text.chars().enumerate() {
+            let cell = Cell::new_for_test(
+                c,
+                ronsole_term::TerminalColor::default_foreground(),
+                ronsole_term::TerminalColor::default_background(),
+                ronsole_term::CellFlags::empty(),
+                ronsole_term::UnderlineStyle::None,
+            );
+            grid.set_cell_for_test(row, x, cell);
+        }
+        grid.mark_changed();
     }
 
     #[test]
@@ -550,9 +571,12 @@ mod tests {
 
     #[test]
     fn search_maps_wide_and_combining_text_to_physical_grid_columns() {
-        let mut grid = TermGrid::new(32, 1);
-        let mut parser = vte::Parser::new();
-        parser.advance(&mut grid, "é界e\u{0301}needle".as_bytes());
+        let mut grid = new_grid(32, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        grid.advance("é界e\u{0301}needle".as_bytes(), Instant::now(), &mut sink);
 
         let mut search = TerminalSearchState::default();
         search.open();
@@ -583,17 +607,23 @@ mod tests {
 
     #[test]
     fn search_uses_reflowed_scrollback_rows_after_width_change() {
-        let mut grid = TermGrid::new(12, 1);
-        let mut history = vec![crate::terminal::Cell::default(); 12];
+        let mut grid = new_grid(12, 1);
+        let mut history = vec![Cell::default(); 12];
         for (index, c) in "hit   needle".chars().enumerate() {
-            history[index].set_ch(c);
+            history[index] = Cell::new_for_test(
+                c,
+                ronsole_term::TerminalColor::default_foreground(),
+                ronsole_term::TerminalColor::default_background(),
+                ronsole_term::CellFlags::empty(),
+                ronsole_term::UnderlineStyle::None,
+            );
         }
         grid.push_scrollback_row_for_test(history, 12, false);
 
         grid.resize(7, 1);
-        assert_eq!(grid.cols, 7);
-        assert_eq!(grid.scrollback.len(), 2);
-        assert!(grid.scrollback.iter().all(|row| row.len() == 7));
+        assert_eq!(grid.cols(), 7);
+        assert_eq!(grid.scrollback_len(), 2);
+        assert!((0..grid.scrollback_len()).all(|y| grid.row(y).is_some_and(|row| row.len() == 7)));
 
         let mut second_row = TerminalSearchState::default();
         second_row.open();
@@ -624,7 +654,7 @@ mod tests {
 
     #[test]
     fn search_reuses_results_until_query_or_grid_generation_changes() {
-        let mut grid = TermGrid::new(32, 2);
+        let mut grid = new_grid(32, 2);
         set_row(&mut grid, 0, "Alpha alpha");
         let mut search = TerminalSearchState::default();
         search.open();
@@ -641,7 +671,7 @@ mod tests {
 
     #[test]
     fn reopening_search_rebuilds_results_after_close_clears_them() {
-        let mut grid = TermGrid::new(16, 1);
+        let mut grid = new_grid(16, 1);
         set_row(&mut grid, 0, "needle");
         let mut search = TerminalSearchState::default();
         search.open();
@@ -657,14 +687,11 @@ mod tests {
 
     #[test]
     fn search_results_remain_bounded_under_match_flood() {
-        let mut grid = TermGrid::new(256, 300);
-        for row in &mut grid.lines {
-            row.fill(crate::terminal::Cell::default());
-            for cell in row {
-                cell.set_ch('a');
-            }
+        let mut grid = new_grid(256, 300);
+        for row in 0..300 {
+            set_row(&mut grid, row, &"a".repeat(256));
         }
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        grid.mark_changed();
         let mut search = TerminalSearchState::default();
         search.open();
         search.insert_text("a");
@@ -674,7 +701,7 @@ mod tests {
 
     #[test]
     fn passive_grid_refresh_preserves_exact_active_match() {
-        let mut grid = TermGrid::new(32, 4);
+        let mut grid = new_grid(32, 4);
         set_row(&mut grid, 0, "needle");
         set_row(&mut grid, 1, "needle");
         set_row(&mut grid, 2, "needle");
@@ -691,12 +718,12 @@ mod tests {
 
         assert_eq!(search.active_match(), Some(before));
         assert_eq!(search.current, Some(1));
-        assert_eq!(grid.selection, Some((before.start_x, before.y, before.end_x, before.y)));
+        assert_eq!(grid.selection(),Some((before.start_x, before.y, before.end_x, before.y)));
     }
 
     #[test]
     fn passive_refresh_preserves_cross_row_match_when_start_x_decreases() {
-        let mut grid = TermGrid::new(32, 3);
+        let mut grid = new_grid(32, 3);
         set_row(&mut grid, 0, "..........needle");
         set_row(&mut grid, 1, "needle");
         let mut search = TerminalSearchState::default();
@@ -730,7 +757,7 @@ mod tests {
 
     #[test]
     fn passive_refresh_fallback_uses_row_major_insertion_order() {
-        let mut grid = TermGrid::new(40, 3);
+        let mut grid = new_grid(40, 3);
         set_row(&mut grid, 0, "..........needle");
         set_row(&mut grid, 1, "needle");
         set_row(&mut grid, 2, "....................needle");
@@ -749,8 +776,8 @@ mod tests {
             }
         );
 
-        grid.lines[0].fill(crate::terminal::Cell::default());
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        clear_row(&mut grid, 0);
+        grid.mark_changed();
         assert!(search.recompute_if_needed(&grid, SearchRefreshCause::Grid));
 
         assert_eq!(
@@ -783,7 +810,7 @@ mod tests {
 
     #[test]
     fn passive_new_matching_output_does_not_steal_current_result() {
-        let mut grid = TermGrid::new(32, 4);
+        let mut grid = new_grid(32, 4);
         set_row(&mut grid, 0, "needle");
         set_row(&mut grid, 1, "needle");
         set_row(&mut grid, 2, "needle");
@@ -801,12 +828,12 @@ mod tests {
         assert_eq!(search.results.len(), 4);
         assert_eq!(search.active_match(), Some(before));
         assert_ne!(search.current, Some(search.results.len() - 1));
-        assert_eq!(grid.selection, Some((before.start_x, before.y, before.end_x, before.y)));
+        assert_eq!(grid.selection(),Some((before.start_x, before.y, before.end_x, before.y)));
     }
 
     #[test]
     fn passive_refresh_uses_nearby_fallback_and_clears_stale_selection_when_empty() {
-        let mut grid = TermGrid::new(32, 3);
+        let mut grid = new_grid(32, 3);
         set_row(&mut grid, 0, "needle");
         set_row(&mut grid, 1, "needle");
         set_row(&mut grid, 2, "needle");
@@ -819,19 +846,19 @@ mod tests {
         search.set_active_grid_selection(&mut grid);
         let now = Instant::now();
 
-        grid.lines[1].fill(crate::terminal::Cell::default());
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        clear_row(&mut grid, 1);
+        grid.mark_changed();
         assert!(search.refresh_for_grid_at(&mut grid, SearchRefreshCause::Grid, now));
         let fallback = search.active_match().expect("nearby result should remain");
         assert_ne!(fallback, removed);
         assert_eq!(fallback.y, 2);
         assert!(search.current.is_some_and(|index| index < search.results.len()));
-        assert_eq!(grid.selection, Some((fallback.start_x, fallback.y, fallback.end_x, fallback.y)));
+        assert_eq!(grid.selection(),Some((fallback.start_x, fallback.y, fallback.end_x, fallback.y)));
 
-        for row in &mut grid.lines {
-            row.fill(crate::terminal::Cell::default());
+        for row in 0..grid.rows() {
+            clear_row(&mut grid, row);
         }
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        grid.mark_changed();
         assert!(search.refresh_for_grid_at(
             &mut grid,
             SearchRefreshCause::Grid,
@@ -839,12 +866,12 @@ mod tests {
         ));
         assert!(search.results.is_empty());
         assert_eq!(search.current, None);
-        assert_eq!(grid.selection, None);
+        assert_eq!(grid.selection(),None);
     }
 
     #[test]
     fn passive_search_refresh_coalesces_generation_flood_and_finishes_after_quiescence() {
-        let mut grid = TermGrid::new(32, 2);
+        let mut grid = new_grid(32, 2);
         set_row(&mut grid, 0, "needle");
         let mut search = TerminalSearchState::default();
         search.open();
@@ -854,7 +881,7 @@ mod tests {
 
         let mut passive_scan_count = 0usize;
         for update in 0..100u64 {
-            grid.content_generation = grid.content_generation.wrapping_add(1);
+            grid.mark_changed();
             let now = base + Duration::from_micros(update * 100);
             passive_scan_count += usize::from(search.refresh_for_grid_at(
                 &mut grid,
@@ -863,7 +890,7 @@ mod tests {
             ));
         }
         assert_eq!(passive_scan_count, 1);
-        let latest_generation = grid.content_generation;
+        let latest_generation = grid.content_generation();
         let deadline = search
             .pending_passive_refresh_deadline()
             .expect("coalesced passive search needs a final wakeup");
@@ -879,13 +906,13 @@ mod tests {
         assert!(search.pending_passive_refresh_deadline().is_none());
 
         search.insert_text("x");
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        grid.mark_changed();
         assert!(search.refresh_for_grid_at(
             &mut grid,
             SearchRefreshCause::User,
             deadline + Duration::from_millis(1),
         ));
-        assert_eq!(search.scanned_grid_generation, grid.content_generation);
+        assert_eq!(search.scanned_grid_generation, grid.content_generation());
         assert!(search.pending_passive_refresh_deadline().is_none());
     }
 

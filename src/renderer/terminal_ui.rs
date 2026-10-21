@@ -6,10 +6,12 @@ use crate::search::{
     terminal_search_geometry,
 };
 use crate::terminal::{
-    CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Cell, TermGrid, Terminal, TerminalColor,
+    CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Terminal, TerminalColor,
     normalized_selection_bounds, terminal_should_render_zero_width,
 };
-use ronsole_term::{terminal_force_text_presentation, xterm_256_rgb};
+use ronsole_term::{
+    Cell, Rgb, Term, TermPalette, terminal_force_text_presentation, xterm_256_rgb,
+};
 
 const ANSI_16_COLORS: [[f32; 4]; 16] = [
     [0.10, 0.10, 0.10, 1.0],
@@ -29,6 +31,37 @@ const ANSI_16_COLORS: [[f32; 4]; 16] = [
     [0.40, 1.00, 1.00, 1.0],
     [1.00, 1.00, 1.00, 1.0],
 ];
+
+/// Builds the terminal palette the renderer draws with: default foreground
+/// is `ANSI_16_COLORS[7]`, default background is the configured colour, and
+/// the cursor has no palette colour of its own, so it follows the foreground.
+pub(crate) fn terminal_palette(background: crate::config::RgbColor) -> TermPalette {
+    let foreground = palette_rgb(ANSI_16_COLORS[7]);
+    TermPalette {
+        foreground,
+        background: Rgb {
+            r: background.r,
+            g: background.g,
+            b: background.b,
+        },
+        cursor: foreground,
+        ansi: std::array::from_fn(|index| palette_rgb(ANSI_16_COLORS[index])),
+    }
+}
+
+fn palette_rgb(rgba: [f32; 4]) -> Rgb {
+    Rgb {
+        r: terminal_palette_channel(rgba[0]),
+        g: terminal_palette_channel(rgba[1]),
+        b: terminal_palette_channel(rgba[2]),
+    }
+}
+
+/// Converts one unit-range channel to a byte, rounding half away from zero
+/// in f32 arithmetic.
+fn terminal_palette_channel(value: f32) -> u8 {
+    (value * 255.0).round() as u8
+}
 
 fn terminal_color_rgba(color: TerminalColor) -> [f32; 4] {
     if color.is_default_foreground() {
@@ -986,12 +1019,12 @@ fn terminal_dimensions_changed(
 }
 
 fn prepare_terminal_grid_for_render(
-    grid: &mut TermGrid,
+    grid: &mut Term,
     search: &mut TerminalSearchState,
     new_cols: usize,
     new_rows: usize,
 ) -> bool {
-    let resized = terminal_dimensions_changed(grid.cols, grid.visible_rows, new_cols, new_rows);
+    let resized = terminal_dimensions_changed(grid.cols(), grid.rows(), new_cols, new_rows);
     if resized {
         grid.resize(new_cols, new_rows);
     }
@@ -2548,11 +2581,11 @@ impl Renderer {
             prepare_terminal_grid_for_render(&mut grid, search, new_cols, new_rows);
         }
         let presentation_visible = grid.presentation_visible();
-        grid.dirty = false;
-        let scrollback_len = if grid.is_alt { 0 } else { grid.scrollback.len() };
-        let total_lines = scrollback_len + grid.lines.len();
-        let max_scroll = if grid.is_alt { 0.0 } else { terminal_max_scroll(total_lines, char_h, body.h, s) };
-        let scroll_offset = terminal_render_scroll_offset(terminal.scroll_y.current, max_scroll, grid.is_alt);
+        grid.set_dirty(false);
+        let is_alt = grid.is_alt_screen();
+        let total_lines = grid.total_rows();
+        let max_scroll = if is_alt { 0.0 } else { terminal_max_scroll(total_lines, char_h, body.h, s) };
+        let scroll_offset = terminal_render_scroll_offset(terminal.scroll_y.current, max_scroll, is_alt);
         let text_x = body.x + 10.0 * s;
         let (_, bottom_pad) = terminal_text_padding(s);
         let separator = terminal_focus_separator_rect(body, s);
@@ -2579,11 +2612,7 @@ impl Renderer {
                         i,
                         scroll_offset,
                     );
-                    let row = if i < scrollback_len {
-                        &grid.scrollback[i]
-                    } else {
-                        &grid.lines[i - scrollback_len]
-                    };
+                    let row = grid.row(i).unwrap_or(&[]);
                     match layer {
                         TerminalBodyLayer::Background => {
                             let row_matches = if search.shown {
@@ -2593,7 +2622,7 @@ impl Renderer {
                             };
                             let active_search_match = search.active_match();
                             let mut row_match_index = 0usize;
-                            for (cell_index, cell) in row.iter().take(grid.cols).enumerate() {
+                            for (cell_index, cell) in row.iter().take(grid.cols()).enumerate() {
                                 let (x, next_x) =
                                     terminal_cell_x_bounds(text_x, cell_index, char_w);
                                 let cell_w = (next_x - x).max(1.0);
@@ -2603,7 +2632,7 @@ impl Renderer {
                                     cell_index
                                 };
                                 let (_, mut bg) = terminal_cell_render_colors(cell, palette);
-                                if let Some((sx, sy, ex, ey)) = grid.selection {
+                                if let Some((sx, sy, ex, ey)) = grid.selection() {
                                     let (start_x, start_y, end_x, end_y) =
                                         normalized_selection_bounds(sx, sy, ex, ey);
                                     let selected = if i > start_y && i < end_y {
@@ -2642,7 +2671,7 @@ impl Renderer {
                             }
                         }
                         TerminalBodyLayer::Glyph => {
-                            for (cell_index, cell) in row.iter().take(grid.cols).enumerate() {
+                            for (cell_index, cell) in row.iter().take(grid.cols()).enumerate() {
                                 let Some((x, glyph_cell_w)) =
                                     terminal_glyph_cell_geometry(text_x, cell_index, cell, char_w)
                                 else {
@@ -2719,12 +2748,13 @@ impl Renderer {
                 }
             }
 
-            if input_focused && grid.cursor_visible {
-                let cursor_offset = grid.lines.len().saturating_sub(1).saturating_sub(grid.cur_y);
+            if input_focused && grid.cursor_visible() {
+                let (cursor_x, cursor_y_row) = grid.cursor();
+                let cursor_offset = grid.rows().saturating_sub(1).saturating_sub(cursor_y_row);
                 let cursor_y = body.y + body.h - bottom_pad - char_h
                     - cursor_offset as f32 * char_h + scroll_offset;
                 if cursor_y + char_h >= body.y && cursor_y <= body.y + body.h {
-                    let (x1, x2) = terminal_cell_x_bounds(text_x, grid.cur_x, char_w);
+                    let (x1, x2) = terminal_cell_x_bounds(text_x, cursor_x, char_w);
                     self.push_rounded_rect(x1, cursor_y, (x2 - x1).max(1.0), char_h, 0.0, [1.0, 1.0, 1.0, 0.5]);
                 }
             }
@@ -2778,7 +2808,62 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ronsole_term::UnderlineStyle;
+    use ronsole_term::{TermConfig, TermIdentity, UnderlineStyle};
+
+    fn test_term(cols: usize, rows: usize) -> Term {
+        Term::new(TermConfig {
+            cols,
+            rows,
+            scrollback_lines: 10_000,
+            identity: TermIdentity {
+                name: "ronsole",
+                version: "test",
+            },
+            palette: terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+        })
+    }
+
+    fn set_test_char(grid: &mut Term, row: usize, col: usize, c: char) {
+        let cell = Cell::new_for_test(
+            c,
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            ronsole_term::CellFlags::empty(),
+            UnderlineStyle::None,
+        );
+        grid.set_cell_for_test(row, col, cell);
+    }
+
+    #[test]
+    fn terminal_palette_from_config() {
+        let background = crate::config::RgbColor::new(0x12, 0xAB, 0xEF);
+        let palette = terminal_palette(background);
+        let grey = Rgb {
+            r: 230,
+            g: 230,
+            b: 230,
+        };
+        assert_eq!(palette.foreground, grey);
+        assert_eq!(palette.cursor, grey);
+        assert_eq!(
+            palette.background,
+            Rgb {
+                r: 0x12,
+                g: 0xAB,
+                b: 0xEF,
+            }
+        );
+        assert_eq!(palette.ansi[7], grey);
+        assert_eq!(
+            palette.ansi[15],
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }
+        );
+        assert_eq!(terminal_palette_channel(0.70), 179);
+    }
 
     fn test_glyph(width: f32, height: f32, mode: f32) -> GlyphInfo {
         GlyphInfo {
@@ -3189,12 +3274,12 @@ mod tests {
 
     #[test]
     fn terminal_glyph_cell_geometry_preserves_ascii_wide_and_spacer_semantics() {
-        let mut ascii = Cell::default();
-        ascii.set_char(
+        let ascii = Cell::new_for_test(
             'A',
             TerminalColor::default_foreground(),
             TerminalColor::default_background(),
-            false,
+            ronsole_term::CellFlags::empty(),
+            UnderlineStyle::None,
         );
         assert_eq!(
             terminal_glyph_cell_geometry(0.0, 1, &ascii, 7.4),
@@ -3221,23 +3306,29 @@ mod tests {
         assert_eq!(terminal_glyph_cell_geometry(0.0, 1, &spacer, 7.4), None);
 
         // A hidden cell keeps its text but draws no glyph.
-        ascii.set_hidden(true);
-        assert_eq!(terminal_glyph_cell_geometry(0.0, 1, &ascii, 7.4), None);
+        let hidden_ascii = Cell::new_for_test(
+            'A',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            ronsole_term::CellFlags::HOST_HIDDEN,
+            UnderlineStyle::None,
+        );
+        assert_eq!(terminal_glyph_cell_geometry(0.0, 1, &hidden_ascii, 7.4), None);
     }
 
     #[test]
     fn resize_refreshes_search_to_the_new_grid_generation_before_render() {
-        let mut grid = TermGrid::new(16, 2);
+        let mut grid = test_term(16, 2);
         for (x, c) in "needle12345".chars().enumerate() {
-            grid.lines[0][x].set_ch(c);
+            set_test_char(&mut grid, 0, x, c);
         }
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        grid.mark_changed();
         let mut search = TerminalSearchState::default();
         search.open();
         search.insert_text("needle12345");
         assert!(search.recompute_if_needed(&grid, SearchRefreshCause::User));
         assert_eq!(search.results.len(), 1);
-        let old_generation = grid.content_generation;
+        let old_generation = grid.content_generation();
 
         assert!(prepare_terminal_grid_for_render(
             &mut grid,
@@ -3246,27 +3337,27 @@ mod tests {
             2,
         ));
 
-        assert_ne!(grid.content_generation, old_generation);
+        assert_ne!(grid.content_generation(), old_generation);
         assert_eq!(
             search.scanned_grid_generation_for_test(),
-            grid.content_generation
+            grid.content_generation()
         );
         assert!(search.results.is_empty());
         assert_eq!(search.current, None);
 
-        let post_resize_generation = grid.content_generation;
-        grid.lines[1][0].set_ch('x');
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        let post_resize_generation = grid.content_generation();
+        set_test_char(&mut grid, 1, 0, 'x');
+        grid.mark_changed();
         assert!(!prepare_terminal_grid_for_render(
             &mut grid,
             &mut search,
             10,
             2,
         ));
-        assert_ne!(grid.content_generation, post_resize_generation);
+        assert_ne!(grid.content_generation(), post_resize_generation);
         assert_ne!(
             search.scanned_grid_generation_for_test(),
-            grid.content_generation
+            grid.content_generation()
         );
         assert!(search.pending_passive_refresh_deadline().is_some());
     }

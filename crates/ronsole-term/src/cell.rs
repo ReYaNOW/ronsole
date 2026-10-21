@@ -196,13 +196,13 @@ impl Cell {
 
     // pub until Task 3 moves the grid
     #[doc(hidden)]
-    pub fn blank_with_background(bg: TerminalColor) -> Self {
+    pub(crate) fn blank_with_background(bg: TerminalColor) -> Self {
         Self { bg, ..Self::default() }
     }
 
     // pub until Task 3 moves the grid
     #[doc(hidden)]
-    pub fn set_ch(&mut self, c: char) {
+    pub(crate) fn set_ch(&mut self, c: char) {
         self.c = c;
     }
 
@@ -230,7 +230,7 @@ impl Cell {
 
     // pub until Task 3 moves the grid
     #[doc(hidden)]
-    pub fn set_presentation(&mut self, presentation: u8) {
+    pub(crate) fn set_presentation(&mut self, presentation: u8) {
         self.presentation = presentation;
     }
 
@@ -250,7 +250,7 @@ impl Cell {
 
     // pub until Task 3 moves the grid
     #[doc(hidden)]
-    pub fn set_hidden(&mut self, hidden: bool) {
+    pub(crate) fn set_hidden(&mut self, hidden: bool) {
         if hidden {
             self.flags = CellFlags(self.flags.0 | CellFlags::HOST_HIDDEN.0);
         } else {

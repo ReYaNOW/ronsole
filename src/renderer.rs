@@ -1,7 +1,7 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
     SettingsHit, SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
-    terminal_scrollbar_drag_target,
+    terminal_palette, terminal_scrollbar_drag_target,
 };
 use glow::HasContext;
 use rustc_hash::FxHashMap;

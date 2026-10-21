@@ -10,7 +10,7 @@ use crate::input_types::{
 use crate::launch::TerminalLaunchSpec;
 use crate::platform::{KdeActivationWorker, kde_session_active};
 use crate::platform::single_instance::BridgeResult;
-use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit};
+use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit, terminal_palette};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::TerminalSearchHit;
@@ -546,7 +546,7 @@ impl App {
         let Some(terminal) = self.terminals.get(index) else {
             return;
         };
-        let reporting = crate::platform::lock_recover(&terminal.grid).focus_reporting;
+        let reporting = crate::platform::lock_recover(&terminal.grid).focus_reporting();
         if let Some(sequence) = focus_report_sequence(reporting, focused) {
             let _ = terminal.write_input(sequence);
         }
@@ -558,10 +558,10 @@ impl App {
         }
         let old_reporting = old
             .and_then(|index| self.terminals.get(index))
-            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting);
+            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting());
         let new_reporting = new
             .and_then(|index| self.terminals.get(index))
-            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting);
+            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting());
         let (focus_out, focus_in) =
             terminal_focus_transition_plan(self.focused, true, old_reporting, new_reporting);
         if let (Some(index), Some(sequence)) = (old, focus_out)
@@ -641,7 +641,12 @@ impl App {
         let wake = self.runtime.as_ref()?.wake_handle();
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
-        let terminal = Terminal::spawn(Some(wake), display_number, launch);
+        let terminal = Terminal::spawn(
+            Some(wake),
+            display_number,
+            launch,
+            terminal_palette(self.config.terminal_background),
+        );
         let index = self.terminals.len();
         self.terminals.push(terminal);
         if self.terminals.len() == 1 {
@@ -1948,9 +1953,14 @@ mod tests {
     fn bridge_snapshot_confirm_forget_and_missing_tab_behave_as_specified() {
         let id = [9; 16];
         let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
-        vte::Parser::new().advance(
-            &mut *crate::platform::lock_recover(&terminal.grid),
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
             b"ordinary screen without bridge warning",
+            Instant::now(),
+            &mut sink,
         );
         let mut app = App::new();
         app.terminals.push(terminal);
@@ -1977,9 +1987,14 @@ mod tests {
     fn bridge_manual_confirm_after_auto_confirm_returns_already_confirmed() {
         let id = [10; 16];
         let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
-        vte::Parser::new().advance(
-            &mut *crate::platform::lock_recover(&terminal.grid),
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
             b"WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n\xe2\x9d\xaf 1. I am using this for local development",
+            Instant::now(),
+            &mut sink,
         );
         let mut app = App::new();
         app.terminals.push(terminal);
@@ -1991,9 +2006,13 @@ mod tests {
     }
 
     fn feed_batch(terminal: &Terminal, bytes: &str) {
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
         let mut grid = crate::platform::lock_recover(&terminal.grid);
-        vte::Parser::new().advance(&mut *grid, bytes.as_bytes());
-        grid.content_generation = grid.content_generation.wrapping_add(1);
+        grid.advance(bytes.as_bytes(), Instant::now(), &mut sink);
+        grid.mark_changed();
     }
 
     #[test]
@@ -2373,7 +2392,12 @@ mod tests {
             std::process::id()
         ));
         let mut app = App::new();
-        let terminal = Terminal::spawn(None, 1, TerminalLaunchSpec::hermetic_shell_for_test());
+        let terminal = Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec::hermetic_shell_for_test(),
+            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+        );
         terminal
             .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
             .unwrap();
@@ -2418,6 +2442,7 @@ mod tests {
                 hold: true,
                 bridge_launch_id: None,
             },
+            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
         );
         app.terminals.push(held);
         app.active_terminal = 0;
@@ -2453,6 +2478,7 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             },
+            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
         ));
         app.active_terminal = 0;
 
@@ -2483,6 +2509,7 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             },
+            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
         );
 
         assert!(!terminal.has_process());
@@ -3449,12 +3476,12 @@ mod tests {
     fn active_terminal_selection_clear_helper_removes_manual_selection() {
         let mut app = App::new();
         app.terminals.push(Terminal::new_for_test(80, 30, 1));
-        crate::platform::lock_recover(&app.terminals[0].grid).selection = Some((1, 2, 5, 2));
+        crate::platform::lock_recover(&app.terminals[0].grid).set_selection(Some((1, 2, 5, 2)));
 
         assert!(app.clear_active_terminal_text_selection());
         assert!(
             crate::platform::lock_recover(&app.terminals[0].grid)
-                .selection
+                .selection()
                 .is_none()
         );
         assert!(!app.clear_active_terminal_text_selection());

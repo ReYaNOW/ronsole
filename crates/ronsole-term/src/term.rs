@@ -226,6 +226,21 @@ impl Term {
         }
     }
 
+    /// Whether row `index` (indexed as in [`Term::row`]) continues onto the next row.
+    pub fn row_soft_wrapped(&self, index: usize) -> bool {
+        let scrollback_len = self.scrollback_len();
+        if index < scrollback_len {
+            self.scrollback_meta
+                .get(index)
+                .is_some_and(|meta| meta.soft_wrapped)
+        } else {
+            let row = index - scrollback_len;
+            self.line_meta
+                .get(row)
+                .is_some_and(|meta| meta.soft_wrapped)
+        }
+    }
+
     /// Visible row `y`, counted from the top of the screen.
     pub fn visible_row(&self, y: usize) -> Option<&[Cell]> {
         self.lines.get(y).map(Vec::as_slice)
