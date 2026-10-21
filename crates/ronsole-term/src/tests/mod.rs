@@ -2,6 +2,7 @@ mod csi;
 mod edges;
 mod osc;
 mod reflow;
+mod sgr;
 mod support;
 
 use crate::term::Term;

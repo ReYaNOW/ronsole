@@ -1,7 +1,7 @@
 //! `vte::Perform` for the terminal: CSI, ESC, control characters, DECSET/DECRST and replies.
 
 use crate::cell::{
-    Cell, apply_ansi_sgr,
+    Cell,
     is_terminal_zero_width_format, terminal_char_width, terminal_is_emoji_modifier,
     terminal_presentation_selector,
 };
@@ -11,6 +11,7 @@ use crate::grid::{
 };
 use crate::input::MouseTrackingMode;
 use crate::osc::terminal_programmed_title;
+use crate::sgr::apply_sgr;
 use crate::term::Performer;
 use vte::{Params, Perform};
 
@@ -264,7 +265,7 @@ impl Perform for Performer<'_> {
             }
             'J' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 match param {
                     0 => {
                         if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
@@ -318,7 +319,7 @@ impl Perform for Performer<'_> {
             }
             'K' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
                     match param {
                         0 => {
@@ -382,7 +383,7 @@ impl Perform for Performer<'_> {
                     return;
                 }
                 let count = csi_count(params, bottom - self.term.cur_y + 1);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 for _ in 0..count {
                     if let Some((mut line, _)) =
                         remove_line_with_meta(&mut self.term.lines, &mut self.term.line_meta, bottom)
@@ -412,7 +413,7 @@ impl Perform for Performer<'_> {
                     return;
                 }
                 let count = csi_count(params, bottom - self.term.cur_y + 1);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 for _ in 0..count {
                     if let Some((mut line, _)) =
                         remove_line_with_meta(&mut self.term.lines, &mut self.term.line_meta, self.term.cur_y)
@@ -437,7 +438,7 @@ impl Perform for Performer<'_> {
                 }
             }
             'P' => {
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 let mut deleted = 0usize;
                 if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
                     let count = csi_count(params, line.len().saturating_sub(self.term.cur_x));
@@ -459,7 +460,7 @@ impl Perform for Performer<'_> {
                 }
             }
             'X' => {
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 let mut erased_end = None;
                 if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
                     let start = self.term.cur_x.min(line.len());
@@ -482,15 +483,7 @@ impl Perform for Performer<'_> {
                 }
             }
             'm' => {
-                apply_ansi_sgr(
-                    params,
-                    &mut self.term.cur_fg,
-                    &mut self.term.cur_bg,
-                    &mut self.term.cur_bold,
-                    &mut self.term.cur_dim,
-                    &mut self.term.cur_underline,
-                    &mut self.term.cur_inverse,
-                );
+                apply_sgr(&mut self.term.pen, params);
             }
             'C' => {
                 let p = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
@@ -544,7 +537,7 @@ impl Perform for Performer<'_> {
             }
             '@' => {
                 let count = csi_count(params, self.term.cols.saturating_sub(self.term.cur_x));
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 if count > 0
                     && let Some(line) = self.term.lines.get_mut(self.term.cur_y)
                 {

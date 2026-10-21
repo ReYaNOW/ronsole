@@ -57,7 +57,7 @@ fn terminal_csi_defaults_scroll_modes_and_sgr_edges_end_to_end() {
         (grid.lines[0][5].ch(), grid.lines[0][5].fg(), grid.lines[0][5].bg()),
         ('F', TerminalColor::indexed(13), TerminalColor::indexed(6))
     );
-    assert!(!grid.cur_bold);
+    assert!(!grid.pen.bold);
 
     feed(&mut grid, &mut sink, b"\x1b[?25l\x1b[?1h\x1b[?1002h");
     assert!(!grid.cursor_visible);
@@ -127,8 +127,8 @@ fn terminal_osc_insert_delete_and_truecolor_edges_end_to_end() {
     );
 
     feed(&mut grid, &mut sink, b"\x1b[38;2;1;2;3m\x1b[48;5;42mX\x1b[39;49m");
-    assert!(grid.cur_bg.is_default_background());
-    assert!(grid.cur_fg.is_default_foreground());
+    assert!(grid.pen.bg.is_default_background());
+    assert!(grid.pen.fg.is_default_foreground());
     assert_eq!(grid.lines[1][0].bg(), 42);
     assert_eq!(grid.lines[1][0].fg().rgb_value(), Some((1, 2, 3)));
 
@@ -643,12 +643,12 @@ fn common_dec_modes_cover_wrap_origin_insert_tabs_mouse_focus_and_paste() {
 }
 
 fn assert_terminal_modes_reset(grid: &Term) {
-    assert!(grid.cur_fg.is_default_foreground());
-    assert!(grid.cur_bg.is_default_background());
-    assert!(!grid.cur_bold);
-    assert!(!grid.cur_dim);
-    assert_eq!(grid.cur_underline, UnderlineStyle::None);
-    assert!(!grid.cur_inverse);
+    assert!(grid.pen.fg.is_default_foreground());
+    assert!(grid.pen.bg.is_default_background());
+    assert!(!grid.pen.bold);
+    assert!(!grid.pen.dim);
+    assert_eq!(grid.pen.underline, UnderlineStyle::None);
+    assert!(!grid.pen.inverse);
     assert!(!grid.insert_mode);
     assert!(!grid.origin_mode);
     assert!(grid.autowrap);

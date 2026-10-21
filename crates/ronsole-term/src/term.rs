@@ -1,7 +1,7 @@
 //! The terminal model: state, host-facing API and the parser driver.
 
-use crate::cell::{Cell, UnderlineStyle};
-use crate::color::{TermPalette, TerminalColor};
+use crate::cell::{Cell, Pen};
+use crate::color::TermPalette;
 use crate::grid::LineMeta;
 use crate::input::MouseTrackingMode;
 use std::ops::Range;
@@ -65,12 +65,7 @@ pub struct Term {
     pub(crate) visible_rows: usize,
     pub(crate) cur_x: usize,
     pub(crate) cur_y: usize,
-    pub(crate) cur_fg: TerminalColor,
-    pub(crate) cur_bg: TerminalColor,
-    pub(crate) cur_bold: bool,
-    pub(crate) cur_dim: bool,
-    pub(crate) cur_underline: UnderlineStyle,
-    pub(crate) cur_inverse: bool,
+    pub(crate) pen: Pen,
     pub(crate) dirty: bool,
     pub(crate) content_generation: u64,
     pub(crate) presentation_ready: bool,
@@ -136,12 +131,7 @@ impl Term {
             visible_rows: rows,
             cur_x: 0,
             cur_y: 0,
-            cur_fg: TerminalColor::default_foreground(),
-            cur_bg: TerminalColor::default_background(),
-            cur_bold: false,
-            cur_dim: false,
-            cur_underline: UnderlineStyle::None,
-            cur_inverse: false,
+            pen: Pen::default(),
             dirty: true,
             content_generation: 0,
             presentation_ready: false,

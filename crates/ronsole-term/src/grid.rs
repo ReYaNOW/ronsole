@@ -1,10 +1,9 @@
 //! Grid storage, scrollback, reflow, selection and mode resets for [`Term`].
 
 use crate::cell::{
-    CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Cell, UnderlineStyle, terminal_char_width,
+    CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Cell, Pen, terminal_char_width,
     terminal_effective_foreground, terminal_force_text_presentation,
 };
-use crate::color::TerminalColor;
 use crate::input::MouseTrackingMode;
 use crate::term::Term;
 use vte::Params;
@@ -834,15 +833,15 @@ impl Term {
                     self.join_next = false;
                     return;
                 }
-                let blank = Cell::blank_with_background(self.cur_bg);
+                let blank = Cell::blank_with_background(self.pen.bg);
                 if let Some(line) = self.lines.get_mut(self.cur_y) {
                     clear_wide_footprint(line, self.cur_x, &blank);
                 }
                 self.soft_wrap_to_next_line();
             }
         }
-        let fg = terminal_effective_foreground(self.cur_fg, self.cur_bold);
-        let bg = self.cur_bg;
+        let fg = terminal_effective_foreground(self.pen.fg, self.pen.bold);
+        let bg = self.pen.bg;
         let blank = Cell::blank_with_background(bg);
         let previous_used = self
             .line_meta
@@ -864,13 +863,13 @@ impl Term {
             }
             if let Some(cell) = line.get_mut(self.cur_x) {
                 cell.set_char(c, fg, bg, width == 2);
-                cell.set_sgr_style(self.cur_inverse, self.cur_underline, self.cur_dim);
+                cell.set_sgr_style(&self.pen);
             }
             if width == 2
                 && let Some(cell) = line.get_mut(self.cur_x + 1)
             {
                 cell.set_wide_spacer(fg, bg);
-                cell.set_sgr_style(self.cur_inverse, self.cur_underline, self.cur_dim);
+                cell.set_sgr_style(&self.pen);
             }
         }
         if let Some(state) = self.line_meta.get_mut(self.cur_y) {
@@ -996,12 +995,7 @@ impl Term {
     }
 
     pub(crate) fn reset_terminal_modes(&mut self) {
-        self.cur_fg = TerminalColor::default_foreground();
-        self.cur_bg = TerminalColor::default_background();
-        self.cur_bold = false;
-        self.cur_dim = false;
-        self.cur_underline = UnderlineStyle::None;
-        self.cur_inverse = false;
+        self.pen = Pen::default();
         self.saved_cursor = None;
         self.alt_saved_cursor = None;
         self.scroll_region = (0, self.visible_rows.saturating_sub(1));
@@ -1101,7 +1095,7 @@ impl Term {
             return;
         }
         let rows = rows.min(bottom - top + 1);
-        let blank = Cell::blank_with_background(self.cur_bg);
+        let blank = Cell::blank_with_background(self.pen.bg);
         for _ in 0..rows {
             let (mut removed, removed_meta) =
                 remove_line_with_meta(&mut self.lines, &mut self.line_meta, top)
@@ -1140,7 +1134,7 @@ impl Term {
             return;
         }
         let rows = rows.min(bottom - top + 1);
-        let blank = Cell::blank_with_background(self.cur_bg);
+        let blank = Cell::blank_with_background(self.pen.bg);
         for _ in 0..rows {
             if let Some((mut removed, _)) =
                 remove_line_with_meta(&mut self.lines, &mut self.line_meta, bottom)

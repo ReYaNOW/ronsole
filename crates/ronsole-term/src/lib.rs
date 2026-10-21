@@ -12,6 +12,7 @@ mod grid;
 mod input;
 mod osc;
 mod perform;
+mod sgr;
 mod term;
 #[cfg(test)]
 mod tests;
