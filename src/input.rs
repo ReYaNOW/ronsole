@@ -1740,7 +1740,7 @@ mod tests {
             let ready = crate::platform::lock_recover(&terminal.grid)
                 .lines
                 .iter()
-                .flat_map(|line| line.iter().map(|cell| cell.c))
+                .flat_map(|line| line.iter().map(|cell| cell.ch()))
                 .collect::<String>()
                 .contains("__READY__");
             if ready && out.exists() {

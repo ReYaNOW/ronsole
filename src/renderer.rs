@@ -1412,11 +1412,6 @@ fn default_emoji_presentation(c: char) -> bool {
     )
 }
 
-#[inline(always)]
-pub(crate) fn terminal_force_text_presentation(c: char) -> bool {
-    matches!(c, '✔' | '✓')
-}
-
 fn parse_graphics_version(version: &str) -> Option<(u8, u8)> {
     let numeric = version
         .split_whitespace()

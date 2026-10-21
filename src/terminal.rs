@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use vte::{Params, Parser, Perform};
 
-pub(crate) use crate::terminal_compat::{
-    CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Cell,
-    MouseTrackingMode, TerminalColor, apply_ansi_sgr, is_terminal_zero_width_format,
-    terminal_char_width, terminal_color_rgba, terminal_effective_foreground,
-    terminal_is_emoji_modifier, terminal_presentation_selector, terminal_should_render_zero_width,
+pub(crate) use ronsole_term::{
+    CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Cell, MouseTrackingMode, TerminalColor,
+    apply_ansi_sgr, is_terminal_zero_width_format, terminal_char_width,
+    terminal_effective_foreground, terminal_is_emoji_modifier, terminal_presentation_selector,
+    terminal_should_render_zero_width, UnderlineStyle,
 };
 #[cfg(test)]
-use crate::terminal_compat::CELL_PRESENTATION_AUTO;
+use ronsole_term::CELL_PRESENTATION_AUTO;
 
 #[inline(always)]
 pub(crate) fn normalized_selection_bounds(
@@ -505,7 +505,7 @@ pub struct TermGrid {
     pub(crate) cur_bg: TerminalColor,
     pub cur_bold: bool,
     pub(crate) cur_dim: bool,
-    pub(crate) cur_underline: bool,
+    pub(crate) cur_underline: UnderlineStyle,
     pub(crate) cur_inverse: bool,
     pub dirty: bool,
     pub content_generation: u64,
@@ -561,7 +561,7 @@ impl TermGrid {
             cur_bg: TerminalColor::default_background(),
             cur_bold: false,
             cur_dim: false,
-            cur_underline: false,
+            cur_underline: UnderlineStyle::None,
             cur_inverse: false,
             dirty: true,
             content_generation: 0,
@@ -1026,7 +1026,7 @@ impl TermGrid {
 
     fn attach_zero_width(&mut self, c: char) {
         if let Some(cell) = self.previous_base_cell_mut()
-            && cell.c != ' '
+            && cell.ch() != ' '
         {
             cell.push_zero_width(c);
         }
@@ -1036,14 +1036,14 @@ impl TermGrid {
         let Some(cell) = self.previous_base_cell_mut() else {
             return;
         };
-        if cell.c != ' ' {
-            cell.presentation = if presentation == CELL_PRESENTATION_EMOJI
-                && crate::renderer::terminal_force_text_presentation(cell.c)
+        if cell.ch() != ' ' {
+            cell.set_presentation(if presentation == CELL_PRESENTATION_EMOJI
+                && ronsole_term::terminal_force_text_presentation(cell.ch())
             {
                 CELL_PRESENTATION_TEXT
             } else {
                 presentation
-            };
+            });
             cell.push_zero_width(selector);
         }
     }
@@ -1120,7 +1120,7 @@ impl TermGrid {
         self.cur_bg = TerminalColor::default_background();
         self.cur_bold = false;
         self.cur_dim = false;
-        self.cur_underline = false;
+        self.cur_underline = UnderlineStyle::None;
         self.cur_inverse = false;
         self.saved_cursor = None;
         self.alt_saved_cursor = None;
@@ -1355,7 +1355,7 @@ mod tests {
     fn set_line(grid: &mut TermGrid, row: usize, text: &str) {
         let mut used_cols = 0usize;
         for (x, ch) in text.chars().enumerate() {
-            grid.lines[row][x].c = ch;
+            grid.lines[row][x].set_ch(ch);
             used_cols = x + 1;
         }
         if let Some(state) = grid.line_meta.get_mut(row) {
@@ -1430,11 +1430,11 @@ mod tests {
                     "wide spacer at column {column} has no base"
                 );
             }
-            if terminal_char_width(cell.c) == 2 && !cell.is_wide_spacer() {
+            if terminal_char_width(cell.ch()) == 2 && !cell.is_wide_spacer() {
                 assert!(
                     cell.is_wide(),
                     "width-2 glyph {:?} survived as a one-cell glyph at column {column}",
-                    cell.c
+                    cell.ch()
                 );
             }
         }
@@ -1476,7 +1476,7 @@ mod tests {
         let text = grid
             .lines
             .iter()
-            .flat_map(|line| line.iter().map(|cell| cell.c))
+            .flat_map(|line| line.iter().map(|cell| cell.ch()))
             .collect::<String>();
         assert!(text.contains("Ronsole terminal error: spawn failed"));
     }
@@ -1489,15 +1489,15 @@ mod tests {
         }
         grid.put_char('e');
 
-        assert_eq!(grid.lines[0][0].c, 'a');
-        assert_eq!(grid.lines[0][3].c, 'd');
-        assert_eq!(grid.lines[1][0].c, 'e');
+        assert_eq!(grid.lines[0][0].ch(), 'a');
+        assert_eq!(grid.lines[0][3].ch(), 'd');
+        assert_eq!(grid.lines[1][0].ch(), 'e');
 
         grid.newline();
         grid.execute(b'\r');
         grid.put_char('z');
         assert_eq!(grid.scrollback.len(), 1);
-        assert_eq!(grid.lines[1][0].c, 'z');
+        assert_eq!(grid.lines[1][0].ch(), 'z');
 
         grid.selection = Some((0, 2, 0, 2));
         assert_eq!(grid.get_selection_text(), "z");
@@ -1551,8 +1551,8 @@ mod tests {
     fn repeated_column_reflow_keeps_scrollback_storage_width_bounded() {
         let mut grid = TermGrid::new(4096, 1);
         let mut history = vec![Cell::default(); 4096];
-        history[0].c = 'A';
-        history[79].c = 'Z';
+        history[0].set_ch('A');
+        history[79].set_ch('Z');
         grid.push_scrollback_row_for_test(history, 80, false);
 
         for width in [3000, 2000, 1200, 700, 400, 240, 140, 80] {
@@ -1568,16 +1568,16 @@ mod tests {
         }
 
         let logical = logical_cell_lines(&grid);
-        assert_eq!(logical[0][0].c, 'A');
-        assert_eq!(logical[0][79].c, 'Z');
+        assert_eq!(logical[0][0].ch(), 'A');
+        assert_eq!(logical[0][79].ch(), 'Z');
     }
 
     #[test]
     fn minor_column_shrink_reflows_scrollback_without_hidden_tail_storage() {
         let mut grid = TermGrid::new(120, 1);
         let mut history = vec![Cell::default(); 120];
-        history[0].c = 'A';
-        history[119].c = 'Z';
+        history[0].set_ch('A');
+        history[119].set_ch('Z');
         grid.push_scrollback_row_for_test(history, 120, false);
 
         grid.resize(119, 1);
@@ -1585,8 +1585,8 @@ mod tests {
         assert_eq!(grid.scrollback.len(), 2);
         assert!(grid.scrollback.iter().all(|row| row.len() == 119));
         let logical = logical_cell_lines(&grid);
-        assert_eq!(logical[0][0].c, 'A');
-        assert_eq!(logical[0][119].c, 'Z');
+        assert_eq!(logical[0][0].ch(), 'A');
+        assert_eq!(logical[0][119].ch(), 'Z');
         assert_line_metadata_invariant(&grid);
     }
 
@@ -1673,10 +1673,10 @@ mod tests {
         assert!(
             before
                 .iter()
-                .any(|cell| cell.presentation != CELL_PRESENTATION_AUTO)
+                .any(|cell| cell.presentation() != CELL_PRESENTATION_AUTO)
         );
         assert!(before.iter().any(Cell::is_inverse));
-        assert!(before.iter().any(Cell::is_underlined));
+        assert!(before.iter().any(|cell| cell.underline() != UnderlineStyle::None));
         assert!(before.iter().any(Cell::is_dim));
 
         grid.resize(4, 5);
@@ -1697,14 +1697,14 @@ mod tests {
         let red = TerminalColor::indexed(1);
         let mut grid = TermGrid::new(4, 2);
         feed(&mut grid, b"\x1b[41m\x1b[2J");
-        assert!(grid.lines.iter().flatten().all(|cell| cell.bg == red));
+        assert!(grid.lines.iter().flatten().all(|cell| cell.bg() == red));
 
         grid.resize(2, 2);
 
         let logical = logical_cell_lines(&grid);
         assert_eq!(logical.len(), 2);
         assert!(logical.iter().all(|line| line.len() == 4));
-        assert!(logical.iter().flatten().all(|cell| cell.bg == red));
+        assert!(logical.iter().flatten().all(|cell| cell.bg() == red));
         assert_line_metadata_invariant(&grid);
     }
 
@@ -1715,12 +1715,12 @@ mod tests {
 
         grid.resize(4, 4);
 
-        assert_eq!(grid.lines[0][0].c, 'a');
-        assert_eq!(grid.lines[0][2].c, 'c');
-        assert_eq!(grid.lines[0][3].c, ' ');
+        assert_eq!(grid.lines[0][0].ch(), 'a');
+        assert_eq!(grid.lines[0][2].ch(), 'c');
+        assert_eq!(grid.lines[0][3].ch(), ' ');
         assert!(grid.lines[1][0].is_wide());
         assert!(grid.lines[1][1].is_wide_spacer());
-        assert_eq!(grid.lines[1][2].c, 'Z');
+        assert_eq!(grid.lines[1][2].ch(), 'Z');
         assert_eq!(grid.line_meta[0].used_cols, 3);
         assert!(grid.line_meta[0].soft_wrapped);
         for row in &grid.lines {
@@ -1792,7 +1792,7 @@ mod tests {
             grid.lines[0]
                 .iter()
                 .take(3)
-                .map(|cell| cell.c)
+                .map(|cell| cell.ch())
                 .collect::<String>(),
             "ALT"
         );
@@ -1817,15 +1817,15 @@ mod tests {
         grid.resize(8, 3);
 
         assert_eq!(
-            grid.lines[0].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[0].iter().map(|cell| cell.ch()).collect::<String>(),
             "abcdef  "
         );
         assert_eq!(
-            grid.lines[1].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[1].iter().map(|cell| cell.ch()).collect::<String>(),
             "ghijkl  "
         );
         assert_eq!(
-            grid.lines[2].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[2].iter().map(|cell| cell.ch()).collect::<String>(),
             "mnopqr  "
         );
         assert!(grid.scrollback.is_empty());
@@ -1844,12 +1844,12 @@ mod tests {
         }
         assert_eq!(reconstructed, "✔\u{FE0F}X✅\u{FE0E}Y");
         assert_eq!(grid.cur_x, 5);
-        assert_eq!(grid.lines[0][0].presentation, CELL_PRESENTATION_TEXT);
-        assert_eq!(grid.lines[0][1].presentation, CELL_PRESENTATION_AUTO);
-        assert_eq!(grid.lines[0][2].presentation, CELL_PRESENTATION_TEXT);
+        assert_eq!(grid.lines[0][0].presentation(), CELL_PRESENTATION_TEXT);
+        assert_eq!(grid.lines[0][1].presentation(), CELL_PRESENTATION_AUTO);
+        assert_eq!(grid.lines[0][2].presentation(), CELL_PRESENTATION_TEXT);
         assert!(grid.lines[0][2].is_wide());
         assert!(grid.lines[0][3].is_wide_spacer());
-        assert_eq!(grid.lines[0][4].presentation, CELL_PRESENTATION_AUTO);
+        assert_eq!(grid.lines[0][4].presentation(), CELL_PRESENTATION_AUTO);
         assert_eq!(
             terminal_presentation_selector('\u{FE0F}'),
             Some(CELL_PRESENTATION_EMOJI)
@@ -1881,19 +1881,19 @@ mod tests {
             b"abc\x1b[2D!\x1b[s\x1b[3;8H?\x1b[u\x1b[31;44;1mX\x1b[22mY\x1b[38;5;200;48;5;17mZ",
         );
 
-        assert_eq!(grid.lines[0][0].c, 'a');
-        assert_eq!(grid.lines[0][1].c, '!');
-        assert_eq!(grid.lines[2][7].c, '?');
+        assert_eq!(grid.lines[0][0].ch(), 'a');
+        assert_eq!(grid.lines[0][1].ch(), '!');
+        assert_eq!(grid.lines[2][7].ch(), '?');
         assert_eq!(
-            (grid.lines[0][2].c, grid.lines[0][2].fg, grid.lines[0][2].bg),
+            (grid.lines[0][2].ch(), grid.lines[0][2].fg(), grid.lines[0][2].bg()),
             ('X', TerminalColor::indexed(9), TerminalColor::indexed(4))
         );
         assert_eq!(
-            (grid.lines[0][3].c, grid.lines[0][3].fg, grid.lines[0][3].bg),
+            (grid.lines[0][3].ch(), grid.lines[0][3].fg(), grid.lines[0][3].bg()),
             ('Y', TerminalColor::indexed(1), TerminalColor::indexed(4))
         );
         assert_eq!(
-            (grid.lines[0][4].c, grid.lines[0][4].fg, grid.lines[0][4].bg),
+            (grid.lines[0][4].ch(), grid.lines[0][4].fg(), grid.lines[0][4].bg()),
             ('Z', TerminalColor::indexed(200), TerminalColor::indexed(17))
         );
 
@@ -1923,7 +1923,7 @@ mod tests {
         feed(&mut grid, b"\x1b[?1049hALT\x1b[?1049l");
         assert!(!grid.is_alt);
         assert!(grid.alt_lines.is_none());
-        assert_eq!(grid.lines[0][0].c, 'a');
+        assert_eq!(grid.lines[0][0].ch(), 'a');
     }
 
     #[test]
@@ -1961,19 +1961,19 @@ mod tests {
         set_line(&mut grid, 3, "pqrst");
 
         feed(&mut grid, b"\x1b[2;2H\x1b[K");
-        assert_eq!(grid.lines[1][0].c, 'f');
-        assert_eq!(grid.lines[1][1].c, ' ');
+        assert_eq!(grid.lines[1][0].ch(), 'f');
+        assert_eq!(grid.lines[1][1].ch(), ' ');
 
         feed(&mut grid, b"\x1b[1;3H\x1b[1K");
-        assert_eq!(grid.lines[0][0].c, ' ');
-        assert_eq!(grid.lines[0][3].c, 'd');
+        assert_eq!(grid.lines[0][0].ch(), ' ');
+        assert_eq!(grid.lines[0][3].ch(), 'd');
 
         feed(&mut grid, b"\x1b[2J");
         assert!(
             grid.lines
                 .iter()
                 .flat_map(|line| line.iter())
-                .all(|cell| cell.c == ' ')
+                .all(|cell| cell.ch() == ' ')
         );
 
         set_line(&mut grid, 0, "11111");
@@ -1985,11 +1985,11 @@ mod tests {
         assert_eq!(grid.cur_y, 1);
 
         feed(&mut grid, b"\x1b[1;1H12345\x1b[1;3H\x1b[2P");
-        let top: String = grid.lines[0].iter().map(|cell| cell.c).collect();
+        let top: String = grid.lines[0].iter().map(|cell| cell.ch()).collect();
         assert_eq!(top, "125  ");
 
         feed(&mut grid, b"\x1b[1;1Habcde\x1b[1;2H\x1b[3X");
-        let top: String = grid.lines[0].iter().map(|cell| cell.c).collect();
+        let top: String = grid.lines[0].iter().map(|cell| cell.ch()).collect();
         assert_eq!(top, "a   e");
 
         feed(&mut grid, b"\x1b[3J");
@@ -2001,7 +2001,7 @@ mod tests {
         let mut grid = TermGrid::new(7, 2);
         let mut old = vec![Cell::default(); 7];
         for (index, c) in "old    ".chars().enumerate() {
-            old[index].c = c;
+            old[index].set_ch(c);
         }
         grid.push_scrollback_row_for_test(old, 7, false);
         set_line(&mut grid, 0, "visible");
@@ -2024,7 +2024,7 @@ mod tests {
             grid.lines
                 .iter()
                 .flat_map(|line| line.iter())
-                .all(|cell| cell.c == ' ')
+                .all(|cell| cell.ch() == ' ')
         );
     }
 
@@ -2046,29 +2046,29 @@ mod tests {
 
         feed(&mut grid, b"\x1b[2;1H\x1b[L");
         assert_eq!(
-            grid.lines[0].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[0].iter().map(|cell| cell.ch()).collect::<String>(),
             "11111"
         );
         assert_eq!(
-            grid.lines[1].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[1].iter().map(|cell| cell.ch()).collect::<String>(),
             "     "
         );
         assert_eq!(
-            grid.lines[2].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[2].iter().map(|cell| cell.ch()).collect::<String>(),
             "22222"
         );
         assert_eq!(
-            grid.lines[4].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[4].iter().map(|cell| cell.ch()).collect::<String>(),
             "55555"
         );
 
         feed(&mut grid, b"\x1b[2;1H\x1b[M");
         assert_eq!(
-            grid.lines[0].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[0].iter().map(|cell| cell.ch()).collect::<String>(),
             "11111"
         );
         assert_eq!(
-            grid.lines[4].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[4].iter().map(|cell| cell.ch()).collect::<String>(),
             "55555"
         );
     }
@@ -2088,8 +2088,8 @@ mod tests {
         assert_eq!(grid.scrollback.len(), 2);
         assert_eq!(grid.cur_y, 1);
         assert_eq!(grid.saved_cursor, Some((1, 1)));
-        let row0: String = grid.lines[0].iter().map(|cell| cell.c).collect();
-        let row1: String = grid.lines[1].iter().map(|cell| cell.c).collect();
+        let row0: String = grid.lines[0].iter().map(|cell| cell.ch()).collect();
+        let row1: String = grid.lines[1].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row0, "cccc");
         assert_eq!(row1, "dddd");
 
@@ -2098,8 +2098,8 @@ mod tests {
         assert!(grid.scrollback.is_empty());
         assert_eq!(grid.cur_y, 3);
         assert_eq!(grid.saved_cursor, Some((1, 3)));
-        let row0: String = grid.lines[0].iter().map(|cell| cell.c).collect();
-        let row3: String = grid.lines[3].iter().map(|cell| cell.c).collect();
+        let row0: String = grid.lines[0].iter().map(|cell| cell.ch()).collect();
+        let row3: String = grid.lines[3].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row0, "aaaa");
         assert_eq!(row3, "dddd");
 
@@ -2117,8 +2117,8 @@ mod tests {
         assert_eq!(grid.visible_rows, 2);
         assert!(grid.scrollback.is_empty());
         assert!(grid.lines.iter().all(|line| line.len() == 6));
-        let row0: String = grid.lines[0].iter().map(|cell| cell.c).collect();
-        let row1: String = grid.lines[1].iter().map(|cell| cell.c).collect();
+        let row0: String = grid.lines[0].iter().map(|cell| cell.ch()).collect();
+        let row1: String = grid.lines[1].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row0, "3333  ");
         assert_eq!(row1, "4444  ");
 
@@ -2126,8 +2126,8 @@ mod tests {
 
         assert!(!grid.is_alt);
         assert!(grid.alt_lines.is_none());
-        let row0: String = grid.lines[0].iter().map(|cell| cell.c).collect();
-        let row1: String = grid.lines[1].iter().map(|cell| cell.c).collect();
+        let row0: String = grid.lines[0].iter().map(|cell| cell.ch()).collect();
+        let row1: String = grid.lines[1].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row0, "aaaa  ");
         assert_eq!(row1, "bbbb  ");
         assert_eq!(grid.cur_y, 1);
@@ -2139,7 +2139,7 @@ mod tests {
 
         feed(&mut grid, b"\t\x08\x08Z");
         assert_eq!((grid.cur_x, grid.cur_y), (4, 0));
-        assert_eq!(grid.lines[0][3].c, 'Z');
+        assert_eq!(grid.lines[0][3].ch(), 'Z');
 
         feed(&mut grid, b"\x1b[0G");
         assert_eq!(grid.cur_x, 0);
@@ -2157,26 +2157,26 @@ mod tests {
             b"\x1b[m\x1b[1;34;104mA\x1b[39;49mB\x1b[38;2;1;2;3;48;2;4;5;6mC\x1b[90;107mD\x1b[0mE\x1b[38;5;13;48;5;6mF",
         );
         assert_eq!(
-            (grid.lines[0][0].c, grid.lines[0][0].fg, grid.lines[0][0].bg),
+            (grid.lines[0][0].ch(), grid.lines[0][0].fg(), grid.lines[0][0].bg()),
             ('A', TerminalColor::indexed(12), TerminalColor::indexed(12))
         );
         assert_eq!(
-            (grid.lines[0][1].c, grid.lines[0][1].fg, grid.lines[0][1].bg),
+            (grid.lines[0][1].ch(), grid.lines[0][1].fg(), grid.lines[0][1].bg()),
             ('B', TerminalColor::default_foreground(), TerminalColor::default_background())
         );
-        assert_eq!(grid.lines[0][2].c, 'C');
-        assert_eq!(grid.lines[0][2].fg.rgb_value(), Some((1, 2, 3)));
-        assert_eq!(grid.lines[0][2].bg.rgb_value(), Some((4, 5, 6)));
+        assert_eq!(grid.lines[0][2].ch(), 'C');
+        assert_eq!(grid.lines[0][2].fg().rgb_value(), Some((1, 2, 3)));
+        assert_eq!(grid.lines[0][2].bg().rgb_value(), Some((4, 5, 6)));
         assert_eq!(
-            (grid.lines[0][3].c, grid.lines[0][3].fg, grid.lines[0][3].bg),
+            (grid.lines[0][3].ch(), grid.lines[0][3].fg(), grid.lines[0][3].bg()),
             ('D', TerminalColor::indexed(8), TerminalColor::indexed(15))
         );
         assert_eq!(
-            (grid.lines[0][4].c, grid.lines[0][4].fg, grid.lines[0][4].bg),
+            (grid.lines[0][4].ch(), grid.lines[0][4].fg(), grid.lines[0][4].bg()),
             ('E', TerminalColor::default_foreground(), TerminalColor::default_background())
         );
         assert_eq!(
-            (grid.lines[0][5].c, grid.lines[0][5].fg, grid.lines[0][5].bg),
+            (grid.lines[0][5].ch(), grid.lines[0][5].fg(), grid.lines[0][5].bg()),
             ('F', TerminalColor::indexed(13), TerminalColor::indexed(6))
         );
         assert!(!grid.cur_bold);
@@ -2199,16 +2199,16 @@ mod tests {
         set_line(&mut scroll, 2, "cccc");
 
         feed(&mut scroll, b"\x1b[2;3r\x1b[S");
-        let row0: String = scroll.lines[0].iter().map(|cell| cell.c).collect();
-        let row1: String = scroll.lines[1].iter().map(|cell| cell.c).collect();
-        let row2: String = scroll.lines[2].iter().map(|cell| cell.c).collect();
+        let row0: String = scroll.lines[0].iter().map(|cell| cell.ch()).collect();
+        let row1: String = scroll.lines[1].iter().map(|cell| cell.ch()).collect();
+        let row2: String = scroll.lines[2].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row0, "aaaa");
         assert_eq!(row1, "cccc");
         assert_eq!(row2, "    ");
 
         feed(&mut scroll, b"\x1b[T");
-        let row1: String = scroll.lines[1].iter().map(|cell| cell.c).collect();
-        let row2: String = scroll.lines[2].iter().map(|cell| cell.c).collect();
+        let row1: String = scroll.lines[1].iter().map(|cell| cell.ch()).collect();
+        let row2: String = scroll.lines[2].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row1, "    ");
         assert_eq!(row2, "cccc");
     }
@@ -2226,11 +2226,11 @@ mod tests {
         );
 
         feed(&mut grid, b"\x1b[2;1Habcdefgh\x1b[2;3H\x1b[2P");
-        let row1: String = grid.lines[1].iter().map(|cell| cell.c).collect();
+        let row1: String = grid.lines[1].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row1, "abefgh  ");
 
         feed(&mut grid, b"\x1b[2;2H\x1b[3X");
-        let row1: String = grid.lines[1].iter().map(|cell| cell.c).collect();
+        let row1: String = grid.lines[1].iter().map(|cell| cell.ch()).collect();
         assert_eq!(row1, "a   gh  ");
 
         set_line(&mut grid, 1, "11111111");
@@ -2238,25 +2238,25 @@ mod tests {
         set_line(&mut grid, 3, "33333333");
         feed(&mut grid, b"\x1b[2;4r\x1b[3;1H\x1b[L");
         assert_eq!(
-            grid.lines[2].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[2].iter().map(|cell| cell.ch()).collect::<String>(),
             "        "
         );
         assert_eq!(
-            grid.lines[3].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[3].iter().map(|cell| cell.ch()).collect::<String>(),
             "22222222"
         );
 
         feed(&mut grid, b"\x1b[2;1H\x1b[M");
         assert_eq!(
-            grid.lines[1].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[1].iter().map(|cell| cell.ch()).collect::<String>(),
             "        "
         );
 
         feed(&mut grid, b"\x1b[38;2;1;2;3m\x1b[48;5;42mX\x1b[39;49m");
         assert!(grid.cur_bg.is_default_background());
         assert!(grid.cur_fg.is_default_foreground());
-        assert_eq!(grid.lines[1][0].bg, 42);
-        assert_eq!(grid.lines[1][0].fg.rgb_value(), Some((1, 2, 3)));
+        assert_eq!(grid.lines[1][0].bg(), 42);
+        assert_eq!(grid.lines[1][0].fg().rgb_value(), Some((1, 2, 3)));
 
         let before = (grid.cols, grid.visible_rows, grid.lines.len());
         grid.resize(before.0, before.1);
@@ -2274,7 +2274,7 @@ mod tests {
         set_line(&mut grid, 0, "abc");
         set_line(&mut grid, 1, "def");
         let mut scrollback_cell = Cell::default();
-        scrollback_cell.c = 's';
+        scrollback_cell.set_ch('s');
         grid.push_scrollback_row_for_test(vec![scrollback_cell; 3], 3, false);
         grid.saved_cursor = Some((2, 1));
 
@@ -2284,7 +2284,7 @@ mod tests {
         assert_eq!(grid.saved_cursor, Some((2, 2)));
         assert!(grid.scrollback.is_empty());
         assert_eq!(
-            grid.lines[0].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[0].iter().map(|cell| cell.ch()).collect::<String>(),
             "sss"
         );
 
@@ -2316,11 +2316,11 @@ mod tests {
 
         feed(&mut grid, b"\x1b[2;3H\x1b[J");
         assert_eq!(
-            grid.lines[1].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[1].iter().map(|cell| cell.ch()).collect::<String>(),
             "fg   "
         );
         assert_eq!(
-            grid.lines[2].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[2].iter().map(|cell| cell.ch()).collect::<String>(),
             "     "
         );
 
@@ -2329,18 +2329,18 @@ mod tests {
         set_line(&mut grid, 2, "klmno");
         feed(&mut grid, b"\x1b[2;3H\x1b[1J");
         assert_eq!(
-            grid.lines[0].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[0].iter().map(|cell| cell.ch()).collect::<String>(),
             "     "
         );
         assert_eq!(
-            grid.lines[1].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[1].iter().map(|cell| cell.ch()).collect::<String>(),
             "   ij"
         );
 
         set_line(&mut grid, 1, "fghij");
         feed(&mut grid, b"\x1b[2;3H\x1b[2K");
         assert_eq!(
-            grid.lines[1].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[1].iter().map(|cell| cell.ch()).collect::<String>(),
             "     "
         );
 
@@ -2367,9 +2367,9 @@ mod tests {
         );
 
         feed(&mut grid, b"\x1b[38;5;123m\x1b[48;2;9;8;7mQ\x1b[999m");
-        assert_eq!(grid.lines[1][2].c, 'Q');
-        assert_eq!(grid.lines[1][2].fg, 123);
-        assert_eq!(grid.lines[1][2].bg.rgb_value(), Some((9, 8, 7)));
+        assert_eq!(grid.lines[1][2].ch(), 'Q');
+        assert_eq!(grid.lines[1][2].fg(), 123);
+        assert_eq!(grid.lines[1][2].bg().rgb_value(), Some((9, 8, 7)));
     }
 
     #[test]
@@ -2396,9 +2396,9 @@ mod tests {
         assert_eq!(grid.get_selection_text(), text);
 
         feed(&mut grid, b"\x1b[1;3HZ");
-        assert_eq!(grid.lines[0][1].c, ' ');
+        assert_eq!(grid.lines[0][1].ch(), ' ');
         assert!(!grid.lines[0][1].is_wide());
-        assert_eq!(grid.lines[0][2].c, 'Z');
+        assert_eq!(grid.lines[0][2].ch(), 'Z');
         assert!(!grid.lines[0][2].is_wide_spacer());
     }
 
@@ -2411,14 +2411,14 @@ mod tests {
         }
         assert_eq!(
             grid.lines[0][0].zero_width().len(),
-            crate::terminal_compat::TERMINAL_CELL_EXTRA_MAX_CHARS
+            ronsole_term::TERMINAL_CELL_EXTRA_MAX_CHARS
         );
 
         grid.selection = Some((0, 0, 0, 0));
         let selected = grid.get_selection_text();
         assert_eq!(
             selected.chars().count(),
-            1 + crate::terminal_compat::TERMINAL_CELL_EXTRA_MAX_CHARS
+            1 + ronsole_term::TERMINAL_CELL_EXTRA_MAX_CHARS
         );
 
         grid.content_generation = grid.content_generation.wrapping_add(1);
@@ -2447,7 +2447,7 @@ mod tests {
             feed(&mut grid, "界X".as_bytes());
             feed(&mut grid, sequence);
             assert_wide_line_invariant(&grid.lines[0]);
-            assert_ne!(grid.lines[0][0].c, '界');
+            assert_ne!(grid.lines[0][0].ch(), '界');
         }
 
         let mut resized = TermGrid::new(4, 1);
@@ -2456,7 +2456,7 @@ mod tests {
         assert!(resized.lines[0][3].is_wide_spacer());
         resized.resize(3, 1);
         assert_wide_line_invariant(&resized.lines[0]);
-        assert_eq!(resized.lines[0][2].c, ' ');
+        assert_eq!(resized.lines[0][2].ch(), ' ');
     }
 
     #[test]
@@ -2469,7 +2469,7 @@ mod tests {
             true,
         );
         repair_wide_line(&mut orphan_base);
-        assert_eq!(orphan_base[0].c, ' ');
+        assert_eq!(orphan_base[0].ch(), ' ');
         assert_wide_line_invariant(&orphan_base);
 
         let mut orphan_spacer = vec![Cell::default(); 2];
@@ -2478,7 +2478,7 @@ mod tests {
             TerminalColor::default_background(),
         );
         repair_wide_line(&mut orphan_spacer);
-        assert_eq!(orphan_spacer[1].c, ' ');
+        assert_eq!(orphan_spacer[1].ch(), ' ');
         assert_wide_line_invariant(&orphan_spacer);
     }
 
@@ -2488,16 +2488,16 @@ mod tests {
         feed(&mut no_wrap, b"\x1b[?7l\x1b[1;4H");
         feed(&mut no_wrap, "界".as_bytes());
         assert_eq!((no_wrap.cur_x, no_wrap.cur_y), (3, 0));
-        assert!(!no_wrap.lines[0].iter().any(|cell| cell.c == '界'));
+        assert!(!no_wrap.lines[0].iter().any(|cell| cell.ch() == '界'));
         assert_wide_line_invariant(&no_wrap.lines[0]);
 
         let mut wrap = TermGrid::new(4, 2);
-        wrap.lines[0][3].c = 'Q';
+        wrap.lines[0][3].set_ch('Q');
         feed(&mut wrap, b"\x1b[41m\x1b[1;4H");
         feed(&mut wrap, "界".as_bytes());
-        assert_eq!(wrap.lines[0][3].c, ' ');
-        assert_eq!(wrap.lines[0][3].bg, TerminalColor::indexed(1));
-        assert_eq!(wrap.lines[1][0].c, '界');
+        assert_eq!(wrap.lines[0][3].ch(), ' ');
+        assert_eq!(wrap.lines[0][3].bg(), TerminalColor::indexed(1));
+        assert_eq!(wrap.lines[1][0].ch(), '界');
         assert!(wrap.lines[1][0].is_wide());
         assert!(wrap.lines[1][1].is_wide_spacer());
         assert_wide_line_invariant(&wrap.lines[0]);
@@ -2505,7 +2505,7 @@ mod tests {
 
         let mut one_col = TermGrid::new(1, 2);
         feed(&mut one_col, "界".as_bytes());
-        assert!(!one_col.lines.iter().flatten().any(|cell| cell.c == '界'));
+        assert!(!one_col.lines.iter().flatten().any(|cell| cell.ch() == '界'));
         for line in &one_col.lines {
             assert_wide_line_invariant(line);
         }
@@ -2527,12 +2527,12 @@ mod tests {
         assert_eq!(grid.cur_y, 5);
 
         feed(&mut grid, b"\x1b[5;1H\n");
-        assert_eq!(grid.lines[0].iter().map(|cell| cell.c).collect::<String>(), "00000");
-        assert_eq!(grid.lines[1].iter().map(|cell| cell.c).collect::<String>(), "11111");
-        assert_eq!(grid.lines[2].iter().map(|cell| cell.c).collect::<String>(), "33333");
-        assert_eq!(grid.lines[3].iter().map(|cell| cell.c).collect::<String>(), "44444");
-        assert_eq!(grid.lines[4].iter().map(|cell| cell.c).collect::<String>(), "     ");
-        assert_eq!(grid.lines[5].iter().map(|cell| cell.c).collect::<String>(), "55555");
+        assert_eq!(grid.lines[0].iter().map(|cell| cell.ch()).collect::<String>(), "00000");
+        assert_eq!(grid.lines[1].iter().map(|cell| cell.ch()).collect::<String>(), "11111");
+        assert_eq!(grid.lines[2].iter().map(|cell| cell.ch()).collect::<String>(), "33333");
+        assert_eq!(grid.lines[3].iter().map(|cell| cell.ch()).collect::<String>(), "44444");
+        assert_eq!(grid.lines[4].iter().map(|cell| cell.ch()).collect::<String>(), "     ");
+        assert_eq!(grid.lines[5].iter().map(|cell| cell.ch()).collect::<String>(), "55555");
         assert_eq!(grid.cur_y, 4);
 
         let region_after_scroll = grid.lines.clone();
@@ -2557,9 +2557,9 @@ mod tests {
         assert_eq!(grid.cur_y, 5);
 
         feed(&mut grid, b"\x1b[5;1H\x1bD");
-        assert_eq!(grid.lines[2].iter().map(|cell| cell.c).collect::<String>(), "33333");
-        assert_eq!(grid.lines[3].iter().map(|cell| cell.c).collect::<String>(), "44444");
-        assert_eq!(grid.lines[4].iter().map(|cell| cell.c).collect::<String>(), "     ");
+        assert_eq!(grid.lines[2].iter().map(|cell| cell.ch()).collect::<String>(), "33333");
+        assert_eq!(grid.lines[3].iter().map(|cell| cell.ch()).collect::<String>(), "44444");
+        assert_eq!(grid.lines[4].iter().map(|cell| cell.ch()).collect::<String>(), "     ");
         assert_eq!(grid.cur_y, 4);
     }
 
@@ -2571,30 +2571,30 @@ mod tests {
         set_line(&mut erase_display, 0, "ABCDE");
         set_line(&mut erase_display, 1, "FGHIJ");
         feed(&mut erase_display, b"\x1b[41m\x1b[2J");
-        assert!(erase_display.lines.iter().flatten().all(|cell| cell.c == ' ' && cell.bg == red));
+        assert!(erase_display.lines.iter().flatten().all(|cell| cell.ch() == ' ' && cell.bg() == red));
 
         let mut erase_line = TermGrid::new(5, 1);
         set_line(&mut erase_line, 0, "ABCDE");
         feed(&mut erase_line, b"\x1b[41m\x1b[1;3H\x1b[K");
-        assert_eq!(erase_line.lines[0][1].c, 'B');
-        assert!(erase_line.lines[0][2..].iter().all(|cell| cell.c == ' ' && cell.bg == red));
+        assert_eq!(erase_line.lines[0][1].ch(), 'B');
+        assert!(erase_line.lines[0][2..].iter().all(|cell| cell.ch() == ' ' && cell.bg() == red));
 
         let mut ech = TermGrid::new(5, 1);
         set_line(&mut ech, 0, "ABCDE");
         feed(&mut ech, b"\x1b[41m\x1b[1;2H\x1b[2X");
-        assert!(ech.lines[0][1..3].iter().all(|cell| cell.c == ' ' && cell.bg == red));
+        assert!(ech.lines[0][1..3].iter().all(|cell| cell.ch() == ' ' && cell.bg() == red));
 
         let mut dch = TermGrid::new(5, 1);
         set_line(&mut dch, 0, "ABCDE");
         feed(&mut dch, b"\x1b[41m\x1b[1;2H\x1b[P");
-        assert_eq!(dch.lines[0].iter().map(|cell| cell.c).collect::<String>(), "ACDE ");
-        assert_eq!(dch.lines[0][4].bg, red);
+        assert_eq!(dch.lines[0].iter().map(|cell| cell.ch()).collect::<String>(), "ACDE ");
+        assert_eq!(dch.lines[0][4].bg(), red);
 
         let mut ich = TermGrid::new(5, 1);
         set_line(&mut ich, 0, "ABCDE");
         feed(&mut ich, b"\x1b[41m\x1b[1;2H\x1b[@");
-        assert_eq!(ich.lines[0][1].c, ' ');
-        assert_eq!(ich.lines[0][1].bg, red);
+        assert_eq!(ich.lines[0][1].ch(), ' ');
+        assert_eq!(ich.lines[0][1].bg(), red);
     }
 
     #[test]
@@ -2606,21 +2606,21 @@ mod tests {
             set_line(&mut il, row, text);
         }
         feed(&mut il, b"\x1b[41m\x1b[2;1H\x1b[L");
-        assert!(il.lines[1].iter().all(|cell| cell.c == ' ' && cell.bg == red));
+        assert!(il.lines[1].iter().all(|cell| cell.ch() == ' ' && cell.bg() == red));
 
         let mut dl = TermGrid::new(4, 3);
         for (row, text) in ["1111", "2222", "3333"].into_iter().enumerate() {
             set_line(&mut dl, row, text);
         }
         feed(&mut dl, b"\x1b[41m\x1b[2;1H\x1b[M");
-        assert!(dl.lines[2].iter().all(|cell| cell.c == ' ' && cell.bg == red));
+        assert!(dl.lines[2].iter().all(|cell| cell.ch() == ' ' && cell.bg() == red));
 
         let mut scroll = TermGrid::new(4, 3);
         for (row, text) in ["1111", "2222", "3333"].into_iter().enumerate() {
             set_line(&mut scroll, row, text);
         }
         feed(&mut scroll, b"\x1b[41m\x1b[3;1H\n");
-        assert!(scroll.lines[2].iter().all(|cell| cell.c == ' ' && cell.bg == red));
+        assert!(scroll.lines[2].iter().all(|cell| cell.ch() == ' ' && cell.bg() == red));
         assert_eq!(scroll.scrollback.len(), 1);
     }
 
@@ -2631,12 +2631,12 @@ mod tests {
             &mut grid,
             b"\x1b[1mA\x1b[31;1mB\x1b[22mC\x1b[91mD\x1b[22mE\x1b[1;91mF",
         );
-        assert!(grid.lines[0][0].fg.is_default_foreground());
-        assert_eq!(grid.lines[0][1].fg, TerminalColor::indexed(9));
-        assert_eq!(grid.lines[0][2].fg, TerminalColor::indexed(1));
-        assert_eq!(grid.lines[0][3].fg, TerminalColor::indexed(9));
-        assert_eq!(grid.lines[0][4].fg, TerminalColor::indexed(9));
-        assert_eq!(grid.lines[0][5].fg, TerminalColor::indexed(9));
+        assert!(grid.lines[0][0].fg().is_default_foreground());
+        assert_eq!(grid.lines[0][1].fg(), TerminalColor::indexed(9));
+        assert_eq!(grid.lines[0][2].fg(), TerminalColor::indexed(1));
+        assert_eq!(grid.lines[0][3].fg(), TerminalColor::indexed(9));
+        assert_eq!(grid.lines[0][4].fg(), TerminalColor::indexed(9));
+        assert_eq!(grid.lines[0][5].fg(), TerminalColor::indexed(9));
     }
 
     #[test]
@@ -2650,20 +2650,20 @@ mod tests {
         feed(&mut grid, b"\x1b[0mG");
         assert!(grid.lines[0][0].is_inverse());
         assert!(!grid.lines[0][1].is_inverse());
-        assert!(grid.lines[0][2].is_underlined());
-        assert!(!grid.lines[0][3].is_underlined());
+        assert!(grid.lines[0][2].underline() != UnderlineStyle::None);
+        assert!(grid.lines[0][3].underline() == UnderlineStyle::None);
         assert!(grid.lines[0][4].is_dim());
         assert!(!grid.lines[0][5].is_dim());
         assert!(grid.lines[0][6].is_wide());
         assert!(grid.lines[0][6].is_inverse());
-        assert!(grid.lines[0][6].is_underlined());
+        assert!(grid.lines[0][6].underline() != UnderlineStyle::None);
         assert!(grid.lines[0][6].is_dim());
         assert!(grid.lines[0][7].is_wide_spacer());
         assert!(grid.lines[0][7].is_inverse());
-        assert!(grid.lines[0][7].is_underlined());
+        assert!(grid.lines[0][7].underline() != UnderlineStyle::None);
         assert!(grid.lines[0][7].is_dim());
         assert!(!grid.lines[0][8].is_inverse());
-        assert!(!grid.lines[0][8].is_underlined());
+        assert!(grid.lines[0][8].underline() == UnderlineStyle::None);
         assert!(!grid.lines[0][8].is_dim());
         assert_wide_line_invariant(&grid.lines[0]);
     }
@@ -2673,12 +2673,12 @@ mod tests {
         let mut grid = TermGrid::new(4, 1);
         feed(&mut grid, b"\x1b[4mA\x1b[4:0m B");
 
-        assert_eq!(grid.lines[0][0].c, 'A');
-        assert!(grid.lines[0][0].is_underlined());
-        assert_eq!(grid.lines[0][1].c, ' ');
-        assert!(!grid.lines[0][1].is_underlined());
-        assert_eq!(grid.lines[0][2].c, 'B');
-        assert!(!grid.lines[0][2].is_underlined());
+        assert_eq!(grid.lines[0][0].ch(), 'A');
+        assert!(grid.lines[0][0].underline() != UnderlineStyle::None);
+        assert_eq!(grid.lines[0][1].ch(), ' ');
+        assert!(grid.lines[0][1].underline() == UnderlineStyle::None);
+        assert_eq!(grid.lines[0][2].ch(), 'B');
+        assert!(grid.lines[0][2].underline() == UnderlineStyle::None);
     }
 
     #[test]
@@ -2686,7 +2686,7 @@ mod tests {
         let mut grid = TermGrid::new(13, 1);
         let mut row = vec![Cell::default(); 13];
         for (cell, c) in row.iter_mut().zip("hit....SECRET".chars()) {
-            cell.c = c;
+            cell.set_ch(c);
         }
         grid.push_scrollback_row_for_test(row, 13, false);
         grid.selection = Some((7, 0, 12, 0));
@@ -2710,19 +2710,19 @@ mod tests {
         let mut erase = TermGrid::new(4, 1);
         feed(&mut erase, "界X".as_bytes());
         feed(&mut erase, b"\x1b[41m\x1b[1;2H\x1b[X");
-        assert_eq!(erase.lines[0][0].c, ' ');
-        assert_eq!(erase.lines[0][1].c, ' ');
-        assert_eq!(erase.lines[0][0].bg, red);
-        assert_eq!(erase.lines[0][1].bg, red);
+        assert_eq!(erase.lines[0][0].ch(), ' ');
+        assert_eq!(erase.lines[0][1].ch(), ' ');
+        assert_eq!(erase.lines[0][0].bg(), red);
+        assert_eq!(erase.lines[0][1].bg(), red);
         assert_wide_line_invariant(&erase.lines[0]);
 
         let mut overwrite = TermGrid::new(4, 1);
         feed(&mut overwrite, "界X".as_bytes());
         feed(&mut overwrite, b"\x1b[41m\x1b[1;2HZ");
-        assert_eq!(overwrite.lines[0][0].c, ' ');
-        assert_eq!(overwrite.lines[0][0].bg, red);
-        assert_eq!(overwrite.lines[0][1].c, 'Z');
-        assert_eq!(overwrite.lines[0][1].bg, red);
+        assert_eq!(overwrite.lines[0][0].ch(), ' ');
+        assert_eq!(overwrite.lines[0][0].bg(), red);
+        assert_eq!(overwrite.lines[0][1].ch(), 'Z');
+        assert_eq!(overwrite.lines[0][1].bg(), red);
         assert_wide_line_invariant(&overwrite.lines[0]);
     }
 
@@ -2748,7 +2748,7 @@ mod tests {
 
         feed(&mut grid, b"abc\x1b[1;2H\x1b[4hX\x1b[4l");
         assert_eq!(
-            grid.lines[0][..4].iter().map(|cell| cell.c).collect::<String>(),
+            grid.lines[0][..4].iter().map(|cell| cell.ch()).collect::<String>(),
             "aXbc"
         );
 
@@ -2772,11 +2772,11 @@ mod tests {
 
         let mut wrap = TermGrid::new(3, 2);
         feed(&mut wrap, b"\x1b[?7l\x1b[1;3HAB");
-        assert_eq!(wrap.lines[0][2].c, 'B');
+        assert_eq!(wrap.lines[0][2].ch(), 'B');
         assert_eq!((wrap.cur_x, wrap.cur_y), (2, 0));
         feed(&mut wrap, b"\x1b[?7h\x1b[1;3HCD");
-        assert_eq!(wrap.lines[0][2].c, 'C');
-        assert_eq!(wrap.lines[1][0].c, 'D');
+        assert_eq!(wrap.lines[0][2].ch(), 'C');
+        assert_eq!(wrap.lines[1][0].ch(), 'D');
         assert_eq!((wrap.cur_x, wrap.cur_y), (1, 1));
     }
 
@@ -2785,7 +2785,7 @@ mod tests {
         assert!(grid.cur_bg.is_default_background());
         assert!(!grid.cur_bold);
         assert!(!grid.cur_dim);
-        assert!(!grid.cur_underline);
+        assert_eq!(grid.cur_underline, UnderlineStyle::None);
         assert!(!grid.cur_inverse);
         assert!(!grid.insert_mode);
         assert!(!grid.origin_mode);
@@ -2830,7 +2830,7 @@ mod tests {
             .lines
             .iter()
             .flatten()
-            .all(|cell| cell.c == ' ' && cell.bg.is_default_background()));
+            .all(|cell| cell.ch() == ' ' && cell.bg().is_default_background()));
         assert_terminal_modes_reset(&grid);
         assert_eq!(grid.tab_stops, default_tab_stops(grid.cols));
         assert!(grid.presentation_ready);
@@ -2843,7 +2843,7 @@ mod tests {
     fn decstr_soft_reset_preserves_content_and_history_but_resets_mutable_modes() {
         let mut grid = TermGrid::new(16, 4);
         let mut history = vec![Cell::default(); 16];
-        history[0].c = 'H';
+        history[0].set_ch('H');
         grid.push_scrollback_row_for_test(history, 1, false);
         feed(
             &mut grid,
@@ -2878,7 +2878,7 @@ mod tests {
         assert!(!grid.is_alt);
         assert!(grid.scrollback.is_empty());
         assert_eq!((grid.cur_x, grid.cur_y), (0, 0));
-        assert!(grid.lines.iter().flatten().all(|cell| cell.c == ' '));
+        assert!(grid.lines.iter().flatten().all(|cell| cell.ch() == ' '));
     }
 
     #[test]
@@ -2938,7 +2938,7 @@ mod tests {
                 grid.scrollback
                     .iter()
                     .chain(grid.lines.iter())
-                    .flat_map(|line| line.iter().map(|cell| cell.c))
+                    .flat_map(|line| line.iter().map(|cell| cell.ch()))
                     .collect::<String>()
             };
             if text.contains("__RONS_PTY__") && text.contains("40 120") {
@@ -3290,7 +3290,7 @@ mod tests {
     /// (hidden, non-blank) cell counts of screen row `row`.
     fn hidden_cells(terminal: &Terminal, row: usize) -> (usize, usize) {
         let grid = crate::platform::lock_recover(&terminal.grid);
-        let cells = grid.lines[row].iter().filter(|cell| cell.c != ' ');
+        let cells = grid.lines[row].iter().filter(|cell| cell.ch() != ' ');
         let (hidden, total) = cells.fold((0, 0), |(hidden, total), cell| {
             (hidden + usize::from(cell.is_hidden()), total + 1)
         });
@@ -3394,11 +3394,11 @@ mod tests {
         for row in 0..3 {
             assert!(grid.lines[row][..79]
                 .iter()
-                .filter(|cell| cell.c != ' ')
+                .filter(|cell| cell.ch() != ' ')
                 .all(|cell| cell.is_hidden()), "banner row {row}");
-            assert_eq!(grid.lines[row][79].c, '│');
+            assert_eq!(grid.lines[row][79].ch(), '│');
             assert!(!grid.lines[row][79].is_hidden(), "divider row {row}");
-            assert_eq!(grid.lines[row][81].c, 'p');
+            assert_eq!(grid.lines[row][81].ch(), 'p');
             assert!(!grid.lines[row][81].is_hidden(), "panel row {row}");
         }
     }
@@ -3461,8 +3461,8 @@ mod tests {
         let mut hidden_text = String::new();
         for line in grid.scrollback.iter().chain(grid.lines.iter()) {
             let cells = &line[..grid.cols.min(line.len())];
-            let text: String = cells.iter().map(|cell| cell.c).collect();
-            let drawn = cells.iter().filter(|cell| cell.c != ' ');
+            let text: String = cells.iter().map(|cell| cell.ch()).collect();
+            let drawn = cells.iter().filter(|cell| cell.ch() != ' ');
             let (hidden, total) = drawn.fold((0, 0), |(hidden, total), cell| {
                 (hidden + usize::from(cell.is_hidden()), total + 1)
             });
@@ -3665,7 +3665,7 @@ mod tests {
                 grid.scrollback
                     .iter()
                     .chain(grid.lines.iter())
-                    .flat_map(|line| line.iter().map(|cell| cell.c))
+                    .flat_map(|line| line.iter().map(|cell| cell.ch()))
                     .collect::<String>()
             };
             if text.contains("__DIRECT__")
@@ -3703,7 +3703,7 @@ mod tests {
         let grid = Mutex::new(TermGrid::new(4, 2));
         let mut guard = crate::platform::lock_recover(&grid);
         guard.put_char('R');
-        assert_eq!(guard.lines[0][0].c, 'R');
+        assert_eq!(guard.lines[0][0].ch(), 'R');
         drop(guard);
 
         let source = include_str!("platform.rs");
@@ -4392,8 +4392,8 @@ fn match_banner_row<'a>(
     pos: usize,
 ) -> Option<usize> {
     let mut cells = cells.filter(|cell| !cell.is_wide_spacer());
-    let plain = |cell: &Cell, c: char| cell.c == c && cell.zero_width().is_empty();
-    let bar = cells.find(|cell| cell.c != ' ')?;
+    let plain = |cell: &Cell, c: char| cell.ch() == c && cell.zero_width().is_empty();
+    let bar = cells.find(|cell| cell.ch() != ' ')?;
     if !plain(bar, DEV_CHANNEL_BANNER_BAR) || !cells.next().is_some_and(|cell| plain(cell, ' ')) {
         return None;
     }
@@ -4401,20 +4401,20 @@ fn match_banner_row<'a>(
     // Byte position in `expected` after the last matched non-blank cell.
     let mut end = None;
     while let Some(cell) = cells.next() {
-        if end.is_none() && pos > 0 && cell.c != ' ' {
+        if end.is_none() && pos > 0 && cell.ch() != ' ' {
             rest = rest.strip_prefix(' ').unwrap_or(rest);
         }
         let mut chars = rest.chars();
         if !chars.next().is_some_and(|c| plain(cell, c)) {
             // Claude Code's side panel begins after the chat column. Its
             // divider and text share the terminal row with the banner.
-            if cell.c != '│' {
+            if cell.ch() != '│' {
                 // Past the end of `expected` the text must end at a word
                 // boundary: "names" is not the line "name".
                 let continues = if rest.is_empty() {
-                    cell.c != ' '
+                    cell.ch() != ' '
                 } else {
-                    cell.c != ' ' || !cells.all(|cell| cell.c == ' ')
+                    cell.ch() != ' ' || !cells.all(|cell| cell.ch() == ' ')
                 };
                 if continues {
                     return None;
@@ -4426,7 +4426,7 @@ fn match_banner_row<'a>(
             break;
         }
         rest = chars.as_str();
-        if cell.c != ' ' {
+        if cell.ch() != ' ' {
             end = Some(expected.len() - rest.len());
         }
     }
@@ -4519,10 +4519,10 @@ impl<'a> BannerRows<'a> {
             return None;
         }
         let mut cells = self.row(0)?.0.iter().filter(|cell| !cell.is_wide_spacer());
-        if cells.find(|cell| cell.c != ' ')?.c != DEV_CHANNEL_BANNER_BAR {
+        if cells.find(|cell| cell.ch() != ' ')?.ch() != DEV_CHANNEL_BANNER_BAR {
             return None;
         }
-        let lead = cells.find(|cell| cell.c != ' ')?.c;
+        let lead = cells.find(|cell| cell.ch() != ' ')?.ch();
         DEV_CHANNEL_BANNER_LINES[0]
             .char_indices()
             .skip(1)
@@ -4589,7 +4589,7 @@ impl DevBannerState {
             };
             drawn |= rows
                 .cells(row, len)
-                .any(|cell| cell.c != ' ' && !cell.is_hidden());
+                .any(|cell| cell.ch() != ' ' && !cell.is_hidden());
             self.blocks.push((row, len));
             row += len;
         }
@@ -4622,9 +4622,9 @@ impl DevBannerState {
             for cell in line.iter_mut().take(cols) {
                 if !in_block {
                     cell.set_hidden(false);
-                } else if cell.c == '│' {
+                } else if cell.ch() == '│' {
                     break;
-                } else if cell.c != ' ' {
+                } else if cell.ch() != ' ' {
                     cell.set_hidden(true);
                 }
             }

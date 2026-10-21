@@ -535,7 +535,7 @@ mod tests {
 
     fn set_row(grid: &mut TermGrid, row: usize, text: &str) {
         for (x, c) in text.chars().enumerate() {
-            grid.lines[row][x].c = c;
+            grid.lines[row][x].set_ch(c);
         }
         grid.content_generation = grid.content_generation.wrapping_add(1);
     }
@@ -586,7 +586,7 @@ mod tests {
         let mut grid = TermGrid::new(12, 1);
         let mut history = vec![crate::terminal::Cell::default(); 12];
         for (index, c) in "hit   needle".chars().enumerate() {
-            history[index].c = c;
+            history[index].set_ch(c);
         }
         grid.push_scrollback_row_for_test(history, 12, false);
 
@@ -661,7 +661,7 @@ mod tests {
         for row in &mut grid.lines {
             row.fill(crate::terminal::Cell::default());
             for cell in row {
-                cell.c = 'a';
+                cell.set_ch('a');
             }
         }
         grid.content_generation = grid.content_generation.wrapping_add(1);

@@ -202,6 +202,12 @@ impl Cell {
 
     // pub until Task 3 moves the grid
     #[doc(hidden)]
+    pub fn set_ch(&mut self, c: char) {
+        self.c = c;
+    }
+
+    // pub until Task 3 moves the grid
+    #[doc(hidden)]
     pub fn set_char(&mut self, c: char, fg: TerminalColor, bg: TerminalColor, wide: bool) {
         self.c = c;
         self.fg = fg;

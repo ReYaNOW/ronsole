@@ -7,8 +7,58 @@ use crate::search::{
 };
 use crate::terminal::{
     CELL_PRESENTATION_EMOJI, CELL_PRESENTATION_TEXT, Cell, TermGrid, Terminal, TerminalColor,
-    normalized_selection_bounds, terminal_color_rgba, terminal_should_render_zero_width,
+    normalized_selection_bounds, terminal_should_render_zero_width,
 };
+use ronsole_term::{terminal_force_text_presentation, xterm_256_rgb};
+
+const ANSI_16_COLORS: [[f32; 4]; 16] = [
+    [0.10, 0.10, 0.10, 1.0],
+    [0.95, 0.30, 0.30, 1.0],
+    [0.30, 0.85, 0.30, 1.0],
+    [0.90, 0.85, 0.20, 1.0],
+    [0.30, 0.60, 1.00, 1.0],
+    [0.90, 0.35, 0.90, 1.0],
+    [0.20, 0.85, 0.85, 1.0],
+    [0.90, 0.90, 0.90, 1.0],
+    [0.45, 0.45, 0.45, 1.0],
+    [1.00, 0.40, 0.40, 1.0],
+    [0.40, 1.00, 0.40, 1.0],
+    [1.00, 1.00, 0.40, 1.0],
+    [0.50, 0.70, 1.00, 1.0],
+    [1.00, 0.50, 1.00, 1.0],
+    [0.40, 1.00, 1.00, 1.0],
+    [1.00, 1.00, 1.00, 1.0],
+];
+
+fn terminal_color_rgba(color: TerminalColor) -> [f32; 4] {
+    if color.is_default_foreground() {
+        return ANSI_16_COLORS[7];
+    }
+    if color.is_default_background() {
+        return ANSI_16_COLORS[0];
+    }
+    if let Some(index) = color.indexed_value() {
+        if index < 16 {
+            return ANSI_16_COLORS[index as usize];
+        }
+        if let Some(rgb) = xterm_256_rgb(index) {
+            return rgb_rgba(rgb.r, rgb.g, rgb.b);
+        }
+    }
+    let (red, green, blue) = color.rgb_value().unwrap_or((255, 255, 255));
+    rgb_rgba(red, green, blue)
+}
+
+#[inline]
+fn rgb_rgba(red: u8, green: u8, blue: u8) -> [f32; 4] {
+    const DENOMINATOR: f32 = 255.0;
+    [
+        red as f32 / DENOMINATOR,
+        green as f32 / DENOMINATOR,
+        blue as f32 / DENOMINATOR,
+        1.0,
+    ]
+}
 
 pub(crate) const TERMINAL_TEXT_SCALE: f32 = 1.05;
 const TERMINAL_TAB_BAR_PAD: f32 = 8.0;
@@ -1075,7 +1125,7 @@ fn terminal_glyph_cell_geometry(
     cell: &Cell,
     char_w: f32,
 ) -> Option<(f32, f32)> {
-    if cell.c == ' ' || cell.is_wide_spacer() || cell.is_hidden() {
+    if cell.ch() == ' ' || cell.is_wide_spacer() || cell.is_hidden() {
         return None;
     }
     let (x, next_x) = terminal_cell_x_bounds(text_x, cell_index, char_w);
@@ -1130,14 +1180,14 @@ fn terminal_cell_render_colors(
     cell: &Cell,
     palette: TerminalPalette,
 ) -> ([f32; 4], Option<[f32; 4]>) {
-    let source_fg = terminal_render_color(cell.fg, palette);
-    let source_bg = terminal_render_color(cell.bg, palette);
+    let source_fg = terminal_render_color(cell.fg(), palette);
+    let source_bg = terminal_render_color(cell.bg(), palette);
     let (mut foreground, background) = if cell.is_inverse() {
         (source_bg, Some(source_fg))
     } else {
         (
             source_fg,
-            (!cell.bg.is_default_background()).then_some(source_bg),
+            (!cell.bg().is_default_background()).then_some(source_bg),
         )
     };
     if cell.is_dim() {
@@ -2599,12 +2649,12 @@ impl Renderer {
                                     continue;
                                 };
                                 let (fg, _) = terminal_cell_render_colors(cell, palette);
-                                if let Some(glyph) = self.terminal_glyph(cell.c, cell.presentation)
+                                if let Some(glyph) = self.terminal_glyph(cell.ch(), cell.presentation())
                                 {
                                     let baseline =
                                         draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
                                     let (gx, gy, gs) = terminal_glyph_anchor(
-                                        cell.c,
+                                        cell.ch(),
                                         glyph,
                                         x,
                                         draw_y,
@@ -2633,7 +2683,7 @@ impl Renderer {
                                         continue;
                                     }
                                     if let Some(glyph) =
-                                        self.terminal_glyph(extra, cell.presentation)
+                                        self.terminal_glyph(extra, cell.presentation())
                                     {
                                         let baseline =
                                             draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
@@ -2728,6 +2778,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ronsole_term::UnderlineStyle;
 
     fn test_glyph(width: f32, height: f32, mode: f32) -> GlyphInfo {
         GlyphInfo {
@@ -3023,7 +3074,7 @@ mod tests {
             [0.2, 0.3, 0.4, 1.0],
         );
         let mut default_cell = Cell::default();
-        default_cell.set_sgr_style(true, false, false);
+        default_cell.set_sgr_style(true, UnderlineStyle::None, false);
         let (default_fg, default_bg) = terminal_cell_render_colors(&default_cell, palette);
         assert_eq!(default_fg, palette.bg);
         assert_eq!(default_bg, Some(terminal_color_rgba(TerminalColor::default_foreground())));
@@ -3035,11 +3086,29 @@ mod tests {
             TerminalColor::indexed(4),
             false,
         );
-        explicit.set_sgr_style(true, false, false);
+        explicit.set_sgr_style(true, UnderlineStyle::None, false);
         let (fg, bg) = terminal_cell_render_colors(&explicit, palette);
         assert_eq!(fg, terminal_color_rgba(TerminalColor::indexed(4)));
         assert_eq!(bg, Some(terminal_color_rgba(TerminalColor::indexed(1))));
         assert_ne!(default_fg, terminal_color_rgba(TerminalColor::indexed(0)));
+    }
+
+    #[test]
+    fn xterm_palette_mapping_covers_cube_and_grayscale() {
+        assert_eq!(terminal_color_rgba(TerminalColor::indexed(16)), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(terminal_color_rgba(TerminalColor::indexed(231)), [1.0, 1.0, 1.0, 1.0]);
+        let gray = terminal_color_rgba(TerminalColor::indexed(232));
+        assert!((gray[0] - 8.0 / 255.0).abs() < f32::EPSILON);
+        assert_eq!(gray[0], gray[1]);
+        assert_eq!(gray[1], gray[2]);
+    }
+
+    #[test]
+    fn default_background_is_distinct_from_explicit_ansi_black() {
+        let cell = Cell::default();
+        assert!(cell.bg().is_default_background());
+        assert!(!TerminalColor::indexed(0).is_default_background());
+        assert_eq!(terminal_color_rgba(TerminalColor::indexed(0)), ANSI_16_COLORS[0]);
     }
 
     #[test]
@@ -3055,7 +3124,7 @@ mod tests {
             TerminalColor::indexed(4),
             false,
         );
-        cell.set_sgr_style(false, false, true);
+        cell.set_sgr_style(false, UnderlineStyle::None, true);
         let (fg, bg) = terminal_cell_render_colors(&cell, palette);
         let source = terminal_color_rgba(TerminalColor::rgb(150, 120, 90));
         assert!((fg[0] - source[0] * 0.66).abs() < 0.0001);
@@ -3074,9 +3143,9 @@ mod tests {
             TerminalColor::default_background(),
             false,
         );
-        cell.set_sgr_style(false, true, false);
+        cell.set_sgr_style(false, UnderlineStyle::Single, false);
 
-        assert!(cell.is_underlined());
+        assert!(cell.underline() == UnderlineStyle::Single);
         assert_eq!(
             TERMINAL_BODY_LAYERS,
             [TerminalBodyLayer::Background, TerminalBodyLayer::Glyph]
@@ -3160,7 +3229,7 @@ mod tests {
     fn resize_refreshes_search_to_the_new_grid_generation_before_render() {
         let mut grid = TermGrid::new(16, 2);
         for (x, c) in "needle12345".chars().enumerate() {
-            grid.lines[0][x].c = c;
+            grid.lines[0][x].set_ch(c);
         }
         grid.content_generation = grid.content_generation.wrapping_add(1);
         let mut search = TerminalSearchState::default();
@@ -3186,7 +3255,7 @@ mod tests {
         assert_eq!(search.current, None);
 
         let post_resize_generation = grid.content_generation;
-        grid.lines[1][0].c = 'x';
+        grid.lines[1][0].set_ch('x');
         grid.content_generation = grid.content_generation.wrapping_add(1);
         assert!(!prepare_terminal_grid_for_render(
             &mut grid,

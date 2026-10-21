@@ -15,7 +15,6 @@ mod single_line_input;
 mod tab_input;
 mod tabs;
 pub mod terminal;
-mod terminal_compat;
 mod terminal_process;
 mod wake;
 mod wayland_input;

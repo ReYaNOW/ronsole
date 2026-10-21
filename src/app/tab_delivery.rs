@@ -533,7 +533,7 @@ mod tests {
                 let ready = crate::platform::lock_recover(&terminal.grid)
                     .lines
                     .iter()
-                    .flat_map(|line| line.iter().map(|cell| cell.c))
+                    .flat_map(|line| line.iter().map(|cell| cell.ch()))
                     .collect::<String>()
                     .contains("__READY__");
                 if ready && root.join("out").exists() {
@@ -725,7 +725,7 @@ mod tests {
         {
             let mut grid = crate::platform::lock_recover(&fx.app.terminals[0].grid);
             let row = grid.lines.len() - 3;
-            grid.lines[row][2].c = 'x';
+            grid.lines[row][2].set_ch('x');
         }
         fx.advance(100);
         assert_eq!(reply.try_recv(), Ok(TabInputCode::InputBoxUnavailable));
