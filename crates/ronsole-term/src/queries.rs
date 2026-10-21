@@ -17,6 +17,12 @@ impl Term {
         self.queue_reply(msg.as_bytes());
     }
 
+    /// Kitty flags reply to `CSI ? u`: `CSI ? flags u` with the active flags.
+    pub(crate) fn queue_kitty_query(&mut self) {
+        let msg = format!("\x1B[?{}u", self.kitty_flags());
+        self.queue_reply(msg.as_bytes());
+    }
+
     /// DECRQM reply for a private mode, `CSI ? Ps ; Pm $ y`.
     pub(crate) fn queue_decrqm_private(&mut self, mode: u16) {
         let state = self.private_mode_state(mode);

@@ -10,6 +10,7 @@ mod cell;
 mod color;
 mod grid;
 mod input;
+mod keys;
 mod osc;
 mod perform;
 mod queries;
@@ -33,3 +34,4 @@ pub use input::{
     MouseButton, MouseEventKind, MouseTrackingMode, bracketed_paste_bytes,
     focus_report_sequence, mouse_report,
 };
+pub use keys::{KeyEvent, KeyKind, KeyMods, KeyOutcome, KpKey, ModKey, TermKey};

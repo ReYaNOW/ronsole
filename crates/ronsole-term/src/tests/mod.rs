@@ -1,5 +1,6 @@
 mod csi;
 mod edges;
+mod keys;
 mod osc;
 mod queries;
 mod reflow;

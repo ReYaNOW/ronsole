@@ -151,6 +151,7 @@ impl Perform for Performer<'_> {
         let query = match action {
             'c' | 'q' => intermediates == b">",
             'p' => intermediates.contains(&b'$'),
+            'u' => matches!(intermediates, [b'?'] | [b'>'] | [b'<'] | [b'=']),
             _ => false,
         };
         if action != 'm' && !query {
@@ -173,6 +174,7 @@ impl Perform for Performer<'_> {
                         if value == 1049 || value == 47 || value == 1047 {
                             if enable && !self.term.is_alt {
                                 self.term.is_alt = true;
+                                self.term.key_protocol.screen_switched();
                                 self.term.alt_saved_cursor = Some((self.term.cur_x, self.term.cur_y));
                                 let mut alt = std::collections::VecDeque::new();
                                 let mut alt_meta = std::collections::VecDeque::new();
@@ -195,6 +197,7 @@ impl Perform for Performer<'_> {
                                 self.term.dirty = true;
                             } else if !enable && self.term.is_alt {
                                 self.term.is_alt = false;
+                                self.term.key_protocol.screen_switched();
                                 if let Some(alt) = self.term.alt_lines.take() {
                                     let old_lines = std::mem::replace(&mut self.term.lines, alt);
                                     for mut line in old_lines {
@@ -249,12 +252,33 @@ impl Perform for Performer<'_> {
                 }
             }
             's' => self.term.saved_cursor = Some((self.term.cur_x, self.term.cur_y)),
-            'u' => {
-                if let Some((x, y)) = self.term.saved_cursor {
-                    self.term.cur_x = x.min(self.term.cols.saturating_sub(1));
-                    self.term.cur_y = y.min(self.term.visible_rows.saturating_sub(1));
+            'u' => match intermediates {
+                // Restore cursor (DECRC). vte reports an omitted parameter as 0, so
+                // `CSI u` and `CSI 0 u` cannot be told apart and both restore.
+                [] => {
+                    if let Some((x, y)) = self.term.saved_cursor {
+                        self.term.cur_x = x.min(self.term.cols.saturating_sub(1));
+                        self.term.cur_y = y.min(self.term.visible_rows.saturating_sub(1));
+                    }
                 }
-            }
+                // Kitty keyboard protocol; these forms never move the cursor.
+                [b'?'] => self.term.queue_kitty_query(),
+                [b'>'] => {
+                    let flags = params.iter().next().map_or(0, |p| p[0]);
+                    self.term.key_protocol.push(self.term.is_alt, flags);
+                }
+                [b'<'] => {
+                    let count = params.iter().next().map_or(1, |p| p[0]);
+                    self.term.key_protocol.pop(self.term.is_alt, count);
+                }
+                [b'='] => {
+                    let flags = params.iter().next().map_or(0, |p| p[0]);
+                    // An omitted mode is 1 (replace); vte reads an empty mode as 0.
+                    let mode = params.iter().nth(1).map_or(1, |p| p[0]);
+                    self.term.key_protocol.set(self.term.is_alt, flags, mode);
+                }
+                _ => {}
+            },
             'G' | '`' => {
                 let p = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
                 let p = if p == 0 { 1 } else { p };

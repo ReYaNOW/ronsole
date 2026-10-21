@@ -1011,6 +1011,8 @@ impl Term {
         self.insert_mode = false;
         self.origin_mode = false;
         self.join_next = false;
+        // Shared by RIS and DECSTR: both stacks, the flags and the sent-key set.
+        self.key_protocol.reset();
     }
 
     pub(crate) fn soft_reset_terminal_state(&mut self) {

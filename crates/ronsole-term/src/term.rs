@@ -3,7 +3,8 @@
 use crate::cell::{Cell, Pen};
 use crate::color::TermPalette;
 use crate::grid::LineMeta;
-use crate::input::MouseTrackingMode;
+use crate::input::{MouseTrackingMode, focus_report_sequence};
+use crate::keys::KeyProtocol;
 use std::ops::Range;
 use std::time::Instant;
 use vte::Parser;
@@ -86,6 +87,8 @@ pub struct Term {
     pub(crate) origin_mode: bool,
     pub(crate) tab_stops: Vec<bool>,
     pub(crate) join_next: bool,
+    /// Kitty keyboard flag stacks and the sent-key set.
+    pub(crate) key_protocol: KeyProtocol,
     pub(crate) scrollback_storage_cols: usize,
     /// Rows ever appended to `scrollback` (wrapping); lets a scan find the
     /// rows that entered it since an earlier scan.
@@ -169,6 +172,7 @@ impl Term {
             origin_mode: false,
             tab_stops: crate::grid::default_tab_stops(cols),
             join_next: false,
+            key_protocol: KeyProtocol::default(),
             scrollback_storage_cols: cols,
             scrollback_pushed: 0,
             pool: Vec::with_capacity(128),
@@ -318,6 +322,21 @@ impl Term {
 
     pub fn focus_reporting(&self) -> bool {
         self.focus_reporting
+    }
+
+    /// Kitty keyboard flags of the active screen, limited to the supported bits.
+    pub fn kitty_flags(&self) -> u8 {
+        self.key_protocol.flags(self.is_alt)
+    }
+
+    /// Reports a focus change from the host. Returns `CSI I` or `CSI O` when
+    /// focus reporting (mode 1004) is on, otherwise `None`. A focus loss clears
+    /// the sent-key set, so releases of keys held across it are ignored.
+    pub fn focus_changed(&mut self, focused: bool) -> Option<&'static [u8]> {
+        if !focused {
+            self.key_protocol.clear_sent();
+        }
+        focus_report_sequence(self.focus_reporting, focused)
     }
 
     pub fn bracketed_paste(&self) -> bool {
