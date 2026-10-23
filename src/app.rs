@@ -8,7 +8,7 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::platform::{KdeActivationWorker, kde_session_active};
+use crate::platform::{KdeActivationWorker, kde_session_active, open_uri, open_uri_allowed};
 use crate::platform::single_instance::BridgeResult;
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit, terminal_palette};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
@@ -950,6 +950,7 @@ impl App {
         self.unfocused_redraw_pending = !focused;
         self.modifiers = Modifiers::empty();
         self.interaction.set_modifiers(Modifiers::empty());
+        self.update_link_hover();
         if self.active_terminal_presented {
             self.send_terminal_focus_state(self.active_terminal, focused);
         }
@@ -1243,14 +1244,38 @@ impl App {
                     runtime.terminal_tab_hit_test(self.pointer_x, self.pointer_y)
                 })
         };
-        ui_cursor_icon(
+        let icon = ui_cursor_icon(
             settings_modal_active,
             settings_hit,
             self.settings_background_dragging,
             search_hit,
             tab_hit,
             self.terminal_tab_drag.is_some(),
-        )
+        );
+        let link_hovered = self
+            .terminals
+            .get(self.active_terminal)
+            .is_some_and(|terminal| terminal.hovered_link().is_some());
+        if icon == CursorKind::Default && link_hovered {
+            CursorKind::Pointer
+        } else {
+            icon
+        }
+    }
+
+    /// Recomputes the Ctrl+hover link of the active tab and refreshes the cursor.
+    /// Called on pointer motion and on modifier changes.
+    fn update_link_hover(&mut self) {
+        let settings_modal_active = self.settings_modal_active();
+        let (x, y) = (self.pointer_x, self.pointer_y);
+        if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
+            if settings_modal_active {
+                terminal.set_hovered_link(None);
+            } else {
+                self.interaction.update_link_hover(terminal, x, y);
+            }
+        }
+        self.refresh_cursor_icon();
     }
 
     fn refresh_cursor_icon(&mut self) {
@@ -1495,6 +1520,7 @@ impl App {
     fn on_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
         self.interaction.set_modifiers(modifiers);
+        self.update_link_hover();
     }
 
     fn on_ime_commit(&mut self, text: &str) {
@@ -1578,6 +1604,7 @@ impl App {
         let previous_y = self.pointer_y;
         self.pointer_x = position.x;
         self.pointer_y = position.y;
+        self.update_link_hover();
         if self.settings_modal_active() {
             let previous_hit = self.settings_hit_test(previous_x, previous_y);
             let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
@@ -1749,6 +1776,11 @@ impl App {
                 self.sync_animation_state();
                 self.request_frame();
             }
+        }
+        if let Some(uri) = self.interaction.take_link_uri()
+            && open_uri_allowed(&uri, crate::terminal::local_host_name())
+        {
+            open_uri(&uri);
         }
         false
     }

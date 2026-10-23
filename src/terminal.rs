@@ -4,7 +4,7 @@ use crate::terminal_process::{
     HostChannels, PendingHostEvents, SessionSink, notify_main_loop, terminal_reply_channel,
 };
 use crate::wake::WakeHandle;
-use ronsole_term::{Term, TermConfig, TermIdentity, TermPalette};
+use ronsole_term::{LinkTarget, Term, TermConfig, TermIdentity, TermPalette};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::io;
@@ -219,6 +219,7 @@ mod tests {
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
             osc7_cwd: None,
+            hovered_link: None,
             reply_tx: terminal_reply_channel().0,
             pending: Arc::new(Mutex::new(PendingHostEvents::default())),
             wake: None,
@@ -1493,6 +1494,10 @@ pub struct Terminal {
     /// Working directory from the latest OSC 7 report that passed
     /// `accept_osc7_cwd`; a new tab inherits it.
     pub(crate) osc7_cwd: Option<PathBuf>,
+    /// Link under the pointer while Ctrl is held, with the grid's
+    /// `content_generation` at search time. Written only by
+    /// `set_hovered_link`.
+    hovered_link: Option<(LinkTarget, u64)>,
     /// Sender clone kept for `flush_expired`; the parser thread holds another.
     reply_tx: SyncSender<Vec<u8>>,
     pending: Arc<Mutex<PendingHostEvents>>,
@@ -1536,7 +1541,7 @@ fn accept_osc7_cwd(host: &str, path: &[u8], local_host: &str) -> Option<PathBuf>
 }
 
 /// This machine's host name, read once per process on first use.
-fn local_host_name() -> &'static str {
+pub(crate) fn local_host_name() -> &'static str {
     static LOCAL_HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LOCAL_HOST.get_or_init(read_host_name)
 }
@@ -1591,6 +1596,7 @@ impl Terminal {
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
             osc7_cwd: None,
+            hovered_link: None,
             // No reader exists for test tabs, so replies are dropped unless a
             // test installs its own sender.
             reply_tx: terminal_reply_channel().0,
@@ -1673,6 +1679,7 @@ impl Terminal {
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
             osc7_cwd: None,
+            hovered_link: None,
             reply_tx,
             pending,
             wake,
@@ -2006,6 +2013,16 @@ impl Terminal {
 
     pub fn write_display_title(&self, output: &mut String) {
         crate::platform::lock_recover(&self.title_cache).write_resolved(output);
+    }
+
+    /// Link found under the pointer by the last hover search, if any.
+    pub(crate) fn hovered_link(&self) -> Option<&(LinkTarget, u64)> {
+        self.hovered_link.as_ref()
+    }
+
+    /// Replaces the hover state; `None` clears it.
+    pub(crate) fn set_hovered_link(&mut self, link: Option<(LinkTarget, u64)>) {
+        self.hovered_link = link;
     }
 
     pub(crate) fn presentation_ready(&self) -> bool {

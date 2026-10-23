@@ -2,13 +2,13 @@ use crate::input_types::{
     KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton, ScrollDelta,
 };
 use crate::platform::Clipboard;
-use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target};
+use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target, visible_row_range};
 use crate::search::{SearchRefreshCause, TerminalSearchHit, TerminalSearchState};
 use crate::terminal::{MouseTrackingMode, Terminal};
 use crate::wayland_input::us_base_char_from_evdev;
 use ronsole_term::{
-    KeyEvent, KeyKind, KeyMods, KeyOutcome, KpKey, MouseButton, MouseEventKind, Term, TermKey,
-    bracketed_paste_bytes, mouse_report,
+    KeyEvent, KeyKind, KeyMods, KeyOutcome, KpKey, LinkTarget, MouseButton, MouseEventKind, Term,
+    TermKey, bracketed_paste_bytes, mouse_report,
 };
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,10 @@ pub(crate) struct TerminalInteraction {
     pointer_capture: PointerCapture,
     terminal_selection_anchor: Option<(usize, usize)>,
     scroll_sensitivity: f32,
+    /// URI of the last Ctrl+click on a link, until `take_link_uri` hands it out.
+    link_uri: Option<Box<str>>,
+    /// True from a Ctrl+press on a link until the matching release.
+    link_press_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,6 +57,8 @@ impl Default for TerminalInteraction {
             pointer_capture: PointerCapture::None,
             terminal_selection_anchor: None,
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
+            link_uri: None,
+            link_press_pending: false,
         }
     }
 }
@@ -60,6 +66,23 @@ impl Default for TerminalInteraction {
 impl TerminalInteraction {
     pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
+    }
+
+    /// Recomputes the hovered link for the pointer at (`x`, `y`). The link is
+    /// kept only while Ctrl is held and the pointer is over the terminal body.
+    pub(crate) fn update_link_hover(&self, terminal: &mut Terminal, x: f32, y: f32) {
+        let link = if self.modifiers.control_key() && self.layout.body.contains(x, y) {
+            link_under_pointer(self.layout, terminal, x, y)
+        } else {
+            None
+        };
+        terminal.set_hovered_link(link);
+    }
+
+    /// Takes the URI of the last Ctrl+click on a link; the caller decides
+    /// whether to open it.
+    pub(crate) fn take_link_uri(&mut self) -> Option<Box<str>> {
+        self.link_uri.take()
     }
 
     pub(crate) fn set_scroll_sensitivity(&mut self, sensitivity: f32) {
@@ -606,6 +629,11 @@ impl TerminalInteraction {
             return true;
         }
 
+        if state == KeyState::Released && button == PointerButton::Left && self.link_press_pending {
+            self.link_press_pending = false;
+            return true;
+        }
+
         if let Some(search) = self.layout.search
             && state == KeyState::Pressed
             && button == PointerButton::Left
@@ -667,6 +695,17 @@ impl TerminalInteraction {
 
         if !self.layout.body.contains(x, y) {
             return false;
+        }
+        // Ctrl+click on a link opens it and never reaches the PTY, even under
+        // mouse tracking, and never starts a selection.
+        if state == KeyState::Pressed
+            && button == PointerButton::Left
+            && self.modifiers.control_key()
+            && let Some((link, _)) = link_under_pointer(self.layout, terminal, x, y)
+        {
+            self.link_uri = Some(link.uri);
+            self.link_press_pending = true;
+            return true;
         }
         if state == KeyState::Pressed {
             let search_owned_selection = self.search.owns_grid_selection();
@@ -747,6 +786,26 @@ impl TerminalInteraction {
         terminal.scroll_y.clamp_target(0.0, self.layout.max_scroll);
         true
     }
+}
+
+/// Link under (`x`, `y`) among the visible rows, with the grid's content
+/// generation at search time. The grid lock is held only for the search.
+fn link_under_pointer(
+    layout: TerminalUiLayout,
+    terminal: &Terminal,
+    x: f32,
+    y: f32,
+) -> Option<(LinkTarget, u64)> {
+    let grid = crate::platform::lock_recover(&terminal.grid);
+    let (col, row) = terminal_cell_from_grid(layout, &grid, x, y, layout.scroll_offset, false)?;
+    let rows = visible_row_range(
+        grid.total_rows(),
+        layout.visible_rows,
+        layout.scroll_offset,
+        layout.char_h,
+    );
+    let link = grid.link_at(row, col, rows)?;
+    Some((link, grid.content_generation()))
 }
 
 fn terminal_cell_at(
@@ -1858,6 +1917,115 @@ mod tests {
             mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 2, 3),
             Some(vec![0x1b, b'[', b'M', 32, 35, 36])
         );
+    }
+
+    /// Test terminal whose bottom row holds a URL at columns 4..25. The point
+    /// (73, 682) is on that URL: column 6, bottom row of the body. With
+    /// `tracking`, SGR mouse tracking (`ESC[?1000h`, `ESC[?1006h`) is on.
+    fn link_test_terminal(tracking: bool) -> Terminal {
+        let terminal = selection_test_terminal();
+        let mode: &[u8] = if tracking {
+            b"\x1b[?1000h\x1b[?1006h"
+        } else {
+            b""
+        };
+        let bytes = [mode, b"\x1b[30;1Hsee https://example.com/x"].concat();
+        crate::platform::lock_recover(&terminal.grid).advance(
+            &bytes,
+            std::time::Instant::now(),
+            &mut crate::terminal_process::SessionSink {
+                reply_tx: None,
+                title_cache: None,
+                pending: None,
+                wake: None,
+            },
+        );
+        terminal
+    }
+
+    #[test]
+    fn ctrl_click_with_tracking_not_sent_to_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(true);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(!interaction.terminal_selection_active());
+        assert_eq!(
+            interaction.take_link_uri().as_deref(),
+            Some("https://example.com/x")
+        );
+        assert!(interaction.take_link_uri().is_none());
+    }
+
+    #[test]
+    fn ctrl_click_off_link_with_tracking_still_reports_to_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(true);
+        interaction.layout = mouse_test_layout(0.0);
+        // Column 60 of the same row: no link there.
+        interaction.mouse_x = 613.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(terminal.input_bytes_for_test().starts_with(b"\x1b[<"));
+        assert!(interaction.take_link_uri().is_none());
+    }
+
+    #[test]
+    fn ctrl_hover_sets_pointer_and_range() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        let (link, generation) = terminal.hovered_link().expect("link under pointer");
+        let term = crate::platform::lock_recover(&terminal.grid);
+        // The URL is written on the bottom row, which is the last row of the grid.
+        assert_eq!(&*link.uri, "https://example.com/x");
+        assert_eq!(link.cells, vec![(term.total_rows() - 1, 4..25)]);
+        assert_eq!(*generation, term.content_generation());
+    }
+
+    #[test]
+    fn hover_without_ctrl_keeps_default_cursor() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_none());
+    }
+
+    #[test]
+    fn releasing_ctrl_clears_hovered_link() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_some());
+        interaction.set_modifiers(Modifiers::empty());
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_none());
     }
 
     fn mouse_test_layout(scroll_offset: f32) -> TerminalUiLayout {
