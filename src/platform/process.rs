@@ -3,6 +3,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const PROCESS_TREE_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
@@ -297,6 +298,71 @@ fn resolve_executable_with(program: &OsStr, path: Option<&OsStr>) -> Option<Path
     None
 }
 
+/// Returns whether `uri` may be passed to the desktop URI opener.
+///
+/// Only `http`, `https`, and `file` URIs pass. A `file` URI must name an empty
+/// host, `localhost`, or `local_host`, and must have a path below the root.
+/// Scheme and host comparisons ignore ASCII case (RFC 3986 sections 3.1 and
+/// 3.2.2). Control and non-ASCII bytes are rejected outright.
+pub fn open_uri_allowed(uri: &str, local_host: &str) -> bool {
+    if !uri.is_ascii() || uri.bytes().any(|byte| byte.is_ascii_control()) {
+        return false;
+    }
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return false;
+    };
+    let Some(after_slashes) = rest.strip_prefix("//") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        return !after_slashes.is_empty();
+    }
+    if scheme.eq_ignore_ascii_case("file") {
+        let Some(path_start) = after_slashes.find('/') else {
+            return false;
+        };
+        let (host, path) = after_slashes.split_at(path_start);
+        // A bare "/" names only the root, so something must follow it.
+        if path.len() <= 1 {
+            return false;
+        }
+        return host.is_empty()
+            || host.eq_ignore_ascii_case("localhost")
+            || host.eq_ignore_ascii_case(local_host);
+    }
+    false
+}
+
+/// Opens `uri` with `xdg-open` on a dedicated thread.
+///
+/// Callers must check [`open_uri_allowed`] first. The opener runs without a
+/// shell, and its thread is handed to the unit-thread reaper so the caller
+/// never waits for the child process.
+pub fn open_uri(uri: &str) {
+    let uri = uri.to_owned();
+    match super::spawn_named("ronsole-open-uri", move || run_xdg_open(&uri)) {
+        Ok(worker) => super::reap_unit_thread(worker),
+        Err(error) => eprintln!("Ronsole: failed to start URI opener thread: {error}"),
+    }
+}
+
+fn run_xdg_open(uri: &str) {
+    let Some(opener) = resolve_executable(OsStr::new("xdg-open")) else {
+        eprintln!("Ronsole: cannot open link, xdg-open was not found");
+        return;
+    };
+    let mut child = match Command::new(opener).arg(uri).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("Ronsole: failed to run xdg-open: {error}");
+            return;
+        }
+    };
+    if let Err(error) = child.wait() {
+        eprintln!("Ronsole: failed to wait for xdg-open: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +567,45 @@ mod tests {
             "background job in separate PGID remained after session shutdown"
         );
         println!("real PTY cleanup: shell_gone=true job_gone=true");
+    }
+
+    #[test]
+    fn open_uri_allowed_filters_schemes() {
+        // Expected values come from the Task 11 brief, not from the implementation.
+        let local_host = "myhost";
+        let allowed = [
+            "https://a",
+            "http://a",
+            "file:///x",
+            "file://localhost/x",
+            "file://myhost/x",
+            "file://MYHOST/x",
+            "HTTPS://A",
+        ];
+        for uri in allowed {
+            assert!(open_uri_allowed(uri, local_host), "expected allowed: {uri:?}");
+        }
+        let denied = [
+            "file://other/x",
+            "javascript:x",
+            "mailto:a@b",
+            "ftp://x",
+            "",
+            "file:///",
+            "file://localhost",
+            "https:",
+            "https:/a",
+            "file:x",
+            "/etc/passwd",
+            "https://a\nb",
+            "https://a\tb",
+            "https://a\x1b[31m",
+            "https://a\x7f",
+            "https://a/\u{0}",
+            "https://ß",
+        ];
+        for uri in denied {
+            assert!(!open_uri_allowed(uri, local_host), "expected denied: {uri:?}");
+        }
     }
 }
