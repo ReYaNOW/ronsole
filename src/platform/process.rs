@@ -303,9 +303,11 @@ fn resolve_executable_with(program: &OsStr, path: Option<&OsStr>) -> Option<Path
 /// Only `http`, `https`, and `file` URIs pass. A `file` URI must name an empty
 /// host, `localhost`, or `local_host`, and must have a path below the root.
 /// Scheme and host comparisons ignore ASCII case (RFC 3986 sections 3.1 and
-/// 3.2.2). Control and non-ASCII bytes are rejected outright.
+/// 3.2.2). Control characters (C0, DEL, C1) are rejected outright, and a
+/// non-ASCII host is rejected because IDNA is not applied. Non-ASCII path,
+/// query, and fragment are allowed and percent-encoded by [`xdg_open_argument`].
 pub fn open_uri_allowed(uri: &str, local_host: &str) -> bool {
-    if !uri.is_ascii() || uri.bytes().any(|byte| byte.is_ascii_control()) {
+    if uri.chars().any(char::is_control) {
         return false;
     }
     let Some((scheme, rest)) = uri.split_once(':') else {
@@ -315,13 +317,17 @@ pub fn open_uri_allowed(uri: &str, local_host: &str) -> bool {
         return false;
     };
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-        return !after_slashes.is_empty();
+        let host = after_slashes.split(['/', '?', '#']).next().unwrap_or_default();
+        return !after_slashes.is_empty() && host.is_ascii();
     }
     if scheme.eq_ignore_ascii_case("file") {
         let Some(path_start) = after_slashes.find('/') else {
             return false;
         };
         let (host, path) = after_slashes.split_at(path_start);
+        if !host.is_ascii() {
+            return false;
+        }
         // A bare "/" names only the root, so something must follow it.
         if path.len() <= 1 {
             return false;
@@ -347,11 +353,37 @@ pub fn open_uri(uri: &str) {
 }
 
 /// Returns the argument handed to `xdg-open` for a URI accepted by
-/// [`open_uri_allowed`]. A `file` URI is rewritten to the empty-host form
-/// `file:///path`, because `xdg-open` strips `localhost` and the local host
-/// name case-sensitively and would otherwise treat `file://MYHOST/x` as a
-/// relative path. Other URIs are returned unchanged.
+/// [`open_uri_allowed`]. Non-ASCII bytes are percent-encoded, so a UTF-8 path
+/// reaches the opener as a valid URI.
 fn xdg_open_argument(uri: &str) -> String {
+    percent_encode_non_ascii(&file_uri_argument(uri))
+}
+
+/// Percent-encodes every non-ASCII character of `text` as uppercase `%XX` per
+/// UTF-8 byte. ASCII characters are copied unchanged.
+fn percent_encode_non_ascii(text: &str) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(text.len());
+    let mut buffer = [0u8; 4];
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            encoded.push(ch);
+            continue;
+        }
+        for byte in ch.encode_utf8(&mut buffer).bytes() {
+            encoded.push('%');
+            encoded.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX_DIGITS[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
+}
+
+/// Rewrites a `file` URI to the empty-host form `file:///path`, because
+/// `xdg-open` strips `localhost` and the local host name case-sensitively and
+/// would otherwise treat `file://MYHOST/x` as a relative path. Other URIs are
+/// returned unchanged.
+fn file_uri_argument(uri: &str) -> String {
     let Some((scheme, rest)) = uri.split_once(':') else {
         return uri.to_owned();
     };
@@ -647,5 +679,22 @@ mod tests {
             xdg_open_argument("https://example.com/x"),
             "https://example.com/x"
         );
+    }
+
+    #[test]
+    fn open_uri_percent_encodes_non_ascii_path() {
+        // Expected values come from the G2-5 ruling, not from the implementation.
+        assert!(open_uri_allowed("https://example.org/путь", "myhost"));
+        assert_eq!(
+            xdg_open_argument("https://example.org/путь"),
+            "https://example.org/%D0%BF%D1%83%D1%82%D1%8C"
+        );
+    }
+
+    #[test]
+    fn open_uri_refuses_non_ascii_host_and_c1_control() {
+        // Expected values come from the G2-5 ruling: no IDNA, and C1 controls are refused.
+        assert!(!open_uri_allowed("https://пример.рф/", "myhost"));
+        assert!(!open_uri_allowed("https://a.org/\u{85}", "myhost"));
     }
 }
