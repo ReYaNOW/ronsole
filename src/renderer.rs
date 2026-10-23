@@ -1895,6 +1895,8 @@ mod tests {
         // and scales with it like the baseline does.
         let x_height_at_1 = terminal_font_metrics(18.0, 1.0).x_height;
         assert!(x_height_at_1 > 0.0 && x_height_at_1 < 18.0);
+        // The bundled font's OS/2 sxHeight is 550/1000 em, so the x-height at 18 px must be near 9.9.
+        assert!((0.50 * 18.0..0.60 * 18.0).contains(&x_height_at_1));
         assert_eq!(
             terminal_font_metrics(18.0, 1.0),
             TerminalFontMetrics {

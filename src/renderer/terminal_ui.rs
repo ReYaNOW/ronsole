@@ -1282,8 +1282,8 @@ struct TerminalDecorationQuad {
 /// Largest number of rectangles one cell can produce: double underline plus strikethrough.
 const MAX_DECORATION_QUADS: usize = 3;
 
-/// Chooses the decoration of a cell. `link_underline` adds a single underline to a cell
-/// under a hovered link that has none of its own.
+/// Chooses the decoration of a cell. `link_underline` replaces the cell's own underline style
+/// with a single one across a hovered link; strikethrough and underline colour are kept.
 fn terminal_cell_decoration(
     cell: &Cell,
     palette: TerminalPalette,
@@ -1293,7 +1293,7 @@ fn terminal_cell_decoration(
         return None;
     }
     let mut underline = cell.underline();
-    if link_underline && underline == UnderlineStyle::None {
+    if link_underline {
         underline = UnderlineStyle::Single;
     }
     let strike = cell.flags().contains(CellFlags::STRIKE);
@@ -2863,7 +2863,7 @@ impl Renderer {
                                     cell_index,
                                     char_w,
                                     baseline_y,
-                                    self.x_height,
+                                    self.x_height * TERMINAL_TEXT_SCALE,
                                     s,
                                 );
                                 for quad in &quads[..len] {
@@ -3497,13 +3497,16 @@ mod tests {
         ];
         for scale in [1.0_f32, 1.333, 1.5, 2.0] {
             for underline in styles {
+                // x_height 9.9 = 0.55 * 18 is fractional, so the strikethrough rounding is exercised.
                 let (quads, len) =
-                    terminal_decoration_quads(decoration_for(underline, true), 10.0, 3, 14.4, 28.0, 10.0, scale);
+                    terminal_decoration_quads(decoration_for(underline, true), 10.0, 3, 14.4, 28.0, 9.9, scale);
                 assert!(len > 0, "scale {scale} {underline:?} produced no quads");
                 for quad in &quads[..len] {
                     assert_eq!(quad.y.fract(), 0.0, "scale {scale} {underline:?}");
                     assert_eq!(quad.height.fract(), 0.0, "scale {scale} {underline:?}");
                 }
+                // The strikethrough is pushed last: round(28.0 - 9.9 / 2) = round(23.05) = 23.
+                assert_eq!(quads[len - 1].y, 23.0, "scale {scale} {underline:?} strike y");
             }
         }
     }
@@ -3561,11 +3564,13 @@ mod tests {
 
     #[test]
     fn strike_at_half_x_height() {
-        // round(baseline - x_height / 2) = round(28.0 - 5.0) = 23, one pixel thick at scale 1.0.
+        // round(28.0 - 9.9 / 2) = round(23.05) = 23, one pixel thick at scale 1.0.
+        // The fractional x_height makes the rounding observable: unrounded Y would be 23.05.
         let (quads, len) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::None, true), 0.0, 0, 8.0, 28.0, 10.0, 1.0);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::None, true), 0.0, 0, 8.0, 28.0, 9.9, 1.0);
         assert_eq!(len, 1);
         assert_eq!(quads[0].y, 23.0);
+        assert_eq!(quads[0].y.fract(), 0.0);
         assert_eq!(quads[0].height, 1.0);
     }
 
@@ -3618,6 +3623,19 @@ mod tests {
         let decoration = terminal_cell_decoration(&plain, decoration_test_palette(), true)
             .expect("hovered link adds an underline");
         assert_eq!(decoration.underline, UnderlineStyle::Single);
+
+        // A cell with its own curly underline and strikethrough inside the link range:
+        // the link replaces the underline with Single and keeps the strikethrough.
+        let curly = decoration_test_cell(ronsole_term::CellFlags::STRIKE, UnderlineStyle::Curly);
+        let decoration = terminal_cell_decoration(&curly, decoration_test_palette(), true)
+            .expect("hovered link replaces the cell underline");
+        assert_eq!(decoration.underline, UnderlineStyle::Single);
+        assert!(decoration.strike);
+        // Without a matching generation the cell keeps its own Curly underline.
+        let decoration = terminal_cell_decoration(&curly, decoration_test_palette(), false)
+            .expect("cell keeps its own decoration outside the hovered link");
+        assert_eq!(decoration.underline, UnderlineStyle::Curly);
+        assert!(decoration.strike);
     }
 
     #[test]
