@@ -1,6 +1,6 @@
 use super::support::{RecordingSink, feed, test_config};
 use crate::term::Term;
-use crate::{KeyEvent, KeyKind, KeyMods, KeyOutcome, TermKey};
+use crate::{KeyEvent, KeyKind, KeyMods, KeyOutcome, KpKey, ModKey, TermKey};
 
 /// Sends `bytes` and returns exactly the reply bytes they produced.
 pub(super) fn reply_to(term: &mut Term, sink: &mut RecordingSink, bytes: &[u8]) -> Vec<u8> {
@@ -191,4 +191,317 @@ fn kitty_reference_examples() {
 
     set_flags(&mut term, &mut sink, 8);
     assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, mods(true, false, false), press, None)).1, b"\x1b[13;2u");
+}
+
+/// Flag 2 alone: the press is the legacy byte, repeat and release are CSI u with the event field.
+#[test]
+fn escape_flag2_only() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 2);
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, KeyKind::Press, None)), (KeyOutcome::Sent, b"\x1b".to_vec()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, KeyKind::Repeat, None)).1, b"\x1b[27;1:2u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, KeyKind::Release, None)).1, b"\x1b[27;1:3u");
+}
+
+/// Flag 2 alone: text, Ctrl letters, Enter, Backspace and Escape by their press/repeat/release rules.
+#[test]
+fn flag2_only_text_and_escape() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 2);
+    // Ctrl+c: legacy byte on press, CSI u with the event field on repeat and release.
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), ctrl, KeyKind::Press, None)), (KeyOutcome::Sent, b"\x03".to_vec()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), ctrl, KeyKind::Repeat, None)).1, b"\x1b[99;5:2u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), ctrl, KeyKind::Release, None)).1, b"\x1b[99;5:3u");
+    // Plain text stays text on every kind; its release is ignored.
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Press, Some("a"))), (KeyOutcome::Text, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Repeat, Some("a"))), (KeyOutcome::Text, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Backspace, None, none, KeyKind::Repeat, None)), (KeyOutcome::Sent, b"\x7f".to_vec()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, none, KeyKind::Press, None)), (KeyOutcome::Sent, b"\r".to_vec()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, KeyKind::Press, None)).1, b"\x1b");
+    assert_eq!(enc(&mut term, &ev(TermKey::Escape, None, none, KeyKind::Release, None)).1, b"\x1b[27;1:3u");
+}
+
+/// Functional keys lose SS3 as soon as flag 1 is set, whatever DECCKM says.
+#[test]
+fn functional_keys_flag1_no_ss3() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let press = KeyKind::Press;
+
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1h"), b"");
+    assert_eq!(enc(&mut term, &ev(TermKey::Up, None, none, press, None)).1, b"\x1b[A");
+    assert_eq!(enc(&mut term, &ev(TermKey::Home, None, none, press, None)).1, b"\x1b[H");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1l"), b"");
+    assert_eq!(enc(&mut term, &ev(TermKey::Up, None, none, press, None)).1, b"\x1b[A");
+    assert_eq!(enc(&mut term, &ev(TermKey::Home, None, none, press, None)).1, b"\x1b[H");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(1), None, none, press, None)).1, b"\x1b[P");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(2), None, none, press, None)).1, b"\x1b[Q");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(3), None, none, press, None)).1, b"\x1b[13~");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(4), None, none, press, None)).1, b"\x1b[S");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(5), None, none, press, None)).1, b"\x1b[15~");
+    assert_eq!(enc(&mut term, &ev(TermKey::Insert, None, none, press, None)).1, b"\x1b[2~");
+
+    // Flag 0 with DECCKM: cursor keys and F1 keep the legacy SS3 bytes (F1 is `ESC OP` in src/input.rs terminal_key_sequence).
+    set_flags(&mut term, &mut sink, 0);
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1h"), b"");
+    assert_eq!(enc(&mut term, &ev(TermKey::Up, None, none, press, None)).1, b"\x1bOA");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(1), None, none, press, None)).1, b"\x1bOP");
+
+    // Flag 2 alone does not switch cursor keys to SS3 even with DECCKM off: CSI form.
+    set_flags(&mut term, &mut sink, 2);
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1l"), b"");
+    assert_eq!(enc(&mut term, &ev(TermKey::Up, None, none, press, None)).1, b"\x1b[A");
+}
+
+/// A release with no matching press in the sent set is ignored, with or without flag 8.
+#[test]
+fn release_without_sent_press_ignored() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), ctrl, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+
+    set_flags(&mut term, &mut sink, 2);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+
+    set_flags(&mut term, &mut sink, 8);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+
+    set_flags(&mut term, &mut sink, 10);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// The release field is built from the press code even after Ctrl is let go.
+#[test]
+fn release_uses_press_code_after_ctrl_up() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    // Cyrillic Ctrl+С: the code comes from the base key `c`.
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('С'), Some('c'), ctrl, KeyKind::Press, None)).1, b"\x1b[99;5u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('С'), Some('c'), none, KeyKind::Release, None)).1, b"\x1b[99;1:3u");
+}
+
+/// A repeated letter is text under flags 0 and 1.
+#[test]
+fn repeat_letter_is_text_flags0_and_1() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 0);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Repeat, Some("a"))), (KeyOutcome::Text, Vec::new()));
+
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Repeat, Some("a"))), (KeyOutcome::Text, Vec::new()));
+}
+
+/// A repeat of a key that was sent as CSI u is sent again with event type 2.
+#[test]
+fn repeat_sent_key_flags3() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('С'), Some('c'), ctrl, KeyKind::Press, None)).1, b"\x1b[99;5u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('С'), Some('c'), ctrl, KeyKind::Repeat, None)).1, b"\x1b[99;5:2u");
+}
+
+/// Ctrl released during a repeat: the repeat is text, and the pair is gone so the release is ignored.
+#[test]
+fn ctrl_released_during_repeat_goes_text() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), ctrl, KeyKind::Press, None)).1, b"\x1b[99;5u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), none, KeyKind::Repeat, Some("c"))), (KeyOutcome::Text, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// The sent set holds 16 pairs: the 17th press evicts the oldest one, whose release is then ignored.
+#[test]
+fn seventeenth_key_evicts_oldest() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    for (index, letter) in (b'a'..=b'q').enumerate() {
+        let ch = char::from(letter);
+        let press = KeyEvent { physical: index as u64 + 1, ..ev(TermKey::Char(ch), Some(ch), mods(false, true, false), KeyKind::Press, None) };
+        // Expected code is the ASCII code of the letter, i.e. the Unicode codepoint of the key.
+        assert_eq!(enc(&mut term, &press).1, format!("\x1b[{};5u", letter).into_bytes());
+    }
+    // Physical key 1 ('a') was evicted by the 17th press.
+    assert_eq!(enc(&mut term, &KeyEvent { physical: 1, ..ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None) }), (KeyOutcome::Ignore, Vec::new()));
+    // Physical key 17 ('q') is still in the set.
+    assert_eq!(enc(&mut term, &KeyEvent { physical: 17, ..ev(TermKey::Char('q'), Some('q'), none, KeyKind::Release, None) }).1, b"\x1b[113;1:3u");
+}
+
+/// Losing focus clears the sent set, so a later release of a pressed key is ignored.
+#[test]
+fn focus_loss_clears_sent_set() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), ctrl, KeyKind::Press, None)).1, b"\x1b[99;5u");
+    // Mode 1004 is off, so no focus report is produced.
+    assert_eq!(term.focus_changed(false), None);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// Switching to the alternate screen and back clears the sent set; flags are per screen.
+#[test]
+fn screen_switch_clears_sent_set() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1049h"), b"");
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), ctrl, KeyKind::Press, None)).1, b"\x1b[99;5u");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1049l"), b"");
+    // Main screen flags 3 are still active after leaving the alternate screen.
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?u"), b"\x1b[?3u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('c'), Some('c'), none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// Shift+Enter is CSI u under flag 3, and its release is ignored by the flag 2 Enter rule.
+#[test]
+fn shift_enter_release_ignored_flags3() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, mods(true, false, false), KeyKind::Press, None)).1, b"\x1b[13;2u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, none, KeyKind::Release, None)), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// Modifier field is 1 + bits and can reach two digits with Super (8).
+#[test]
+fn super_mods_two_digits() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let super_ctrl = KeyMods { shift: false, ctrl: true, alt: false, super_key: true };
+
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), super_ctrl, KeyKind::Press, None)).1, b"\x1b[97;13u");
+}
+
+/// Modifier keys are reported only with flag 8.
+#[test]
+fn modifier_key_ignored_without_flag8() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::LeftShift), None, none, KeyKind::Press, None)), (KeyOutcome::Ignore, Vec::new()));
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::LeftShift), None, none, KeyKind::Press, None)), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// Left Shift under flags 10: press includes its own bit, release does not.
+#[test]
+fn left_shift_press_and_release_flag8() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 10);
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::LeftShift), None, mods(true, false, false), KeyKind::Press, None)).1, b"\x1b[57441;2u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::LeftShift), None, none, KeyKind::Release, None)).1, b"\x1b[57441;1:3u");
+}
+
+/// Flag 16 adds the text as the third field; flags 26 add event types on top.
+#[test]
+fn associated_text_flag24() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let shift = mods(true, false, false);
+
+    set_flags(&mut term, &mut sink, 24);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Press, Some("a"))).1, b"\x1b[97;;97u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), shift, KeyKind::Press, Some("A"))).1, b"\x1b[97;2;65u");
+
+    set_flags(&mut term, &mut sink, 26);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Press, Some("a"))).1, b"\x1b[97;;97u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None)).1, b"\x1b[97;1:3u");
+}
+
+/// Keypad Enter is a non-text key: PUA code under flag 1.
+#[test]
+fn kp_enter_flag1_is_pua() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Enter), None, none, KeyKind::Press, None)).1, b"\x1b[57414u");
+}
+
+/// Keypad Enter without flags is the same CR as the main Enter key.
+#[test]
+fn kp_enter_flags0_is_cr() {
+    let mut term = Term::new(test_config(10, 3));
+    let none = mods(false, false, false);
+
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Enter), None, none, KeyKind::Press, None)), (KeyOutcome::Sent, b"\r".to_vec()));
+}
+
+/// A non-ASCII character with no base and no Ctrl/Alt is text under flag 1.
+#[test]
+fn non_ascii_char_without_base_is_text_flag1() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('ф'), None, none, KeyKind::Press, Some("ф"))), (KeyOutcome::Text, Vec::new()));
+}
+
+/// Focus reports follow DECSET 1004: `ESC[I`/`ESC[O` when on, `None` when off.
+#[test]
+fn focus_changed_follows_mode_1004() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+
+    assert_eq!(term.focus_changed(true), None);
+    assert_eq!(term.focus_changed(false), None);
+
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1004h"), b"");
+    assert_eq!(term.focus_changed(true), Some(&b"\x1b[I"[..]));
+    assert_eq!(term.focus_changed(false), Some(&b"\x1b[O"[..]));
+
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1004l"), b"");
+    assert_eq!(term.focus_changed(true), None);
 }
