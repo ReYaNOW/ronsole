@@ -593,3 +593,86 @@ fn kp_enter_press_and_release_flags3() {
     assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Enter), None, none, KeyKind::Press, None)), (KeyOutcome::Sent, b"\x1b[57414u".to_vec()));
     assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Enter), None, none, KeyKind::Release, None)), (KeyOutcome::Sent, b"\x1b[57414;1:3u".to_vec()));
 }
+
+/// Reference, "Modifiers" (ref line 121): a modifier key's own bit is the modifier
+/// state after the event, so the press sets `ctrl` and the release clears it.
+/// Flags 8+2, because modifier events are reported only with flag 8.
+#[test]
+fn modifier_own_bit_follows_host_state_flags10() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 10);
+    let press = KeyEvent { physical: 1, ..ev(TermKey::Modifier(ModKey::LeftCtrl), None, ctrl, KeyKind::Press, None) };
+    assert_eq!(enc(&mut term, &press), (KeyOutcome::Sent, b"\x1b[57442;5u".to_vec()));
+    let release = KeyEvent { physical: 1, ..ev(TermKey::Modifier(ModKey::LeftCtrl), None, none, KeyKind::Release, None) };
+    assert_eq!(enc(&mut term, &release), (KeyOutcome::Sent, b"\x1b[57442;1:3u".to_vec()));
+}
+
+/// Reference, "Modifiers" (ref line 121): with both Ctrl keys held, releasing one
+/// keeps the `ctrl` bit set, because the host still reports the other as held.
+#[test]
+fn modifier_release_keeps_ctrl_bit_while_other_ctrl_held_flags10() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 10);
+    let left_press = KeyEvent { physical: 1, ..ev(TermKey::Modifier(ModKey::LeftCtrl), None, ctrl, KeyKind::Press, None) };
+    let right_press = KeyEvent { physical: 2, ..ev(TermKey::Modifier(ModKey::RightCtrl), None, ctrl, KeyKind::Press, None) };
+    let left_release = KeyEvent { physical: 1, ..ev(TermKey::Modifier(ModKey::LeftCtrl), None, ctrl, KeyKind::Release, None) };
+    let right_release = KeyEvent { physical: 2, ..ev(TermKey::Modifier(ModKey::RightCtrl), None, none, KeyKind::Release, None) };
+    assert_eq!(enc(&mut term, &left_press).1, b"\x1b[57442;5u");
+    assert_eq!(enc(&mut term, &right_press).1, b"\x1b[57448;5u");
+    assert_eq!(enc(&mut term, &left_release), (KeyOutcome::Sent, b"\x1b[57442;5:3u".to_vec()));
+    assert_eq!(enc(&mut term, &right_release), (KeyOutcome::Sent, b"\x1b[57448;1:3u".to_vec()));
+}
+
+/// A modifier release is reported only for a press still in the sent set: a
+/// release with no press is ignored, and so is one whose press a focus change cleared.
+#[test]
+fn modifier_release_without_sent_press_is_ignored_flags10() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 10);
+    let release = KeyEvent { physical: 1, ..ev(TermKey::Modifier(ModKey::LeftCtrl), None, none, KeyKind::Release, None) };
+    assert_eq!(enc(&mut term, &release), (KeyOutcome::Ignore, Vec::new()));
+
+    let press = KeyEvent { physical: 1, ..ev(TermKey::Modifier(ModKey::LeftCtrl), None, ctrl, KeyKind::Press, None) };
+    assert_eq!(enc(&mut term, &press).1, b"\x1b[57442;5u");
+    // Every focus change clears the sent set, so the release of the held Ctrl is ignored.
+    assert_eq!(term.focus_changed(true), None);
+    assert_eq!(enc(&mut term, &release), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// Flags 0 keep the bytes of commit 93ad29c (`terminal_key_sequence` and
+/// `terminal_function_key` in `src/input.rs`): modified F1-F4 use
+/// `CSI 1 ; mods <P|Q|R|S>`, and Super is not part of the modifier field.
+#[test]
+fn legacy_flags0_modified_function_keys_match_93ad29c() {
+    let mut term = Term::new(test_config(10, 3));
+    let shift = mods(true, false, false);
+    let alt = mods(false, false, true);
+    let ctrl = mods(false, true, false);
+    let super_only = KeyMods { shift: false, ctrl: false, alt: false, super_key: true };
+    let none = mods(false, false, false);
+    let cases: &[(TermKey, KeyMods, &[u8])] = &[
+        (TermKey::F(1), none, b"\x1bOP"),
+        (TermKey::F(1), ctrl, b"\x1b[1;5P"),
+        (TermKey::F(2), shift, b"\x1b[1;2Q"),
+        (TermKey::F(3), alt, b"\x1b[1;3R"),
+        (TermKey::F(3), ctrl, b"\x1b[1;5R"),
+        (TermKey::F(4), ctrl, b"\x1b[1;5S"),
+        (TermKey::F(3), super_only, b"\x1bOR"),
+        (TermKey::Up, super_only, b"\x1b[A"),
+    ];
+    for (key, modifiers, want) in cases {
+        assert_eq!(enc(&mut term, &ev(*key, None, *modifiers, KeyKind::Press, None)).1, *want, "key {key:?} mods {modifiers:?}");
+    }
+}
