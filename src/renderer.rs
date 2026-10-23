@@ -21,6 +21,7 @@ const PRIMARY_ATLAS_INTERNAL_FORMAT: u32 = glow::R8;
 const PRIMARY_ATLAS_UPLOAD_FORMAT: u32 = glow::RED;
 const COLOR_ATLAS_MODE: f32 = 10.0;
 const SOLID_RECT_MODE: f32 = 2.0;
+const DECORATION_MODE: f32 = 11.0;
 const GLYPH_PRESENTATION_AUTO: u8 = 0;
 const GLYPH_PRESENTATION_TEXT: u8 = 1;
 const GLYPH_PRESENTATION_EMOJI: u8 = 2;
@@ -109,6 +110,17 @@ struct TerminalFontMetrics {
     raster_size: f32,
     line_height: f32,
     baseline_offset: f32,
+    x_height: f32,
+}
+
+/// Returns the x-height of the bundled Regular face in em units; it is the first face of the Regular chain.
+fn terminal_regular_x_height_em() -> f32 {
+    FontRef::from_index(TERMINAL_FONT, 0)
+        .map(|font| {
+            let metrics = font.metrics(&[]);
+            metrics.x_height / f32::from(metrics.units_per_em.max(1))
+        })
+        .unwrap_or(0.0)
 }
 
 fn terminal_font_metrics(logical_size: f32, scale_factor: f32) -> TerminalFontMetrics {
@@ -131,6 +143,7 @@ fn terminal_font_metrics(logical_size: f32, scale_factor: f32) -> TerminalFontMe
         baseline_offset: (LEGACY_TERMINAL_BASELINE_OFFSET * ratio * scale_factor)
             .round()
             .max(1.0),
+        x_height: terminal_regular_x_height_em() * logical_size * scale_factor,
     }
 }
 
@@ -446,6 +459,7 @@ pub struct Renderer {
     height: f32,
     line_height: f32,
     baseline_offset: f32,
+    x_height: f32,
     scratch_buffer: String,
     search_icons: [Option<GlyphInfo>; 4],
     terminal_tab_display_titles: Vec<String>,
@@ -550,6 +564,7 @@ impl Renderer {
             height: 1.0,
             line_height: terminal_metrics.line_height,
             baseline_offset: terminal_metrics.baseline_offset,
+            x_height: terminal_metrics.x_height,
             scratch_buffer: String::with_capacity(128),
             search_icons: [None; 4],
             terminal_tab_display_titles: Vec::with_capacity(8),
@@ -611,6 +626,7 @@ impl Renderer {
         self.ui_font_size = ui_font_size(scale_factor);
         self.line_height = terminal_metrics.line_height;
         self.baseline_offset = terminal_metrics.baseline_offset;
+        self.x_height = terminal_metrics.x_height;
         self.reset_atlases();
         self.prewarm_ascii();
         self.prewarm_search_icons();
@@ -630,6 +646,7 @@ impl Renderer {
         self.terminal_font_size = terminal_metrics.raster_size;
         self.line_height = terminal_metrics.line_height;
         self.baseline_offset = terminal_metrics.baseline_offset;
+        self.x_height = terminal_metrics.x_height;
         self.reset_atlases();
         self.prewarm_ascii();
         self.prewarm_search_icons();
@@ -1256,7 +1273,7 @@ fn create_program(
             .create_shader(glow::FRAGMENT_SHADER)
             .map_err(|error| format!("failed to create fragment shader: {error}"))?;
         let fragment_source = format!(
-            "{shader_preamble}in vec2 v_uv; in vec4 v_color; in float v_mode; flat in vec3 v_sdf_params;\nout vec4 out_color;\nuniform sampler2D tex; uniform sampler2D color_tex;\nfloat rounded_box_sdf(vec2 p, vec2 size, float radius) {{ return length(max(abs(p) - size + radius, 0.0)) - radius; }}\nvoid main() {{\n if (v_mode == 2.0) {{ out_color = v_color; }}\n else if (v_mode == 3.0) {{ float d = rounded_box_sdf(v_uv, vec2(v_sdf_params.x, v_sdf_params.y), v_sdf_params.z); float a = 1.0 - smoothstep(-0.5, 0.5, d); if (a <= 0.0) discard; out_color = vec4(v_color.rgb, v_color.a * a); }}\n else if (v_mode == 10.0) {{ out_color = texture(color_tex, v_uv) * v_color; }}\n else {{ float a = texture(tex, v_uv).r; out_color = vec4(v_color.rgb, a * v_color.a); }}\n}}"
+            "{shader_preamble}in vec2 v_uv; in vec4 v_color; in float v_mode; flat in vec3 v_sdf_params;\nout vec4 out_color;\nuniform sampler2D tex; uniform sampler2D color_tex;\nfloat rounded_box_sdf(vec2 p, vec2 size, float radius) {{ return length(max(abs(p) - size + radius, 0.0)) - radius; }}\nvoid main() {{\n if (v_mode == 2.0) {{ out_color = v_color; }}\n else if (v_mode == 3.0) {{ float d = rounded_box_sdf(v_uv, vec2(v_sdf_params.x, v_sdf_params.y), v_sdf_params.z); float a = 1.0 - smoothstep(-0.5, 0.5, d); if (a <= 0.0) discard; out_color = vec4(v_color.rgb, v_color.a * a); }}\n else if (v_mode == 10.0) {{ out_color = texture(color_tex, v_uv) * v_color; }}\n else if (v_mode == 11.0) {{ float p = fract(v_uv.x); if (v_sdf_params.x == 1.0) {{ if (abs(v_uv.y - 0.5 - sin(p * 6.28318530718) / 3.0) > 1.0 / 6.0) discard; }} else {{ if (abs(v_uv.y - 0.5) > 1.0 / 6.0) discard; if (v_sdf_params.x == 2.0) {{ if (p >= 0.5) discard; }} else {{ if (p >= 0.6) discard; }} }} out_color = v_color; }}\n else {{ float a = texture(tex, v_uv).r; out_color = vec4(v_color.rgb, a * v_color.a); }}\n}}"
         );
         gl.shader_source(fragment_shader, &fragment_source);
         gl.compile_shader(fragment_shader);
@@ -1874,12 +1891,17 @@ mod tests {
 
     #[test]
     fn terminal_font_metrics_preserve_legacy_proportions_and_scale() {
+        // The bundled Regular x-height is a fraction of the em, so it is below the raster size
+        // and scales with it like the baseline does.
+        let x_height_at_1 = terminal_font_metrics(18.0, 1.0).x_height;
+        assert!(x_height_at_1 > 0.0 && x_height_at_1 < 18.0);
         assert_eq!(
             terminal_font_metrics(18.0, 1.0),
             TerminalFontMetrics {
                 raster_size: 18.0,
                 line_height: 26.0,
                 baseline_offset: 19.0,
+                x_height: x_height_at_1,
             }
         );
         assert_eq!(
@@ -1888,6 +1910,7 @@ mod tests {
                 raster_size: 27.0,
                 line_height: 39.0,
                 baseline_offset: 29.0,
+                x_height: 1.5 * x_height_at_1,
             }
         );
         let smaller = terminal_font_metrics(16.0, 1.0);

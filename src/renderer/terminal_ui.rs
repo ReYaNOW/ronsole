@@ -1,5 +1,6 @@
 use super::*;
 use crate::scroll::{ScrollbarThumb, scrollbar_drag_target, scrollbar_thumb};
+use ronsole_term::{LinkTarget, UnderlineStyle};
 use crate::single_line_input::SingleLineInput;
 use crate::search::{
     Rect, SearchRefreshCause, TerminalSearchGeometry, TerminalSearchHit, TerminalSearchState,
@@ -1121,10 +1122,14 @@ pub(crate) fn terminal_scrollbar_drag_target(
 enum TerminalBodyLayer {
     Background,
     Glyph,
+    Decoration,
 }
 
-const TERMINAL_BODY_LAYERS: [TerminalBodyLayer; 2] =
-    [TerminalBodyLayer::Background, TerminalBodyLayer::Glyph];
+const TERMINAL_BODY_LAYERS: [TerminalBodyLayer; 3] = [
+    TerminalBodyLayer::Background,
+    TerminalBodyLayer::Glyph,
+    TerminalBodyLayer::Decoration,
+];
 
 fn terminal_glyph_anchor(
     c: char,
@@ -1158,7 +1163,11 @@ fn terminal_glyph_cell_geometry(
     cell: &Cell,
     char_w: f32,
 ) -> Option<(f32, f32)> {
-    if cell.ch() == ' ' || cell.is_wide_spacer() || cell.is_hidden() {
+    if cell.ch() == ' '
+        || cell.is_wide_spacer()
+        || cell.is_hidden()
+        || cell.flags().contains(CellFlags::CONCEAL)
+    {
         return None;
     }
     let (x, next_x) = terminal_cell_x_bounds(text_x, cell_index, char_w);
@@ -1243,6 +1252,150 @@ fn terminal_cell_render_colors(
         foreground = terminal_dim_color(foreground);
     }
     (foreground, background)
+}
+
+/// Decoration chosen for one cell; colours are already in the f32 path the glyphs use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalCellDecoration {
+    underline: UnderlineStyle,
+    underline_color: [f32; 4],
+    strike: bool,
+    strike_color: [f32; 4],
+}
+
+/// One rectangle of a decoration; `mode` picks the solid or the pattern path of the shader.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TerminalDecorationQuad {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    u: f32,
+    v: f32,
+    uw: f32,
+    vh: f32,
+    mode: f32,
+    sdf_params: [f32; 3],
+    color: [f32; 4],
+}
+
+/// Largest number of rectangles one cell can produce: double underline plus strikethrough.
+const MAX_DECORATION_QUADS: usize = 3;
+
+/// Chooses the decoration of a cell. `link_underline` adds a single underline to a cell
+/// under a hovered link that has none of its own.
+fn terminal_cell_decoration(
+    cell: &Cell,
+    palette: TerminalPalette,
+    link_underline: bool,
+) -> Option<TerminalCellDecoration> {
+    if cell.is_hidden() || cell.flags().contains(CellFlags::CONCEAL) {
+        return None;
+    }
+    let mut underline = cell.underline();
+    if link_underline && underline == UnderlineStyle::None {
+        underline = UnderlineStyle::Single;
+    }
+    let strike = cell.flags().contains(CellFlags::STRIKE);
+    if underline == UnderlineStyle::None && !strike {
+        return None;
+    }
+    let (fg, _) = terminal_cell_render_colors(cell, palette);
+    let underline_color = cell
+        .underline_color()
+        .map_or(fg, |color| terminal_render_color(color, palette));
+    Some(TerminalCellDecoration {
+        underline,
+        underline_color,
+        strike,
+        strike_color: fg,
+    })
+}
+
+/// Whether `(row, col)` lies inside the hovered link, and that link was built for `generation`.
+fn terminal_hovered_link_covers(
+    hovered: Option<&(LinkTarget, u64)>,
+    generation: u64,
+    row: usize,
+    col: usize,
+) -> bool {
+    hovered.is_some_and(|(link, link_generation)| {
+        *link_generation == generation
+            && link
+                .cells
+                .iter()
+                .any(|(link_row, cols)| *link_row == row && cols.contains(&col))
+    })
+}
+
+/// Builds the rectangles of `decoration` for the cell at `cell_index`.
+///
+/// `baseline_y` is the rounded baseline of the row, and `scale` is the render scale factor.
+/// Every coordinate is an integer except the pattern phase, which comes from the unrounded
+/// `text_x` and `char_w` so that neighbouring cells share one phase at their common edge.
+fn terminal_decoration_quads(
+    decoration: TerminalCellDecoration,
+    text_x: f32,
+    cell_index: usize,
+    char_w: f32,
+    baseline_y: f32,
+    x_height: f32,
+    scale: f32,
+) -> ([TerminalDecorationQuad; MAX_DECORATION_QUADS], usize) {
+    let thickness = scale.round().max(1.0);
+    let (x, next_x) = terminal_cell_x_bounds(text_x, cell_index, char_w);
+    let width = next_x - x;
+    let mut quads = [TerminalDecorationQuad::default(); MAX_DECORATION_QUADS];
+    let mut len = 0usize;
+    let mut push = |quad: TerminalDecorationQuad| {
+        quads[len] = quad;
+        len += 1;
+    };
+    let solid = |y: f32, height: f32, color: [f32; 4]| TerminalDecorationQuad {
+        x,
+        y,
+        width,
+        height,
+        u: -1.0,
+        v: -1.0,
+        uw: 0.0,
+        vh: 0.0,
+        mode: SOLID_RECT_MODE,
+        sdf_params: [0.0; 3],
+        color,
+    };
+    // `template` is 1 for the wave, 2 for dots and 3 for dashes; the shader reads `sdf_params[0]`.
+    let pattern = |y: f32, template: f32, period: f32, color: [f32; 4]| TerminalDecorationQuad {
+        x,
+        y,
+        width,
+        height: 3.0 * thickness,
+        u: (x - text_x) / period,
+        v: 0.0,
+        uw: (next_x - x) / period,
+        vh: 1.0,
+        mode: DECORATION_MODE,
+        sdf_params: [template, 0.0, period],
+        color,
+    };
+    let underline_top = baseline_y + thickness;
+    let uc = decoration.underline_color;
+    match decoration.underline {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => push(solid(underline_top, thickness, uc)),
+        UnderlineStyle::Double => {
+            push(solid(underline_top, thickness, uc));
+            push(solid(underline_top + 2.0 * thickness, thickness, uc));
+        }
+        UnderlineStyle::Curly => push(pattern(underline_top, 1.0, char_w, uc)),
+        UnderlineStyle::Dotted => push(pattern(underline_top, 2.0, 2.0 * thickness, uc)),
+        UnderlineStyle::Dashed => push(pattern(underline_top, 3.0, 5.0 * thickness, uc)),
+    }
+    if decoration.strike {
+        let strike_y = (baseline_y - x_height * 0.5).round();
+        push(solid(strike_y, thickness, decoration.strike_color));
+    }
+    (quads, len)
 }
 
 #[inline]
@@ -2616,6 +2769,9 @@ impl Renderer {
                 content_clip.h,
             );
         }
+        // The hovered link applies only while the grid still has the generation it was built for.
+        let hovered_link = terminal.hovered_link();
+        let content_generation = grid.content_generation();
         if presentation_visible && content_clip.is_some() {
             let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
             for layer in TERMINAL_BODY_LAYERS {
@@ -2683,6 +2839,47 @@ impl Renderer {
                                 }
                                 if let Some(color) = bg {
                                     self.push_rect(x, draw_y, cell_w, char_h, color);
+                                }
+                            }
+                        }
+                        TerminalBodyLayer::Decoration => {
+                            let baseline_y =
+                                (draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE).round();
+                            for (cell_index, cell) in row.iter().take(grid.cols()).enumerate() {
+                                let link_underline = terminal_hovered_link_covers(
+                                    hovered_link,
+                                    content_generation,
+                                    i,
+                                    cell_index,
+                                );
+                                let Some(decoration) =
+                                    terminal_cell_decoration(cell, palette, link_underline)
+                                else {
+                                    continue;
+                                };
+                                let (quads, len) = terminal_decoration_quads(
+                                    decoration,
+                                    text_x,
+                                    cell_index,
+                                    char_w,
+                                    baseline_y,
+                                    self.x_height,
+                                    s,
+                                );
+                                for quad in &quads[..len] {
+                                    self.push_quad(
+                                        quad.x,
+                                        quad.y,
+                                        quad.width,
+                                        quad.height,
+                                        quad.u,
+                                        quad.v,
+                                        quad.uw,
+                                        quad.vh,
+                                        quad.color,
+                                        quad.mode,
+                                        quad.sdf_params,
+                                    );
                                 }
                             }
                         }
@@ -3251,25 +3448,176 @@ mod tests {
         assert_eq!(bg, Some(terminal_color_rgba(TerminalColor::indexed(4))));
     }
 
-    #[test]
-    fn terminal_renderer_matches_rriter_by_not_emitting_an_underline_layer() {
-        let cell = Cell::new_for_test(
+    /// Sink that drops every reply; the decoration tests only read grid contents.
+    struct NullSink;
+
+    impl ronsole_term::TermSink for NullSink {
+        fn reply(&mut self, _bytes: &[u8]) {}
+        fn title(&mut self, _title: &str) {}
+        fn clipboard_set(&mut self, _text: String) {}
+        fn working_directory(&mut self, _host: &str, _path: &[u8]) {}
+    }
+
+    fn decoration_test_palette() -> TerminalPalette {
+        TerminalPalette {
+            bg: [0.0; 4],
+            fg: [1.0; 4],
+            minimap_bg: [0.0; 4],
+            accent: [0.0; 4],
+        }
+    }
+
+    fn decoration_test_cell(flags: ronsole_term::CellFlags, underline: UnderlineStyle) -> Cell {
+        Cell::new_for_test(
             'x',
             TerminalColor::default_foreground(),
             TerminalColor::default_background(),
-            ronsole_term::CellFlags::empty(),
-            UnderlineStyle::Single,
-        );
+            flags,
+            underline,
+        )
+    }
 
-        assert!(cell.underline() == UnderlineStyle::Single);
-        assert_eq!(
-            TERMINAL_BODY_LAYERS,
-            [TerminalBodyLayer::Background, TerminalBodyLayer::Glyph]
+    fn decoration_for(underline: UnderlineStyle, strike: bool) -> TerminalCellDecoration {
+        TerminalCellDecoration {
+            underline,
+            underline_color: [1.0, 1.0, 1.0, 1.0],
+            strike,
+            strike_color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn decoration_y_is_integer_at_scales() {
+        let styles = [
+            UnderlineStyle::Single,
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ];
+        for scale in [1.0_f32, 1.333, 1.5, 2.0] {
+            for underline in styles {
+                let (quads, len) =
+                    terminal_decoration_quads(decoration_for(underline, true), 10.0, 3, 14.4, 28.0, 10.0, scale);
+                assert!(len > 0, "scale {scale} {underline:?} produced no quads");
+                for quad in &quads[..len] {
+                    assert_eq!(quad.y.fract(), 0.0, "scale {scale} {underline:?}");
+                    assert_eq!(quad.height.fract(), 0.0, "scale {scale} {underline:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoration_thickness_and_periods_follow_scale() {
+        // Thickness is round(scale), clamped to at least 1: 2 px at 1.5 and 2.0, 1 px at 1.333.
+        let (quads, _) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Single, false), 0.0, 0, 14.4, 28.0, 10.0, 1.5);
+        assert_eq!(quads[0].height, 2.0);
+        let (quads, _) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Curly, false), 0.0, 0, 14.4, 28.0, 10.0, 2.0);
+        assert_eq!(quads[0].height, 6.0);
+        assert_eq!(quads[0].sdf_params, [1.0, 0.0, 14.4]);
+        let (quads, _) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Dotted, false), 0.0, 0, 14.4, 28.0, 10.0, 1.5);
+        assert_eq!(quads[0].sdf_params, [2.0, 0.0, 4.0]);
+        let (quads, _) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Dashed, false), 0.0, 0, 14.4, 28.0, 10.0, 2.0);
+        assert_eq!(quads[0].sdf_params, [3.0, 0.0, 10.0]);
+        let (quads, _) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Dotted, false), 0.0, 0, 14.4, 28.0, 10.0, 1.333);
+        assert_eq!(quads[0].sdf_params, [2.0, 0.0, 2.0]);
+    }
+
+    #[test]
+    fn double_underline_gap_equals_thickness() {
+        let (quads, len) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Double, false), 0.0, 0, 8.0, 28.0, 10.0, 2.0);
+        assert_eq!(len, 2);
+        let (first, second) = (quads[0], quads[1]);
+        assert_eq!(first.height, 2.0);
+        assert_eq!(second.height, 2.0);
+        assert_eq!(second.y - (first.y + first.height), 2.0);
+    }
+
+    #[test]
+    fn pattern_continuous_between_cells() {
+        // Wave: text_x 10.0 and char_w 14.4 put the shared edge of cells 4 and 5 at
+        // round(10.0 + 5 * 14.4) = 82, so both sides read uv.x = (82 - 10) / 14.4 = 5.0.
+        let curly = decoration_for(UnderlineStyle::Curly, false);
+        let (left, _) = terminal_decoration_quads(curly, 10.0, 4, 14.4, 28.0, 10.0, 1.0);
+        let (right, _) = terminal_decoration_quads(curly, 10.0, 5, 14.4, 28.0, 10.0, 1.0);
+        assert!((left[0].u + left[0].uw - 5.0).abs() < 1e-4);
+        assert!((right[0].u - 5.0).abs() < 1e-4);
+
+        // Dots at t = 1 (period 2): text_x 0.0 puts the shared edge at round(5 * 14.4) = 72,
+        // so uv.x = 72 / 2 = 36.0 on both sides.
+        let dotted = decoration_for(UnderlineStyle::Dotted, false);
+        let (left, _) = terminal_decoration_quads(dotted, 0.0, 4, 14.4, 28.0, 10.0, 1.0);
+        let (right, _) = terminal_decoration_quads(dotted, 0.0, 5, 14.4, 28.0, 10.0, 1.0);
+        assert!((left[0].u + left[0].uw - 36.0).abs() < 1e-4);
+        assert!((right[0].u - 36.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn strike_at_half_x_height() {
+        // round(baseline - x_height / 2) = round(28.0 - 5.0) = 23, one pixel thick at scale 1.0.
+        let (quads, len) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::None, true), 0.0, 0, 8.0, 28.0, 10.0, 1.0);
+        assert_eq!(len, 1);
+        assert_eq!(quads[0].y, 23.0);
+        assert_eq!(quads[0].height, 1.0);
+    }
+
+    #[test]
+    fn underline_color_overrides_fg() {
+        let mut term = test_term(10, 2);
+        term.advance(
+            b"\x1b[4m\x1b[58;2;255;0;0m\x1b[38;2;0;255;0mX",
+            Instant::now(),
+            &mut NullSink,
         );
-        assert_eq!(
-            terminal_glyph_cell_geometry(0.0, 0, &cell, 8.0),
-            Some((0.0, 8.0))
+        let cell = &term.row(0).expect("row 0 exists")[0];
+        let decoration =
+            terminal_cell_decoration(cell, decoration_test_palette(), false).expect("underlined");
+        assert_eq!(decoration.underline, UnderlineStyle::Single);
+        // SGR 58 red wins for the underline; SGR 38 green stays on the strikethrough colour.
+        assert_eq!(decoration.underline_color[0], 1.0);
+        assert_eq!(decoration.underline_color[1], 0.0);
+        assert_eq!(decoration.strike_color[0], 0.0);
+        assert_eq!(decoration.strike_color[1], 1.0);
+    }
+
+    #[test]
+    fn concealed_and_host_hidden_emit_no_glyph_or_decoration() {
+        let palette = decoration_test_palette();
+        for flags in [ronsole_term::CellFlags::CONCEAL, ronsole_term::CellFlags::HOST_HIDDEN] {
+            let cell = decoration_test_cell(flags, UnderlineStyle::Single);
+            assert_eq!(terminal_cell_decoration(&cell, palette, true), None);
+            assert_eq!(terminal_glyph_cell_geometry(0.0, 0, &cell, 8.0), None);
+        }
+    }
+
+    #[test]
+    fn hovered_link_underlines_range_when_generation_matches() {
+        let hovered = (
+            LinkTarget {
+                uri: "https://example.com".into(),
+                cells: vec![(0, 1..3)],
+            },
+            7_u64,
         );
+        let hovered = Some(&hovered);
+        assert!(terminal_hovered_link_covers(hovered, 7, 0, 1));
+        assert!(terminal_hovered_link_covers(hovered, 7, 0, 2));
+        assert!(!terminal_hovered_link_covers(hovered, 7, 0, 3));
+        assert!(!terminal_hovered_link_covers(hovered, 7, 1, 1));
+        assert!(!terminal_hovered_link_covers(hovered, 8, 0, 1));
+
+        let plain = decoration_test_cell(ronsole_term::CellFlags::empty(), UnderlineStyle::None);
+        let decoration = terminal_cell_decoration(&plain, decoration_test_palette(), true)
+            .expect("hovered link adds an underline");
+        assert_eq!(decoration.underline, UnderlineStyle::Single);
     }
 
     #[test]
