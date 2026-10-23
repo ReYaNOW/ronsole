@@ -247,7 +247,6 @@ fn out_of_range_function_keys_send_nothing() {
 /// Ronsole `terminal_text_sequence(text, _, _, super_key = true)` returns `None`
 /// (`src/input.rs:1186-1188`): a Super-only text key writes no bytes.
 #[test]
-#[ignore = "bug: crates/ronsole-term/src/keys.rs:462-465 writes text bytes for Super+text at flags 0; Ronsole returns None (src/input.rs:1186-1187)"]
 fn super_text_without_ctrl_or_alt_sends_no_bytes() {
     let (mut term, _) = new_term();
     let super_only = KeyMods {

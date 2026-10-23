@@ -391,7 +391,8 @@ pub(crate) fn encode_key(
 
     let repeat = event.kind == KeyKind::Repeat && events;
     let key = if disambiguate { event.key } else { legacy_equivalent(event.key) };
-    let plain = !event.mods.ctrl && !event.mods.alt && !event.mods.super_key;
+    // Super alone adds no legacy bytes: only disambiguation (flag 1) reports it.
+    let plain = !event.mods.ctrl && !event.mods.alt && (!event.mods.super_key || !disambiguate);
     if !all && plain && is_text_key(key) {
         protocol.sent_mut().remove(event.physical);
         return KeyOutcome::Text;
