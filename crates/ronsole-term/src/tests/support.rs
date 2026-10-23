@@ -13,6 +13,10 @@ pub(crate) struct RecordingSink {
     pub(crate) bytes: Vec<u8>,
     /// Every `title` call, in order.
     pub(crate) titles: Vec<String>,
+    /// Every `clipboard_set` text, in order.
+    pub(crate) clipboard: Vec<String>,
+    /// Every `working_directory` call as (host, percent-decoded path).
+    pub(crate) cwd: Vec<(String, Vec<u8>)>,
     /// Fixed time passed to `advance` by [`feed`].
     pub(crate) now: Instant,
 }
@@ -23,6 +27,8 @@ impl RecordingSink {
             calls: Vec::new(),
             bytes: Vec::new(),
             titles: Vec::new(),
+            clipboard: Vec::new(),
+            cwd: Vec::new(),
             now: Instant::now(),
         }
     }
@@ -38,9 +44,13 @@ impl TermSink for RecordingSink {
         self.titles.push(title.to_owned());
     }
 
-    fn clipboard_set(&mut self, _text: String) {}
+    fn clipboard_set(&mut self, text: String) {
+        self.clipboard.push(text);
+    }
 
-    fn working_directory(&mut self, _host: &str, _path: &[u8]) {}
+    fn working_directory(&mut self, host: &str, path: &[u8]) {
+        self.cwd.push((host.to_owned(), path.to_vec()));
+    }
 }
 
 /// Feeds `bytes` into `term` with the sink's fixed time.

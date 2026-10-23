@@ -10,7 +10,10 @@ use crate::grid::{
     repair_wide_line_with_blank,
 };
 use crate::input::MouseTrackingMode;
-use crate::osc::terminal_programmed_title;
+use crate::osc::{
+    parse_osc8_link, parse_osc52_text, parse_osc7_uri, queue_dynamic_color_query,
+    queue_palette_queries, terminal_programmed_title, with_joined,
+};
 use crate::sgr::apply_sgr;
 use crate::term::Performer;
 use vte::{Params, Perform};
@@ -84,26 +87,43 @@ impl Perform for Performer<'_> {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.applied = true;
-        if params.first().is_some_and(|selector| *selector == b"104") {
-            // Ronsole does not expose a mutable OSC 4 palette; reset is therefore a no-op.
+        let Some(&selector) = params.first() else {
             return;
-        }
-        if params
-            .first()
-            .is_some_and(|selector| *selector == b"0" || *selector == b"2")
-            && let Some(title) = terminal_programmed_title(&params[1..])
-        {
-            self.sink.title(&title);
-        }
-
-        if params.len() >= 2 && params[1] == b"?" {
-            if params[0] == b"10" || params[0] == b"11" {
-                let prefix = std::str::from_utf8(params[0]).unwrap_or("10");
-                let msg = format!("\x1B]{};rgb:ffff/ffff/ffff\x1B\\", prefix);
-                self.term.queue_reply(msg.as_bytes());
+        };
+        match selector {
+            // Ronsole has no mutable palette, so setting or resetting colours is a no-op.
+            b"104" | b"110" | b"111" | b"112" => {}
+            b"0" | b"2" => {
+                if let Some(title) = terminal_programmed_title(&params[1..]) {
+                    self.sink.title(&title);
+                }
             }
+            b"4" => queue_palette_queries(self.term, params, bell_terminated),
+            b"10" | b"11" | b"12" => {
+                queue_dynamic_color_query(self.term, selector, params, bell_terminated)
+            }
+            b"52" => {
+                if let Some(text) =
+                    with_joined(self.term, |joined| parse_osc52_text(params, joined))
+                {
+                    self.sink.clipboard_set(text);
+                }
+            }
+            b"7" => {
+                if let Some((host, path)) =
+                    with_joined(self.term, |joined| parse_osc7_uri(params, joined))
+                {
+                    self.sink.working_directory(&host, &path);
+                }
+            }
+            b"8" => {
+                // A `None` link closes the open hyperlink, as an empty or invalid URI does.
+                let link = with_joined(self.term, |joined| parse_osc8_link(params, joined));
+                self.term.pen.set_hyperlink(link);
+            }
+            _ => {}
         }
     }
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
