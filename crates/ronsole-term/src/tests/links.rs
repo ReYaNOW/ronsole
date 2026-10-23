@@ -301,3 +301,82 @@ fn link_at_prefers_osc8_over_url_text() {
         })
     );
 }
+
+#[test]
+fn osc8_id_of_256_bytes_is_kept() {
+    let id = "i".repeat(256);
+    let term = term_with(
+        10,
+        format!("\x1b]8;id={id};https://a\x1b\\a\x1b]8;;\x1b\\").as_bytes(),
+    );
+    assert_eq!(uri_at(&term, 0, 0).as_deref(), Some("https://a"));
+    let link = term.visible_row(0).unwrap()[0].hyperlink().unwrap();
+    assert_eq!(link.id.as_deref(), Some(id.as_str()));
+}
+
+#[test]
+fn osc8_id_over_256_bytes_voids_sequence_and_closes_link() {
+    // The oversized id voids the second OSC 8, so the open link `https://ok` closes
+    // and the text after it is plain.
+    let id = "i".repeat(257);
+    let term = term_with(
+        10,
+        format!("\x1b]8;;https://ok\x1b\\a\x1b]8;id={id};https://a\x1b\\b\x1b]8;;\x1b\\")
+            .as_bytes(),
+    );
+    assert_eq!(uri_at(&term, 0, 0).as_deref(), Some("https://ok"));
+    assert_eq!(uri_at(&term, 0, 1), None);
+}
+
+#[test]
+fn osc8_c1_control_in_uri_ignored() {
+    // U+0085 is two bytes in UTF-8, so only the decoded character shows it is a C1 control.
+    let term = term_with(
+        10,
+        b"\x1b]8;;https://ok\x1b\\a\x1b]8;;https://a\xc2\x85b\x1b\\b\x1b]8;;\x1b\\",
+    );
+    assert_eq!(uri_at(&term, 0, 0).as_deref(), Some("https://ok"));
+    assert_eq!(uri_at(&term, 0, 1), None);
+}
+
+#[test]
+fn osc8_budget_caps_live_links_and_frees_them_on_reset() {
+    // Each link charges its 1000-byte URI against the 8 MiB budget (8 388 608 bytes),
+    // so 8 388 links fit and the next one is printed without a link.
+    const BUDGET_BYTES: usize = 8 * 1024 * 1024;
+    const URI_BYTES: usize = 1000;
+    let accepted = BUDGET_BYTES / URI_BYTES;
+    let tail = "x".repeat(URI_BYTES - "https://000000/".len());
+    let mut input = Vec::new();
+    for index in 0..=accepted {
+        let link = format!("\x1b]8;;https://{index:06}/{tail}\x1b\\");
+        input.extend_from_slice(link.as_bytes());
+        input.extend_from_slice(b"a\x1b]8;;\x1b\\");
+    }
+    let mut term = term_with(accepted + 16, &input);
+    let row = term.visible_row(0).unwrap();
+    assert!(row[accepted - 1].hyperlink().is_some());
+    assert!(row[accepted].hyperlink().is_none());
+
+    // Hard reset drops every cell, so the budget is free again.
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, b"\x1bc\x1b]8;;https://ok\x1b\\a");
+    assert_eq!(uri_at(&term, 0, 0).as_deref(), Some("https://ok"));
+}
+
+#[test]
+fn link_at_long_logical_line_finds_url_in_window() {
+    // 50 000 cells in one logical line of 100-column rows: 25 000 `x`, a space, the URL
+    // at cells 25 001-25 011, a space, then 24 987 `x`. Row 250 holds the URL at columns 1-11.
+    let mut text = vec![b'x'; 25_000];
+    text.extend_from_slice(b" https://a/b ");
+    text.extend(std::iter::repeat_n(b'x', 24_987));
+    let term = term_with(100, &text);
+    assert_eq!(
+        term.link_at(250, 5, 0..600),
+        Some(LinkTarget {
+            uri: "https://a/b".into(),
+            cells: vec![(250, 1..12)],
+        })
+    );
+}

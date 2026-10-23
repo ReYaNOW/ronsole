@@ -69,6 +69,23 @@ fn sync_repeated_set_keeps_deadline() {
 }
 
 #[test]
+fn sync_hold_needs_lone_2026_param() {
+    // A combined set applies its own modes and holds nothing: `?25h` shows the cursor
+    // and the text is on the grid at once (only a lone `?2026h` starts a hold).
+    let t0 = Instant::now();
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+
+    term.advance(b"\x1b[?25l", t0, &mut sink);
+    assert!(!term.cursor_visible);
+    let outcome = term.advance(b"\x1b[?25;2026hAB", t0, &mut sink);
+    assert!(outcome.grid_changed);
+    assert_eq!(term.sync_deadline(), None);
+    assert!(term.cursor_visible);
+    assert_eq!(row_chars(&term, 0), "AB");
+}
+
+#[test]
 fn sync_set_alone_reports_new_deadline() {
     let t0 = Instant::now();
     let mut term = Term::new(test_config(10, 3));

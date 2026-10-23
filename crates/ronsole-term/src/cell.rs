@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use unicode_width::UnicodeWidthChar;
 
@@ -60,11 +61,86 @@ pub enum UnderlineStyle {
     Dashed = 5,
 }
 
+/// Largest total of `uri` and `id` bytes over the live hyperlinks of one terminal.
+pub(crate) const LINK_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of the live hyperlinks of one terminal, shared by their [`LinkCharge`]s.
+pub(crate) type LinkBudget = Arc<AtomicUsize>;
+
+/// Bytes one live [`Hyperlink`] holds against its terminal's [`LinkBudget`];
+/// released when the link is dropped.
+pub(crate) struct LinkCharge {
+    budget: LinkBudget,
+    bytes: usize,
+}
+
+impl LinkCharge {
+    /// Charges `bytes` to `budget`, or returns `None` when that would take the
+    /// budget over [`LINK_BUDGET_BYTES`].
+    pub(crate) fn reserve(budget: &LinkBudget, bytes: usize) -> Option<Self> {
+        let used = budget.load(Ordering::Relaxed);
+        if used.checked_add(bytes)? > LINK_BUDGET_BYTES {
+            return None;
+        }
+        budget.fetch_add(bytes, Ordering::Relaxed);
+        Some(Self {
+            budget: Arc::clone(budget),
+            bytes,
+        })
+    }
+}
+
+impl Clone for LinkCharge {
+    /// A clone is a second live link, so it takes its own charge.
+    fn clone(&self) -> Self {
+        self.budget.fetch_add(self.bytes, Ordering::Relaxed);
+        Self {
+            budget: Arc::clone(&self.budget),
+            bytes: self.bytes,
+        }
+    }
+}
+
+impl Drop for LinkCharge {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for LinkCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkCharge")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// The charge is bookkeeping, not part of a link's identity, so it never makes
+/// two hyperlinks differ.
+impl PartialEq for LinkCharge {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LinkCharge {}
+
 /// OSC 8 hyperlink target attached to a cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hyperlink {
     pub id: Option<Box<str>>,
     pub uri: Box<str>,
+    /// Budget charge for `id` and `uri`, released when the link is dropped.
+    charge: LinkCharge,
+}
+
+impl Hyperlink {
+    /// Creates a link charged to `budget`, or `None` when the budget has no room.
+    pub(crate) fn new(budget: &LinkBudget, id: Option<Box<str>>, uri: Box<str>) -> Option<Self> {
+        let bytes = uri.len() + id.as_deref().map_or(0, str::len);
+        let charge = LinkCharge::reserve(budget, bytes)?;
+        Some(Self { id, uri, charge })
+    }
 }
 
 /// Maximum number of zero-width characters stored in one cell's extra data;

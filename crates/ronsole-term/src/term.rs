@@ -1,6 +1,6 @@
 //! The terminal model: state, host-facing API and the parser driver.
 
-use crate::cell::{Cell, Pen};
+use crate::cell::{Cell, LinkBudget, Pen};
 use crate::color::TermPalette;
 use crate::grid::LineMeta;
 use crate::input::{MouseTrackingMode, focus_report_sequence};
@@ -103,6 +103,8 @@ pub struct Term {
     /// Scratch for OSC payloads whose `;`-split parts are glued back together;
     /// empty between sequences, see `osc::with_joined`.
     pub(crate) osc_join: Vec<u8>,
+    /// Bytes of the live OSC 8 hyperlinks in the grid; see `cell::LINK_BUDGET_BYTES`.
+    pub(crate) link_budget: LinkBudget,
     /// Bytes held back while synchronized output is on; empty and unallocated otherwise.
     pub(crate) sync_buf: Vec<u8>,
     /// Replay deadline of the held bytes; `None` while synchronized output is off.
@@ -184,6 +186,7 @@ impl Term {
             palette,
             reply_buf: Vec::new(),
             osc_join: Vec::new(),
+            link_budget: LinkBudget::default(),
             sync_buf: Vec::new(),
             sync_until: None,
             replaying: false,
