@@ -1034,7 +1034,6 @@ impl App {
         for terminal in &self.terminals {
             let mut grid = crate::platform::lock_recover(&terminal.grid);
             grid.set_palette(terminal_palette(color));
-            grid.mark_changed();
         }
         self.request_frame();
         if let Some(runtime) = self.runtime.as_mut() {

@@ -910,6 +910,13 @@ impl TermSink for SessionSink<'_> {
     }
 }
 
+/// Folds the outcome of one sub-batch into the outcome of the whole output
+/// batch: any grid change or new deadline stays set.
+fn merge_advance_outcome(total: &mut AdvanceOutcome, step: AdvanceOutcome) {
+    total.grid_changed |= step.grid_changed;
+    total.new_deadline |= step.new_deadline;
+}
+
 /// Feeds one output batch and reports what it changed. The content generation
 /// moves only when the grid changed, so a batch held by synchronized output
 /// does not repaint.
@@ -922,8 +929,7 @@ fn advance_terminal_output_batch(
     let mut outcome = AdvanceOutcome::default();
     for chunk in chunks {
         let step = grid.advance(&chunk.bytes[..chunk.len], now, sink);
-        outcome.grid_changed |= step.grid_changed;
-        outcome.new_deadline |= step.new_deadline;
+        merge_advance_outcome(&mut outcome, step);
     }
     if outcome.grid_changed {
         grid.mark_changed();
@@ -1040,6 +1046,9 @@ fn install_terminal_io_threads(
         while let Some(first_chunk) = first {
             batch.push(first_chunk);
             let started = Instant::now();
+            // The main loop is woken once for the whole output batch, after
+            // its last sub-batch, so a long batch does not repaint mid-way.
+            let mut batch_outcome = AdvanceOutcome::default();
             loop {
                 let action = loop {
                     let action = terminal_output_batch_action(batch.len(), started.elapsed());
@@ -1068,7 +1077,7 @@ fn install_terminal_io_threads(
                     advance_terminal_output_batch(&mut grid, &mut sink, &batch, Instant::now())
                 };
                 recycle_output_chunks(&mut batch, &recycle_tx);
-                notify_main_loop(wake.as_ref(), outcome);
+                merge_advance_outcome(&mut batch_outcome, outcome);
 
                 match action {
                     TerminalOutputBatchAction::FlushAndContinue => {
@@ -1088,6 +1097,7 @@ fn install_terminal_io_threads(
                     }
                 }
             }
+            notify_main_loop(wake.as_ref(), batch_outcome);
             first = rx.recv().ok();
         }
 
@@ -1291,6 +1301,40 @@ fn terminal_fallback_title_with_home(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_advance_outcome_keeps_any_grid_change_and_deadline() {
+        let quiet = AdvanceOutcome::default();
+        let changed = AdvanceOutcome {
+            grid_changed: true,
+            new_deadline: false,
+        };
+        let deadline = AdvanceOutcome {
+            grid_changed: false,
+            new_deadline: true,
+        };
+
+        let mut total = AdvanceOutcome::default();
+        merge_advance_outcome(&mut total, quiet);
+        assert_eq!(total, AdvanceOutcome::default(), "false+false stays false");
+
+        merge_advance_outcome(&mut total, changed);
+        assert!(total.grid_changed, "true+false sets grid_changed");
+        assert!(!total.new_deadline);
+
+        merge_advance_outcome(&mut total, quiet);
+        assert!(total.grid_changed, "a later quiet sub-batch keeps grid_changed");
+
+        merge_advance_outcome(&mut total, deadline);
+        assert!(total.grid_changed);
+        assert!(total.new_deadline, "new_deadline from a later sub-batch is kept");
+
+        merge_advance_outcome(&mut total, quiet);
+        assert!(
+            total.new_deadline,
+            "a later quiet sub-batch keeps new_deadline"
+        );
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct TestLinuxStat {
