@@ -5,8 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 mod kde_activation;
-#[cfg(test)]
-mod offscreen_gl;
+pub(crate) mod offscreen_gl;
 mod process;
 pub(crate) mod single_instance;
 

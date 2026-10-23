@@ -3,6 +3,7 @@ compile_error!("Ronsole supports Linux/Wayland only");
 
 mod app;
 mod config;
+mod headless;
 mod input;
 mod input_types;
 mod launch;
