@@ -422,7 +422,7 @@ pub(crate) fn encode_key(
     if !disambiguate && matches!(key, TermKey::Kp(KpKey::Begin)) {
         return KeyOutcome::Ignore;
     }
-    // Super alone adds no legacy bytes: only disambiguation (flag 1) reports it.
+    // Super alone adds no legacy bytes to a text key: only disambiguation (flag 1) reports it.
     let plain = !event.mods.ctrl && !event.mods.alt && (!event.mods.super_key || !disambiguate);
     if !all && plain && is_text_key(key) {
         protocol.sent_mut().remove(event.physical);
