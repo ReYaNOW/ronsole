@@ -1456,6 +1456,60 @@ mod tests {
     }
 
     #[test]
+    fn alt_a_flag1_sends_no_separate_text() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::ALT);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        // Kitty push of flag 1 (disambiguate escape codes) through the grid parser.
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[>1u",
+            std::time::Instant::now(),
+            &mut sink,
+        );
+        let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
+        key.unshifted = Some('a');
+        key.text = Some("a".to_string());
+        // Sent means the encoder owns the key, so the text is not handled separately.
+        assert!(interaction.handle_key_event(&key, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[97;3u");
+    }
+
+    #[test]
+    #[ignore = "no clipboard seam: platform::Clipboard wraps arboard directly, so pasted text cannot be injected"]
+    fn ctrl_v_repeat_pastes_release_not_sent() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
+        let repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyV), 47);
+        let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
+        interaction.handle_key_event(&press, &mut terminal);
+        interaction.handle_key_event(&repeat, &mut terminal);
+        interaction.handle_key_event(&release, &mut terminal);
+        // The paste text itself is not checked here; only encoder output is.
+        let bytes = terminal.input_bytes_for_test();
+        assert!(!bytes.contains(&0x16));
+        assert!(!bytes.windows(8).any(|window| window == b"\x1b[118;5u"));
+    }
+
+    #[test]
+    fn ctrl_v_repeat_never_reaches_encoder() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyV), 47);
+        interaction.handle_key_event(&repeat, &mut terminal);
+        // Clipboard contents depend on the environment, so only encoder output is checked.
+        let bytes = terminal.input_bytes_for_test();
+        assert!(!bytes.contains(&0x16));
+        assert!(!bytes.windows(8).any(|window| window == b"\x1b[118;5u"));
+    }
+
+    #[test]
     fn search_target_gets_text_after_key() {
         let mut interaction = TerminalInteraction::default();
         interaction.search.open();

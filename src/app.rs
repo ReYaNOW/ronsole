@@ -21,7 +21,6 @@ use crate::tabs::{
 };
 use crate::terminal::{Terminal, TerminalPresentationIntent, screen_hash};
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
-use ronsole_term::focus_report_sequence;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -324,22 +323,6 @@ fn external_launch_plan(
 }
 
 #[inline]
-fn terminal_focus_transition_plan(
-    window_focused: bool,
-    identity_changed: bool,
-    old_reporting: bool,
-    new_reporting: bool,
-) -> (Option<&'static [u8]>, Option<&'static [u8]>) {
-    if !window_focused || !identity_changed {
-        return (None, None);
-    }
-    (
-        focus_report_sequence(old_reporting, false),
-        focus_report_sequence(new_reporting, true),
-    )
-}
-
-#[inline]
 fn drag_threshold_passed(start_x: f32, current_x: f32, scale: f32) -> bool {
     (current_x - start_x).abs() > 5.0 * scale.max(0.1)
 }
@@ -542,12 +525,14 @@ impl App {
         }
     }
 
+    /// Reports focus to one terminal. `Term::focus_changed` also clears that
+    /// terminal's sent-key set on focus loss, so this runs for every change.
     fn send_terminal_focus_state(&self, index: usize, focused: bool) {
         let Some(terminal) = self.terminals.get(index) else {
             return;
         };
-        let reporting = crate::platform::lock_recover(&terminal.grid).focus_reporting();
-        if let Some(sequence) = focus_report_sequence(reporting, focused) {
+        let sequence = crate::platform::lock_recover(&terminal.grid).focus_changed(focused);
+        if let Some(sequence) = sequence {
             let _ = terminal.write_input(sequence);
         }
     }
@@ -556,23 +541,11 @@ impl App {
         if !self.focused || old == new {
             return;
         }
-        let old_reporting = old
-            .and_then(|index| self.terminals.get(index))
-            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting());
-        let new_reporting = new
-            .and_then(|index| self.terminals.get(index))
-            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting());
-        let (focus_out, focus_in) =
-            terminal_focus_transition_plan(self.focused, true, old_reporting, new_reporting);
-        if let (Some(index), Some(sequence)) = (old, focus_out)
-            && let Some(terminal) = self.terminals.get(index)
-        {
-            let _ = terminal.write_input(sequence);
+        if let Some(index) = old {
+            self.send_terminal_focus_state(index, false);
         }
-        if let (Some(index), Some(sequence)) = (new, focus_in)
-            && let Some(terminal) = self.terminals.get(index)
-        {
-            let _ = terminal.write_input(sequence);
+        if let Some(index) = new {
+            self.send_terminal_focus_state(index, true);
         }
     }
 
@@ -2848,38 +2821,56 @@ mod tests {
         assert_eq!(app.pending_external_launches.front(), Some(&request));
     }
 
-    #[test]
-    fn focus_reporting_uses_xterm_sequences_only_when_enabled() {
-        assert_eq!(focus_report_sequence(false, true), None);
-        assert_eq!(focus_report_sequence(false, false), None);
-        assert_eq!(
-            focus_report_sequence(true, true),
-            Some(b"\x1b[I".as_slice())
-        );
-        assert_eq!(
-            focus_report_sequence(true, false),
-            Some(b"\x1b[O".as_slice())
+    /// Turns on focus reporting (DECSET 1004) through the same grid path the PTY uses.
+    fn enable_focus_reporting_for_test(terminal: &Terminal) {
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[?1004h",
+            Instant::now(),
+            &mut sink,
         );
     }
 
     #[test]
-    fn committed_tab_focus_transition_plans_xterm_out_then_in_only_when_app_is_focused() {
-        assert_eq!(
-            terminal_focus_transition_plan(true, true, true, true),
-            (Some(b"\x1b[O".as_slice()), Some(b"\x1b[I".as_slice()))
-        );
-        assert_eq!(
-            terminal_focus_transition_plan(true, true, false, true),
-            (None, Some(b"\x1b[I".as_slice()))
-        );
-        assert_eq!(
-            terminal_focus_transition_plan(true, false, true, true),
-            (None, None)
-        );
-        assert_eq!(
-            terminal_focus_transition_plan(false, true, true, true),
-            (None, None)
-        );
+    fn focus_loss_reports_1004() {
+        let mut app = App::new();
+        let terminal = Terminal::new_for_test(8, 2, 1);
+        enable_focus_reporting_for_test(&terminal);
+        app.terminals.push(terminal);
+        app.active_terminal_presented = true;
+        app.on_focus_changed(false);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
+    }
+
+    #[test]
+    fn focus_loss_without_1004_sends_nothing() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.active_terminal_presented = true;
+        app.on_focus_changed(false);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn tab_focus_transition_reports_out_then_in_only_when_focused() {
+        let mut app = App::new();
+        for display_number in [1, 2] {
+            let terminal = Terminal::new_for_test(8, 2, display_number);
+            enable_focus_reporting_for_test(&terminal);
+            app.terminals.push(terminal);
+        }
+        app.focused = false;
+        app.send_terminal_focus_transition(Some(0), Some(1));
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        app.focused = true;
+        app.send_terminal_focus_transition(Some(0), Some(1));
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
     }
 
     #[test]
@@ -3359,6 +3350,24 @@ mod tests {
             ),
             CursorKind::Default
         );
+    }
+
+    #[test]
+    fn global_shortcut_fires_on_repeat() {
+        let mut app = App::new();
+        let f1 = |state| KeyInput {
+            state,
+            physical_key: PhysicalKey::Code(KeyCode::F1),
+            keycode: 59,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        };
+        app.on_key(f1(KeyState::Released));
+        assert!(!app.settings_open);
+        app.on_key(f1(KeyState::Repeat));
+        assert!(app.settings_open);
     }
 
     #[test]
