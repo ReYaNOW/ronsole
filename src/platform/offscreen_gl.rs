@@ -349,5 +349,9 @@ mod tests {
         assert!(ctx.resize(0, 0).is_err());
         assert_eq!(ctx.size(), (16, 16));
         ctx.make_current().expect("old surface still current");
+        // u32::MAX as i32 == -1: Mesa rejects the pbuffer, so the EGL rollback path runs.
+        assert!(ctx.resize(u32::MAX, 16).is_err());
+        assert_eq!(ctx.size(), (16, 16));
+        ctx.make_current().expect("old surface survives EGL failure");
     }
 }
