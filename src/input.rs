@@ -410,8 +410,7 @@ impl TerminalInteraction {
         self.clipboard.get_file_list()
     }
 
-    #[cfg(test)]
-    pub(crate) fn clipboard_is_memory_for_test(&self) -> bool {
+    pub(crate) fn clipboard_is_memory(&self) -> bool {
         matches!(self.clipboard, ClipboardOwner::Memory { .. })
     }
 

@@ -1184,9 +1184,14 @@ impl AutomationController {
     }
 
     fn selection_copy_and_clear(&mut self, app: &mut App) -> Result<StepResult, String> {
-        if let Some(previous_clipboard) = app.interaction.clipboard_text() {
+        let previous_clipboard = app.interaction.clipboard_text();
+        if previous_clipboard.is_some() || app.interaction.clipboard_is_memory() {
             press_key(app, Modifiers::CONTROL, KeyCode::KeyC)?;
-            let _ = app.interaction.set_clipboard_text(previous_clipboard);
+            // A memory clipboard without prior text has no system side effect, so the
+            // copied selection is kept; only previous text is restored.
+            if let Some(previous_clipboard) = previous_clipboard {
+                let _ = app.interaction.set_clipboard_text(previous_clipboard);
+            }
         } else {
             self.skipped_steps
                 .push("selection-copy-clipboard-unavailable".to_string());
@@ -1911,5 +1916,47 @@ mod tests {
         assert!(cleanup < process_complete);
         assert!(process_complete < finish);
         assert_eq!(steps[finish], AutomationStep::Finish);
+    }
+
+    #[test]
+    fn headless_selection_copy_uses_memory_clipboard_without_skipping() {
+        struct NullSink;
+        impl ronsole_term::TermSink for NullSink {
+            fn reply(&mut self, _bytes: &[u8]) {}
+            fn title(&mut self, _title: &str) {}
+            fn clipboard_set(&mut self, _text: String) {}
+            fn working_directory(&mut self, _host: &str, _path: &[u8]) {}
+        }
+
+        let profile =
+            std::env::temp_dir().join(format!("ronsole-selection-copy-{}", std::process::id()));
+        let workspace = profile.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join(FIXTURE_NAME), "").expect("fixture");
+        let options = AutomationOptions {
+            workspace,
+            report: profile.join("report.json"),
+            timeout: Duration::from_secs(30),
+        };
+        let mut controller =
+            AutomationController::with_steps(options, Vec::new()).expect("controller");
+        let mut app = App::load_headless(None, &profile).expect("headless app");
+        app.terminals
+            .push(crate::terminal::Terminal::new_for_test(16, 2, 1));
+        app.active_terminal = 0;
+        assert_eq!(app.interaction.clipboard_text(), None);
+        {
+            let mut grid = crate::platform::lock_recover(&app.terminals[0].grid);
+            let _ = grid.advance(b"hello", Instant::now(), &mut NullSink);
+            grid.set_selection(Some((0, 0, 4, 0)));
+        }
+
+        let result = controller
+            .selection_copy_and_clear(&mut app)
+            .expect("selection copy step");
+
+        assert_eq!(result, StepResult::Done);
+        assert!(controller.skipped_steps.is_empty());
+        assert_eq!(app.interaction.clipboard_text().as_deref(), Some("hello"));
     }
 }

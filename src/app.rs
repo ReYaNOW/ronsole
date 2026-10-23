@@ -3141,7 +3141,7 @@ mod tests {
     fn headless_app_uses_memory_clipboard_and_recording_opener() {
         let profile = std::env::temp_dir().join(format!("ronsole-headless-{}", std::process::id()));
         let app = App::load_headless(None, &profile).expect("headless app");
-        assert!(app.interaction.clipboard_is_memory_for_test());
+        assert!(app.interaction.clipboard_is_memory());
         assert!(matches!(app.open_sink, OpenSink::Record(_)));
     }
 
