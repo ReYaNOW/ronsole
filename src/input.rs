@@ -8,7 +8,7 @@ use crate::terminal::{MouseTrackingMode, Terminal};
 use crate::wayland_input::us_base_char_from_evdev;
 use ronsole_term::{
     KeyEvent, KeyKind, KeyMods, KeyOutcome, KpKey, LinkTarget, MouseButton, MouseEventKind, Term,
-    TermKey, bracketed_paste_bytes, mouse_report,
+    TermKey, bracketed_paste_bytes, mouse_report, ModKey,
 };
 use std::path::{Path, PathBuf};
 
@@ -30,6 +30,8 @@ pub(crate) struct TerminalInteraction {
     /// Key whose press the host consumed as a copy; its repeat and release stay away
     /// from the encoder until that key is released.
     held_host_key: Option<PhysicalKey>,
+    /// Physical modifier keys held now, one bit per key as given by `modifier_key_bits`.
+    held_modifier_keys: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,13 +65,56 @@ impl Default for TerminalInteraction {
             link_uri: None,
             link_press_pending: false,
             held_host_key: None,
+            held_modifier_keys: 0,
         }
     }
 }
 
 impl TerminalInteraction {
     pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {
+        // No host modifier means no modifier key is down, so a release that never
+        // arrived (for example after focus loss) must not leave its key marked held.
+        if modifiers.is_empty() {
+            self.held_modifier_keys = 0;
+        }
         self.modifiers = modifiers;
+    }
+
+    /// Records a physical modifier key as held or released. Called before any early
+    /// return in `handle_key_event`, because the held state is physical.
+    fn note_modifier_key(&mut self, key: &KeyInput) {
+        let Some(TermKey::Modifier(modifier)) = key.named else {
+            return;
+        };
+        let Some((bit, _, _)) = modifier_key_bits(modifier) else {
+            return;
+        };
+        if key.state.is_pressed() {
+            self.held_modifier_keys |= bit;
+        } else {
+            self.held_modifier_keys &= !bit;
+        }
+    }
+
+    /// Modifiers for the encoder event of `key`. The host learns the state after a key
+    /// only from the following `wl_keyboard.modifiers`, so a modifier key's own flag is
+    /// set here: on press and repeat, and on release only while its other key is held.
+    fn event_modifiers(&self, key: &KeyInput) -> Modifiers {
+        let Some(TermKey::Modifier(modifier)) = key.named else {
+            return self.modifiers;
+        };
+        let Some((_, flag, family)) = modifier_key_bits(modifier) else {
+            return self.modifiers;
+        };
+        let on = key.state.is_pressed() || self.held_modifier_keys & family != 0;
+        let own = |candidate: Modifiers| candidate == flag;
+        let current = self.modifiers;
+        Modifiers::new(
+            if own(Modifiers::SHIFT) { on } else { current.shift_key() },
+            if own(Modifiers::CONTROL) { on } else { current.control_key() },
+            if own(Modifiers::ALT) { on } else { current.alt_key() },
+            if own(Modifiers::SUPER) { on } else { current.super_key() },
+        )
     }
 
     /// Forgets a Ctrl+press on a link whose release will never be delivered,
@@ -444,6 +489,7 @@ impl TerminalInteraction {
         key_event: &KeyInput,
         terminal: &mut Terminal,
     ) -> bool {
+        self.note_modifier_key(key_event);
         if self.handle_search_key(key_event, terminal) {
             if let Some(text) = key_event.text.as_deref() {
                 self.handle_text(text, terminal);
@@ -526,7 +572,7 @@ impl TerminalInteraction {
             }
             return false;
         }
-        let Some(key) = terminal_key_event(key_event, self.modifiers) else {
+        let Some(key) = terminal_key_event(key_event, self.event_modifiers(key_event)) else {
             return false;
         };
         let mut out = Vec::new();
@@ -1213,6 +1259,26 @@ fn terminal_text_sequence(text: &str, ctrl: bool, alt: bool, super_key: bool) ->
     Some(terminal_alt_prefixed(text.as_bytes(), alt))
 }
 
+/// Held-key bit, modifier flag, and the bits of both physical keys setting that flag,
+/// for a physical modifier key. Keys that set no `Modifiers` flag give `None`.
+fn modifier_key_bits(modifier: ModKey) -> Option<(u8, Modifiers, u8)> {
+    const SHIFT_KEYS: u8 = 0b0001_0001;
+    const CONTROL_KEYS: u8 = 0b0010_0010;
+    const ALT_KEYS: u8 = 0b0100_0100;
+    const SUPER_KEYS: u8 = 0b1000_1000;
+    Some(match modifier {
+        ModKey::LeftShift => (0b0000_0001, Modifiers::SHIFT, SHIFT_KEYS),
+        ModKey::RightShift => (0b0001_0000, Modifiers::SHIFT, SHIFT_KEYS),
+        ModKey::LeftCtrl => (0b0000_0010, Modifiers::CONTROL, CONTROL_KEYS),
+        ModKey::RightCtrl => (0b0010_0000, Modifiers::CONTROL, CONTROL_KEYS),
+        ModKey::LeftAlt => (0b0000_0100, Modifiers::ALT, ALT_KEYS),
+        ModKey::RightAlt => (0b0100_0000, Modifiers::ALT, ALT_KEYS),
+        ModKey::LeftSuper => (0b0000_1000, Modifiers::SUPER, SUPER_KEYS),
+        ModKey::RightSuper => (0b1000_0000, Modifiers::SUPER, SUPER_KEYS),
+        _ => return None,
+    })
+}
+
 /// Builds the encoder event for one host key. The named key wins over the
 /// physical key, which wins over the layout character.
 fn terminal_key_event(key: &KeyInput, mods: Modifiers) -> Option<KeyEvent<'_>> {
@@ -1774,6 +1840,88 @@ mod tests {
         );
         assert!(!interaction.handle_key_event(&key, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    fn modifier_key(state: KeyState, modifier: ModKey, keycode: u32) -> KeyInput {
+        KeyInput {
+            named: Some(TermKey::Modifier(modifier)),
+            ..raw_key(state, PhysicalKey::Unidentified, keycode)
+        }
+    }
+
+    /// Terminal with Kitty flags 10 (report all keys and report event types) pushed.
+    fn modifier_test_terminal() -> Terminal {
+        let terminal = Terminal::new_for_test(80, 30, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[>10u",
+            std::time::Instant::now(),
+            &mut sink,
+        );
+        terminal
+    }
+
+    // Expected bytes follow the reference "Modifiers" rule (protocol ref line 121) and
+    // the encoder tests in crates/ronsole-term/src/tests/keys.rs, not the host output.
+    #[test]
+    fn left_ctrl_press_sets_own_ctrl_bit_with_empty_host_modifiers() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;5u");
+    }
+
+    #[test]
+    fn left_ctrl_release_clears_ctrl_bit_when_no_other_ctrl_held() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        let release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(interaction.handle_key_event(&release, &mut terminal));
+        assert_eq!(
+            terminal.input_bytes_for_test(),
+            b"\x1b[57442;5u\x1b[57442;1:3u"
+        );
+    }
+
+    #[test]
+    fn left_ctrl_release_keeps_ctrl_bit_while_right_ctrl_held() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let left_press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        let right_press = modifier_key(KeyState::Pressed, ModKey::RightCtrl, 97);
+        let left_release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(interaction.handle_key_event(&left_press, &mut terminal));
+        assert!(interaction.handle_key_event(&right_press, &mut terminal));
+        assert!(interaction.handle_key_event(&left_release, &mut terminal));
+        assert_eq!(
+            terminal.input_bytes_for_test(),
+            b"\x1b[57442;5u\x1b[57448;5u\x1b[57442;5:3u"
+        );
+    }
+
+    #[test]
+    fn modifier_release_without_sent_press_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // A focus change clears the sent set, so the release of a Ctrl pressed before it is dropped.
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        let before = terminal.input_bytes_for_test();
+        let _ = crate::platform::lock_recover(&terminal.grid).focus_changed(true);
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), before);
     }
 
     #[test]
