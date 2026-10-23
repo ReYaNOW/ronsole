@@ -21,6 +21,8 @@ TEST ?=
 # Package selection for cargo test; narrow crate run: make test TEST_PKG='-p ronsole-term'
 TEST_PKG ?= --workspace
 TEST_THREADS ?= 1
+# EGL vendor for GL tests; passed as RONSOLE_EGL_VENDOR, read by prefer_egl_vendor (src/main.rs)
+TEST_EGL_VENDOR ?= mesa
 BUILD_STD_TEST = $(BUILD_STD)
 
 .PHONY: all fast max bloat-max codex_test test test-one test-list test-hunt test-time scroll-bench pgo-bench-tools pgo-bench-self-test pgo-bench-build pgo-bench-run pgo-bench pgo-gen pgo-run pgo-merge pgo-max pgo-auto pgo-gen-fast pgo-script pgo-train pgo-use pgo-clean pgo clean
@@ -82,6 +84,7 @@ codex_test:
 test:
 	@echo "🧪 Запуск тестов (на базе FAST профиля, подробный режим)..."
 	$(FAST_PROFILE_OPTS) \
+	RONSOLE_EGL_VENDOR=$(TEST_EGL_VENDOR) \
 	CARGO_TERM_COLOR=always \
 	RUSTFLAGS="$(COMMON_RUSTFLAGS)" \
 	RUST_BACKTRACE=full \
@@ -113,6 +116,7 @@ test-one:
 	fi
 	@echo "🎯 Запуск одного теста: $(TEST)"
 	$(FAST_PROFILE_OPTS) \
+	RONSOLE_EGL_VENDOR=$(TEST_EGL_VENDOR) \
 	CARGO_TERM_COLOR=always \
 	RUSTFLAGS="$(COMMON_RUSTFLAGS)" \
 	RUST_BACKTRACE=full \
@@ -183,7 +187,7 @@ pgo-gen:
 	@echo "✅ Instrumented Ronsole: $(PGO_GENERATE_TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)"
 
 pgo-run:
-	@echo "🏃 Автоматическая Wayland-тренировка существующего instrumented Ronsole..."
+	@echo "🏃 Автоматическая headless-тренировка существующего instrumented Ronsole..."
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --run-only
 
 pgo-merge:
@@ -197,20 +201,20 @@ pgo-max:
 	@echo "✅ PGO Ronsole: $(PGO_USE_TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)"
 
 pgo-auto:
-	@echo "🤖 Полный свежий PGO: instrumented MAX → Wayland training → verify/merge → MAX profile-use"
+	@echo "🤖 Полный свежий PGO: instrumented MAX → headless training → verify/merge → MAX profile-use"
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh
 
 pgo-gen-fast:
-	@echo "⚡ Быстрый Ronsole для отладки PGO GUI-сценария (без instrumentation/LTO)..."
+	@echo "⚡ Быстрый Ronsole для отладки PGO-сценария (без instrumentation/LTO)..."
 	@CARGO_NET_OFFLINE=true $(MAKE) fast
 	@echo "✅ Тестовый бинарник: $(PGO_FAST_EXECUTABLE)"
 
 pgo-script:
-	@echo "🎬 Только GUI automation на быстром Ronsole — без instrumented/final PGO build"
+	@echo "🎬 Только headless automation на быстром Ronsole — без instrumented/final PGO build"
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_RUN_ARGS) --mode fresh --run-only --run-executable "$(PGO_FAST_EXECUTABLE)"
 
 pgo-train:
-	@echo "🤖 Свежая instrumented сборка + Wayland training + проверенный merged profile, без final build"
+	@echo "🤖 Свежая instrumented сборка + headless training + проверенный merged profile, без final build"
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --train-only
 
 pgo-use:

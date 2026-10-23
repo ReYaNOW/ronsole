@@ -16,7 +16,7 @@ pub(crate) struct TerminalInteraction {
     pub search: TerminalSearchState,
     pub layout: TerminalUiLayout,
     modifiers: Modifiers,
-    clipboard: Option<Clipboard>,
+    clipboard: ClipboardOwner,
     mouse_x: f32,
     mouse_y: f32,
     pressed_mouse_buttons: u8,
@@ -44,6 +44,60 @@ enum PointerCapture {
     SearchControl,
 }
 
+/// Owns clipboard text and file lists, so every access goes through one place.
+enum ClipboardOwner {
+    /// The Wayland clipboard, created on first use. A failed creation leaves the
+    /// slot empty, and the next access tries again.
+    System(Option<Clipboard>),
+    /// Headless buffer that keeps the last written text and has no file list.
+    Memory { text: Option<String> },
+}
+
+impl ClipboardOwner {
+    fn get_text(&mut self) -> Option<String> {
+        match self {
+            Self::System(slot) => system_clipboard(slot)?.get_text().ok(),
+            Self::Memory { text } => text.clone(),
+        }
+    }
+
+    fn set_text(&mut self, text: String) -> bool {
+        match self {
+            Self::System(slot) => {
+                system_clipboard(slot).is_some_and(|clipboard| clipboard.set_text(text).is_ok())
+            }
+            Self::Memory { text: slot } => {
+                *slot = Some(text);
+                true
+            }
+        }
+    }
+
+    /// Reports whether a clipboard exists, creating the system one on first use.
+    /// A failed write does not make it unavailable.
+    fn is_available(&mut self) -> bool {
+        match self {
+            Self::System(slot) => system_clipboard(slot).is_some(),
+            Self::Memory { .. } => true,
+        }
+    }
+
+    fn get_file_list(&mut self) -> Option<Vec<PathBuf>> {
+        match self {
+            Self::System(slot) => system_clipboard(slot)?.get_file_list().ok(),
+            Self::Memory { .. } => None,
+        }
+    }
+}
+
+/// Creates the Wayland clipboard on first use. Returns `None` when creation fails.
+fn system_clipboard(slot: &mut Option<Clipboard>) -> Option<&mut Clipboard> {
+    if slot.is_none() {
+        *slot = Clipboard::new().ok();
+    }
+    slot.as_mut()
+}
+
 #[inline]
 fn search_refresh_should_jump(changed: bool, cause: SearchRefreshCause) -> bool {
     changed && cause == SearchRefreshCause::User
@@ -55,7 +109,7 @@ impl Default for TerminalInteraction {
             search: TerminalSearchState::default(),
             layout: TerminalUiLayout::default(),
             modifiers: Modifiers::empty(),
-            clipboard: None,
+            clipboard: ClipboardOwner::System(None),
             mouse_x: 0.0,
             mouse_y: 0.0,
             pressed_mouse_buttons: 0,
@@ -336,21 +390,28 @@ impl TerminalInteraction {
         self.pressed_mouse_buttons
     }
 
-    fn clipboard(&mut self) -> Option<&mut Clipboard> {
-        if self.clipboard.is_none() {
-            self.clipboard = Clipboard::new().ok();
+    /// Clipboard backed by an in-process buffer instead of the Wayland clipboard.
+    pub(crate) fn new_with_memory_clipboard() -> Self {
+        Self {
+            clipboard: ClipboardOwner::Memory { text: None },
+            ..Self::default()
         }
-        self.clipboard.as_mut()
     }
 
     pub(crate) fn clipboard_text(&mut self) -> Option<String> {
-        self.clipboard()
-            .and_then(|clipboard| clipboard.get_text().ok())
+        self.clipboard.get_text()
     }
 
     pub(crate) fn set_clipboard_text(&mut self, text: String) -> bool {
-        self.clipboard()
-            .is_some_and(|clipboard| clipboard.set_text(text).is_ok())
+        self.clipboard.set_text(text)
+    }
+
+    fn clipboard_file_list(&mut self) -> Option<Vec<PathBuf>> {
+        self.clipboard.get_file_list()
+    }
+
+    pub(crate) fn clipboard_is_memory(&self) -> bool {
+        matches!(self.clipboard, ClipboardOwner::Memory { .. })
     }
 
     pub(crate) fn refresh_search(
@@ -434,26 +495,22 @@ impl TerminalInteraction {
             }
             PhysicalKey::Code(KeyCode::KeyA) if ctrl => self.search.select_all(),
             PhysicalKey::Code(KeyCode::KeyC) if ctrl => {
-                if let Some(text) = self.search.selected_text()
-                    && let Some(clipboard) = self.clipboard()
-                {
-                    let _ = clipboard.set_text(text);
+                if let Some(text) = self.search.selected_text() {
+                    self.set_clipboard_text(text);
                 }
             }
             PhysicalKey::Code(KeyCode::KeyX) if ctrl => {
+                // Cuts whenever a clipboard exists, even if the write fails, as before 40ddd7a.
                 if let Some(text) = self.search.selected_text()
-                    && let Some(clipboard) = self.clipboard()
+                    && self.clipboard.is_available()
                 {
-                    let _ = clipboard.set_text(text);
+                    let _ = self.clipboard.set_text(text);
                     self.search.insert_text("");
                     edited = true;
                 }
             }
             PhysicalKey::Code(KeyCode::KeyV) if ctrl => {
-                if let Some(text) = self
-                    .clipboard()
-                    .and_then(|clipboard| clipboard.get_text().ok())
-                {
+                if let Some(text) = self.clipboard_text() {
                     let clean = text.replace(['\r', '\n'], "");
                     if !clean.is_empty() {
                         self.search.insert_text(&clean);
@@ -507,12 +564,9 @@ impl TerminalInteraction {
         // neither a repeat nor a release of an intercepted key reaches the encoder.
         if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV) {
             if pressed {
-                let file_list = self
-                    .clipboard()
-                    .and_then(|clipboard| clipboard.get_file_list().ok());
+                let file_list = self.clipboard_file_list();
                 let paste = terminal_clipboard_paste_bytes(file_list.as_deref(), None).or_else(|| {
-                    self.clipboard()
-                        .and_then(|clipboard| clipboard.get_text().ok())
+                    self.clipboard_text()
                         .and_then(|text| terminal_clipboard_paste_bytes(None, Some(&text)))
                 });
                 if let Some(bytes) = paste {
@@ -551,9 +605,8 @@ impl TerminalInteraction {
             drop(grid);
             if let Some(text) = copied
                 && !text.is_empty()
-                && let Some(clipboard) = self.clipboard()
             {
-                let _ = clipboard.set_text(text);
+                self.set_clipboard_text(text);
             }
             return pressed;
         }
@@ -1671,9 +1724,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "no clipboard seam: platform::Clipboard wraps arboard directly, so pasted text cannot be injected"]
+    fn memory_clipboard_round_trip() {
+        // Expected values come from the Task 3 brief: Memory keeps the last written text.
+        let mut interaction = TerminalInteraction::new_with_memory_clipboard();
+        assert_eq!(interaction.clipboard_text(), None);
+        assert!(interaction.set_clipboard_text("x".to_string()));
+        assert_eq!(interaction.clipboard_text().as_deref(), Some("x"));
+        assert_eq!(interaction.clipboard_file_list(), None);
+    }
+
+    #[test]
     fn ctrl_v_repeat_pastes_release_not_sent() {
-        let mut interaction = TerminalInteraction::default();
+        let mut interaction = TerminalInteraction::new_with_memory_clipboard();
+        assert!(interaction.set_clipboard_text("pasted".to_string()));
         interaction.set_modifiers(Modifiers::CONTROL);
         let mut terminal = Terminal::new_for_test(80, 30, 1);
         let press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
@@ -1682,10 +1745,12 @@ mod tests {
         interaction.handle_key_event(&press, &mut terminal);
         interaction.handle_key_event(&repeat, &mut terminal);
         interaction.handle_key_event(&release, &mut terminal);
-        // The paste text itself is not checked here; only encoder output is.
+        // Press and repeat each paste the seeded Memory text once; the release sends nothing.
+        // Bracketed paste is off in `new_for_test`, so the payload is written verbatim.
         let bytes = terminal.input_bytes_for_test();
         assert!(!bytes.contains(&0x16));
         assert!(!bytes.windows(8).any(|window| window == b"\x1b[118;5u"));
+        assert_eq!(bytes, b"pastedpasted");
     }
 
     #[test]

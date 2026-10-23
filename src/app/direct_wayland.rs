@@ -8,6 +8,12 @@ use std::time::Instant;
 
 const EXTERNAL_LAUNCH_QUEUE_CAPACITY: usize = 32;
 
+/// Outcome of one event-loop iteration: keep looping, or stop with the final result.
+pub(super) enum LoopStep {
+    Continue,
+    Exit(Result<(), String>),
+}
+
 impl App {
     pub(crate) fn run_direct_wayland(
         &mut self,
@@ -33,22 +39,8 @@ impl App {
             self.config.terminal_font_size,
             self.config.terminal_background,
         )?;
-        let metrics = runtime.wayland_metrics();
         let wake = runtime.wake_handle();
-        self.on_runtime_ready(
-            runtime,
-            metrics.physical_width,
-            metrics.physical_height,
-            initial_launch,
-        );
-        self.on_resize_with_logical_size(
-            metrics.physical_width,
-            metrics.physical_height,
-            Some((
-                f64::from(metrics.logical_width),
-                f64::from(metrics.logical_height),
-            )),
-        );
+        self.prepare_bootstrapped_runtime(runtime, initial_launch);
 
         let (launch_tx, launch_rx) = sync_channel(EXTERNAL_LAUNCH_QUEUE_CAPACITY);
         primary_instance
@@ -136,89 +128,135 @@ impl App {
         false
     }
 
+    /// Installs a freshly bootstrapped runtime and sizes the app to its physical
+    /// target. Shared by the Wayland and headless entry points.
+    pub(super) fn prepare_bootstrapped_runtime(
+        &mut self,
+        runtime: WindowRuntime,
+        initial_launch: TerminalLaunchSpec,
+    ) {
+        let metrics = runtime.wayland_metrics();
+        self.on_runtime_ready(
+            runtime,
+            metrics.physical_width,
+            metrics.physical_height,
+            initial_launch,
+        );
+        self.on_resize_with_logical_size(
+            metrics.physical_width,
+            metrics.physical_height,
+            Some((
+                f64::from(metrics.logical_width),
+                f64::from(metrics.logical_height),
+            )),
+        );
+    }
+
+    /// Runs one event-loop iteration. `external_launches` is `None` for headless
+    /// runs, which have no single-instance listener.
+    pub(super) fn loop_step(
+        &mut self,
+        external_launches: Option<&Receiver<InstanceMessage>>,
+    ) -> Result<LoopStep, String> {
+        // A session error (for example a failed pbuffer resize) ends the run before
+        // any further work. Wayland runtimes never report one.
+        if let Some(error) = self.runtime.as_mut().and_then(WindowRuntime::take_session_error) {
+            self.interrupt_automation(&error);
+            self.prepare_exit();
+            let automation_result = self.take_automation_exit_result();
+            return Ok(LoopStep::Exit(automation_result.and(Err(error))));
+        }
+
+        if let Some(receiver) = external_launches {
+            let _ = self.drain_external_launches(receiver);
+        }
+
+        let now = Instant::now();
+        let pending_events = {
+            let runtime = self.runtime.as_mut().ok_or_else(|| {
+                "Wayland runtime disappeared from application state".to_string()
+            })?;
+            runtime.process_wayland_input_deadline(now);
+            runtime.take_wayland_events()
+        };
+        if self.handle_wayland_runtime_events(pending_events) {
+            return Ok(LoopStep::Exit(self.take_automation_exit_result()));
+        }
+
+        let control = self.on_about_to_wait();
+        if control == AppLoopControl::Exit {
+            return Ok(LoopStep::Exit(self.take_automation_exit_result()));
+        }
+
+        let frame_ready = self
+            .runtime
+            .as_ref()
+            .is_some_and(WindowRuntime::wayland_frame_ready_requested);
+        if frame_ready {
+            let take_frame = self
+                .runtime
+                .as_ref()
+                .is_some_and(WindowRuntime::take_wayland_frame_ready);
+            if take_frame {
+                self.on_frame()?;
+            }
+            return Ok(LoopStep::Continue);
+        }
+
+        let app_deadline = match control {
+            AppLoopControl::WaitUntil(deadline) => Some(deadline),
+            AppLoopControl::Exit | AppLoopControl::Wait | AppLoopControl::Poll => None,
+        };
+        let input_deadline = self
+            .runtime
+            .as_ref()
+            .and_then(WindowRuntime::wayland_input_deadline);
+        let deadline = match (app_deadline, input_deadline) {
+            (Some(app), Some(input)) => Some(app.min(input)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
+        let timeout_ms = poll_timeout_millis(deadline, Instant::now());
+        let outcome = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| "Wayland runtime disappeared from application state".to_string())?
+            .poll_wayland(timeout_ms)?;
+        let events = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| "Wayland runtime disappeared from application state".to_string())?
+            .take_wayland_events();
+
+        if self.handle_wayland_runtime_events(events) {
+            return Ok(LoopStep::Exit(self.take_automation_exit_result()));
+        }
+
+        if outcome.woke {
+            if let Some(receiver) = external_launches {
+                let _ = self.drain_external_launches(receiver);
+            }
+            // Timer-only wakes (synchronized-output deadlines) must not
+            // spend a frame; only frame-requesting wakes do.
+            let frame_wanted = self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.wake_handle().take_frame_wake());
+            if frame_wanted {
+                self.request_frame();
+            }
+        }
+
+        Ok(LoopStep::Continue)
+    }
+
     fn direct_wayland_loop(
         &mut self,
         external_launches: &Receiver<InstanceMessage>,
     ) -> Result<(), String> {
         loop {
-            let _ = self.drain_external_launches(external_launches);
-
-            let now = Instant::now();
-            let pending_events = {
-                let runtime = self.runtime.as_mut().ok_or_else(|| {
-                    "Wayland runtime disappeared from application state".to_string()
-                })?;
-                runtime.process_wayland_input_deadline(now);
-                runtime.take_wayland_events()
-            };
-            if self.handle_wayland_runtime_events(pending_events) {
-                return self.take_automation_exit_result();
-            }
-
-            let control = self.on_about_to_wait();
-            if control == AppLoopControl::Exit {
-                return self.take_automation_exit_result();
-            }
-
-            let frame_ready = self
-                .runtime
-                .as_ref()
-                .is_some_and(WindowRuntime::wayland_frame_ready_requested);
-            if frame_ready {
-                let take_frame = self
-                    .runtime
-                    .as_ref()
-                    .is_some_and(WindowRuntime::take_wayland_frame_ready);
-                if take_frame {
-                    self.on_frame()?;
-                }
-                continue;
-            }
-
-            let app_deadline = match control {
-                AppLoopControl::WaitUntil(deadline) => Some(deadline),
-                AppLoopControl::Exit | AppLoopControl::Wait | AppLoopControl::Poll => None,
-            };
-            let input_deadline = self
-                .runtime
-                .as_ref()
-                .and_then(WindowRuntime::wayland_input_deadline);
-            let deadline = match (app_deadline, input_deadline) {
-                (Some(app), Some(input)) => Some(app.min(input)),
-                (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-                (None, None) => None,
-            };
-            let timeout_ms = poll_timeout_millis(deadline, Instant::now());
-            let outcome = self
-                .runtime
-                .as_mut()
-                .ok_or_else(|| "Wayland runtime disappeared from application state".to_string())?
-                .poll_wayland(timeout_ms)?;
-            let events = self
-                .runtime
-                .as_mut()
-                .ok_or_else(|| "Wayland runtime disappeared from application state".to_string())?
-                .take_wayland_events();
-
-            if self.handle_wayland_runtime_events(events) {
-                return self.take_automation_exit_result();
-            }
-
-            if outcome.woke {
-                let _ = self.drain_external_launches(external_launches);
-                // Timer-only wakes (synchronized-output deadlines) must not
-                // spend a frame; only frame-requesting wakes do.
-                let frame_wanted = self
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.wake_handle().take_frame_wake());
-                if frame_wanted {
-                    self.request_frame();
-                }
-            }
-
-            if outcome.timed_out {
-                continue;
+            if let LoopStep::Exit(result) = self.loop_step(Some(external_launches))? {
+                return result;
             }
         }
     }

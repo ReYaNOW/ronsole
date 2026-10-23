@@ -339,18 +339,33 @@ pub fn open_uri_allowed(uri: &str, local_host: &str) -> bool {
     false
 }
 
-/// Opens `uri` with `xdg-open` on a dedicated thread.
+/// Where the argument of an opened URI goes.
+#[derive(Clone, Debug)]
+pub(crate) enum OpenSink {
+    /// Runs `xdg-open` with the argument.
+    System,
+    /// Sends the argument to the receiver and launches nothing.
+    Record(std::sync::mpsc::Sender<String>),
+}
+
+/// Opens `uri` through `sink` on a dedicated thread.
 ///
 /// Callers must check [`open_uri_allowed`] first. File-system checks for
 /// `file` URIs run on that thread through [`opener_argument`], so the caller
 /// never blocks on disk I/O. The opener runs without a shell, and its thread
 /// is handed to the unit-thread reaper so the caller never waits for the child
 /// process.
-pub fn open_uri(uri: &str) {
+pub fn open_uri_with(uri: &str, sink: OpenSink) {
     let uri = uri.to_owned();
     match super::spawn_named("ronsole-open-uri", move || {
         if let Some(argument) = opener_argument(&uri) {
-            run_xdg_open(&argument);
+            match sink {
+                OpenSink::System => run_xdg_open(&argument),
+                // A dropped receiver means nobody is listening, so the send error is ignored.
+                OpenSink::Record(sender) => {
+                    let _ = sender.send(argument);
+                }
+            }
         }
     }) {
         Ok(worker) => super::reap_unit_thread(worker),
@@ -816,6 +831,38 @@ mod tests {
         for uri in denied {
             assert!(!open_uri_allowed(uri, local_host), "expected denied: {uri:?}");
         }
+    }
+
+    #[test]
+    fn record_sink_receives_opener_argument() {
+        // Expected values come from the Task 3 brief, not from the implementation.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        open_uri_with("https://example.com/a", OpenSink::Record(sender));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).ok().as_deref(),
+            Some("https://example.com/a")
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ronsole-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create opener test dir");
+        let script = dir.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        let canonical = std::fs::canonicalize(&dir).expect("canonical test dir");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        open_uri_with(
+            &format!("file://{}/run.sh", dir.display()),
+            OpenSink::Record(sender),
+        );
+        // An executable opens its containing directory, not the file itself.
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(format!("file://{}", canonical.display()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

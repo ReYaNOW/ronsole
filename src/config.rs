@@ -69,6 +69,8 @@ pub(crate) struct AppConfig {
     pub(crate) terminal_font_size: f32,
     pub(crate) scroll_sensitivity: f32,
     pub(crate) terminal_background: RgbColor,
+    /// File this config was loaded from, which `save` writes back to. `None` writes nothing.
+    pub(crate) path: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -79,27 +81,36 @@ impl Default for AppConfig {
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             terminal_background: DEFAULT_TERMINAL_BACKGROUND,
+            path: None,
         }
     }
 }
 
 impl AppConfig {
     pub(crate) fn load() -> Self {
-        let Some(path) = config_path() else {
-            return Self::default();
-        };
-        match fs::read_to_string(&path) {
+        match config_path() {
+            Some(path) => Self::load_at(path),
+            None => Self::default(),
+        }
+    }
+
+    /// Loads the config at `path` and remembers that path for `save`. A missing
+    /// or unreadable file yields the defaults, still bound to `path`.
+    pub(crate) fn load_at(path: PathBuf) -> Self {
+        let mut config = match fs::read_to_string(&path) {
             Ok(content) => parse_config_content(&content),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Self::default(),
             Err(error) => {
                 eprintln!("Ronsole: failed to load config {}: {error}", path.display());
                 Self::default()
             }
-        }
+        };
+        config.path = Some(path);
+        config
     }
 
     pub(crate) fn save(&self) -> io::Result<()> {
-        let Some(path) = config_path() else {
+        let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
         let Some(parent) = path.parent() else {
@@ -256,11 +267,28 @@ mod tests {
             terminal_font_size: 21.0,
             scroll_sensitivity: 1.75,
             terminal_background: RgbColor::new(0x12, 0xAB, 0xEF),
+            path: None,
         };
         assert_eq!(
             parse_config_content(&format_config_content(&config)),
             config
         );
+    }
+
+    #[test]
+    fn config_load_at_saves_to_same_path() {
+        let dir = std::env::temp_dir().join(format!("ronsole-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config");
+        let mut config = AppConfig::load_at(path.clone());
+        // Expected values come from the Task 3 brief: a missing file yields the defaults.
+        assert_eq!(config.terminal_font_size, DEFAULT_TERMINAL_FONT_SIZE);
+        assert_eq!(config.scroll_sensitivity, DEFAULT_SCROLL_SENSITIVITY);
+        config.terminal_font_size = 21.0;
+        config.save().expect("save config");
+        assert!(path.is_file());
+        assert_eq!(AppConfig::load_at(path).terminal_font_size, 21.0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

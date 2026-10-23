@@ -570,6 +570,24 @@ pub(super) struct AutomationController {
 
 impl AutomationController {
     pub(super) fn new(options: AutomationOptions) -> Result<Self, String> {
+        Self::with_steps(options, scenario())
+    }
+
+    /// Short scenario for tests: ready, every semantic block once, then the cleanup
+    /// barrier and finish. Blocks are checked in `SemanticBlock::ALL` order.
+    #[cfg(test)]
+    pub(super) fn with_short_scenario(options: AutomationOptions) -> Result<Self, String> {
+        let mut steps = vec![AutomationStep::WaitReady];
+        for block in SemanticBlock::ALL {
+            steps.push(AutomationStep::WaitPresentedFrame);
+            steps.push(AutomationStep::Complete(block));
+        }
+        steps.push(AutomationStep::CleanupBarrierFinal);
+        steps.push(AutomationStep::Finish);
+        Self::with_steps(options, steps)
+    }
+
+    fn with_steps(options: AutomationOptions, steps: Vec<AutomationStep>) -> Result<Self, String> {
         let fixture_path = options.workspace.join(FIXTURE_NAME);
         if let Some(parent) = options.report.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -601,7 +619,7 @@ impl AutomationController {
         Ok(Self {
             options,
             fixture_path,
-            steps: scenario(),
+            steps,
             step_index: 0,
             step_started: started,
             started,
@@ -1166,9 +1184,14 @@ impl AutomationController {
     }
 
     fn selection_copy_and_clear(&mut self, app: &mut App) -> Result<StepResult, String> {
-        if let Some(previous_clipboard) = app.interaction.clipboard_text() {
+        let previous_clipboard = app.interaction.clipboard_text();
+        if previous_clipboard.is_some() || app.interaction.clipboard_is_memory() {
             press_key(app, Modifiers::CONTROL, KeyCode::KeyC)?;
-            let _ = app.interaction.set_clipboard_text(previous_clipboard);
+            // A memory clipboard without prior text has no system side effect, so the
+            // copied selection is kept; only previous text is restored.
+            if let Some(previous_clipboard) = previous_clipboard {
+                let _ = app.interaction.set_clipboard_text(previous_clipboard);
+            }
         } else {
             self.skipped_steps
                 .push("selection-copy-clipboard-unavailable".to_string());
@@ -1553,9 +1576,30 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl App {
-    pub(crate) fn load_with_automation(options: AutomationOptions) -> Result<Self, String> {
-        let mut app = Self::from_config(crate::config::AppConfig::load());
-        app.automation = Some(AutomationController::new(options)?);
+    /// Builds a headless app: config comes from `profile_dir`, clipboard text stays
+    /// in memory, and opened links are recorded instead of launched.
+    pub(crate) fn load_headless(
+        options: Option<AutomationOptions>,
+        profile_dir: &Path,
+    ) -> Result<Self, String> {
+        let automation = options.map(AutomationController::new).transpose()?;
+        Self::load_headless_with(automation, profile_dir)
+    }
+
+    pub(super) fn load_headless_with(
+        automation: Option<AutomationController>,
+        profile_dir: &Path,
+    ) -> Result<Self, String> {
+        // The receiver is dropped on purpose: no reader of recorded links exists yet,
+        // and a failed send is ignored by the opener.
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let config = crate::config::AppConfig::load_at(profile_dir.join("config"));
+        let mut app = Self::from_parts(
+            config,
+            crate::input::TerminalInteraction::new_with_memory_clipboard(),
+            crate::platform::OpenSink::Record(sender),
+        );
+        app.automation = automation;
         Ok(app)
     }
 
@@ -1872,5 +1916,47 @@ mod tests {
         assert!(cleanup < process_complete);
         assert!(process_complete < finish);
         assert_eq!(steps[finish], AutomationStep::Finish);
+    }
+
+    #[test]
+    fn headless_selection_copy_uses_memory_clipboard_without_skipping() {
+        struct NullSink;
+        impl ronsole_term::TermSink for NullSink {
+            fn reply(&mut self, _bytes: &[u8]) {}
+            fn title(&mut self, _title: &str) {}
+            fn clipboard_set(&mut self, _text: String) {}
+            fn working_directory(&mut self, _host: &str, _path: &[u8]) {}
+        }
+
+        let profile =
+            std::env::temp_dir().join(format!("ronsole-selection-copy-{}", std::process::id()));
+        let workspace = profile.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join(FIXTURE_NAME), "").expect("fixture");
+        let options = AutomationOptions {
+            workspace,
+            report: profile.join("report.json"),
+            timeout: Duration::from_secs(30),
+        };
+        let mut controller =
+            AutomationController::with_steps(options, Vec::new()).expect("controller");
+        let mut app = App::load_headless(None, &profile).expect("headless app");
+        app.terminals
+            .push(crate::terminal::Terminal::new_for_test(16, 2, 1));
+        app.active_terminal = 0;
+        assert_eq!(app.interaction.clipboard_text(), None);
+        {
+            let mut grid = crate::platform::lock_recover(&app.terminals[0].grid);
+            let _ = grid.advance(b"hello", Instant::now(), &mut NullSink);
+            grid.set_selection(Some((0, 0, 4, 0)));
+        }
+
+        let result = controller
+            .selection_copy_and_clear(&mut app)
+            .expect("selection copy step");
+
+        assert_eq!(result, StepResult::Done);
+        assert!(controller.skipped_steps.is_empty());
+        assert_eq!(app.interaction.clipboard_text().as_deref(), Some("hello"));
     }
 }

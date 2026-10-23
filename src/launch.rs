@@ -13,12 +13,6 @@ pub(crate) struct TerminalLaunchSpec {
     pub(crate) bridge_launch_id: Option<[u8; 16]>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StartupMode {
-    Normal(TerminalLaunchSpec),
-    PgoAutomation,
-}
-
 enum NormalCliToken<'a> {
     WorkingDirectory {
         option: &'a OsString,
@@ -65,7 +59,9 @@ fn normal_cli_token(args: &[OsString], index: usize) -> (NormalCliToken<'_>, usi
     (NormalCliToken::Other(arg), index + 1)
 }
 
-fn pgo_automation_requested(args: &[OsString]) -> bool {
+/// Detects `--pgo-train` among normal options, stopping at `-e` so that a
+/// child command's own arguments are never read as Ronsole flags.
+pub(crate) fn pgo_train_without_headless(args: &[OsString]) -> bool {
     let mut index = 1usize;
     while index < args.len() {
         let (token, next_index) = normal_cli_token(args, index);
@@ -81,14 +77,11 @@ fn pgo_automation_requested(args: &[OsString]) -> bool {
 pub(crate) fn parse_startup_args_with_current_dir<F>(
     args: &[OsString],
     current_dir: F,
-) -> Result<StartupMode, String>
+) -> Result<TerminalLaunchSpec, String>
 where
     F: Fn() -> io::Result<PathBuf>,
 {
-    if pgo_automation_requested(args) {
-        return Ok(StartupMode::PgoAutomation);
-    }
-    parse_terminal_launch_args_with_current_dir(args, current_dir).map(StartupMode::Normal)
+    parse_terminal_launch_args_with_current_dir(args, current_dir)
 }
 
 fn parse_terminal_launch_args_with_current_dir<F>(
@@ -198,7 +191,7 @@ mod tests {
         })
     }
 
-    fn parse_startup(values: &[&str]) -> Result<StartupMode, String> {
+    fn parse_startup(values: &[&str]) -> Result<TerminalLaunchSpec, String> {
         parse_startup_args_with_current_dir(&args(values), || Ok(PathBuf::from("/launcher/cwd")))
     }
 
@@ -296,79 +289,96 @@ mod tests {
     }
 
     #[test]
-    fn startup_mode_does_not_reinterpret_execute_remainder_as_pgo() {
+    fn execute_remainder_does_not_reinterpret_pgo_flags() {
         let parsed = parse_startup(&["ronsole", "-e", "foo", "--pgo-train"]).unwrap();
         assert_eq!(
             parsed,
-            StartupMode::Normal(TerminalLaunchSpec {
+            TerminalLaunchSpec {
                 working_directory: None,
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: false,
                 bridge_launch_id: None,
-            })
+            }
         );
 
         let pgo_option =
             parse_startup(&["ronsole", "-e", "foo", "--pgo-workspace", "/tmp/x"]).unwrap();
         assert_eq!(
             pgo_option,
-            StartupMode::Normal(TerminalLaunchSpec {
+            TerminalLaunchSpec {
                 working_directory: None,
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-workspace", "/tmp/x"]),
                 hold: false,
                 bridge_launch_id: None,
-            })
+            }
         );
     }
 
     #[test]
-    fn startup_mode_preserves_normal_options_before_execute_boundary() {
+    fn normal_options_before_execute_boundary_are_preserved() {
         let held = parse_startup(&["ronsole", "--hold", "-e", "foo", "--pgo-train"]).unwrap();
         assert_eq!(
             held,
-            StartupMode::Normal(TerminalLaunchSpec {
+            TerminalLaunchSpec {
                 working_directory: None,
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: true,
                 bridge_launch_id: None,
-            })
+            }
         );
 
         let workdir =
             parse_startup(&["ronsole", "--workdir", "/tmp", "-e", "foo", "--pgo-train"]).unwrap();
         assert_eq!(
             workdir,
-            StartupMode::Normal(TerminalLaunchSpec {
+            TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/tmp")),
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: false,
                 bridge_launch_id: None,
-            })
+            }
         );
     }
 
     #[test]
-    fn startup_mode_skips_normal_option_values_when_detecting_pgo() {
+    fn workdir_value_is_not_read_as_pgo_flag() {
         let parsed = parse_startup(&["ronsole", "--workdir", "--pgo-train"]).unwrap();
         assert_eq!(
             parsed,
-            StartupMode::Normal(TerminalLaunchSpec {
+            TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/launcher/cwd/--pgo-train")),
                 inherited_directory: None,
                 command: Vec::new(),
                 hold: false,
                 bridge_launch_id: None,
-            })
+            }
         );
     }
 
     #[test]
-    fn startup_mode_detects_frozen_pgo_invocation_before_normal_parsing() {
-        let parsed = parse_startup(&[
+    fn pgo_train_without_headless_detected() {
+        assert!(pgo_train_without_headless(&args(&["ronsole", "--pgo-train"])));
+        assert!(!pgo_train_without_headless(&args(&[
+            "ronsole",
+            "-e",
+            "foo",
+            "--pgo-train"
+        ])));
+        assert!(!pgo_train_without_headless(&args(&[
+            "ronsole",
+            "--workdir",
+            "--pgo-train"
+        ])));
+        assert!(!pgo_train_without_headless(&args(&["ronsole"])));
+    }
+
+    #[test]
+    fn pgo_train_without_headless_detects_frozen_invocation() {
+        assert!(pgo_train_without_headless(&args(&[
             "ronsole",
             "--pgo-train",
             "--pgo-workspace",
@@ -377,9 +387,7 @@ mod tests {
             "/tmp/report.json",
             "--pgo-timeout-seconds",
             "120",
-        ])
-        .unwrap();
-        assert_eq!(parsed, StartupMode::PgoAutomation);
+        ])));
     }
 
     #[test]

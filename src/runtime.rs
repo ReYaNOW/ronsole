@@ -1,4 +1,6 @@
+use crate::headless::backend::HeadlessBackend;
 use crate::input_types::{CursorKind, KeyInput, KeyState, Modifiers};
+use crate::platform::offscreen_gl::OffscreenContext;
 use crate::renderer::Renderer;
 use crate::wake::WakeHandle;
 use crate::wayland_input::{
@@ -2650,16 +2652,50 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub settings_background_editing: bool,
 }
 
+/// Field order is destruction order: the renderer goes first while its GL target is
+/// alive, then the target, then the backend, and the wake eventfd last.
 pub struct WindowRuntime {
     renderer: Renderer,
-    config: Config,
-    context: PossiblyCurrentContext,
-    surface: Surface<WindowSurface>,
-    wayland: Box<DirectWaylandBackend>,
+    target: GlTarget,
+    backend: RuntimeBackend,
     wake: WakeHandle,
-    requested_plan: GlContextPlan,
-    requested_priority: GlContextPriorityRequest,
-    swap_interval_applied: bool,
+}
+
+/// GL render target. Variant field order is destruction order: the window context is
+/// dropped before its surface.
+enum GlTarget {
+    Window {
+        config: Config,
+        context: PossiblyCurrentContext,
+        surface: Surface<WindowSurface>,
+        requested_plan: GlContextPlan,
+        requested_priority: GlContextPriorityRequest,
+        swap_interval_applied: bool,
+    },
+    Offscreen(OffscreenContext),
+}
+
+/// Frame pacing, event and presentation source of a `WindowRuntime`.
+enum RuntimeBackend {
+    Wayland(Box<DirectWaylandBackend>),
+    Headless(HeadlessBackend),
+}
+
+impl RuntimeBackend {
+    fn metrics(&self) -> WaylandWindowMetrics {
+        match self {
+            Self::Wayland(wayland) => wayland.metrics(),
+            Self::Headless(headless) => headless.metrics(),
+        }
+    }
+}
+
+impl Drop for WindowRuntime {
+    fn drop(&mut self) {
+        // Keep the renderer's GL objects releasable: they are dropped after this
+        // with the offscreen context still bound.
+        self.make_target_current();
+    }
 }
 
 impl WindowRuntime {
@@ -2708,21 +2744,59 @@ impl WindowRuntime {
             WakeHandle::new().map_err(|error| format!("eventfd creation failed: {error}"))?;
         let runtime = Self {
             renderer,
-            config: gl_config,
-            context,
-            surface,
-            wayland: Box::new(wayland),
+            target: GlTarget::Window {
+                config: gl_config,
+                context,
+                surface,
+                requested_plan,
+                requested_priority,
+                swap_interval_applied,
+            },
+            backend: RuntimeBackend::Wayland(Box::new(wayland)),
             wake,
-            requested_plan,
-            requested_priority,
-            swap_interval_applied,
+        };
+        trim_allocator_after_gl_bootstrap();
+        Ok(runtime)
+    }
+
+    pub(crate) fn bootstrap_headless(
+        physical_width: u32,
+        physical_height: u32,
+        scale_factor: f32,
+        terminal_font_size: f32,
+        terminal_background: crate::config::RgbColor,
+    ) -> Result<Self, String> {
+        // OffscreenContext::new reports zero size without the stage prefix.
+        if physical_width == 0 || physical_height == 0 {
+            return Err("EGL setup failed at CreatePbuffer: zero size".to_string());
+        }
+        let offscreen = OffscreenContext::new(physical_width, physical_height)?;
+        let mut renderer = Renderer::new(
+            offscreen.glow(),
+            scale_factor,
+            terminal_font_size,
+            terminal_background,
+        )
+        .map_err(|error| format!("EGL setup failed at renderer: {error}"))?;
+        renderer.resize(physical_width, physical_height);
+        let wake = WakeHandle::new()
+            .map_err(|error| format!("EGL setup failed at eventfd: {error}"))?;
+        let runtime = Self {
+            renderer,
+            target: GlTarget::Offscreen(offscreen),
+            backend: RuntimeBackend::Headless(HeadlessBackend::new(
+                physical_width,
+                physical_height,
+                scale_factor,
+            )),
+            wake,
         };
         trim_allocator_after_gl_bootstrap();
         Ok(runtime)
     }
 
     pub(crate) fn wayland_metrics(&self) -> WaylandWindowMetrics {
-        self.wayland.metrics()
+        self.backend.metrics()
     }
 
     pub(crate) fn wake_handle(&self) -> WakeHandle {
@@ -2730,7 +2804,10 @@ impl WindowRuntime {
     }
 
     pub(crate) fn request_frame(&self) {
-        self.wayland.request_frame();
+        match &self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.request_frame(),
+            RuntimeBackend::Headless(headless) => headless.request_frame(),
+        }
     }
 
     pub(crate) fn acknowledge_wake(&self) {
@@ -2738,65 +2815,112 @@ impl WindowRuntime {
     }
 
     pub(crate) fn take_wayland_frame_ready(&self) -> bool {
-        self.wayland.take_frame_ready()
+        match &self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.take_frame_ready(),
+            RuntimeBackend::Headless(headless) => headless.take_frame_ready(Instant::now()),
+        }
     }
 
     pub(crate) fn wayland_frame_ready_requested(&self) -> bool {
-        self.wayland.frame_ready_requested()
+        match &self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.frame_ready_requested(),
+            RuntimeBackend::Headless(headless) => headless.frame_ready(Instant::now()),
+        }
     }
 
     pub(crate) fn poll_wayland(&mut self, timeout_ms: i32) -> Result<WaylandPollOutcome, String> {
         let wake = self.wake.clone();
-        self.wayland.poll(&wake, timeout_ms)
+        match &mut self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.poll(&wake, timeout_ms),
+            RuntimeBackend::Headless(headless) => {
+                let timeout_ms = headless.poll_timeout(timeout_ms, Instant::now());
+                headless.poll(&wake, timeout_ms)
+            }
+        }
     }
 
     pub(crate) fn take_wayland_events(&mut self) -> WaylandRuntimeEvents {
-        self.wayland.take_events()
+        match &mut self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.take_events(),
+            RuntimeBackend::Headless(_) => WaylandRuntimeEvents::default(),
+        }
     }
 
     pub(crate) fn wayland_input_deadline(&self) -> Option<Instant> {
-        self.wayland.input_deadline()
+        match &self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.input_deadline(),
+            RuntimeBackend::Headless(_) => None,
+        }
     }
 
     pub(crate) fn process_wayland_input_deadline(&mut self, now: Instant) {
-        self.wayland.process_input_deadline(now);
+        if let RuntimeBackend::Wayland(wayland) = &mut self.backend {
+            wayland.process_input_deadline(now);
+        }
     }
 
     pub fn activate_existing_window(&mut self, activation_token: Option<String>) {
-        self.wayland.activate_existing_window(activation_token);
+        if let RuntimeBackend::Wayland(wayland) = &mut self.backend {
+            wayland.activate_existing_window(activation_token);
+        }
     }
 
     pub fn update_scale_factor(&mut self, scale_factor: f32) {
+        self.make_target_current();
         self.renderer.update_scale_factor(scale_factor);
+        if let RuntimeBackend::Headless(headless) = &mut self.backend {
+            // Take the scale the renderer accepted, not the raw input (NaN or zero is rejected there).
+            headless.set_scale_factor(self.renderer.scale_factor());
+        }
     }
 
     pub(crate) fn set_terminal_font_size(&mut self, logical_size: f32) -> bool {
+        self.make_target_current();
         self.renderer.set_terminal_font_size(logical_size)
     }
 
     pub(crate) fn set_terminal_background(&mut self, background: crate::config::RgbColor) -> bool {
+        self.make_target_current();
         self.renderer.set_terminal_background(background)
     }
 
     pub(crate) fn reset_fps_counter(&mut self) {
+        self.make_target_current();
         self.renderer.reset_fps_counter();
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        let Some(width) = NonZeroU32::new(width) else {
-            return;
-        };
-        let Some(height) = NonZeroU32::new(height) else {
-            return;
-        };
-        self.surface.resize(&self.context, width, height);
-        self.renderer.resize(width.get(), height.get());
+        self.make_target_current();
+        match (&mut self.target, &mut self.backend) {
+            (GlTarget::Window { context, surface, .. }, RuntimeBackend::Wayland(_)) => {
+                let Some(width) = NonZeroU32::new(width) else {
+                    return;
+                };
+                let Some(height) = NonZeroU32::new(height) else {
+                    return;
+                };
+                surface.resize(context, width, height);
+                self.renderer.resize(width.get(), height.get());
+            }
+            (GlTarget::Offscreen(offscreen), RuntimeBackend::Headless(headless)) => {
+                if offscreen.size() != (width, height)
+                    && let Err(error) = offscreen.resize(width, height)
+                {
+                    headless.set_session_error(format!("resize pbuffer {width}x{height}: {error}"));
+                    return;
+                }
+                self.renderer.resize(width, height);
+                headless.set_physical_size(width, height);
+            }
+            _ => {}
+        }
     }
 
     pub fn render_terminal_and_present(
         &mut self,
         params: TerminalRenderParams<'_>,
     ) -> Result<crate::renderer::TerminalUiLayout, String> {
+        self.make_target_current();
         let show_fps = params.show_fps;
         let layout = self.renderer.render_terminal_app(
             params.terminals,
@@ -2815,13 +2939,22 @@ impl WindowRuntime {
             params.settings_background_input,
             params.settings_background_editing,
         );
-        self.surface
-            .swap_buffers(&self.context)
-            .map_err(|error| format!("swap buffers failed: {error}"))?;
+        match (&mut self.target, &self.backend) {
+            (GlTarget::Window { context, surface, .. }, RuntimeBackend::Wayland(_)) => {
+                surface
+                    .swap_buffers(context)
+                    .map_err(|error| format!("swap buffers failed: {error}"))?;
+            }
+            (GlTarget::Offscreen(_), RuntimeBackend::Headless(_)) => {}
+            _ => return Err("render target and runtime backend disagree".to_string()),
+        }
         if show_fps {
             self.renderer.record_presented_frame(Instant::now());
         }
-        self.wayland.mark_presented();
+        match &mut self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.mark_presented(),
+            RuntimeBackend::Headless(headless) => headless.finish_frame(Instant::now()),
+        }
         Ok(layout)
     }
 
@@ -2852,7 +2985,9 @@ impl WindowRuntime {
     }
 
     pub(crate) fn set_cursor_kind(&self, kind: CursorKind) {
-        self.wayland.set_cursor_kind(kind);
+        if let RuntimeBackend::Wayland(wayland) = &self.backend {
+            wayland.set_cursor_kind(kind);
+        }
     }
 
     pub fn terminal_tab_strip_layout(&self) -> crate::renderer::TerminalTabStripLayout {
@@ -2887,34 +3022,93 @@ impl WindowRuntime {
     }
 
     fn physical_size(&self) -> (u32, u32) {
-        let metrics = self.wayland.metrics();
+        let metrics = self.backend.metrics();
         (metrics.physical_width, metrics.physical_height)
+    }
+
+    /// Binds the render target to the calling thread before GL work. Dropping an
+    /// offscreen context unbinds the thread, so this rebinds it on every entry point.
+    fn make_target_current(&mut self) {
+        let GlTarget::Offscreen(offscreen) = &self.target else {
+            return;
+        };
+        if let Err(error) = offscreen.make_current()
+            && let RuntimeBackend::Headless(headless) = &mut self.backend
+        {
+            headless.set_session_error(error);
+        }
+    }
+
+    pub fn take_session_error(&mut self) -> Option<String> {
+        match &mut self.backend {
+            RuntimeBackend::Wayland(_) => None,
+            RuntimeBackend::Headless(headless) => headless.take_session_error(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn inject_session_error(&mut self, error: String) {
+        if let RuntimeBackend::Headless(headless) = &mut self.backend {
+            headless.set_session_error(error);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn headless_frames(&self) -> Option<u64> {
+        match &self.backend {
+            RuntimeBackend::Wayland(_) => None,
+            RuntimeBackend::Headless(headless) => Some(headless.frames()),
+        }
     }
 
     pub fn diagnostics_report(&self) -> String {
         let (width, height) = self.physical_size();
         let gl = self.renderer.graphics_diagnostics();
-        format!(
-            "Context request: {} / {} priority\nActual context priority: {}\nOpenGL: {}\nGLSL: {}\nGPU: {} / {}\nFramebuffer: hardware={} samples={} depth={} stencil={} alpha={} srgb={} transparent={:?}\nFramebuffer size: {}x{}\nScale factor: {:.3}\nSwap interval: Wait(1), applied={}",
-            self.requested_plan.label(),
-            self.requested_priority.label(),
-            priority_label(self.context.priority()),
-            gl.version,
-            gl.shading_language,
-            gl.vendor,
-            gl.renderer,
-            self.config.hardware_accelerated(),
-            self.config.num_samples(),
-            self.config.depth_size(),
-            self.config.stencil_size(),
-            self.config.alpha_size(),
-            self.config.srgb_capable(),
-            self.config.supports_transparency(),
-            width,
-            height,
-            self.renderer.scale_factor(),
-            self.swap_interval_applied,
-        )
+        match &self.target {
+            GlTarget::Window {
+                config,
+                context,
+                requested_plan,
+                requested_priority,
+                swap_interval_applied,
+                ..
+            } => format!(
+                "Context request: {} / {} priority\nActual context priority: {}\nOpenGL: {}\nGLSL: {}\nGPU: {} / {}\nFramebuffer: hardware={} samples={} depth={} stencil={} alpha={} srgb={} transparent={:?}\nFramebuffer size: {}x{}\nScale factor: {:.3}\nSwap interval: Wait(1), applied={}",
+                requested_plan.label(),
+                requested_priority.label(),
+                priority_label(context.priority()),
+                gl.version,
+                gl.shading_language,
+                gl.vendor,
+                gl.renderer,
+                config.hardware_accelerated(),
+                config.num_samples(),
+                config.depth_size(),
+                config.stencil_size(),
+                config.alpha_size(),
+                config.srgb_capable(),
+                config.supports_transparency(),
+                width,
+                height,
+                self.renderer.scale_factor(),
+                swap_interval_applied,
+            ),
+            GlTarget::Offscreen(offscreen) => {
+                let strings = offscreen.gl_strings();
+                format!(
+                    "OpenGL: {}\nGPU: {} / {}\nFramebuffer size: {}x{}\nScale factor: {:.3}\nheadless pbuffer {}x{} {}",
+                    strings.version,
+                    strings.vendor,
+                    strings.renderer,
+                    width,
+                    height,
+                    self.renderer.scale_factor(),
+                    width,
+                    height,
+                    offscreen.requested_context(),
+                )
+            }
+        }
     }
 }
 
@@ -3427,12 +3621,127 @@ mod tests {
             .and_then(|tail| tail.split("    pub fn terminal_tab_hit_test").next())
             .expect("terminal present function must remain present");
         let swap = render
-            .find(".swap_buffers(&self.context)")
+            .find(".swap_buffers(context)")
             .expect("terminal present path must swap buffers");
         let record = render
             .find("record_presented_frame(Instant::now())")
             .expect("FPS accounting must remain in terminal present path");
         assert!(swap < record);
+    }
+
+    fn headless_runtime(width: u32, height: u32) -> WindowRuntime {
+        crate::prefer_egl_vendor();
+        WindowRuntime::bootstrap_headless(
+            width,
+            height,
+            1.0,
+            14.0,
+            crate::config::DEFAULT_TERMINAL_BACKGROUND,
+        )
+        .expect("headless runtime must bootstrap on Mesa EGL surfaceless")
+    }
+
+    fn render_empty_frame(runtime: &mut WindowRuntime) {
+        let mut search = crate::search::TerminalSearchState::default();
+        let mut background_input = crate::single_line_input::SingleLineInput::default();
+        let result = runtime.render_terminal_and_present(TerminalRenderParams {
+            terminals: &[],
+            active_terminal: 0,
+            search: &mut search,
+            focused: true,
+            show_fps: false,
+            tab_scroll_x: 0.0,
+            drag: None,
+            pointer_x: 0.0,
+            pointer_y: 0.0,
+            settings_progress: 0.0,
+            settings_tab: Default::default(),
+            settings_font_value: "",
+            settings_scroll_value: "",
+            settings_background_input: &mut background_input,
+            settings_background_editing: false,
+        });
+        assert!(result.is_ok(), "render failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn bootstrap_headless_rejects_zero_size_with_egl_stage() {
+        crate::prefer_egl_vendor();
+        let error = WindowRuntime::bootstrap_headless(
+            0,
+            0,
+            1.0,
+            14.0,
+            crate::config::DEFAULT_TERMINAL_BACKGROUND,
+        )
+        .err()
+        .expect("zero-size pbuffer must not bootstrap");
+        assert_eq!(error, "EGL setup failed at CreatePbuffer: zero size");
+    }
+
+    #[test]
+    fn headless_update_scale_factor_keeps_accepted_scale() {
+        let mut runtime = headless_runtime(320, 200);
+        runtime.update_scale_factor(f32::NAN);
+        runtime.update_scale_factor(0.0);
+        let metrics = runtime.wayland_metrics();
+        assert_eq!(metrics.scale_factor, 1.0);
+        assert_eq!((metrics.logical_width, metrics.logical_height), (320, 200));
+        assert_eq!((metrics.physical_width, metrics.physical_height), (320, 200));
+    }
+
+    #[test]
+    fn headless_runtime_renders_frame() {
+        let mut runtime = headless_runtime(320, 200);
+        runtime.request_frame();
+        assert!(runtime.take_wayland_frame_ready());
+        render_empty_frame(&mut runtime);
+        assert_eq!(runtime.headless_frames(), Some(1));
+    }
+
+    #[test]
+    fn headless_poll_wakes_at_frame_pace() {
+        let mut runtime = headless_runtime(320, 200);
+        runtime.request_frame();
+        assert!(runtime.take_wayland_frame_ready());
+        render_empty_frame(&mut runtime);
+
+        runtime.request_frame();
+        assert!(!runtime.take_wayland_frame_ready());
+        let started = Instant::now();
+        let outcome = runtime.poll_wayland(-1).expect("headless poll must succeed");
+        assert!(outcome.timed_out, "poll must wake at the pace deadline");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(runtime.take_wayland_frame_ready());
+    }
+
+    #[test]
+    fn headless_resize_changes_pbuffer() {
+        let mut runtime = headless_runtime(320, 200);
+        runtime.resize(640, 400);
+        let metrics = runtime.wayland_metrics();
+        assert_eq!((metrics.physical_width, metrics.physical_height), (640, 400));
+        assert_eq!(runtime.take_session_error(), None);
+    }
+
+    #[test]
+    fn headless_resize_failure_sets_session_error() {
+        let mut runtime = headless_runtime(320, 200);
+        runtime.resize(0, 0);
+        let metrics = runtime.wayland_metrics();
+        assert_eq!((metrics.physical_width, metrics.physical_height), (320, 200));
+        let error = runtime
+            .take_session_error()
+            .expect("zero-size resize must set a session error");
+        assert!(error.starts_with("resize pbuffer 0x0: "), "{error}");
+    }
+
+    #[test]
+    fn headless_session_error_is_taken_once() {
+        let mut runtime = headless_runtime(320, 200);
+        runtime.inject_session_error("boom".to_string());
+        assert_eq!(runtime.take_session_error().as_deref(), Some("boom"));
+        assert_eq!(runtime.take_session_error(), None);
     }
 
     #[test]
