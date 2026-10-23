@@ -73,6 +73,15 @@ impl ClipboardOwner {
         }
     }
 
+    /// Reports whether a clipboard exists, creating the system one on first use.
+    /// A failed write does not make it unavailable.
+    fn is_available(&mut self) -> bool {
+        match self {
+            Self::System(slot) => system_clipboard(slot).is_some(),
+            Self::Memory { .. } => true,
+        }
+    }
+
     fn get_file_list(&mut self) -> Option<Vec<PathBuf>> {
         match self {
             Self::System(slot) => system_clipboard(slot)?.get_file_list().ok(),
@@ -492,9 +501,11 @@ impl TerminalInteraction {
                 }
             }
             PhysicalKey::Code(KeyCode::KeyX) if ctrl => {
+                // Cuts whenever a clipboard exists, even if the write fails, as before 40ddd7a.
                 if let Some(text) = self.search.selected_text()
-                    && self.set_clipboard_text(text)
+                    && self.clipboard.is_available()
                 {
+                    let _ = self.clipboard.set_text(text);
                     self.search.insert_text("");
                     edited = true;
                 }
@@ -1735,11 +1746,12 @@ mod tests {
         interaction.handle_key_event(&press, &mut terminal);
         interaction.handle_key_event(&repeat, &mut terminal);
         interaction.handle_key_event(&release, &mut terminal);
-        // The seeded Memory text must reach the encoder once, from the press alone.
+        // Press and repeat each paste the seeded Memory text once; the release sends nothing.
+        // Bracketed paste is off in `new_for_test`, so the payload is written verbatim.
         let bytes = terminal.input_bytes_for_test();
         assert!(!bytes.contains(&0x16));
         assert!(!bytes.windows(8).any(|window| window == b"\x1b[118;5u"));
-        assert!(bytes.windows(6).any(|window| window == b"pasted"));
+        assert_eq!(bytes, b"pastedpasted");
     }
 
     #[test]
