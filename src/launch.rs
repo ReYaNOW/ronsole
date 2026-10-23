@@ -5,6 +5,9 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TerminalLaunchSpec {
     pub(crate) working_directory: Option<PathBuf>,
+    /// Directory reported by the active tab's shell via OSC 7; used only when
+    /// `working_directory` is unset and the path still exists.
+    pub(crate) inherited_directory: Option<PathBuf>,
     pub(crate) command: Vec<OsString>,
     pub(crate) hold: bool,
     pub(crate) bridge_launch_id: Option<[u8; 16]>,
@@ -205,6 +208,7 @@ mod tests {
             TerminalLaunchSpec::default(),
             TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: Vec::new(),
                 hold: false,
                 bridge_launch_id: None,
@@ -298,6 +302,7 @@ mod tests {
             parsed,
             StartupMode::Normal(TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: false,
                 bridge_launch_id: None,
@@ -310,6 +315,7 @@ mod tests {
             pgo_option,
             StartupMode::Normal(TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: args(&["foo", "--pgo-workspace", "/tmp/x"]),
                 hold: false,
                 bridge_launch_id: None,
@@ -324,6 +330,7 @@ mod tests {
             held,
             StartupMode::Normal(TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: true,
                 bridge_launch_id: None,
@@ -336,6 +343,7 @@ mod tests {
             workdir,
             StartupMode::Normal(TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/tmp")),
+                inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
                 hold: false,
                 bridge_launch_id: None,
@@ -350,6 +358,7 @@ mod tests {
             parsed,
             StartupMode::Normal(TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/launcher/cwd/--pgo-train")),
+                inherited_directory: None,
                 command: Vec::new(),
                 hold: false,
                 bridge_launch_id: None,

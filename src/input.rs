@@ -1694,6 +1694,8 @@ mod tests {
                 &mut crate::terminal_process::SessionSink {
                     reply_tx: None,
                     title_cache: None,
+                    pending: None,
+                    wake: None,
                 },
             );
         }
@@ -1738,6 +1740,7 @@ mod tests {
         let out = root.join("out");
         let launch = crate::launch::TerminalLaunchSpec {
             working_directory: Some(root.clone()),
+            inherited_directory: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -2131,6 +2134,8 @@ mod tests {
                 &mut crate::terminal_process::SessionSink {
                     reply_tx: None,
                     title_cache: None,
+                    pending: None,
+                    wake: None,
                 },
             );
         }

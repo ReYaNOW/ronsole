@@ -1,8 +1,16 @@
+use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
-use crate::terminal_process::SessionSink;
+use crate::terminal_process::{
+    HostChannels, PendingHostEvents, SessionSink, notify_main_loop, terminal_reply_channel,
+};
+use crate::wake::WakeHandle;
 use ronsole_term::{Term, TermConfig, TermIdentity, TermPalette};
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +40,128 @@ fn new_term(cols: usize, rows: usize, palette: TermPalette) -> Term {
 mod tests {
     use super::*;
 
+    /// Feeds `bytes` into the tab's grid at `now` without a reader, so an
+    /// open synchronized-output block holds them until its deadline.
+    fn hold_in_sync_block(terminal: &Terminal, bytes: &[u8], now: Instant) {
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        grid.advance(bytes, now, &mut sink);
+    }
+
+    fn row_text(terminal: &Terminal) -> String {
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        (0..grid.total_rows())
+            .filter_map(|row| grid.row(row))
+            .flat_map(|line| line.iter().map(|cell| cell.ch()))
+            .collect()
+    }
+
+    #[test]
+    fn sync_flush_expired_bumps_content_generation() {
+        let terminal = Terminal::new_for_test(40, 3, 1);
+        let now = Instant::now();
+        hold_in_sync_block(&terminal, b"\x1b[?2026hX", now);
+        let before = crate::platform::lock_recover(&terminal.grid).content_generation();
+
+        terminal.flush_expired(now + Duration::from_secs(1));
+
+        let after = crate::platform::lock_recover(&terminal.grid).content_generation();
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn background_tab_buffer_flushed_at_deadline() {
+        let background = Terminal::new_for_test(40, 3, 2);
+        let now = Instant::now();
+        hold_in_sync_block(&background, b"\x1b[?2026hX", now);
+        // The 150 ms hold window comes from the synchronized-output spec (5.4).
+        let deadline = background
+            .sync_deadline()
+            .expect("held bytes set a deadline");
+        assert_eq!(deadline, now + Duration::from_millis(150));
+
+        background.flush_expired(deadline - Duration::from_millis(1));
+        assert!(!row_text(&background).contains('X'));
+
+        background.flush_expired(deadline);
+        assert!(row_text(&background).contains('X'));
+    }
+
+    #[test]
+    fn reply_from_flush_reaches_writer() {
+        let mut terminal = Terminal::new_for_test(40, 3, 7);
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
+        terminal.set_reply_sender_for_test(reply_tx);
+        let now = Instant::now();
+        hold_in_sync_block(&terminal, b"\x1b[?2026h\x1b[c\x1b]2;t\x07", now);
+        assert!(reply_rx.try_recv().is_err());
+
+        terminal.flush_expired(now + Duration::from_secs(1));
+
+        // DA1 answer of the VT model (`ESC[?62c`, perform.rs), then the
+        // numbered title `t (7)` from the programmed OSC 2 title.
+        assert_eq!(reply_rx.try_recv().ok(), Some(b"\x1b[?62c".to_vec()));
+        let mut title = String::new();
+        crate::platform::lock_recover(&terminal.title_cache).write_resolved(&mut title);
+        assert_eq!(title, "t (7)");
+    }
+
+    #[test]
+    fn accept_osc7_cwd_host_check() {
+        let path = PathBuf::from("/tmp");
+        assert_eq!(accept_osc7_cwd("", b"/tmp", "myhost"), Some(path.clone()));
+        assert_eq!(
+            accept_osc7_cwd("localhost", b"/tmp", "myhost"),
+            Some(path.clone())
+        );
+        assert_eq!(accept_osc7_cwd("myhost", b"/tmp", "myhost"), Some(path));
+        assert_eq!(accept_osc7_cwd("other", b"/tmp", "myhost"), None);
+    }
+
+    #[test]
+    fn accept_osc7_cwd_takes_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let accepted = accept_osc7_cwd("", b"/tmp/\xff", "myhost").expect("path accepted");
+        assert_eq!(accepted, PathBuf::from(OsStr::from_bytes(b"/tmp/\xff")));
+    }
+
+    #[test]
+    fn accept_osc7_cwd_rejects_bad_paths() {
+        assert_eq!(accept_osc7_cwd("", b"", "myhost"), None);
+        assert_eq!(accept_osc7_cwd("", b"relative/dir", "myhost"), None);
+        assert_eq!(accept_osc7_cwd("", b"/tmp/a\0b", "myhost"), None);
+        // The 4096-byte limit is from the OSC 7 spec (5.8): exactly 4096 is
+        // accepted, one byte more is refused.
+        let at_limit = format!("/{}", "a".repeat(4095));
+        assert!(accept_osc7_cwd("", at_limit.as_bytes(), "myhost").is_some());
+        let over_limit = format!("/{}", "a".repeat(4096));
+        assert_eq!(accept_osc7_cwd("", over_limit.as_bytes(), "myhost"), None);
+    }
+
+    #[test]
+    fn earliest_terminal_deadline_picks_minimum() {
+        let active = Terminal::new_for_test(40, 3, 1);
+        let background = Terminal::new_for_test(40, 3, 2);
+        let now = Instant::now();
+        hold_in_sync_block(&active, b"\x1b[?2026hX", now + Duration::from_secs(1));
+        hold_in_sync_block(&background, b"\x1b[?2026hX", now);
+
+        assert_eq!(
+            earliest_terminal_deadline(&[active, background]),
+            Some(now + Duration::from_millis(150))
+        );
+        assert_eq!(
+            earliest_terminal_deadline(&[Terminal::new_for_test(40, 3, 3)]),
+            None
+        );
+    }
+
     /// Terminal model with the default background palette, as
     /// `Terminal::new_for_test` builds it.
     fn test_term(cols: usize, rows: usize) -> Term {
@@ -48,6 +178,8 @@ mod tests {
         let mut sink = SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         term.advance(bytes, Instant::now(), &mut sink);
     }
@@ -86,6 +218,10 @@ mod tests {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            osc7_cwd: None,
+            reply_tx: terminal_reply_channel().0,
+            pending: Arc::new(Mutex::new(PendingHostEvents::default())),
+            wake: None,
             test_input: None,
         };
 
@@ -116,6 +252,8 @@ mod tests {
             let mut sink = SessionSink {
                 reply_tx: Some(&reply_tx),
                 title_cache: None,
+                pending: None,
+                wake: None,
             };
             for _ in 0..QUERY_BATCHES {
                 grid.advance(b"\x1b[6n\x1b[c\x1b]10;?\x1b\\", Instant::now(), &mut sink);
@@ -891,6 +1029,7 @@ mod tests {
 
         let launch = TerminalLaunchSpec {
             working_directory: Some(root.clone()),
+            inherited_directory: None,
             command: vec![
                 OsString::from("./fixture"),
                 OsString::from("arg one"),
@@ -1351,6 +1490,13 @@ pub struct Terminal {
     bridge_launch: Option<BridgeLaunchState>,
     dev_warning: DevWarningState,
     dev_banner: DevBannerState,
+    /// Working directory from the latest OSC 7 report that passed
+    /// `accept_osc7_cwd`; a new tab inherits it.
+    pub(crate) osc7_cwd: Option<PathBuf>,
+    /// Sender clone kept for `flush_expired`; the parser thread holds another.
+    reply_tx: SyncSender<Vec<u8>>,
+    pending: Arc<Mutex<PendingHostEvents>>,
+    wake: Option<WakeHandle>,
     #[cfg(test)]
     test_input: Option<Arc<Mutex<Vec<u8>>>>,
 }
@@ -1363,9 +1509,56 @@ fn write_terminal_spawn_error(term: &mut Term, error: &io::Error) {
     let mut sink = SessionSink {
         reply_tx: None,
         title_cache: None,
+        pending: None,
+        wake: None,
     };
     term.advance(message.as_bytes(), Instant::now(), &mut sink);
     term.mark_presentation_ready();
+}
+
+/// Longest OSC 7 path, in bytes after percent-decoding, that a tab may adopt.
+const OSC7_PATH_MAX_BYTES: usize = 4096;
+
+/// Accepts an OSC 7 report only when it names this machine (empty host,
+/// `localhost`, or `local_host`) and carries a non-empty absolute path
+/// without NUL bytes. The path is taken as raw bytes, so non-UTF-8 names
+/// that Linux filesystems allow are accepted. Anything else returns `None`,
+/// and the previous directory stays in place.
+fn accept_osc7_cwd(host: &str, path: &[u8], local_host: &str) -> Option<PathBuf> {
+    if !(host.is_empty() || host == "localhost" || host == local_host) {
+        return None;
+    }
+    if path.is_empty() || path.len() > OSC7_PATH_MAX_BYTES || path.contains(&0) {
+        return None;
+    }
+    let path = Path::new(OsStr::from_bytes(path));
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// This machine's host name, read once per process on first use.
+fn local_host_name() -> &'static str {
+    static LOCAL_HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LOCAL_HOST.get_or_init(read_host_name)
+}
+
+fn read_host_name() -> String {
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `buffer` is valid for writes of its full length.
+    let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if status != 0 {
+        return String::new();
+    }
+    let len = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..len]).into_owned()
+}
+
+/// Earliest synchronized-output deadline across all tabs; `None` when no tab
+/// holds bytes.
+pub(crate) fn earliest_terminal_deadline(terminals: &[Terminal]) -> Option<Instant> {
+    terminals.iter().filter_map(Terminal::sync_deadline).min()
 }
 
 impl Terminal {
@@ -1397,6 +1590,12 @@ impl Terminal {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            osc7_cwd: None,
+            // No reader exists for test tabs, so replies are dropped unless a
+            // test installs its own sender.
+            reply_tx: terminal_reply_channel().0,
+            pending: Arc::new(Mutex::new(PendingHostEvents::default())),
+            wake: None,
             test_input: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
@@ -1432,11 +1631,18 @@ impl Terminal {
         let grid = Arc::new(Mutex::new(new_term(200, 60, palette)));
         let bridge_screen_lock = Arc::new(Mutex::new(()));
         let tab_token = crate::terminal_process::TabToken::generate();
+        let (reply_tx, reply_rx) = terminal_reply_channel();
+        let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
         let process = match crate::terminal_process::TerminalProcess::spawn(
             grid.clone(),
             bridge_screen_lock.clone(),
             title_cache.clone(),
-            wake,
+            wake.clone(),
+            HostChannels {
+                reply_tx: reply_tx.clone(),
+                reply_rx,
+                pending: pending.clone(),
+            },
             launch,
             &tab_token,
         ) {
@@ -1466,9 +1672,63 @@ impl Terminal {
             bridge_launch,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            osc7_cwd: None,
+            reply_tx,
+            pending,
+            wake,
             #[cfg(test)]
             test_input: None,
         }
+    }
+
+    /// Earliest synchronized-output deadline of this tab, if it holds bytes.
+    /// Takes the grid lock briefly.
+    pub(crate) fn sync_deadline(&self) -> Option<Instant> {
+        crate::platform::lock_recover(&self.grid).sync_deadline()
+    }
+
+    /// Replays held synchronized-output bytes whose deadline has passed at
+    /// `now`, using the same sink as the parser thread. Marks the grid changed
+    /// and wakes the main loop when the replay changed it.
+    pub(crate) fn flush_expired(&self, now: Instant) {
+        let outcome = {
+            // Same lock order as the parser thread: screen lock, then grid.
+            let _screen_guard = crate::platform::lock_recover(&self.bridge_screen_lock);
+            let mut grid = crate::platform::lock_recover(&self.grid);
+            let mut sink = SessionSink {
+                reply_tx: Some(&self.reply_tx),
+                title_cache: Some(&self.title_cache),
+                pending: Some(&self.pending),
+                wake: self.wake.as_ref(),
+            };
+            let outcome = grid.flush_expired(now, &mut sink);
+            if outcome.grid_changed {
+                grid.mark_changed();
+            }
+            outcome
+        };
+        notify_main_loop(self.wake.as_ref(), outcome);
+    }
+
+    /// Applies the clipboard and working-directory events parked by the
+    /// parser thread. Called on the main thread; holds only the pending lock.
+    pub(crate) fn apply_host_events(&mut self, interaction: &mut TerminalInteraction) {
+        let events = PendingHostEvents::take(&self.pending);
+        if let Some(text) = events.clipboard {
+            let _ = interaction.set_clipboard_text(text);
+        }
+        if let Some((host, path)) = events.cwd
+            && let Some(cwd) = accept_osc7_cwd(&host, &path, local_host_name())
+        {
+            self.osc7_cwd = Some(cwd);
+        }
+    }
+
+    /// Replaces the reply sender used by [`Terminal::flush_expired`]; tests
+    /// use it to observe replies without a PTY.
+    #[cfg(test)]
+    pub(crate) fn set_reply_sender_for_test(&mut self, reply_tx: SyncSender<Vec<u8>>) {
+        self.reply_tx = reply_tx;
     }
 
     pub(crate) fn bridge_launch_state(&self) -> Option<&BridgeLaunchState> {
