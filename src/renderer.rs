@@ -415,6 +415,18 @@ fn font_maps_char(font: FontRef<'_>, c: char) -> bool {
     font.charmap().map(c) != 0
 }
 
+/// Face under which `c` is rasterized and cached. Color glyphs and chars the styled face
+/// does not map are drawn by the Regular chain alone, so they share the Regular entry.
+fn glyph_raster_face(face: u8, prefer_color: bool, face_font: Option<FontRef<'_>>, c: char) -> u8 {
+    if face == GLYPH_FACE_REGULAR {
+        face
+    } else if prefer_color || !face_font.is_some_and(|font| font_maps_char(font, c)) {
+        GLYPH_FACE_REGULAR
+    } else {
+        face
+    }
+}
+
 struct RasterizedGlyph {
     image: Option<Image>,
     advance: f32,
@@ -753,22 +765,24 @@ impl Renderer {
         if let Some(glyph) = self.glyphs.get(&cache_key) {
             return Some(*glyph);
         }
-        let prefer_color = prefer_color.unwrap_or_else(|| default_emoji_presentation(c));
-        let face_font = if prefer_color {
-            None
-        } else {
-            self.faces.font(face)
-        };
+        let color = prefer_color.unwrap_or_else(|| default_emoji_presentation(c));
+        let face_font = if color { None } else { self.faces.font(face) };
+        let raster_face = glyph_raster_face(face, color, face_font, c);
+        if raster_face != face {
+            // The Regular chain draws this glyph, so reuse its raster and atlas slot.
+            let glyph = self.get_glyph(c, prefer_color, raster_face)?;
+            self.glyphs.insert(cache_key, glyph);
+            return Some(glyph);
+        }
         let rasterized = rasterize_glyph(
             &self.fonts,
             face_font,
             &mut self.scale_context,
             c,
             self.terminal_font_size,
-            prefer_color,
+            color,
         );
-        let glyph = if let Some(glyph) =
-            self.finish_rasterized_glyph(c, rasterized, prefer_color, false)
+        let glyph = if let Some(glyph) = self.finish_rasterized_glyph(c, rasterized, color, false)
         {
             glyph
         } else if c != '□' {
@@ -1729,6 +1743,30 @@ mod tests {
         let mut ctx = ScaleContext::new();
         let c = '\u{10FFFE}';
         assert!(rasterize_glyph(&chain, Some(inter), &mut ctx, c, 16.0, false).is_none());
+    }
+
+    #[test]
+    fn glyph_raster_face_shares_regular_entry_for_color_and_unmapped_chars() {
+        let bold = TerminalFaces::default()
+            .font(GLYPH_FACE_BOLD)
+            .expect("bold face parses");
+        let inter = FontRef::from_index(UI_FONT, 0).expect("bundled UI font parses");
+        let emoji = '\u{1F600}';
+        let nerd = '\u{E0A0}';
+        assert!(!font_maps_char(inter, nerd));
+        assert!(font_maps_char(bold, 'A'));
+        for face in [GLYPH_FACE_BOLD, GLYPH_FACE_ITALIC, GLYPH_FACE_BOLD_ITALIC] {
+            assert_eq!(glyph_raster_face(face, true, None, emoji), GLYPH_FACE_REGULAR);
+            assert_eq!(
+                glyph_raster_face(face, false, Some(inter), nerd),
+                GLYPH_FACE_REGULAR
+            );
+            assert_eq!(glyph_raster_face(face, false, Some(bold), 'A'), face);
+        }
+        assert_eq!(
+            glyph_raster_face(GLYPH_FACE_REGULAR, false, Some(inter), nerd),
+            GLYPH_FACE_REGULAR
+        );
     }
 
     #[test]

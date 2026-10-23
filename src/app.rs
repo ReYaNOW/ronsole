@@ -1264,16 +1264,18 @@ impl App {
     }
 
     /// Recomputes the Ctrl+hover link of the active tab and refreshes the cursor.
-    /// Called on pointer motion and on modifier changes.
+    /// Called on pointer motion and on modifier changes. Marks the app dirty
+    /// when the hovered link changed, so the underline is drawn on an idle window.
     fn update_link_hover(&mut self) {
         let settings_modal_active = self.settings_modal_active();
         let (x, y) = (self.pointer_x, self.pointer_y);
-        if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
-            if settings_modal_active {
-                terminal.set_hovered_link(None);
-            } else {
-                self.interaction.update_link_hover(terminal, x, y);
-            }
+        let changed = match self.terminals.get_mut(self.active_terminal) {
+            Some(terminal) if settings_modal_active => terminal.set_hovered_link(None),
+            Some(terminal) => self.interaction.update_link_hover(terminal, x, y),
+            None => false,
+        };
+        if changed {
+            self.mark_dirty();
         }
         self.refresh_cursor_icon();
     }
@@ -3617,6 +3619,47 @@ mod tests {
         focus_app.interaction.set_pressed_mouse_buttons_for_test(1);
         focus_app.on_focus_changed(false);
         assert_eq!(focus_app.interaction.pressed_mouse_buttons_for_test(), 0);
+    }
+
+    #[test]
+    fn ctrl_hover_link_change_marks_app_dirty_for_idle_redraw() {
+        use crate::renderer::TerminalUiLayout;
+
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 30, 1));
+        feed_batch(&app.terminals[0], "\x1b[30;1Hsee https://example.com/x");
+        app.interaction.update_layout(TerminalUiLayout {
+            body: crate::search::Rect {
+                x: 0.0,
+                y: 100.0,
+                w: 800.0,
+                h: 600.0,
+            },
+            text_x: 8.0,
+            char_w: 10.0,
+            char_h: 20.0,
+            visible_rows: 29,
+            cols: 80,
+            scroll_offset: 0.0,
+            bottom_pad: 8.0,
+            scale: 1.0,
+            ..TerminalUiLayout::default()
+        });
+        app.pointer_x = 73.0;
+        app.pointer_y = 682.0;
+
+        app.dirty = false;
+        app.on_modifiers(Modifiers::CONTROL);
+        assert!(app.terminals[0].hovered_link().is_some());
+        assert!(app.dirty);
+
+        app.dirty = false;
+        app.on_modifiers(Modifiers::CONTROL);
+        assert!(!app.dirty);
+
+        app.on_modifiers(Modifiers::empty());
+        assert!(app.terminals[0].hovered_link().is_none());
+        assert!(app.dirty);
     }
 
     #[test]

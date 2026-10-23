@@ -1312,33 +1312,57 @@ fn terminal_cell_decoration(
     })
 }
 
-/// Whether `(row, col)` lies inside the hovered link, and that link was built for `generation`.
-fn terminal_hovered_link_covers(
+/// Column ranges of the hovered link on `row`, when the link was built for `generation`.
+/// `cells` is sorted by row and then by start column, so one row is a contiguous slice.
+fn terminal_hovered_link_row_ranges(
     hovered: Option<&(LinkTarget, u64)>,
     generation: u64,
     row: usize,
+) -> &[(usize, std::ops::Range<usize>)] {
+    let Some((link, link_generation)) = hovered else {
+        return &[];
+    };
+    if *link_generation != generation {
+        return &[];
+    }
+    let start = link.cells.partition_point(|(link_row, _)| *link_row < row);
+    let end = link.cells.partition_point(|(link_row, _)| *link_row <= row);
+    &link.cells[start..end]
+}
+
+/// Whether column `col` lies in one of `ranges`, the sorted and disjoint column ranges of one row.
+/// `next` is the caller's cursor, so columns must be visited in increasing order.
+fn terminal_row_ranges_contain(
+    ranges: &[(usize, std::ops::Range<usize>)],
+    next: &mut usize,
     col: usize,
 ) -> bool {
-    hovered.is_some_and(|(link, link_generation)| {
-        *link_generation == generation
-            && link
-                .cells
-                .iter()
-                .any(|(link_row, cols)| *link_row == row && cols.contains(&col))
-    })
+    while ranges
+        .get(*next)
+        .is_some_and(|(_, range)| range.end <= col)
+    {
+        *next += 1;
+    }
+    ranges
+        .get(*next)
+        .is_some_and(|(_, range)| range.start <= col)
 }
 
 /// Builds the rectangles of `decoration` for the cell at `cell_index`.
 ///
-/// `baseline_y` is the rounded baseline of the row, and `scale` is the render scale factor.
+/// `baseline_y` is the rounded baseline of the row, `row_bottom` is the integer bottom edge of
+/// the row, and `scale` is the render scale factor. An underline that would cross `row_bottom`
+/// moves up to stay inside the row; strikethrough is not moved.
 /// Every coordinate is an integer except the pattern phase, which comes from the unrounded
 /// `text_x` and `char_w` so that neighbouring cells share one phase at their common edge.
+#[allow(clippy::too_many_arguments)]
 fn terminal_decoration_quads(
     decoration: TerminalCellDecoration,
     text_x: f32,
     cell_index: usize,
     char_w: f32,
     baseline_y: f32,
+    row_bottom: f32,
     x_height: f32,
     scale: f32,
 ) -> ([TerminalDecorationQuad; MAX_DECORATION_QUADS], usize) {
@@ -1378,7 +1402,15 @@ fn terminal_decoration_quads(
         sdf_params: [template, 0.0, period],
         color,
     };
-    let underline_top = baseline_y + thickness;
+    // Height from the top edge that the underline occupies as built below.
+    let underline_extent = match decoration.underline {
+        UnderlineStyle::None | UnderlineStyle::Single => thickness,
+        UnderlineStyle::Double
+        | UnderlineStyle::Curly
+        | UnderlineStyle::Dotted
+        | UnderlineStyle::Dashed => 3.0 * thickness,
+    };
+    let underline_top = (baseline_y + thickness).min(row_bottom - underline_extent);
     let uc = decoration.underline_color;
     match decoration.underline {
         UnderlineStyle::None => {}
@@ -1392,7 +1424,8 @@ fn terminal_decoration_quads(
         UnderlineStyle::Dashed => push(pattern(underline_top, 3.0, 5.0 * thickness, uc)),
     }
     if decoration.strike {
-        let strike_y = (baseline_y - x_height * 0.5).round();
+        // Centre the band on the x-height midline: its top edge sits half a thickness higher.
+        let strike_y = (baseline_y - x_height * 0.5 - thickness * 0.5).round();
         push(solid(strike_y, thickness, decoration.strike_color));
     }
     (quads, len)
@@ -2845,11 +2878,14 @@ impl Renderer {
                         TerminalBodyLayer::Decoration => {
                             let baseline_y =
                                 (draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE).round();
+                            let row_bottom = (draw_y + char_h).floor();
+                            let hovered_ranges =
+                                terminal_hovered_link_row_ranges(hovered_link, content_generation, i);
+                            let mut hovered_range_next = 0usize;
                             for (cell_index, cell) in row.iter().take(grid.cols()).enumerate() {
-                                let link_underline = terminal_hovered_link_covers(
-                                    hovered_link,
-                                    content_generation,
-                                    i,
+                                let link_underline = terminal_row_ranges_contain(
+                                    hovered_ranges,
+                                    &mut hovered_range_next,
                                     cell_index,
                                 );
                                 let Some(decoration) =
@@ -2863,6 +2899,7 @@ impl Renderer {
                                     cell_index,
                                     char_w,
                                     baseline_y,
+                                    row_bottom,
                                     self.x_height * TERMINAL_TEXT_SCALE,
                                     s,
                                 );
@@ -3498,15 +3535,25 @@ mod tests {
         for scale in [1.0_f32, 1.333, 1.5, 2.0] {
             for underline in styles {
                 // x_height 9.9 = 0.55 * 18 is fractional, so the strikethrough rounding is exercised.
-                let (quads, len) =
-                    terminal_decoration_quads(decoration_for(underline, true), 10.0, 3, 14.4, 28.0, 9.9, scale);
+                let (quads, len) = terminal_decoration_quads(
+                    decoration_for(underline, true),
+                    10.0,
+                    3,
+                    14.4,
+                    28.0,
+                    f32::INFINITY,
+                    9.9,
+                    scale,
+                );
                 assert!(len > 0, "scale {scale} {underline:?} produced no quads");
                 for quad in &quads[..len] {
                     assert_eq!(quad.y.fract(), 0.0, "scale {scale} {underline:?}");
                     assert_eq!(quad.height.fract(), 0.0, "scale {scale} {underline:?}");
                 }
-                // The strikethrough is pushed last: round(28.0 - 9.9 / 2) = round(23.05) = 23.
-                assert_eq!(quads[len - 1].y, 23.0, "scale {scale} {underline:?} strike y");
+                // The strikethrough is pushed last: round(28.0 - 9.9 / 2 - t / 2) with t = round(scale).
+                // That is round(22.55) = 23 for t = 1 and round(22.05) = 22 for t = 2.
+                let expected_strike_y = if scale < 1.4 { 23.0 } else { 22.0 };
+                assert_eq!(quads[len - 1].y, expected_strike_y, "scale {scale} {underline:?} strike y");
             }
         }
     }
@@ -3515,27 +3562,27 @@ mod tests {
     fn decoration_thickness_and_periods_follow_scale() {
         // Thickness is round(scale), clamped to at least 1: 2 px at 1.5 and 2.0, 1 px at 1.333.
         let (quads, _) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::Single, false), 0.0, 0, 14.4, 28.0, 10.0, 1.5);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Single, false), 0.0, 0, 14.4, 28.0, f32::INFINITY, 10.0, 1.5);
         assert_eq!(quads[0].height, 2.0);
         let (quads, _) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::Curly, false), 0.0, 0, 14.4, 28.0, 10.0, 2.0);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Curly, false), 0.0, 0, 14.4, 28.0, f32::INFINITY, 10.0, 2.0);
         assert_eq!(quads[0].height, 6.0);
         assert_eq!(quads[0].sdf_params, [1.0, 0.0, 14.4]);
         let (quads, _) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::Dotted, false), 0.0, 0, 14.4, 28.0, 10.0, 1.5);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Dotted, false), 0.0, 0, 14.4, 28.0, f32::INFINITY, 10.0, 1.5);
         assert_eq!(quads[0].sdf_params, [2.0, 0.0, 4.0]);
         let (quads, _) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::Dashed, false), 0.0, 0, 14.4, 28.0, 10.0, 2.0);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Dashed, false), 0.0, 0, 14.4, 28.0, f32::INFINITY, 10.0, 2.0);
         assert_eq!(quads[0].sdf_params, [3.0, 0.0, 10.0]);
         let (quads, _) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::Dotted, false), 0.0, 0, 14.4, 28.0, 10.0, 1.333);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Dotted, false), 0.0, 0, 14.4, 28.0, f32::INFINITY, 10.0, 1.333);
         assert_eq!(quads[0].sdf_params, [2.0, 0.0, 2.0]);
     }
 
     #[test]
     fn double_underline_gap_equals_thickness() {
         let (quads, len) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::Double, false), 0.0, 0, 8.0, 28.0, 10.0, 2.0);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::Double, false), 0.0, 0, 8.0, 28.0, f32::INFINITY, 10.0, 2.0);
         assert_eq!(len, 2);
         let (first, second) = (quads[0], quads[1]);
         assert_eq!(first.height, 2.0);
@@ -3548,30 +3595,145 @@ mod tests {
         // Wave: text_x 10.0 and char_w 14.4 put the shared edge of cells 4 and 5 at
         // round(10.0 + 5 * 14.4) = 82, so both sides read uv.x = (82 - 10) / 14.4 = 5.0.
         let curly = decoration_for(UnderlineStyle::Curly, false);
-        let (left, _) = terminal_decoration_quads(curly, 10.0, 4, 14.4, 28.0, 10.0, 1.0);
-        let (right, _) = terminal_decoration_quads(curly, 10.0, 5, 14.4, 28.0, 10.0, 1.0);
+        let (left, _) = terminal_decoration_quads(curly, 10.0, 4, 14.4, 28.0, f32::INFINITY, 10.0, 1.0);
+        let (right, _) = terminal_decoration_quads(curly, 10.0, 5, 14.4, 28.0, f32::INFINITY, 10.0, 1.0);
         assert!((left[0].u + left[0].uw - 5.0).abs() < 1e-4);
         assert!((right[0].u - 5.0).abs() < 1e-4);
 
         // Dots at t = 1 (period 2): text_x 0.0 puts the shared edge at round(5 * 14.4) = 72,
         // so uv.x = 72 / 2 = 36.0 on both sides.
         let dotted = decoration_for(UnderlineStyle::Dotted, false);
-        let (left, _) = terminal_decoration_quads(dotted, 0.0, 4, 14.4, 28.0, 10.0, 1.0);
-        let (right, _) = terminal_decoration_quads(dotted, 0.0, 5, 14.4, 28.0, 10.0, 1.0);
+        let (left, _) = terminal_decoration_quads(dotted, 0.0, 4, 14.4, 28.0, f32::INFINITY, 10.0, 1.0);
+        let (right, _) = terminal_decoration_quads(dotted, 0.0, 5, 14.4, 28.0, f32::INFINITY, 10.0, 1.0);
         assert!((left[0].u + left[0].uw - 36.0).abs() < 1e-4);
         assert!((right[0].u - 36.0).abs() < 1e-4);
     }
 
     #[test]
     fn strike_at_half_x_height() {
-        // round(28.0 - 9.9 / 2) = round(23.05) = 23, one pixel thick at scale 1.0.
-        // The fractional x_height makes the rounding observable: unrounded Y would be 23.05.
+        // round(28.0 - 9.9 / 2 - 1 / 2) = round(22.55) = 23, one pixel thick at scale 1.0.
+        // The fractional x_height makes the rounding observable.
         let (quads, len) =
-            terminal_decoration_quads(decoration_for(UnderlineStyle::None, true), 0.0, 0, 8.0, 28.0, 9.9, 1.0);
+            terminal_decoration_quads(decoration_for(UnderlineStyle::None, true), 0.0, 0, 8.0, 28.0, f32::INFINITY, 9.9, 1.0);
         assert_eq!(len, 1);
         assert_eq!(quads[0].y, 23.0);
         assert_eq!(quads[0].y.fract(), 0.0);
         assert_eq!(quads[0].height, 1.0);
+
+        // Two pixels thick at scale 2.0: round(28.0 - 9.9 / 2 - 2 / 2) = round(22.05) = 22.
+        // The band 22..24 is centred on 23.0, within half a pixel of the midline at 23.05.
+        let (quads, len) =
+            terminal_decoration_quads(decoration_for(UnderlineStyle::None, true), 0.0, 0, 8.0, 28.0, f32::INFINITY, 9.9, 2.0);
+        assert_eq!(len, 1);
+        assert_eq!(quads[0].y, 22.0);
+        assert_eq!(quads[0].height, 2.0);
+    }
+
+    #[test]
+    fn underline_stays_inside_row_at_fractional_scales() {
+        // Metrics come from the renderer helper, and the rounding mirrors the draw loop.
+        for (size, scale) in [(10.0_f32, 1.0_f32), (10.0, 1.5), (10.0, 1.75), (16.0, 1.0)] {
+            let metrics = terminal_font_metrics(size, scale);
+            let char_h = metrics.line_height * TERMINAL_TEXT_SCALE;
+            for draw_y in [0.0_f32, 0.25, 0.5, 0.75, 3.4, 7.9, 13.37, 100.6] {
+                let baseline_y = (draw_y + metrics.baseline_offset * TERMINAL_TEXT_SCALE).round();
+                let row_bottom = (draw_y + char_h).floor();
+                for underline in [
+                    UnderlineStyle::Single,
+                    UnderlineStyle::Double,
+                    UnderlineStyle::Curly,
+                    UnderlineStyle::Dotted,
+                    UnderlineStyle::Dashed,
+                ] {
+                    let (quads, len) = terminal_decoration_quads(
+                        decoration_for(underline, false),
+                        0.0,
+                        0,
+                        8.0,
+                        baseline_y,
+                        row_bottom,
+                        metrics.x_height * TERMINAL_TEXT_SCALE,
+                        scale,
+                    );
+                    assert!(len > 0, "size {size} scale {scale} {underline:?} produced no quads");
+                    for quad in &quads[..len] {
+                        assert!(
+                            quad.y + quad.height <= row_bottom,
+                            "size {size} scale {scale} draw_y {draw_y} {underline:?}: quad ends at {} below row bottom {row_bottom}",
+                            quad.y + quad.height,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn underline_at_default_size_is_not_moved() {
+        // Size 16 at scale 1.0 with the legacy constants 26, 19 and 18 (renderer.rs):
+        // line height round(26 * 16 / 18) = 23, baseline offset round(19 * 16 / 18) = 17.
+        // So the baseline is round(17 * 1.05) = 18 and the row bottom is floor(23 * 1.05) = 24.
+        let metrics = terminal_font_metrics(16.0, 1.0);
+        let char_h = metrics.line_height * TERMINAL_TEXT_SCALE;
+        let baseline_y = (metrics.baseline_offset * TERMINAL_TEXT_SCALE).round();
+        let row_bottom = char_h.floor();
+        assert_eq!((baseline_y, row_bottom), (18.0, 24.0));
+
+        let (quads, len) = terminal_decoration_quads(
+            decoration_for(UnderlineStyle::Double, false),
+            0.0,
+            0,
+            8.0,
+            baseline_y,
+            row_bottom,
+            metrics.x_height * TERMINAL_TEXT_SCALE,
+            1.0,
+        );
+        assert_eq!(len, 2);
+        // Unclamped: the first line is one pixel below the baseline, the second two pixels lower.
+        assert_eq!(quads[0].y, baseline_y + 1.0);
+        assert_eq!(quads[1].y, baseline_y + 3.0);
+    }
+
+    #[test]
+    fn decoration_is_the_last_body_layer() {
+        // Decorations must be drawn after the glyphs so that lines sit on top of them.
+        assert_eq!(TERMINAL_BODY_LAYERS.last(), Some(&TerminalBodyLayer::Decoration));
+    }
+
+    #[test]
+    fn decoration_color_follows_rendered_foreground_after_inverse_and_dim() {
+        let palette = decoration_test_palette();
+        // INVERSE draws the foreground in the cell background colour, indexed(4).
+        let inverse = Cell::new_for_test(
+            'x',
+            TerminalColor::indexed(1),
+            TerminalColor::indexed(4),
+            ronsole_term::CellFlags::INVERSE,
+            UnderlineStyle::Single,
+        );
+        let decoration = terminal_cell_decoration(&inverse, palette, false).expect("underlined");
+        let expected = terminal_color_rgba(TerminalColor::indexed(4));
+        assert_eq!(decoration.underline_color, expected);
+        assert_eq!(decoration.strike_color, expected);
+        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&inverse, palette).0);
+
+        // DIM scales the rendered foreground RGB by 0.66, as in dim_affects_only_effective_foreground_rgb.
+        let dim = Cell::new_for_test(
+            'x',
+            TerminalColor::rgb(150, 120, 90),
+            TerminalColor::indexed(4),
+            ronsole_term::CellFlags::DIM,
+            UnderlineStyle::Single,
+        );
+        let decoration = terminal_cell_decoration(&dim, palette, false).expect("underlined");
+        let source = terminal_color_rgba(TerminalColor::rgb(150, 120, 90));
+        let expected = [source[0] * 0.66, source[1] * 0.66, source[2] * 0.66, source[3]];
+        for channel in 0..4 {
+            assert!((decoration.underline_color[channel] - expected[channel]).abs() < 0.0001);
+        }
+        assert_eq!(decoration.strike_color, decoration.underline_color);
+        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&dim, palette).0);
     }
 
     #[test]
@@ -3603,6 +3765,47 @@ mod tests {
         }
     }
 
+    /// Columns in `0..cols` of `row` that the hovered link covers, in increasing order.
+    fn hovered_covered_cols(
+        hovered: Option<&(LinkTarget, u64)>,
+        generation: u64,
+        row: usize,
+        cols: usize,
+    ) -> Vec<usize> {
+        let ranges = terminal_hovered_link_row_ranges(hovered, generation, row);
+        let mut next = 0usize;
+        (0..cols)
+            .filter(|&col| terminal_row_ranges_contain(ranges, &mut next, col))
+            .collect()
+    }
+
+    #[test]
+    fn hovered_link_ranges_are_found_per_row_on_many_rows() {
+        // Even rows below 40 hold two ranges each and odd rows none; cells are sorted by row, then column.
+        let mut cells = Vec::new();
+        for row in (0..40).step_by(2) {
+            cells.push((row, 1..3));
+            cells.push((row, 5..6));
+        }
+        let hovered = (
+            LinkTarget {
+                uri: "https://example.com".into(),
+                cells,
+            },
+            3_u64,
+        );
+        let hovered = Some(&hovered);
+        for row in 0..42 {
+            let expected = if row < 40 && row % 2 == 0 {
+                vec![1, 2, 5]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(hovered_covered_cols(hovered, 3, row, 8), expected, "row {row}");
+        }
+        assert!(terminal_hovered_link_row_ranges(hovered, 4, 0).is_empty());
+    }
+
     #[test]
     fn hovered_link_underlines_range_when_generation_matches() {
         let hovered = (
@@ -3613,11 +3816,9 @@ mod tests {
             7_u64,
         );
         let hovered = Some(&hovered);
-        assert!(terminal_hovered_link_covers(hovered, 7, 0, 1));
-        assert!(terminal_hovered_link_covers(hovered, 7, 0, 2));
-        assert!(!terminal_hovered_link_covers(hovered, 7, 0, 3));
-        assert!(!terminal_hovered_link_covers(hovered, 7, 1, 1));
-        assert!(!terminal_hovered_link_covers(hovered, 8, 0, 1));
+        assert_eq!(hovered_covered_cols(hovered, 7, 0, 8), vec![1, 2]);
+        assert_eq!(hovered_covered_cols(hovered, 7, 1, 8), Vec::<usize>::new());
+        assert_eq!(hovered_covered_cols(hovered, 8, 0, 8), Vec::<usize>::new());
 
         let plain = decoration_test_cell(ronsole_term::CellFlags::empty(), UnderlineStyle::None);
         let decoration = terminal_cell_decoration(&plain, decoration_test_palette(), true)

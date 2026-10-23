@@ -125,13 +125,14 @@ impl TerminalInteraction {
 
     /// Recomputes the hovered link for the pointer at (`x`, `y`). The link is
     /// kept only while Ctrl is held and the pointer is over the terminal body.
-    pub(crate) fn update_link_hover(&self, terminal: &mut Terminal, x: f32, y: f32) {
+    /// Returns whether the hovered link changed.
+    pub(crate) fn update_link_hover(&self, terminal: &mut Terminal, x: f32, y: f32) -> bool {
         let link = if self.modifiers.control_key() && self.layout.body.contains(x, y) {
             link_under_pointer(self.layout, terminal, x, y)
         } else {
             None
         };
-        terminal.set_hovered_link(link);
+        terminal.set_hovered_link(link)
     }
 
     /// Takes the URI of the last Ctrl+click on a link; the caller decides
