@@ -1540,6 +1540,9 @@ impl App {
     }
 
     fn on_key(&mut self, key_input: KeyInput) -> bool {
+        // Before the early returns below, so modifier presses and releases seen while the
+        // settings modal or a global shortcut owns the key still update the held state.
+        self.interaction.note_modifier_key(&key_input);
         if key_input.state.is_pressed()
             && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
         {

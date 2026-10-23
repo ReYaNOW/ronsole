@@ -116,6 +116,8 @@ pub struct KeyEvent<'a> {
     pub key: TermKey,
     /// Unshifted character of the same physical key on a US layout.
     pub base: Option<char>,
+    /// Held modifiers. For a modifier key this is the state after the event
+    /// (protocol reference, "Modifiers" section).
     pub mods: KeyMods,
     pub kind: KeyKind,
     /// Text the key produces with the current modifiers.
@@ -312,7 +314,7 @@ impl KeyProtocol {
         self.sent.clear();
     }
 
-    /// Clears the sent-key set. Called on focus loss.
+    /// Clears the sent-key set. Called on every focus change (gained or lost), see `Term::focus_changed`.
     pub(crate) fn clear_sent(&mut self) {
         self.sent.clear();
     }
@@ -367,7 +369,7 @@ pub(crate) fn encode_key(
     let events = flags & FLAG_REPORT_EVENTS != 0;
     let disambiguate = all || flags & FLAG_DISAMBIGUATE != 0;
     let release = event.kind == KeyKind::Release;
-    let enhanced = flags & (FLAG_DISAMBIGUATE | FLAG_REPORT_EVENTS | FLAG_REPORT_ALL) != 0;
+    let enhanced = flags != 0;
     let bits = reported_bits(event.mods, enhanced);
     // Associated text may not hold control codes, and empty text adds no field (reference, flag 16).
     let text = event.text.filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
@@ -516,7 +518,7 @@ fn write_legacy(
             if flags & (FLAG_DISAMBIGUATE | FLAG_REPORT_EVENTS | FLAG_REPORT_ALL) != 0 {
                 return None;
             }
-            let bits = reported_bits(mods, false);
+            let bits = reported_bits(mods, flags != 0);
             if bits != 0 {
                 // Modified F1-F4 keep the `CSI 1 ; mods <P|Q|R|S>` form, F3 included.
                 if let TermKey::F(1..=4) = key {
@@ -798,8 +800,8 @@ fn modifier_code(key: ModKey) -> u32 {
     }
 }
 
-/// Modifier bits as the modifier field reports them. Without progressive
-/// enhancement Super is not reported, so it is left out of the field.
+/// Modifier bits as the modifier field reports them. Super is left out of the
+/// field only while no Kitty flag is set (flags 0).
 fn reported_bits(mods: KeyMods, enhanced: bool) -> u8 {
     let bits = modifier_bits(mods);
     if enhanced { bits } else { bits & !BIT_SUPER }
