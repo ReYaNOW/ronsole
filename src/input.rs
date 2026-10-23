@@ -469,7 +469,9 @@ impl TerminalInteraction {
         if key_event.ime_preedit {
             return false;
         }
-        let key = terminal_key_event(key_event, self.modifiers);
+        let Some(key) = terminal_key_event(key_event, self.modifiers) else {
+            return false;
+        };
         let mut out = Vec::new();
         let outcome = grid.encode_key(&key, &mut out);
         drop(grid);
@@ -1109,13 +1111,14 @@ fn terminal_text_sequence(text: &str, ctrl: bool, alt: bool, super_key: bool) ->
 
 /// Builds the encoder event for one host key. The named key wins over the
 /// physical key, which wins over the layout character.
-fn terminal_key_event(key: &KeyInput, mods: Modifiers) -> KeyEvent<'_> {
+fn terminal_key_event(key: &KeyInput, mods: Modifiers) -> Option<KeyEvent<'_>> {
+    // A key with no named, physical, or layout identity has nothing to encode,
+    // so it is dropped instead of being encoded as a placeholder character.
     let named = key
         .named
         .or_else(|| terminal_named_key(key.physical_key))
-        .or(key.unshifted.map(TermKey::Char))
-        .unwrap_or(TermKey::Char('\0'));
-    KeyEvent {
+        .or(key.unshifted.map(TermKey::Char))?;
+    Some(KeyEvent {
         physical: u64::from(key.keycode),
         key: named,
         base: us_base_char_from_evdev(key.keycode),
@@ -1131,7 +1134,7 @@ fn terminal_key_event(key: &KeyInput, mods: Modifiers) -> KeyEvent<'_> {
             KeyState::Released => KeyKind::Release,
         },
         text: key.text.as_deref(),
-    }
+    })
 }
 
 /// Named keys that have a fixed terminal meaning independent of the layout.
@@ -1391,7 +1394,7 @@ mod tests {
     fn key_event_maps_russian_ctrl_c() {
         let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyC), 46);
         key.unshifted = Some('с');
-        let event = terminal_key_event(&key, Modifiers::CONTROL);
+        let event = terminal_key_event(&key, Modifiers::CONTROL).expect("identified key");
         assert_eq!(event.physical, 46);
         assert_eq!(event.key, TermKey::Char('с'));
         assert_eq!(event.base, Some('c'));
@@ -1403,12 +1406,17 @@ mod tests {
     fn key_event_base_for_punctuation() {
         let mut semicolon = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 39);
         semicolon.unshifted = Some('ж');
-        let event = terminal_key_event(&semicolon, Modifiers::empty());
+        let event = terminal_key_event(&semicolon, Modifiers::empty()).expect("identified key");
         assert_eq!(event.key, TermKey::Char('ж'));
         assert_eq!(event.base, Some(';'));
 
-        let digit = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 4);
-        assert_eq!(terminal_key_event(&digit, Modifiers::empty()).base, Some('3'));
+        // Any layout's level-0 character for the digit key is '3', so the fixture carries it.
+        let mut digit = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 4);
+        digit.unshifted = Some('3');
+        assert_eq!(
+            terminal_key_event(&digit, Modifiers::empty()).expect("identified key").base,
+            Some('3')
+        );
     }
 
     #[test]
@@ -1416,7 +1424,7 @@ mod tests {
         let mut enter = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::NumpadEnter), 96);
         enter.named = Some(TermKey::Kp(KpKey::Enter));
         assert_eq!(
-            terminal_key_event(&enter, Modifiers::empty()).key,
+            terminal_key_event(&enter, Modifiers::empty()).expect("identified key").key,
             TermKey::Kp(KpKey::Enter)
         );
     }
@@ -1443,6 +1451,21 @@ mod tests {
         assert!(!interaction.handle_key_event(&release, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
         assert!(crate::platform::lock_recover(&terminal.grid).selection().is_some());
+    }
+
+    #[test]
+    fn ctrl_c_with_selection_press_copies_and_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        // The selection lies past the grid rows, so its copied text is empty and
+        // the clipboard write is skipped; only selection state and encoder output are checked.
+        crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1000, 4, 1000)));
+        let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyC), 46);
+        press.unshifted = Some('c');
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(crate::platform::lock_recover(&terminal.grid).selection().is_none());
     }
 
     #[test]
@@ -1563,6 +1586,32 @@ mod tests {
         let mut terminal = Terminal::new_for_test(80, 30, 1);
         let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
         interaction.handle_key_event(&key, &mut terminal);
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn unidentified_alt_key_sends_nothing_with_or_without_kitty_flags() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::ALT);
+        let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
+
+        // Flags 0: an encoded placeholder would arrive as ESC NUL.
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        assert!(!interaction.handle_key_event(&key, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // Kitty flag 8 (report all keys as escape codes) through the grid parser.
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[>8u",
+            std::time::Instant::now(),
+            &mut sink,
+        );
+        assert!(!interaction.handle_key_event(&key, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
     }
 

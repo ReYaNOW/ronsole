@@ -775,7 +775,7 @@ impl XkbKeyboard {
     }
 
     #[cfg(test)]
-    fn set_layouts_for_test(&mut self, layouts: &str) -> Result<(), String> {
+    pub(crate) fn set_layouts_for_test(&mut self, layouts: &str) -> Result<(), String> {
         use std::ffi::CString;
         use xkbcommon_dl::{xkb_keymap_compile_flags, xkb_rule_names};
 

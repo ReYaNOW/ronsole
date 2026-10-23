@@ -1632,11 +1632,9 @@ impl WaylandState {
     fn queue_key_event(&mut self, evdev_key: u32, state: KeyState, repeat: bool, now: Instant) {
         let physical_key = physical_key_from_evdev(evdev_key);
         let preedit_active = self.ime.preedit_active();
-        // A pressed key during an active IME preedit belongs to the composition, so its text is
-        // not delivered. The key itself still reaches the host and is flagged for the encoder.
-        let text = if state.is_pressed() && preedit_active {
-            None
-        } else if should_emit_xkb_text(
+        // During an active IME preedit, should_emit_xkb_text drops only synthetic repeat text.
+        // A pressed key keeps its text. The key itself still reaches the host and is flagged.
+        let text = if should_emit_xkb_text(
             state,
             physical_key,
             self.modifiers,
@@ -3135,6 +3133,33 @@ mod tests {
         assert_eq!(configured_dimension(1100, 0), 1100);
         assert_eq!(configured_dimension(720, 0), 720);
         assert_eq!(configured_dimension(1100, 900), 900);
+    }
+
+    #[test]
+    fn ime_preedit_keeps_press_text_and_suppresses_repeat_text() {
+        const KEY_A: u32 = 30;
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.keyboard_focused = true;
+        state.text_input_enabled = true;
+        state
+            .xkb
+            .set_layouts_for_test("us")
+            .expect("test keymap must compile");
+        state.ime.preedit(Some("compose".to_string()));
+
+        state.queue_key_event(KEY_A, KeyState::Pressed, false, Instant::now());
+        state.queue_key_event(KEY_A, KeyState::Repeat, true, Instant::now());
+
+        let input = state.take_events().input;
+        let [WaylandInputEvent::Key(press), WaylandInputEvent::Key(repeat)] = input.as_slice()
+        else {
+            panic!("expected press and repeat key events, got {input:?}");
+        };
+        assert!(press.ime_preedit);
+        // Layout "us" maps evdev KEY_A (30) to 'a'.
+        assert_eq!(press.text.as_deref(), Some("a"));
+        assert!(repeat.ime_preedit);
+        assert_eq!(repeat.text, None);
     }
 
     #[test]
