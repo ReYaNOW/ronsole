@@ -1372,10 +1372,18 @@ fn press_key(app: &mut App, modifiers: Modifiers, code: KeyCode) -> Result<(), S
     let pressed_exit = app.on_key(KeyInput {
         state: KeyState::Pressed,
         physical_key: PhysicalKey::Code(code),
+        keycode: 0,
+        text: None,
+        unshifted: None,
+        named: None,
     });
     let released_exit = app.on_key(KeyInput {
         state: KeyState::Released,
         physical_key: PhysicalKey::Code(code),
+        keycode: 0,
+        text: None,
+        unshifted: None,
+        named: None,
     });
     app.on_modifiers(Modifiers::empty());
     if pressed_exit || released_exit {

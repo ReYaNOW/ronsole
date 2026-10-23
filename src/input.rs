@@ -317,7 +317,7 @@ impl TerminalInteraction {
     }
 
     fn handle_search_key(&mut self, key_event: &KeyInput, terminal: &mut Terminal) -> bool {
-        if !search_owns_keyboard(&self.search) || key_event.state != KeyState::Pressed {
+        if !search_owns_keyboard(&self.search) || !key_event.state.is_pressed() {
             return false;
         }
         if search_key_falls_through_to_terminal(
@@ -424,7 +424,7 @@ impl TerminalInteraction {
         if self.handle_search_key(key_event, terminal) {
             return true;
         }
-        if key_event.state != KeyState::Pressed {
+        if !key_event.state.is_pressed() {
             return false;
         }
         let ctrl = self.modifiers.control_key();
@@ -1339,6 +1339,10 @@ mod tests {
             &KeyInput {
                 state: KeyState::Released,
                 physical_key: PhysicalKey::Code(KeyCode::ArrowUp),
+                keycode: 103,
+                text: None,
+                unshifted: None,
+                named: None,
             },
             &mut terminal,
         ));
@@ -1615,6 +1619,10 @@ mod tests {
         KeyInput {
             state: KeyState::Pressed,
             physical_key: PhysicalKey::Code(KeyCode::Enter),
+            keycode: 28,
+            text: None,
+            unshifted: None,
+            named: None,
         }
     }
 

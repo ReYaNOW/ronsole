@@ -3,8 +3,9 @@ use crate::renderer::Renderer;
 use crate::wake::WakeHandle;
 use crate::wayland_input::{
     CursorShape, ImeBatch, KeyRepeatState, PointerAxisFrame, PointerAxisSource, RepeatConfig,
-    WaylandInputEvent, XkbKeyboard, cursor_shape_for_kind, physical_key_from_evdev,
-    pointer_button_from_linux, pointer_position, push_bounded_input_event, should_emit_xkb_text,
+    WaylandInputEvent, XkbKeyboard, cursor_shape_for_kind, named_term_key,
+    physical_key_from_evdev, pointer_button_from_linux, pointer_position,
+    push_bounded_input_event, should_emit_xkb_text,
 };
 use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
 use glutin::context::{
@@ -1630,20 +1631,29 @@ impl WaylandState {
 
     fn queue_key_event(&mut self, evdev_key: u32, state: KeyState, repeat: bool, now: Instant) {
         let physical_key = physical_key_from_evdev(evdev_key);
-        self.push_input(WaylandInputEvent::Key(KeyInput {
-            state,
-            physical_key,
-        }));
-        if should_emit_xkb_text(
+        let text = if should_emit_xkb_text(
             state,
             physical_key,
             self.modifiers,
             self.text_input_enabled,
             repeat,
             self.ime.preedit_active(),
-        ) && let Some(text) = self.xkb.text_for_key(evdev_key)
-            && !text.is_empty()
-        {
+        ) {
+            self.xkb.text_for_key(evdev_key).filter(|text| !text.is_empty())
+        } else {
+            None
+        };
+        let level0_keysym = self.xkb.level0_keysym(evdev_key);
+        let current_keysym = self.xkb.current_keysym(evdev_key);
+        self.push_input(WaylandInputEvent::Key(KeyInput {
+            state,
+            physical_key,
+            keycode: evdev_key,
+            text: text.clone(),
+            unshifted: self.xkb.unshifted_char(evdev_key),
+            named: named_term_key(evdev_key, level0_keysym, current_keysym),
+        }));
+        if let Some(text) = text {
             self.push_input(WaylandInputEvent::Text(text));
         }
         if repeat {
@@ -1653,7 +1663,7 @@ impl WaylandState {
             KeyState::Pressed if self.xkb.key_repeats(evdev_key) => {
                 self.repeat.start(evdev_key, now)
             }
-            KeyState::Pressed => {}
+            KeyState::Pressed | KeyState::Repeat => {}
             KeyState::Released => self.repeat.stop_key(evdev_key),
         }
     }
@@ -1668,7 +1678,7 @@ impl WaylandState {
             return;
         }
         if let Some(key) = self.repeat.take_due(now) {
-            self.queue_key_event(key, KeyState::Pressed, true, now);
+            self.queue_key_event(key, KeyState::Repeat, true, now);
         }
     }
 
