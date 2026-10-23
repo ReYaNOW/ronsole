@@ -950,6 +950,7 @@ impl App {
         self.unfocused_redraw_pending = !focused;
         self.modifiers = Modifiers::empty();
         self.interaction.set_modifiers(Modifiers::empty());
+        self.interaction.cancel_link_press();
         self.update_link_hover();
         if self.active_terminal_presented {
             self.send_terminal_focus_state(self.active_terminal, focused);

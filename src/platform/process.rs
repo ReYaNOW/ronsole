@@ -3,7 +3,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const PROCESS_TREE_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
@@ -339,19 +339,47 @@ pub fn open_uri_allowed(uri: &str, local_host: &str) -> bool {
 /// shell, and its thread is handed to the unit-thread reaper so the caller
 /// never waits for the child process.
 pub fn open_uri(uri: &str) {
-    let uri = uri.to_owned();
-    match super::spawn_named("ronsole-open-uri", move || run_xdg_open(&uri)) {
+    let argument = xdg_open_argument(uri);
+    match super::spawn_named("ronsole-open-uri", move || run_xdg_open(&argument)) {
         Ok(worker) => super::reap_unit_thread(worker),
         Err(error) => eprintln!("Ronsole: failed to start URI opener thread: {error}"),
     }
 }
 
-fn run_xdg_open(uri: &str) {
+/// Returns the argument handed to `xdg-open` for a URI accepted by
+/// [`open_uri_allowed`]. A `file` URI is rewritten to the empty-host form
+/// `file:///path`, because `xdg-open` strips `localhost` and the local host
+/// name case-sensitively and would otherwise treat `file://MYHOST/x` as a
+/// relative path. Other URIs are returned unchanged.
+fn xdg_open_argument(uri: &str) -> String {
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return uri.to_owned();
+    };
+    if !scheme.eq_ignore_ascii_case("file") {
+        return uri.to_owned();
+    }
+    let Some(after_slashes) = rest.strip_prefix("//") else {
+        return uri.to_owned();
+    };
+    let path = after_slashes
+        .find('/')
+        .map_or("", |index| &after_slashes[index..]);
+    format!("file://{path}")
+}
+
+fn run_xdg_open(argument: &str) {
     let Some(opener) = resolve_executable(OsStr::new("xdg-open")) else {
         eprintln!("Ronsole: cannot open link, xdg-open was not found");
         return;
     };
-    let mut child = match Command::new(opener).arg(uri).spawn() {
+    // The opener must not share the terminal's stdio.
+    let spawned = Command::new(opener)
+        .arg(argument)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
             eprintln!("Ronsole: failed to run xdg-open: {error}");
@@ -607,5 +635,17 @@ mod tests {
         for uri in denied {
             assert!(!open_uri_allowed(uri, local_host), "expected denied: {uri:?}");
         }
+    }
+
+    #[test]
+    fn xdg_open_argument_drops_file_host() {
+        // Expected values come from the Task 11 brief, not from the implementation.
+        assert_eq!(xdg_open_argument("file://MYHOST/x"), "file:///x");
+        assert_eq!(xdg_open_argument("file://localhost/x"), "file:///x");
+        assert_eq!(xdg_open_argument("file:///x"), "file:///x");
+        assert_eq!(
+            xdg_open_argument("https://example.com/x"),
+            "https://example.com/x"
+        );
     }
 }

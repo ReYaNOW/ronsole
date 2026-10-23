@@ -68,6 +68,12 @@ impl TerminalInteraction {
         self.modifiers = modifiers;
     }
 
+    /// Forgets a Ctrl+press on a link whose release will never be delivered,
+    /// for example after a focus change.
+    pub(crate) fn cancel_link_press(&mut self) {
+        self.link_press_pending = false;
+    }
+
     /// Recomputes the hovered link for the pointer at (`x`, `y`). The link is
     /// kept only while Ctrl is held and the pointer is over the terminal body.
     pub(crate) fn update_link_hover(&self, terminal: &mut Terminal, x: f32, y: f32) {
@@ -122,6 +128,9 @@ impl TerminalInteraction {
         self.pressed_mouse_buttons = 0;
         self.pointer_capture = PointerCapture::None;
         self.terminal_selection_anchor = None;
+        // Hover is only refreshed for the active tab, so drop the left tab's
+        // link to keep it from showing a stale pointer when it is reactivated.
+        terminal.set_hovered_link(None);
     }
 
     pub(crate) fn cancel_pointer_interaction(&mut self, terminal: &mut Terminal) {
@@ -618,6 +627,10 @@ impl TerminalInteraction {
         let x = self.mouse_x;
         let y = self.mouse_y;
         update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, state);
+        if state == KeyState::Pressed && button == PointerButton::Left {
+            // A new press supersedes a link press whose release never arrived.
+            self.link_press_pending = false;
+        }
 
         if state == KeyState::Released && self.pointer_capture != PointerCapture::None {
             self.finish_terminal_selection(terminal);
@@ -705,6 +718,13 @@ impl TerminalInteraction {
         {
             self.link_uri = Some(link.uri);
             self.link_press_pending = true;
+            // The press is not forwarded to the PTY, so the button must not
+            // count as held for motion reports (drag) until it is released.
+            update_pressed_mouse_buttons(
+                &mut self.pressed_mouse_buttons,
+                PointerButton::Left,
+                KeyState::Released,
+            );
             return true;
         }
         if state == KeyState::Pressed {
@@ -1923,13 +1943,18 @@ mod tests {
     /// (73, 682) is on that URL: column 6, bottom row of the body. With
     /// `tracking`, SGR mouse tracking (`ESC[?1000h`, `ESC[?1006h`) is on.
     fn link_test_terminal(tracking: bool) -> Terminal {
-        let terminal = selection_test_terminal();
         let mode: &[u8] = if tracking {
             b"\x1b[?1000h\x1b[?1006h"
         } else {
             b""
         };
-        let bytes = [mode, b"\x1b[30;1Hsee https://example.com/x"].concat();
+        link_test_terminal_with_modes(mode)
+    }
+
+    /// Like `link_test_terminal`, but writes `modes` before the URL row.
+    fn link_test_terminal_with_modes(modes: &[u8]) -> Terminal {
+        let terminal = selection_test_terminal();
+        let bytes = [modes, b"\x1b[30;1Hsee https://example.com/x"].concat();
         crate::platform::lock_recover(&terminal.grid).advance(
             &bytes,
             std::time::Instant::now(),
@@ -2025,6 +2050,85 @@ mod tests {
         assert!(terminal.hovered_link().is_some());
         interaction.set_modifiers(Modifiers::empty());
         interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_none());
+    }
+
+    #[test]
+    fn ctrl_press_on_link_under_button_event_mode_does_not_leak_drag_to_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal_with_modes(b"\x1b[?1002h\x1b[?1006h");
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        // The pointer moves one column while the Ctrl+press is still held down.
+        assert!(!interaction.cursor_moved(83.0, 682.0, &mut terminal, |_, _, _| 0));
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn new_left_press_clears_stale_link_press_so_next_release_reaches_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(true);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        // The Release of the link press never reached mouse_input (for example
+        // a modal swallowed it), so the next plain press must clear the pending state.
+        interaction.set_modifiers(Modifiers::empty());
+        interaction.mouse_x = 300.0;
+        interaction.mouse_y = 300.0;
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        // SGR reports: one press (final byte `M`) and one release (final byte `m`).
+        let input = String::from_utf8_lossy(&terminal.input_bytes_for_test()).into_owned();
+        assert_eq!(
+            input.matches("\x1b[<").count(),
+            2,
+            "press and release must both reach the PTY: {input:?}"
+        );
+        assert!(input.ends_with('m'), "release report expected: {input:?}");
+    }
+
+    #[test]
+    fn switching_terminal_clears_hovered_link_of_terminal_left() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_some());
+        interaction.reset_for_terminal_switch(&mut terminal);
         assert!(terminal.hovered_link().is_none());
     }
 
