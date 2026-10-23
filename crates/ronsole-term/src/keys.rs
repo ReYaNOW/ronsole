@@ -129,7 +129,8 @@ pub enum KeyOutcome {
     Sent,
     /// The host sends `text` through its text path.
     Text,
-    /// Nothing is sent.
+    /// Nothing is sent. This includes Super-only text without flag 1: it is
+    /// neither bytes nor text for the host, and the press is not remembered.
     Ignore,
 }
 
@@ -261,6 +262,8 @@ pub(crate) struct KeyProtocol {
     /// Index 0 is the main screen, index 1 the alternate screen.
     stacks: [KittyFlagStack; 2],
     sent: SentKeys,
+    /// Whether the alternate screen is active; changed only through [`KeyProtocol::set_alt`].
+    alt: bool,
 }
 
 /// Masks requested Kitty flags down to the supported bits.
@@ -269,29 +272,29 @@ fn masked_flags(raw: u16) -> u8 {
 }
 
 impl KeyProtocol {
-    /// Flags of the given screen (`alt` is true for the alternate screen).
-    pub(crate) fn flags(&self, alt: bool) -> u8 {
-        self.stacks[usize::from(alt)].current()
+    /// Flags of the active screen, limited to the supported bits.
+    pub(crate) fn flags(&self) -> u8 {
+        self.stacks[usize::from(self.alt)].current()
     }
 
     /// `CSI > flags u`. Clears the sent-key set.
-    pub(crate) fn push(&mut self, alt: bool, raw_flags: u16) {
-        self.stacks[usize::from(alt)].push(masked_flags(raw_flags));
+    pub(crate) fn push(&mut self, raw_flags: u16) {
+        self.stacks[usize::from(self.alt)].push(masked_flags(raw_flags));
         self.sent.clear();
     }
 
     /// `CSI < count u`; a count of 0 pops one entry. Clears the sent-key set.
-    pub(crate) fn pop(&mut self, alt: bool, count: u16) {
-        self.stacks[usize::from(alt)].pop(usize::from(count.max(1)));
+    pub(crate) fn pop(&mut self, count: u16) {
+        self.stacks[usize::from(self.alt)].pop(usize::from(count.max(1)));
         self.sent.clear();
     }
 
     /// `CSI = flags ; mode u`: mode 1 (and 0) replaces, 2 adds bits, 3 removes
     /// bits. Other modes change nothing. Clears the sent-key set only when a
     /// known mode is applied.
-    pub(crate) fn set(&mut self, alt: bool, raw_flags: u16, mode: u16) {
+    pub(crate) fn set(&mut self, raw_flags: u16, mode: u16) {
         let flags = masked_flags(raw_flags);
-        let stack = &mut self.stacks[usize::from(alt)];
+        let stack = &mut self.stacks[usize::from(self.alt)];
         let next = match mode {
             0 | 1 => flags,
             2 => stack.current() | flags,
@@ -302,26 +305,30 @@ impl KeyProtocol {
         self.sent.clear();
     }
 
+    /// Selects the active screen. Switching clears the sent-key set, so a
+    /// release that crosses the switch is ignored.
+    pub(crate) fn set_alt(&mut self, alt: bool) {
+        self.alt = alt;
+        self.sent.clear();
+    }
+
     /// Clears the sent-key set. Called on focus loss.
     pub(crate) fn clear_sent(&mut self) {
         self.sent.clear();
     }
 
-    /// Clears the sent-key set when the active screen changes.
-    pub(crate) fn screen_switched(&mut self) {
-        self.sent.clear();
-    }
-
     /// Clears both stacks, all flags and the sent-key set (RIS and DECSTR).
+    /// The active screen is kept; RIS moves it through [`KeyProtocol::set_alt`].
     pub(crate) fn reset(&mut self) {
-        *self = Self::default();
+        let alt = self.alt;
+        *self = Self { alt, ..Self::default() };
     }
 
-    pub(crate) fn sent(&self) -> &SentKeys {
+    fn sent(&self) -> &SentKeys {
         &self.sent
     }
 
-    pub(crate) fn sent_mut(&mut self) -> &mut SentKeys {
+    fn sent_mut(&mut self) -> &mut SentKeys {
         &mut self.sent
     }
 }
@@ -361,6 +368,11 @@ pub(crate) fn encode_key(
     let disambiguate = all || flags & FLAG_DISAMBIGUATE != 0;
     let release = event.kind == KeyKind::Release;
     let bits = modifier_bits(event.mods);
+    // Associated text may not hold control codes, and empty text adds no field (reference, flag 16).
+    let text = event.text.filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
+    let associated = if all && flags & FLAG_REPORT_TEXT != 0 { text } else { None };
+    // The base character stands in for a non-ASCII key only with Ctrl, Alt or Super (decision 18).
+    let base = event.base.filter(|_| event.mods.ctrl || event.mods.alt || event.mods.super_key);
 
     if let TermKey::Modifier(modifier) = event.key {
         if !all || (release && !events) {
@@ -373,38 +385,44 @@ pub(crate) fn encode_key(
     }
 
     let mod_field = 1 + bits;
+    // Press, repeat and release all read the same key: keypad keys become their
+    // legacy equivalents only while flag 1 is off.
+    let key = if disambiguate { event.key } else { legacy_equivalent(event.key) };
     if release {
         if !events {
             return KeyOutcome::Ignore;
         }
         let pair = protocol.sent_mut().remove(event.physical);
-        let key = legacy_equivalent(event.key);
         if !all && matches!(key, TermKey::Enter | TermKey::Tab | TermKey::Backspace) {
             return KeyOutcome::Ignore;
         }
         let Some(pair) = pair else {
             return KeyOutcome::Ignore;
         };
-        write_sent(out, pair, mod_field, 3);
+        write_sent(out, pair, mod_field, 3, None);
         return KeyOutcome::Sent;
     }
 
     let repeat = event.kind == KeyKind::Repeat && events;
-    let key = if disambiguate { event.key } else { legacy_equivalent(event.key) };
+    // KP_BEGIN has no legacy form (reference legacy column `-`), so without flag 1 it sends nothing.
+    if !disambiguate && matches!(key, TermKey::Kp(KpKey::Begin)) {
+        return KeyOutcome::Ignore;
+    }
     // Super alone adds no legacy bytes: only disambiguation (flag 1) reports it.
     let plain = !event.mods.ctrl && !event.mods.alt && (!event.mods.super_key || !disambiguate);
     if !all && plain && is_text_key(key) {
         protocol.sent_mut().remove(event.physical);
-        return KeyOutcome::Text;
+        // Super-only text without flag 1 is ignored, not sent as text (KeyOutcome::Ignore).
+        return if event.mods.super_key { KeyOutcome::Ignore } else { KeyOutcome::Text };
     }
 
     // Unmodified Enter, Tab and Backspace keep their legacy bytes under flag 1 and
     // on repeat; every other legacy key needs flags 0 or 2 only.
     let legacy_control = mod_field == 1 && matches!(key, TermKey::Enter | TermKey::Tab | TermKey::Backspace);
     if !all && ((!disambiguate && !repeat) || legacy_control) {
-        if let Some(outcome) = write_legacy(out, key, event, flags, app_cursor) {
+        if let Some(outcome) = write_legacy(out, key, event, text, flags, app_cursor) {
             if outcome == KeyOutcome::Sent && events && event.kind == KeyKind::Press {
-                if let Some((code, form)) = legacy_pair(key, event.base) {
+                if let Some((code, form)) = legacy_pair(key, base) {
                     protocol.sent_mut().insert(SentKey { physical: event.physical, code, form });
                 }
             }
@@ -414,22 +432,21 @@ pub(crate) fn encode_key(
 
     if repeat {
         if let Some(pair) = protocol.sent().get(event.physical) {
-            write_sent(out, pair, mod_field, 2);
+            write_sent(out, pair, mod_field, 2, associated);
             return KeyOutcome::Sent;
         }
     }
 
-    let Some(form) = csi_form(key, event.base) else {
+    let Some(form) = csi_form(key, base) else {
         return KeyOutcome::Ignore;
     };
     let event_code = event_field(event.kind, events);
-    let text = if all && flags & FLAG_REPORT_TEXT != 0 { event.text } else { None };
     match form {
         CsiForm::Letter(final_byte) => {
             let code = if mod_field == 1 && event_code == 1 { 0 } else { 1 };
             write_csi(out, code, mod_field, event_code, None, final_byte);
         }
-        CsiForm::Number(code, final_byte) => write_csi(out, code, mod_field, event_code, text, final_byte),
+        CsiForm::Number(code, final_byte) => write_csi(out, code, mod_field, event_code, associated, final_byte),
     }
     if events {
         let (code, form) = match form {
@@ -448,6 +465,7 @@ fn write_legacy(
     out: &mut Vec<u8>,
     key: TermKey,
     event: &KeyEvent<'_>,
+    text: Option<&str>,
     flags: u8,
     app_cursor: bool,
 ) -> Option<KeyOutcome> {
@@ -462,8 +480,8 @@ fn write_legacy(
                 alt_prefixed(out, alt, &[byte]);
             } else {
                 let mut buf = [0u8; 4];
-                let text = event.text.unwrap_or_else(|| &*c.encode_utf8(&mut buf));
-                alt_prefixed(out, alt, text.as_bytes());
+                let typed = text.unwrap_or_else(|| &*c.encode_utf8(&mut buf));
+                alt_prefixed(out, alt, typed.as_bytes());
             }
         }
         TermKey::Enter => alt_prefixed(out, alt || mods.shift, b"\r"),
@@ -526,9 +544,10 @@ fn write_csi(out: &mut Vec<u8>, code: u32, mods: u8, event: u8, text: Option<&st
 }
 
 /// Writes a sent key again with the form it was pressed in.
-fn write_sent(out: &mut Vec<u8>, pair: SentKey, mod_field: u8, event: u8) {
+/// Only the `Unicode` form carries associated text, as on press.
+fn write_sent(out: &mut Vec<u8>, pair: SentKey, mod_field: u8, event: u8, text: Option<&str>) {
     match pair.form {
-        SentForm::Unicode => write_csi(out, pair.code, mod_field, event, None, b'u'),
+        SentForm::Unicode => write_csi(out, pair.code, mod_field, event, text, b'u'),
         SentForm::Letter(final_byte) => write_csi(out, 1, mod_field, event, None, final_byte),
         SentForm::Tilde => write_csi(out, pair.code, mod_field, event, None, b'~'),
     }
@@ -568,6 +587,8 @@ fn csi_form(key: TermKey, base: Option<char>) -> Option<CsiForm> {
         TermKey::F(4) => CsiForm::Letter(b'S'),
         TermKey::F(n @ (3 | 5..=12)) => CsiForm::Number(tilde_code(n), b'~'),
         TermKey::F(_) => return None,
+        // KP_BEGIN is written in the functional `1 E` form of its reference row, like F1's `1 P`.
+        TermKey::Kp(KpKey::Begin) => CsiForm::Letter(b'E'),
         TermKey::Kp(key) => CsiForm::Number(kp_code(key), b'u'),
         TermKey::Modifier(_) => return None,
     })
@@ -618,8 +639,37 @@ fn is_text_key(key: TermKey) -> bool {
     }
 }
 
+/// Character that a text-producing keypad key stands for without flag 1.
+fn keypad_char(key: KpKey) -> Option<char> {
+    Some(match key {
+        KpKey::Kp0 => '0',
+        KpKey::Kp1 => '1',
+        KpKey::Kp2 => '2',
+        KpKey::Kp3 => '3',
+        KpKey::Kp4 => '4',
+        KpKey::Kp5 => '5',
+        KpKey::Kp6 => '6',
+        KpKey::Kp7 => '7',
+        KpKey::Kp8 => '8',
+        KpKey::Kp9 => '9',
+        KpKey::Decimal => '.',
+        KpKey::Divide => '/',
+        KpKey::Multiply => '*',
+        KpKey::Subtract => '-',
+        KpKey::Add => '+',
+        KpKey::Equal => '=',
+        KpKey::Separator => ',',
+        _ => return None,
+    })
+}
+
 /// Non-keypad key that a keypad key stands for when Kitty flag 1 and flag 8 are off.
 fn legacy_equivalent(key: TermKey) -> TermKey {
+    if let TermKey::Kp(key) = key {
+        if let Some(c) = keypad_char(key) {
+            return TermKey::Char(c);
+        }
+    }
     match key {
         TermKey::Kp(KpKey::Enter) => TermKey::Enter,
         TermKey::Kp(KpKey::Left) => TermKey::Left,

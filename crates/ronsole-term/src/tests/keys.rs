@@ -505,3 +505,91 @@ fn focus_changed_follows_mode_1004() {
     assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1004l"), b"");
     assert_eq!(term.focus_changed(true), None);
 }
+
+/// Flag 16 carries the text on repeat as well as on press; the mods field is
+/// written as `1` once an event type follows (brief, flag 16; kitty `write_csi`).
+#[test]
+fn associated_text_on_repeat_flags26() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 26);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Press, Some("a"))).1, b"\x1b[97;;97u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Repeat, Some("a"))).1, b"\x1b[97;1:2;97u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Release, None)).1, b"\x1b[97;1:3u");
+}
+
+/// Decision 18 (spec 5.3): the base code point is used only with Ctrl, Alt or
+/// Super; a non-ASCII key without them keeps its own code point.
+#[test]
+fn non_ascii_key_code_uses_base_only_with_mods_flag8() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 8);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('ф'), Some('a'), none, KeyKind::Press, Some("ф"))).1, b"\x1b[1092u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('с'), Some('c'), ctrl, KeyKind::Press, None)).1, b"\x1b[99;5u");
+}
+
+/// Keypad digits without flag 1 are their non-keypad equivalents: Alt sends
+/// ESC plus the digit, Ctrl has no C0 byte for it. KP_BEGIN has no legacy
+/// form in the reference (legacy column `-`), so flag 0 sends nothing.
+#[test]
+fn keypad_keys_flags0_use_non_keypad_equivalent() {
+    let mut term = Term::new(test_config(10, 3));
+    let none = mods(false, false, false);
+    let alt = mods(false, false, true);
+    let ctrl = mods(false, true, false);
+
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Kp5), None, alt, KeyKind::Press, Some("5"))), (KeyOutcome::Sent, b"\x1b5".to_vec()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Kp5), None, ctrl, KeyKind::Press, None)), (KeyOutcome::Ignore, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Kp5), None, none, KeyKind::Press, Some("5"))), (KeyOutcome::Text, Vec::new()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Begin), None, none, KeyKind::Press, None)), (KeyOutcome::Ignore, Vec::new()));
+}
+
+/// KP_BEGIN under flag 1 takes the first form of its reference row, `1 E`,
+/// written like F1's `1 P` (code 1 omitted without modifiers).
+#[test]
+fn kp_begin_flag1_is_csi_e() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 1);
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Begin), None, none, KeyKind::Press, None)).1, b"\x1b[E");
+}
+
+/// Associated text may not contain control codes, and empty text adds no field
+/// (reference, Flag 16: "associated text must not contain control codes").
+#[test]
+fn associated_text_skips_control_and_empty_flag24() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let ctrl = mods(false, true, false);
+
+    set_flags(&mut term, &mut sink, 24);
+    assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, none, KeyKind::Press, Some("\r"))).1, b"\x1b[13u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), ctrl, KeyKind::Press, Some("\x01"))).1, b"\x1b[97;5u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('a'), Some('a'), none, KeyKind::Press, Some(""))).1, b"\x1b[97u");
+
+    set_flags(&mut term, &mut sink, 0);
+    let alt = mods(false, false, true);
+    assert_eq!(enc(&mut term, &ev(TermKey::Char('x'), Some('x'), alt, KeyKind::Press, Some(""))), (KeyOutcome::Sent, b"\x1bx".to_vec()));
+}
+
+/// Keypad Enter is a non-text key: its press and its release use the same
+/// PUA code under flag 3, so the release is not dropped as a legacy Enter.
+#[test]
+fn kp_enter_press_and_release_flags3() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 3);
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Enter), None, none, KeyKind::Press, None)), (KeyOutcome::Sent, b"\x1b[57414u".to_vec()));
+    assert_eq!(enc(&mut term, &ev(TermKey::Kp(KpKey::Enter), None, none, KeyKind::Release, None)), (KeyOutcome::Sent, b"\x1b[57414;1:3u".to_vec()));
+}

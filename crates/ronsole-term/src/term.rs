@@ -326,7 +326,7 @@ impl Term {
 
     /// Kitty keyboard flags of the active screen, limited to the supported bits.
     pub fn kitty_flags(&self) -> u8 {
-        self.key_protocol.flags(self.is_alt)
+        self.key_protocol.flags()
     }
 
     /// Encodes a key event into `out` using the active DECCKM and Kitty flags,

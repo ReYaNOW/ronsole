@@ -174,7 +174,7 @@ impl Perform for Performer<'_> {
                         if value == 1049 || value == 47 || value == 1047 {
                             if enable && !self.term.is_alt {
                                 self.term.is_alt = true;
-                                self.term.key_protocol.screen_switched();
+                                self.term.key_protocol.set_alt(true);
                                 self.term.alt_saved_cursor = Some((self.term.cur_x, self.term.cur_y));
                                 let mut alt = std::collections::VecDeque::new();
                                 let mut alt_meta = std::collections::VecDeque::new();
@@ -197,7 +197,7 @@ impl Perform for Performer<'_> {
                                 self.term.dirty = true;
                             } else if !enable && self.term.is_alt {
                                 self.term.is_alt = false;
-                                self.term.key_protocol.screen_switched();
+                                self.term.key_protocol.set_alt(false);
                                 if let Some(alt) = self.term.alt_lines.take() {
                                     let old_lines = std::mem::replace(&mut self.term.lines, alt);
                                     for mut line in old_lines {
@@ -265,17 +265,17 @@ impl Perform for Performer<'_> {
                 [b'?'] => self.term.queue_kitty_query(),
                 [b'>'] => {
                     let flags = params.iter().next().map_or(0, |p| p[0]);
-                    self.term.key_protocol.push(self.term.is_alt, flags);
+                    self.term.key_protocol.push(flags);
                 }
                 [b'<'] => {
                     let count = params.iter().next().map_or(1, |p| p[0]);
-                    self.term.key_protocol.pop(self.term.is_alt, count);
+                    self.term.key_protocol.pop(count);
                 }
                 [b'='] => {
                     let flags = params.iter().next().map_or(0, |p| p[0]);
                     // An omitted mode is 1 (replace); vte reads an empty mode as 0.
                     let mode = params.iter().nth(1).map_or(1, |p| p[0]);
-                    self.term.key_protocol.set(self.term.is_alt, flags, mode);
+                    self.term.key_protocol.set(flags, mode);
                 }
                 _ => {}
             },

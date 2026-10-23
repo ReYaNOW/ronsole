@@ -1032,6 +1032,7 @@ impl Term {
             }
         }
         self.is_alt = false;
+        self.key_protocol.set_alt(false);
         self.alt_lines = None;
         self.alt_line_meta = None;
 

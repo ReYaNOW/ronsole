@@ -258,5 +258,5 @@ fn super_text_without_ctrl_or_alt_sends_no_bytes() {
     let event = ev(TermKey::Char('a'), Some('a'), super_only, KeyKind::Press, Some("a"));
     let (outcome, bytes) = enc(&mut term, &event);
     assert!(bytes.is_empty());
-    assert_ne!(outcome, KeyOutcome::Sent);
+    assert_eq!(outcome, KeyOutcome::Ignore);
 }
