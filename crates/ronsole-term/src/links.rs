@@ -2,7 +2,7 @@
 
 use crate::cell::{Cell, Hyperlink};
 use crate::term::Term;
-use crate::url::find_url;
+use crate::url::{URL_SEARCH_RADIUS, find_url};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -81,23 +81,47 @@ impl Term {
             last += 1;
         }
 
-        // Each physical row of the logical line: index, offset in `line`, length.
-        let mut line: Vec<Cell> = Vec::new();
+        // Each physical row of the logical line: index, offset in the logical line, length.
+        // Only lengths are read for all rows; cells are copied for the rows that the
+        // URL search window touches.
         let mut segments = Vec::with_capacity(last - first + 1);
+        let mut logical_len = 0;
         for index in first..=last {
-            let cells = self.row(index)?;
-            segments.push((index, line.len(), cells.len()));
-            line.extend_from_slice(cells);
+            let len = self.row(index)?.len();
+            segments.push((index, logical_len, len));
+            logical_len += len;
         }
         let base = segments.iter().find(|segment| segment.0 == row)?.1;
-        let range = find_url(&line, base + col)?;
+        let target = base + col;
+        let window_start = target.saturating_sub(URL_SEARCH_RADIUS);
+        let window_end = target.saturating_add(URL_SEARCH_RADIUS).saturating_add(1);
+        // The row starting after the window end is copied too, so the copied line
+        // extends past the window unless it ends the logical line.
+        let first_copied = segments
+            .iter()
+            .position(|&(_, offset, len)| offset + len > window_start)?;
+        let last_copied = segments
+            .iter()
+            .rposition(|&(_, offset, _)| offset <= window_end)?;
+        let copied = segments.get(first_copied..=last_copied)?;
+        let origin = copied.first()?.1;
+
+        // Copied rows: index, offset in `line`, length.
+        let mut line: Vec<Cell> = Vec::new();
+        let mut copied_rows = Vec::with_capacity(copied.len());
+        for &(index, offset, _) in copied {
+            let cells = self.row(index)?;
+            copied_rows.push((index, offset - origin, cells.len()));
+            line.extend_from_slice(cells);
+        }
+        let range = find_url(&line, target - origin)?;
 
         let mut uri = String::new();
         for cell in &line[range.clone()] {
             cell.append_text_to(&mut uri);
         }
         let mut cells = Vec::new();
-        for &(index, offset, len) in &segments {
+        for &(index, offset, len) in &copied_rows {
             if !rows.contains(&index) {
                 continue;
             }

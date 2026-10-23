@@ -7,12 +7,20 @@ use std::ops::Range;
 /// Schemes that start a plain URL.
 const URL_SCHEMES: [&str; 3] = ["http://", "https://", "file://"];
 
+/// Cells searched on each side of the clicked cell for a plain URL.
+pub(crate) const URL_SEARCH_RADIUS: usize = 8192;
+
+/// Opening and closing brackets, one pair per entry; see [`bracket_of`].
+const BRACKET_PAIRS: [(char, char); 4] = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
+
 /// Cell range of the plain URL around `col` in a logical line, or `None`.
 ///
 /// The token is the run of cells around `col` up to a space or control
 /// character. Within it, the last scheme starting at or before `col` wins;
 /// trailing punctuation and unbalanced closing brackets are cut. Wide-character
 /// spacers belong to the wide character before them, and the range includes them.
+/// Only [`URL_SEARCH_RADIUS`] cells on each side of `col` are examined: a token
+/// that does not end within that window is too long, and gives `None`.
 pub fn find_url(line: &[Cell], col: usize) -> Option<Range<usize>> {
     if col >= line.len() {
         return None;
@@ -25,14 +33,20 @@ pub fn find_url(line: &[Cell], col: usize) -> Option<Range<usize>> {
     if is_separator(&line[col]) {
         return None;
     }
-    let start = line[..col]
+    let window_start = col.saturating_sub(URL_SEARCH_RADIUS);
+    let window_end = line
+        .len()
+        .min(col.saturating_add(URL_SEARCH_RADIUS).saturating_add(1));
+    let start = line[window_start..col]
         .iter()
         .rposition(is_separator)
-        .map_or(0, |index| index + 1);
-    let end = line[col..]
-        .iter()
-        .position(is_separator)
-        .map_or(line.len(), |offset| col + offset);
+        .map_or(window_start, |index| window_start + index + 1);
+    let end = match line[col..window_end].iter().position(is_separator) {
+        Some(offset) => col + offset,
+        // The token continues past the window, so the URL end is unknown.
+        None if window_end < line.len() => return None,
+        None => line.len(),
+    };
 
     // Characters of the token with their cell index; spacers carry no character.
     let token: Vec<(char, usize)> = (start..end)
@@ -54,8 +68,19 @@ pub fn find_url(line: &[Cell], col: usize) -> Option<Range<usize>> {
     let (scheme_position, scheme_len) = matched?;
     let body_start = scheme_position + scheme_len;
 
+    // Bracket counts of the candidate `token[scheme_position..token_end]`, updated
+    // as characters are cut, so trimming takes time linear in the token length.
+    let mut brackets = [[0usize; 2]; BRACKET_PAIRS.len()];
+    for &(ch, _) in &token[scheme_position..] {
+        if let Some((pair, closing)) = bracket_of(ch) {
+            brackets[pair][usize::from(closing)] += 1;
+        }
+    }
     let mut token_end = token.len();
-    while token_end > body_start && is_cuttable(&token[scheme_position..token_end]) {
+    while token_end > body_start && is_cuttable(token[token_end - 1].0, &brackets) {
+        if let Some((pair, closing)) = bracket_of(token[token_end - 1].0) {
+            brackets[pair][usize::from(closing)] -= 1;
+        }
         token_end -= 1;
     }
     if token_end <= body_start {
@@ -84,22 +109,31 @@ fn starts_with_scheme(token: &[(char, usize)], position: usize, scheme: &str) ->
     })
 }
 
-/// Whether the last character of `candidate` must be cut from the URL: trailing
+/// Position in [`BRACKET_PAIRS`] of `ch`, and whether `ch` is the closing bracket.
+fn bracket_of(ch: char) -> Option<(usize, bool)> {
+    BRACKET_PAIRS
+        .iter()
+        .enumerate()
+        .find_map(|(pair, &(opening, closing))| {
+            if ch == opening {
+                Some((pair, false))
+            } else if ch == closing {
+                Some((pair, true))
+            } else {
+                None
+            }
+        })
+}
+
+/// Whether the candidate URL's last character `last` must be cut: trailing
 /// sentence punctuation, or a closing bracket with no opening bracket before it.
-fn is_cuttable(candidate: &[(char, usize)]) -> bool {
-    let Some(&(last, _)) = candidate.last() else {
-        return false;
-    };
-    let opening = match last {
-        '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => return true,
-        ')' => '(',
-        ']' => '[',
-        '}' => '{',
-        '>' => '<',
-        _ => return false,
-    };
-    let count = |wanted: char| candidate.iter().filter(|&&(ch, _)| ch == wanted).count();
-    count(last) > count(opening)
+/// `brackets` holds the candidate's counts as `[opening, closing]` per pair.
+fn is_cuttable(last: char, brackets: &[[usize; 2]]) -> bool {
+    match last {
+        '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => true,
+        _ => bracket_of(last)
+            .is_some_and(|(pair, closing)| closing && brackets[pair][1] > brackets[pair][0]),
+    }
 }
 
 /// Decodes standard base64. Trailing `=` padding is optional; when present it

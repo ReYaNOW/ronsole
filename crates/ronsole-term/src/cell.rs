@@ -147,7 +147,14 @@ impl Pen {
 
     /// Opens (`Some`) or closes (`None`) the hyperlink for cells written from now on.
     pub(crate) fn set_hyperlink(&mut self, hyperlink: Option<Arc<Hyperlink>>) {
-        if self.hyperlink() != hyperlink.as_ref() {
+        // Compare by identity: each OSC 8 opening makes its own `Arc`, so two
+        // openings with equal URIs and no id stay separate links.
+        let same = match (self.hyperlink(), hyperlink.as_ref()) {
+            (Some(current), Some(new)) => Arc::ptr_eq(current, new),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
             let underline_color = self.underline_color();
             self.set_extra(underline_color, hyperlink);
         }

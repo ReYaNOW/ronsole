@@ -190,3 +190,18 @@ fn osc7_rejects() {
     assert_eq!(sink.cwd.len(), 1);
     assert_eq!(sink.cwd[0].1.len(), 4096);
 }
+
+#[test]
+fn osc7_rejects_oversized_joined_payload() {
+    // Two parts of 6000 and 6600 bytes: the joined payload (12610 bytes) is over
+    // 3 * 4096 + 255, and the decoded path (12602 bytes) is over 4096.
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let text = format!(
+        "\x1b]7;file://h/{};{}\x07",
+        "a".repeat(6000),
+        "a".repeat(6600)
+    );
+    feed(&mut term, &mut sink, text.as_bytes());
+    assert!(sink.cwd.is_empty());
+}

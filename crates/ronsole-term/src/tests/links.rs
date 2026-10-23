@@ -199,6 +199,81 @@ fn find_url_rejects_degenerate_input() {
 }
 
 #[test]
+fn find_url_trims_long_closing_bracket_run() {
+    // 8000 unbalanced `)` after `https://a` are all cut; the URL is the 9 cells of
+    // `https://a`. The token stays inside the search window, so the whole run is trimmed.
+    let mut text = b"https://a".to_vec();
+    text.resize(text.len() + 8_000, b')');
+    let term = term_with(text.len(), &text);
+    assert_eq!(find_url(term.visible_row(0).unwrap(), 0), Some(0..9));
+}
+
+#[test]
+fn find_url_cuts_only_unbalanced_closers() {
+    // `(b)` is balanced; of the three `)` after it, the last two are unmatched and cut.
+    let term = term_with(40, b"https://a/(b)))");
+    assert_eq!(find_url(term.visible_row(0).unwrap(), 0), Some(0..13));
+}
+
+#[test]
+fn find_url_token_beyond_window_is_none() {
+    // The token is 20008 cells with no separator. Column 10000 is more than
+    // 8192 cells from the token end, so the URL is too long to report.
+    let mut text = b"https://".to_vec();
+    text.resize(20_008, b'a');
+    let term = term_with(20_008, &text);
+    assert_eq!(find_url(term.visible_row(0).unwrap(), 10_000), None);
+}
+
+#[test]
+fn find_url_finds_url_in_long_line() {
+    // 9000 cells of `x`, a space, then the URL at cells 9001-9009; column 9005 is inside the window.
+    let mut text = vec![b'x'; 9_000];
+    text.extend_from_slice(b" https://a");
+    let term = term_with(9_010, &text);
+    assert_eq!(find_url(term.visible_row(0).unwrap(), 9_005), Some(9_001..9_010));
+}
+
+#[test]
+fn link_at_window_skips_rows_before_it() {
+    // Row 0 ends at cell 9000, which is more than 8192 cells before the clicked cell
+    // (logical cell 17495), so the wrapped URL is found from row 1 alone.
+    let mut text = vec![b'x'; 17_490];
+    text.extend_from_slice(b" https://a");
+    let term = term_with(9_000, &text);
+    assert_eq!(
+        term.link_at(1, 8_495, 0..3),
+        Some(LinkTarget {
+            uri: "https://a".into(),
+            cells: vec![(1, 8_491..8_500)],
+        })
+    );
+}
+
+#[test]
+fn osc8_adjacent_equal_uri_without_id_are_distinct() {
+    // Two openings with equal URI and no id, not closed in between: two links (spec 5.5).
+    let term = term_with(
+        10,
+        b"\x1b]8;;https://a\x1b\\a\x1b]8;;https://a\x1b\\b\x1b]8;;\x1b\\",
+    );
+    assert_eq!(
+        term.link_at(0, 0, 0..3),
+        Some(LinkTarget {
+            uri: "https://a".into(),
+            cells: vec![(0, 0..1)],
+        })
+    );
+    assert_eq!(
+        term.link_at(0, 1, 0..3),
+        Some(LinkTarget {
+            uri: "https://a".into(),
+            cells: vec![(0, 1..2)],
+        })
+    );
+}
+
+#[test]
 fn link_at_joins_wrapped_url() {
     // 19 chars in 10 columns: row 0 is soft-wrapped into row 1.
     let term = term_with(10, b"https://ab.c/defghi");

@@ -23,6 +23,10 @@ const OSC52_MAX_ENCODED_BYTES: usize = 5_592_408;
 /// Largest OSC 7 path after percent-decoding.
 const OSC7_MAX_PATH_BYTES: usize = 4096;
 
+/// Largest OSC 7 payload before decoding: each path byte may be a three-byte
+/// `%XX` escape, plus 255 bytes for the `file://` scheme and the host.
+const OSC7_MAX_JOINED_BYTES: usize = 3 * OSC7_MAX_PATH_BYTES + 255;
+
 pub(crate) fn terminal_programmed_title(parts: &[&[u8]]) -> Option<String> {
     let capacity = parts
         .iter()
@@ -87,6 +91,11 @@ fn join_into(joined: &mut Vec<u8>, parts: &[&[u8]]) {
     }
 }
 
+/// Length of `parts` glued by `;` by [`join_into`], computed without copying.
+fn joined_len(parts: &[&[u8]]) -> usize {
+    parts.iter().map(|part| part.len()).sum::<usize>() + parts.len().saturating_sub(1)
+}
+
 /// Text of an OSC 52 write, `OSC 52 ; Pc ; Pd`. Returns `None` for selections
 /// other than clipboard (`c`) or `s`, for reads (`Pd` = `?`, which is not
 /// base64 and so yields no reply), and for invalid, empty or oversized payloads.
@@ -99,9 +108,7 @@ pub(crate) fn parse_osc52_text(params: &[&[u8]], joined: &mut Vec<u8>) -> Option
     }
     let data = params.get(2..)?;
     // Check the raw length before joining, so an oversized payload is never copied.
-    let encoded_len =
-        data.iter().map(|part| part.len()).sum::<usize>() + data.len().saturating_sub(1);
-    if encoded_len > OSC52_MAX_ENCODED_BYTES {
+    if joined_len(data) > OSC52_MAX_ENCODED_BYTES {
         return None;
     }
     join_into(joined, data);
@@ -116,7 +123,12 @@ pub(crate) fn parse_osc52_text(params: &[&[u8]], joined: &mut Vec<u8>) -> Option
 /// `None` for other schemes, a missing path, invalid escapes, a NUL byte, a
 /// non-UTF-8 host, or a path longer than [`OSC7_MAX_PATH_BYTES`].
 pub(crate) fn parse_osc7_uri(params: &[&[u8]], joined: &mut Vec<u8>) -> Option<(String, Vec<u8>)> {
-    join_into(joined, params.get(1..)?);
+    let parts = params.get(1..)?;
+    // Check the raw length before joining, so an oversized payload is never copied.
+    if joined_len(parts) > OSC7_MAX_JOINED_BYTES {
+        return None;
+    }
+    join_into(joined, parts);
     let rest = joined.strip_prefix(b"file://")?;
     // The path starts at the first `/`, so it always starts with `/` once decoded.
     let path_start = rest.iter().position(|&byte| byte == b'/')?;
