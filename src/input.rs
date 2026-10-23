@@ -80,9 +80,9 @@ impl TerminalInteraction {
         self.modifiers = modifiers;
     }
 
-    /// Records a physical modifier key as held or released. Called before any early
-    /// return in `handle_key_event`, because the held state is physical.
-    fn note_modifier_key(&mut self, key: &KeyInput) {
+    /// Records a physical modifier key as held or released. `App::on_key` calls it before
+    /// any of its early returns (settings modal, global shortcuts), because the held state is physical.
+    pub(crate) fn note_modifier_key(&mut self, key: &KeyInput) {
         let Some(TermKey::Modifier(modifier)) = key.named else {
             return;
         };
@@ -489,19 +489,15 @@ impl TerminalInteraction {
         key_event: &KeyInput,
         terminal: &mut Terminal,
     ) -> bool {
-        self.note_modifier_key(key_event);
         if self.handle_search_key(key_event, terminal) {
             if let Some(text) = key_event.text.as_deref() {
                 self.handle_text(text, terminal);
             }
             return true;
         }
-        // Pressed covers auto-repeat. A release is only meaningful to the terminal,
-        // so it is dropped while search owns the keyboard.
+        // Pressed covers auto-repeat. A release still reaches the encoder while search
+        // owns the keyboard: it is ignored unless its press was sent to the terminal.
         let pressed = key_event.state.is_pressed();
-        if !pressed && search_owns_keyboard(&self.search) {
-            return false;
-        }
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         let super_key = self.modifiers.super_key();
@@ -1898,9 +1894,9 @@ mod tests {
         let left_press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
         let right_press = modifier_key(KeyState::Pressed, ModKey::RightCtrl, 97);
         let left_release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
-        assert!(interaction.handle_key_event(&left_press, &mut terminal));
-        assert!(interaction.handle_key_event(&right_press, &mut terminal));
-        assert!(interaction.handle_key_event(&left_release, &mut terminal));
+        assert!(send_key(&mut interaction, &left_press, &mut terminal));
+        assert!(send_key(&mut interaction, &right_press, &mut terminal));
+        assert!(send_key(&mut interaction, &left_release, &mut terminal));
         assert_eq!(
             terminal.input_bytes_for_test(),
             b"\x1b[57442;5u\x1b[57448;5u\x1b[57442;5:3u"
@@ -1922,6 +1918,105 @@ mod tests {
         let _ = crate::platform::lock_recover(&terminal.grid).focus_changed(true);
         assert!(!interaction.handle_key_event(&release, &mut terminal));
         assert_eq!(terminal.input_bytes_for_test(), before);
+    }
+
+    /// Feeds one key the way `App::on_key` does: modifier state is noted first.
+    fn send_key(interaction: &mut TerminalInteraction, key: &KeyInput, terminal: &mut Terminal) -> bool {
+        interaction.note_modifier_key(key);
+        interaction.handle_key_event(key, terminal)
+    }
+
+    /// A Ctrl press sent before search opened still gets its release while search owns the keyboard.
+    #[test]
+    fn ctrl_release_while_search_owns_keyboard_reaches_encoder() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &press, &mut terminal));
+        interaction.search.open();
+        interaction.set_modifiers(Modifiers::empty());
+        let release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;5u\x1b[57442;1:3u");
+    }
+
+    /// A release of a key whose press was never sent stays ignored while search owns the keyboard.
+    #[test]
+    fn letter_release_while_search_owns_keyboard_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.search.open();
+        let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyA), 30);
+        assert!(!send_key(&mut interaction, &release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    /// Modifier events that the settings modal swallows still update the held state,
+    /// so a later Ctrl release does not keep a stale ctrl bit.
+    #[test]
+    fn modifier_state_noted_while_modal_swallows_keys() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let both = Modifiers::new(true, true, false, false);
+        interaction.set_modifiers(both);
+        let left_press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &left_press, &mut terminal));
+        // The modal returns before the encoder: only the held-state update runs.
+        interaction.set_modifiers(Modifiers::SHIFT);
+        interaction.note_modifier_key(&modifier_key(KeyState::Released, ModKey::LeftCtrl, 29));
+        interaction.set_modifiers(both);
+        let right_press = modifier_key(KeyState::Pressed, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &right_press, &mut terminal));
+        interaction.set_modifiers(Modifiers::SHIFT);
+        let right_release = modifier_key(KeyState::Released, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &right_release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;6u\x1b[57448;6u\x1b[57448;2:3u");
+    }
+
+    /// Empty host modifiers mean no modifier key is down, so the held state is cleared.
+    #[test]
+    fn set_modifiers_empty_clears_held_modifier_keys() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let press = modifier_key(KeyState::Pressed, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &press, &mut terminal));
+        interaction.set_modifiers(Modifiers::empty());
+        assert_eq!(interaction.held_modifier_keys, 0);
+        let release = modifier_key(KeyState::Released, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57448;5u\x1b[57448;1:3u");
+    }
+
+    /// Releasing one Ctrl while the other Ctrl and Shift are held keeps shift and drops ctrl.
+    #[test]
+    fn release_of_one_ctrl_keeps_shift_when_both_ctrl_and_shift_held() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::SHIFT);
+        let shift_press = modifier_key(KeyState::Pressed, ModKey::LeftShift, 42);
+        assert!(send_key(&mut interaction, &shift_press, &mut terminal));
+        interaction.set_modifiers(Modifiers::new(true, true, false, false));
+        let ctrl_press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &ctrl_press, &mut terminal));
+        interaction.set_modifiers(Modifiers::SHIFT);
+        let ctrl_release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &ctrl_release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57441;2u\x1b[57442;6u\x1b[57442;2:3u");
+    }
+
+    /// A repeat of a held modifier is a repeat event (type 2) and keeps its own bit.
+    #[test]
+    fn modifier_repeat_is_repeat_event_with_own_bit() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &press, &mut terminal));
+        let repeat = modifier_key(KeyState::Repeat, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &repeat, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;5u\x1b[57442;5:2u");
     }
 
     #[test]

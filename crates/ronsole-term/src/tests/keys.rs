@@ -671,8 +671,56 @@ fn legacy_flags0_modified_function_keys_match_93ad29c() {
         (TermKey::F(4), ctrl, b"\x1b[1;5S"),
         (TermKey::F(3), super_only, b"\x1bOR"),
         (TermKey::Up, super_only, b"\x1b[A"),
+        (TermKey::Home, ctrl, b"\x1b[1;5H"),
+        (TermKey::End, shift, b"\x1b[1;2F"),
+        (TermKey::End, alt, b"\x1b[1;3F"),
+        (TermKey::Home, super_only, b"\x1b[H"),
+        (TermKey::Insert, shift, b"\x1b[2;2~"),
+        (TermKey::Delete, ctrl, b"\x1b[3;5~"),
+        (TermKey::PageUp, alt, b"\x1b[5;3~"),
+        (TermKey::PageDown, super_only, b"\x1b[6~"),
+        (TermKey::F(5), ctrl, b"\x1b[15;5~"),
+        (TermKey::F(5), shift, b"\x1b[15;2~"),
+        (TermKey::F(6), alt, b"\x1b[17;3~"),
+        (TermKey::F(7), ctrl, b"\x1b[18;5~"),
+        (TermKey::F(8), super_only, b"\x1b[19~"),
+        (TermKey::F(9), none, b"\x1b[20~"),
+        (TermKey::F(10), shift, b"\x1b[21;2~"),
+        (TermKey::F(11), ctrl, b"\x1b[23;5~"),
+        (TermKey::F(12), alt, b"\x1b[24;3~"),
     ];
     for (key, modifiers, want) in cases {
         assert_eq!(enc(&mut term, &ev(*key, None, *modifiers, KeyKind::Press, None)).1, *want, "key {key:?} mods {modifiers:?}");
+    }
+}
+
+/// Super enters the modifier field (Super = 8) only when the flags are not 0.
+/// Flag 16 alone is nonzero, so Super+Up becomes `CSI 1;9A` and Super+F3 `CSI 1;9R`.
+/// Source: Kitty modifier bits in the protocol reference (Super = 8, field = bits + 1).
+#[test]
+fn super_reported_when_flags_nonzero_flag16() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let super_only = KeyMods { shift: false, ctrl: false, alt: false, super_key: true };
+
+    set_flags(&mut term, &mut sink, 16);
+    assert_eq!(enc(&mut term, &ev(TermKey::Up, None, super_only, KeyKind::Press, None)).1, b"\x1b[1;9A");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(3), None, super_only, KeyKind::Press, None)).1, b"\x1b[1;9R");
+    set_flags(&mut term, &mut sink, 0);
+    assert_eq!(enc(&mut term, &ev(TermKey::Up, None, super_only, KeyKind::Press, None)).1, b"\x1b[A");
+}
+
+/// Flag 1 already reports Super: F1, F2, F4 use `CSI 1 ; 9 <P|Q|S>`, F3 uses `CSI 13 ; 9 ~`.
+/// Source: protocol reference, functional-key table (F1-F4 row, F3 `13 ~`) and modifier bits (Super = 8, field = bits + 1).
+#[test]
+fn super_f1_to_f4_flags1_report_super_bit() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let super_only = KeyMods { shift: false, ctrl: false, alt: false, super_key: true };
+
+    set_flags(&mut term, &mut sink, 1);
+    let cases: &[(u8, &[u8])] = &[(1, b"\x1b[1;9P"), (2, b"\x1b[1;9Q"), (3, b"\x1b[13;9~"), (4, b"\x1b[1;9S")];
+    for (n, want) in cases {
+        assert_eq!(enc(&mut term, &ev(TermKey::F(*n), None, super_only, KeyKind::Press, None)).1, *want, "F{n}");
     }
 }
