@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -341,15 +341,164 @@ pub fn open_uri_allowed(uri: &str, local_host: &str) -> bool {
 
 /// Opens `uri` with `xdg-open` on a dedicated thread.
 ///
-/// Callers must check [`open_uri_allowed`] first. The opener runs without a
-/// shell, and its thread is handed to the unit-thread reaper so the caller
-/// never waits for the child process.
+/// Callers must check [`open_uri_allowed`] first. File-system checks for
+/// `file` URIs run on that thread through [`opener_argument`], so the caller
+/// never blocks on disk I/O. The opener runs without a shell, and its thread
+/// is handed to the unit-thread reaper so the caller never waits for the child
+/// process.
 pub fn open_uri(uri: &str) {
-    let argument = xdg_open_argument(uri);
-    match super::spawn_named("ronsole-open-uri", move || run_xdg_open(&argument)) {
+    let uri = uri.to_owned();
+    match super::spawn_named("ronsole-open-uri", move || {
+        if let Some(argument) = opener_argument(&uri) {
+            run_xdg_open(&argument);
+        }
+    }) {
         Ok(worker) => super::reap_unit_thread(worker),
         Err(error) => eprintln!("Ronsole: failed to start URI opener thread: {error}"),
     }
+}
+
+/// Returns the argument for `xdg-open`, or `None` when the URI must not be
+/// opened. Non-`file` URIs pass through unchanged. A `file` path is resolved
+/// through symlinks first, and the decision uses the resolved path. An opened
+/// `file` path is passed as its canonical, fully percent-encoded form, never as
+/// the original URI, so the opener cannot reinterpret a fragment, query, or
+/// `..` from it. A missing path logs once and yields `None`.
+fn opener_argument(uri: &str) -> Option<String> {
+    let is_file_uri = uri
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"));
+    if !is_file_uri {
+        return Some(xdg_open_argument(uri));
+    }
+    let path = file_uri_path(uri)?;
+    let resolved = match std::fs::canonicalize(&path) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("Ronsole: cannot open link {}: {error}", path.display());
+            return None;
+        }
+    };
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            eprintln!("Ronsole: cannot open link {}: {error}", resolved.display());
+            return None;
+        }
+    };
+    let decision = local_open_decision(
+        metadata.is_dir(),
+        metadata.is_file(),
+        metadata.permissions().mode(),
+        &resolved,
+    );
+    match decision {
+        LocalOpenDecision::OpenPath => Some(file_uri_for_path(&resolved)),
+        LocalOpenDecision::OpenParent => resolved.parent().map(file_uri_for_path),
+    }
+}
+
+/// What `xdg-open` receives for a resolved local path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalOpenDecision {
+    /// The path itself is opened.
+    OpenPath,
+    /// The containing directory is opened instead.
+    OpenParent,
+}
+
+/// Chooses between opening a resolved path and its parent directory. A
+/// directory always opens itself. A regular file opens itself unless it has an
+/// execute bit (`u`, `g`, or `o`) or a `.desktop` name suffix. Any other kind
+/// of entry (device, FIFO, socket) opens its parent.
+fn local_open_decision(
+    is_directory: bool,
+    is_regular_file: bool,
+    mode: u32,
+    resolved: &Path,
+) -> LocalOpenDecision {
+    if is_directory {
+        return LocalOpenDecision::OpenPath;
+    }
+    if !is_regular_file {
+        return LocalOpenDecision::OpenParent;
+    }
+    let is_desktop_entry = resolved
+        .file_name()
+        .is_some_and(|name| has_desktop_suffix(name.as_bytes()));
+    if mode & 0o111 != 0 || is_desktop_entry {
+        LocalOpenDecision::OpenParent
+    } else {
+        LocalOpenDecision::OpenPath
+    }
+}
+
+/// Matches the `.desktop` suffix ignoring ASCII case.
+fn has_desktop_suffix(name: &[u8]) -> bool {
+    const SUFFIX: &[u8] = b".desktop";
+    name.len() >= SUFFIX.len() && name[name.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+}
+
+/// Extracts the local path of a `file` URI, skipping its host. Host checks are
+/// the job of [`open_uri_allowed`]. Percent escapes decode to raw path bytes.
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let (_, rest) = uri.split_once(':')?;
+    let after_slashes = rest.strip_prefix("//")?;
+    let path_start = after_slashes.find('/')?;
+    let bytes = percent_decode(&after_slashes[path_start..]);
+    Some(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+/// Decodes `%XX` escapes into raw bytes. A malformed escape is copied as-is.
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'%' {
+            if let Some(value) = bytes.get(index + 1..index + 3).and_then(hex_pair_value) {
+                decoded.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(byte);
+        index += 1;
+    }
+    decoded
+}
+
+fn hex_pair_value(pair: &[u8]) -> Option<u8> {
+    match pair {
+        [high, low] => Some((hex_digit_value(*high)? << 4) | hex_digit_value(*low)?),
+        _ => None,
+    }
+}
+
+fn hex_digit_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Builds a `file://` URI for an absolute path. Bytes outside the RFC 3986
+/// unreserved set and `/` are percent-encoded.
+fn file_uri_for_path(path: &Path) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut uri = String::from("file://");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX_DIGITS[usize::from(byte & 0x0F)]));
+        }
+    }
+    uri
 }
 
 /// Returns the argument handed to `xdg-open` for a URI accepted by
@@ -702,5 +851,196 @@ mod tests {
         // Expected values come from the G2-5 ruling: no IDNA, and C1 controls are refused.
         assert!(!open_uri_allowed("https://пример.рф/", "myhost"));
         assert!(!open_uri_allowed("https://a.org/\u{85}", "myhost"));
+    }
+
+    /// Canonical temporary directory for one open test, removed when dropped.
+    struct OpenTestDir(PathBuf);
+
+    impl std::ops::Deref for OpenTestDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for OpenTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_test_dir(name: &str) -> OpenTestDir {
+        let dir = std::env::temp_dir().join(format!("ronsole-open-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create open test dir");
+        OpenTestDir(std::fs::canonicalize(&dir).expect("canonicalize open test dir"))
+    }
+
+    fn make_open_test_file(path: &Path, mode: u32) {
+        std::fs::write(path, b"x").expect("write open test file");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("chmod open test file");
+    }
+
+    #[test]
+    fn opener_argument_opens_plain_file_and_directory_themselves() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let dir = open_test_dir("plain");
+        let file = dir.join("a.txt");
+        make_open_test_file(&file, 0o644);
+        let file_uri = file_uri_for_path(&file);
+        assert_eq!(
+            opener_argument(&file_uri),
+            Some(format!("file://{}/a.txt", dir.display()))
+        );
+        let dir_uri = file_uri_for_path(&dir);
+        assert_eq!(opener_argument(&dir_uri), Some(dir_uri.clone()));
+    }
+
+    #[test]
+    fn opener_argument_opens_parent_of_executable() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let dir = open_test_dir("exec");
+        make_open_test_file(&dir.join("tool"), 0o755);
+        make_open_test_file(&dir.join("other.bin"), 0o001);
+        make_open_test_file(&dir.join("group.bin"), 0o010);
+        let parent = Some(file_uri_for_path(&dir));
+        assert_eq!(opener_argument(&file_uri_for_path(&dir.join("tool"))), parent);
+        assert_eq!(opener_argument(&file_uri_for_path(&dir.join("other.bin"))), parent);
+        assert_eq!(opener_argument(&file_uri_for_path(&dir.join("group.bin"))), parent);
+    }
+
+    #[test]
+    fn opener_argument_opens_parent_of_desktop_entry_any_case() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let dir = open_test_dir("desktop");
+        let parent = Some(file_uri_for_path(&dir));
+        for name in ["x.desktop", "X.DESKTOP"] {
+            let entry = dir.join(name);
+            make_open_test_file(&entry, 0o644);
+            assert_eq!(opener_argument(&file_uri_for_path(&entry)), parent, "{name}");
+        }
+    }
+
+    #[test]
+    fn opener_argument_resolves_symlink_before_deciding() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let dir = open_test_dir("symlink");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin test dir");
+        make_open_test_file(&bin_dir.join("tool"), 0o755);
+        let link = dir.join("a.txt");
+        std::os::unix::fs::symlink(bin_dir.join("tool"), &link).expect("create test symlink");
+        assert_eq!(
+            opener_argument(&file_uri_for_path(&link)),
+            Some(file_uri_for_path(&bin_dir))
+        );
+    }
+
+    #[test]
+    fn opener_argument_decodes_percent_escapes_in_path() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let dir = open_test_dir("escape");
+        make_open_test_file(&dir.join("a b.txt"), 0o644);
+        let uri = format!("file://{}/a%20b.txt", dir.display());
+        assert_eq!(
+            opener_argument(&uri),
+            Some(format!("file://{}/a%20b.txt", dir.display()))
+        );
+    }
+
+    #[test]
+    fn opener_argument_resolves_symlink_to_desktop_entry() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let dir = open_test_dir("symlink_desktop");
+        make_open_test_file(&dir.join("entry.desktop"), 0o644);
+        std::os::unix::fs::symlink(dir.join("entry.desktop"), dir.join("link.txt"))
+            .expect("create test symlink");
+        assert_eq!(
+            opener_argument(&file_uri_for_path(&dir.join("link.txt"))),
+            Some(file_uri_for_path(&dir))
+        );
+    }
+
+    #[test]
+    fn opener_argument_does_not_pass_raw_fragment_to_opener() {
+        // Expected values come from spec section 6.3 (Q1 O2) and the O2-1 review:
+        // xdg-open strips a literal "#...", so the passed path must be encoded.
+        let dir = open_test_dir("fragment");
+        make_open_test_file(&dir.join("tool"), 0o755);
+        make_open_test_file(&dir.join("tool#x"), 0o644);
+        let uri = format!("file://{}/tool#x", dir.display());
+        assert_eq!(
+            opener_argument(&uri),
+            Some(format!("file://{}/tool%23x", dir.display()))
+        );
+    }
+
+    #[test]
+    fn opener_argument_passes_canonical_path_not_dot_dot_uri() {
+        // Expected values come from spec section 6.3 (Q1 O2) and the O2-1 review:
+        // the opener receives the canonical path, so "..": through a symlink is gone.
+        let dir = open_test_dir("dotdot");
+        std::fs::create_dir_all(dir.join("sub")).expect("create sub test dir");
+        std::os::unix::fs::symlink(dir.join("sub"), dir.join("link")).expect("create test symlink");
+        make_open_test_file(&dir.join("x.txt"), 0o644);
+        let uri = format!("file://{}/link/../x.txt", dir.display());
+        assert_eq!(
+            opener_argument(&uri),
+            Some(format!("file://{}/x.txt", dir.display()))
+        );
+    }
+
+    #[test]
+    fn opener_argument_encodes_malformed_percent_sequence_in_passed_path() {
+        // Expected values come from spec section 6.3 (Q1 O2) and the O2-1 review:
+        // xdg-open runs its path through printf, so a raw "%" must reach it encoded.
+        let dir = open_test_dir("percent");
+        make_open_test_file(&dir.join("evil.desk%stop"), 0o644);
+        let uri = format!("file://{}/evil.desk%stop", dir.display());
+        assert_eq!(
+            opener_argument(&uri),
+            Some(format!("file://{}/evil.desk%25stop", dir.display()))
+        );
+    }
+
+    #[test]
+    fn local_open_decision_opens_parent_of_non_regular_entry() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let path = Path::new("/x/entry");
+        assert_eq!(
+            local_open_decision(false, true, 0o644, path),
+            LocalOpenDecision::OpenPath
+        );
+        // Character device such as /dev/zero: mode 0o666 has no execute bit.
+        assert_eq!(
+            local_open_decision(false, false, 0o666, path),
+            LocalOpenDecision::OpenParent
+        );
+        // FIFO or socket with no execute bit.
+        assert_eq!(
+            local_open_decision(false, false, 0o644, path),
+            LocalOpenDecision::OpenParent
+        );
+        assert_eq!(
+            local_open_decision(true, false, 0o755, path),
+            LocalOpenDecision::OpenPath
+        );
+    }
+
+    #[test]
+    fn opener_argument_opens_parent_of_device() {
+        assert_eq!(
+            opener_argument("file:///dev/null"),
+            Some("file:///dev".to_string())
+        );
+    }
+
+    #[test]
+    fn opener_argument_drops_missing_path() {
+        // Expected values come from spec section 6.3 (Q1 O2), not from the implementation.
+        let dir = open_test_dir("missing");
+        assert_eq!(opener_argument(&file_uri_for_path(&dir.join("absent.txt"))), None);
     }
 }
