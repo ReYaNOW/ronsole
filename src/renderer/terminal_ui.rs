@@ -1172,12 +1172,13 @@ fn terminal_glyph_cell_geometry(
     Some((x, glyph_cell_w))
 }
 
-#[inline]
 /// Maps a cell's BOLD and ITALIC flags to the `GLYPH_FACE_*` used for its glyph.
+#[inline]
 fn terminal_cell_face(cell: &Cell) -> u8 {
     terminal_cell_face_from_flags(cell.flags())
 }
 
+#[inline]
 fn terminal_cell_face_from_flags(flags: CellFlags) -> u8 {
     match (flags.contains(CellFlags::BOLD), flags.contains(CellFlags::ITALIC)) {
         (false, false) => GLYPH_FACE_REGULAR,
@@ -1187,6 +1188,7 @@ fn terminal_cell_face_from_flags(flags: CellFlags) -> u8 {
     }
 }
 
+#[inline]
 fn terminal_cell_span_x_bounds(
     text_x: f32,
     cell_index: usize,

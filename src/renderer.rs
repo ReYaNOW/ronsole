@@ -1638,16 +1638,62 @@ mod tests {
         assert!(chain[0].data() == TERMINAL_FONT);
     }
 
+    fn same_image(a: &Option<Image>, b: &Option<Image>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.placement.left == b.placement.left
+                    && a.placement.top == b.placement.top
+                    && a.placement.width == b.placement.width
+                    && a.placement.height == b.placement.height
+                    && a.data == b.data
+            }
+            _ => false,
+        }
+    }
+
+    // The bundled faces share one character map, so Inter stands in as a styled face that lacks the glyph.
     #[test]
-    fn bold_face_covers_regular_charset() {
-        // The bundled faces share one character map, so the Regular-chain fallback
-        // for a missing styled glyph is not reachable with the bundled fonts.
-        let faces = TerminalFaces::default();
-        let bold = faces.font(GLYPH_FACE_BOLD).expect("bundled Bold font parses");
+    fn styled_face_missing_glyph_falls_back_to_regular_chain() {
+        let inter = FontRef::from_index(UI_FONT, 0).expect("bundled UI font parses");
         let regular = FontRef::from_index(TERMINAL_FONT, 0).expect("bundled Regular font parses");
-        let uncovered = ('\u{0021}'..='\u{10FFFF}')
-            .find(|&c| font_maps_char(regular, c) && !font_maps_char(bold, c));
-        assert_eq!(uncovered, None);
+        let chain = [FontData::new_static(TERMINAL_FONT)];
+        let mut ctx = ScaleContext::new();
+        let c = '\u{E0A0}';
+        assert!(!font_maps_char(inter, c));
+        assert!(font_maps_char(regular, c));
+        let with_face = rasterize_glyph(&chain, Some(inter), &mut ctx, c, 16.0, false)
+            .expect("Regular chain maps the Nerd Font glyph");
+        let without_face = rasterize_glyph(&chain, None, &mut ctx, c, 16.0, false)
+            .expect("Regular chain maps the Nerd Font glyph");
+        assert!(with_face.image.is_some());
+        assert_eq!(with_face.advance, without_face.advance);
+        assert!(same_image(&with_face.image, &without_face.image));
+    }
+
+    #[test]
+    fn styled_face_used_when_it_maps_char() {
+        let inter = FontRef::from_index(UI_FONT, 0).expect("bundled UI font parses");
+        let chain = [FontData::new_static(TERMINAL_FONT)];
+        let mut ctx = ScaleContext::new();
+        let c = 'A';
+        assert!(font_maps_char(inter, c));
+        let with_face = rasterize_glyph(&chain, Some(inter), &mut ctx, c, 16.0, false)
+            .expect("styled face maps 'A'");
+        let without_face = rasterize_glyph(&chain, None, &mut ctx, c, 16.0, false)
+            .expect("Regular chain maps 'A'");
+        assert_ne!(with_face.advance, without_face.advance);
+        let direct = rasterize_from_font(inter, &mut ctx, c, 16.0, false).expect("Inter maps 'A'");
+        assert_eq!(with_face.advance, direct.advance);
+    }
+
+    #[test]
+    fn glyph_missing_everywhere_is_none() {
+        let inter = FontRef::from_index(UI_FONT, 0).expect("bundled UI font parses");
+        let chain = [FontData::new_static(TERMINAL_FONT)];
+        let mut ctx = ScaleContext::new();
+        let c = '\u{10FFFE}';
+        assert!(rasterize_glyph(&chain, Some(inter), &mut ctx, c, 16.0, false).is_none());
     }
 
     #[test]
