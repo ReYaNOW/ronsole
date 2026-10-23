@@ -5,6 +5,7 @@ pub(crate) use terminal_ui::{
 };
 use glow::HasContext;
 use rustc_hash::FxHashMap;
+use std::cell::OnceCell;
 use std::sync::Arc;
 use std::time::Instant;
 use swash::FontRef;
@@ -23,6 +24,10 @@ const SOLID_RECT_MODE: f32 = 2.0;
 const GLYPH_PRESENTATION_AUTO: u8 = 0;
 const GLYPH_PRESENTATION_TEXT: u8 = 1;
 const GLYPH_PRESENTATION_EMOJI: u8 = 2;
+const GLYPH_FACE_REGULAR: u8 = 0;
+const GLYPH_FACE_BOLD: u8 = 1;
+const GLYPH_FACE_ITALIC: u8 = 2;
+const GLYPH_FACE_BOLD_ITALIC: u8 = 3;
 const DEFAULT_ACCENT_COLOR: [f32; 4] = [114.0 / 255.0, 89.0 / 255.0, 175.0 / 255.0, 1.0];
 const UI_FONT_LOGICAL_SIZE: f32 = 18.0;
 const LEGACY_TERMINAL_FONT_LOGICAL_SIZE: f32 = 18.0;
@@ -216,6 +221,10 @@ fn load_terminal_palette(background: crate::config::RgbColor) -> TerminalPalette
 }
 
 const TERMINAL_FONT: &[u8] = include_bytes!("fonts/JetBrainsMonoNerdFont-Regular.ttf");
+const TERMINAL_BOLD_FONT: &[u8] = include_bytes!("fonts/JetBrainsMonoNerdFont-Bold.ttf");
+const TERMINAL_ITALIC_FONT: &[u8] = include_bytes!("fonts/JetBrainsMonoNerdFont-Italic.ttf");
+const TERMINAL_BOLD_ITALIC_FONT: &[u8] =
+    include_bytes!("fonts/JetBrainsMonoNerdFont-BoldItalic.ttf");
 const UI_FONT: &[u8] = include_bytes!("fonts/Inter-Regular.otf");
 
 #[repr(C)]
@@ -312,6 +321,87 @@ impl FontData {
     }
 }
 
+/// Builds the Regular font chain once at renderer creation: the bundled Regular
+/// font first, then the system monospace font, symbol fallbacks and emoji.
+fn load_terminal_fonts() -> Vec<FontData> {
+    let mut fonts = Vec::with_capacity(12);
+    fonts.push(FontData::new_static(TERMINAL_FONT));
+    if let Some(font) = FontData::map_first(&[
+        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    ]) {
+        fonts.push(font);
+    }
+    FontData::map_all_into(
+        &[
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+            "/usr/share/fonts/TTF/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/TTF/NotoSansSymbols-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+        ],
+        &mut fonts,
+    );
+    if let Some(font) = FontData::map_first(&[
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto/NotoColorEmoji.google.ttf",
+    ]) {
+        fonts.push(font);
+    }
+    fonts
+}
+
+/// Styled faces bundled with the terminal, indexed by `GLYPH_FACE_*`.
+///
+/// A face is parsed on its first glyph and kept for the renderer lifetime.
+/// Regular is not stored here; it is served by the Regular font chain.
+#[derive(Default)]
+struct TerminalFaces {
+    parsed: [OnceCell<FontRef<'static>>; 3],
+}
+
+impl TerminalFaces {
+    fn face_data(face: u8) -> Option<&'static [u8]> {
+        match face {
+            GLYPH_FACE_BOLD => Some(TERMINAL_BOLD_FONT),
+            GLYPH_FACE_ITALIC => Some(TERMINAL_ITALIC_FONT),
+            GLYPH_FACE_BOLD_ITALIC => Some(TERMINAL_BOLD_ITALIC_FONT),
+            _ => None,
+        }
+    }
+
+    /// Returns the parsed face, parsing it only on the first call for that face.
+    fn font(&self, face: u8) -> Option<FontRef<'static>> {
+        let data = Self::face_data(face)?;
+        let cell = &self.parsed[usize::from(face) - 1];
+        if let Some(font) = cell.get() {
+            return Some(*font);
+        }
+        let font = FontRef::from_index(data, 0)?;
+        let _ = cell.set(font);
+        Some(font)
+    }
+
+    #[cfg(test)]
+    fn is_parsed(&self, face: u8) -> bool {
+        Self::face_data(face).is_some() && self.parsed[usize::from(face) - 1].get().is_some()
+    }
+}
+
+fn font_ref_of(font: &FontData) -> Option<FontRef<'_>> {
+    FontRef::from_index(font.data(), font.index as usize)
+}
+
+fn font_maps_char(font: FontRef<'_>, c: char) -> bool {
+    font.charmap().map(c) != 0
+}
+
 struct RasterizedGlyph {
     image: Option<Image>,
     advance: f32,
@@ -337,8 +427,9 @@ pub struct Renderer {
     vertices: Vec<Vertex>,
     fonts: Vec<FontData>,
     ui_fonts: Vec<FontData>,
+    faces: TerminalFaces,
     scale_context: ScaleContext,
-    glyphs: FxHashMap<(char, u8), GlyphInfo>,
+    glyphs: FxHashMap<(char, u8, u8), GlyphInfo>,
     ui_glyphs: FxHashMap<char, GlyphInfo>,
     alpha_atlas_x: i32,
     alpha_atlas_y: i32,
@@ -412,36 +503,7 @@ impl Renderer {
         let (vao, vbo) = create_vertex_buffer(&gl, program)?;
         let alpha_texture = create_alpha_texture(&gl)?;
 
-        let mut fonts = Vec::with_capacity(12);
-        if let Some(font) = FontData::map_first(&[
-            "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        ]) {
-            fonts.push(font);
-        }
-        fonts.push(FontData::new_static(TERMINAL_FONT));
-        FontData::map_all_into(
-            &[
-                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-                "/usr/share/fonts/TTF/NotoSansSymbols2-Regular.ttf",
-                "/usr/share/fonts/TTF/NotoSansSymbols-Regular.ttf",
-                "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-                "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
-            ],
-            &mut fonts,
-        );
-        if let Some(font) = FontData::map_first(&[
-            "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-            "/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf",
-            "/usr/share/fonts/noto/NotoColorEmoji.google.ttf",
-        ]) {
-            fonts.push(font);
-        }
+        let fonts = load_terminal_fonts();
 
         let mut ui_fonts = Vec::with_capacity(fonts.len() + 3);
         ui_fonts.push(FontData::new_static(UI_FONT));
@@ -469,6 +531,7 @@ impl Renderer {
             vertices: Vec::with_capacity(MAX_VERTICES),
             fonts,
             ui_fonts,
+            faces: TerminalFaces::default(),
             scale_context: ScaleContext::new(),
             glyphs: FxHashMap::default(),
             ui_glyphs: FxHashMap::default(),
@@ -585,7 +648,7 @@ impl Renderer {
     fn prewarm_ascii(&mut self) {
         self.ascii_advances.fill(0.0);
         for byte in 32..128u8 {
-            if let Some(glyph) = self.get_glyph(byte as char, None) {
+            if let Some(glyph) = self.get_glyph(byte as char, None, GLYPH_FACE_REGULAR) {
                 self.ascii_advances[byte as usize] = glyph.advance;
             }
         }
@@ -652,6 +715,7 @@ impl Renderer {
         let prefer_color = default_emoji_presentation(c);
         let rasterized = rasterize_glyph(
             &self.ui_fonts,
+            None,
             &mut self.scale_context,
             c,
             self.ui_font_size,
@@ -662,19 +726,25 @@ impl Renderer {
         Some(glyph)
     }
 
-    fn get_glyph(&mut self, c: char, prefer_color: Option<bool>) -> Option<GlyphInfo> {
+    fn get_glyph(&mut self, c: char, prefer_color: Option<bool>, face: u8) -> Option<GlyphInfo> {
         let presentation = match prefer_color {
             Some(false) => GLYPH_PRESENTATION_TEXT,
             Some(true) => GLYPH_PRESENTATION_EMOJI,
             None => GLYPH_PRESENTATION_AUTO,
         };
-        let cache_key = (c, presentation);
+        let cache_key = (c, presentation, face);
         if let Some(glyph) = self.glyphs.get(&cache_key) {
             return Some(*glyph);
         }
         let prefer_color = prefer_color.unwrap_or_else(|| default_emoji_presentation(c));
+        let face_font = if prefer_color {
+            None
+        } else {
+            self.faces.font(face)
+        };
         let rasterized = rasterize_glyph(
             &self.fonts,
+            face_font,
             &mut self.scale_context,
             c,
             self.terminal_font_size,
@@ -685,7 +755,7 @@ impl Renderer {
         {
             glyph
         } else if c != '□' {
-            self.get_glyph('□', Some(false))?
+            self.get_glyph('□', Some(false), face)?
         } else {
             return None;
         };
@@ -1315,8 +1385,11 @@ fn create_alpha_texture(gl: &glow::Context) -> Result<glow::Texture, String> {
     }
 }
 
+/// Rasterizes `c` with the styled face when it maps `c`, otherwise with the Regular chain.
+/// Color glyphs always use the Regular chain, so `face_font` is ignored for them.
 fn rasterize_glyph(
     fonts: &[FontData],
+    face_font: Option<FontRef<'_>>,
     scale_context: &mut ScaleContext,
     c: char,
     font_size: f32,
@@ -1324,13 +1397,26 @@ fn rasterize_glyph(
 ) -> Option<RasterizedGlyph> {
     if prefer_color {
         for font in fonts.iter().rev() {
-            if let Some(glyph) = rasterize_from_font(font, scale_context, c, font_size, true) {
+            let Some(font_ref) = font_ref_of(font) else {
+                continue;
+            };
+            if let Some(glyph) = rasterize_from_font(font_ref, scale_context, c, font_size, true) {
                 return Some(glyph);
             }
         }
     } else {
+        if let Some(glyph) = face_font
+            .filter(|face| font_maps_char(*face, c))
+            .and_then(|face| rasterize_from_font(face, scale_context, c, font_size, false))
+        {
+            return Some(glyph);
+        }
         for font in fonts {
-            if let Some(glyph) = rasterize_from_font(font, scale_context, c, font_size, false) {
+            let Some(font_ref) = font_ref_of(font) else {
+                continue;
+            };
+            if let Some(glyph) = rasterize_from_font(font_ref, scale_context, c, font_size, false)
+            {
                 return Some(glyph);
             }
         }
@@ -1339,13 +1425,12 @@ fn rasterize_glyph(
 }
 
 fn rasterize_from_font(
-    font_data: &FontData,
+    font_ref: FontRef<'_>,
     scale_context: &mut ScaleContext,
     c: char,
     font_size: f32,
     prefer_color: bool,
 ) -> Option<RasterizedGlyph> {
-    let font_ref = FontRef::from_index(font_data.data(), font_data.index as usize)?;
     let glyph_id = font_ref.charmap().map(c);
     if glyph_id == 0 && !c.is_whitespace() {
         return None;
@@ -1536,6 +1621,34 @@ fn rounded_rect_vertices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn faces_parsed_lazily() {
+        let faces = TerminalFaces::default();
+        assert!(!faces.is_parsed(GLYPH_FACE_BOLD));
+        assert!(faces.font(GLYPH_FACE_BOLD).is_some());
+        assert!(faces.is_parsed(GLYPH_FACE_BOLD));
+        assert!(!faces.is_parsed(GLYPH_FACE_ITALIC));
+    }
+
+    #[test]
+    fn regular_chain_starts_with_bundled_font() {
+        let chain = load_terminal_fonts();
+        assert!(matches!(chain[0].source, FontSource::Static(_)));
+        assert!(chain[0].data() == TERMINAL_FONT);
+    }
+
+    #[test]
+    fn bold_face_covers_regular_charset() {
+        // The bundled faces share one character map, so the Regular-chain fallback
+        // for a missing styled glyph is not reachable with the bundled fonts.
+        let faces = TerminalFaces::default();
+        let bold = faces.font(GLYPH_FACE_BOLD).expect("bundled Bold font parses");
+        let regular = FontRef::from_index(TERMINAL_FONT, 0).expect("bundled Regular font parses");
+        let uncovered = ('\u{0021}'..='\u{10FFFF}')
+            .find(|&c| font_maps_char(regular, c) && !font_maps_char(bold, c));
+        assert_eq!(uncovered, None);
+    }
 
     #[test]
     fn presented_fps_reports_sixty_after_half_second_of_completed_intervals() {

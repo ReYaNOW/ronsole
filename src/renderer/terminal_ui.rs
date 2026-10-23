@@ -10,7 +10,7 @@ use crate::terminal::{
     normalized_selection_bounds, terminal_should_render_zero_width,
 };
 use ronsole_term::{
-    Cell, Rgb, Term, TermPalette, terminal_force_text_presentation, xterm_256_rgb,
+    Cell, CellFlags, Rgb, Term, TermPalette, terminal_force_text_presentation, xterm_256_rgb,
 };
 
 const ANSI_16_COLORS: [[f32; 4]; 16] = [
@@ -1173,6 +1173,20 @@ fn terminal_glyph_cell_geometry(
 }
 
 #[inline]
+/// Maps a cell's BOLD and ITALIC flags to the `GLYPH_FACE_*` used for its glyph.
+fn terminal_cell_face(cell: &Cell) -> u8 {
+    terminal_cell_face_from_flags(cell.flags())
+}
+
+fn terminal_cell_face_from_flags(flags: CellFlags) -> u8 {
+    match (flags.contains(CellFlags::BOLD), flags.contains(CellFlags::ITALIC)) {
+        (false, false) => GLYPH_FACE_REGULAR,
+        (true, false) => GLYPH_FACE_BOLD,
+        (false, true) => GLYPH_FACE_ITALIC,
+        (true, true) => GLYPH_FACE_BOLD_ITALIC,
+    }
+}
+
 fn terminal_cell_span_x_bounds(
     text_x: f32,
     cell_index: usize,
@@ -1409,7 +1423,7 @@ impl Renderer {
         self.draw_search_icon(icon, rect, Some(SEARCH_ICON_VISUAL_SCALE), color);
     }
 
-    fn terminal_glyph(&mut self, c: char, presentation: u8) -> Option<GlyphInfo> {
+    fn terminal_glyph(&mut self, c: char, presentation: u8, face: u8) -> Option<GlyphInfo> {
         let prefer_color = if terminal_force_text_presentation(c) {
             Some(false)
         } else if presentation == CELL_PRESENTATION_TEXT {
@@ -1419,7 +1433,7 @@ impl Renderer {
         } else {
             None
         };
-        self.get_glyph(c, prefer_color)
+        self.get_glyph(c, prefer_color, face)
     }
 
     fn terminal_char_width(&self) -> f32 {
@@ -2678,7 +2692,9 @@ impl Renderer {
                                     continue;
                                 };
                                 let (fg, _) = terminal_cell_render_colors(cell, palette);
-                                if let Some(glyph) = self.terminal_glyph(cell.ch(), cell.presentation())
+                                let face = terminal_cell_face(cell);
+                                if let Some(glyph) =
+                                    self.terminal_glyph(cell.ch(), cell.presentation(), face)
                                 {
                                     let baseline =
                                         draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
@@ -2712,7 +2728,7 @@ impl Renderer {
                                         continue;
                                     }
                                     if let Some(glyph) =
-                                        self.terminal_glyph(extra, cell.presentation())
+                                        self.terminal_glyph(extra, cell.presentation(), face)
                                     {
                                         let baseline =
                                             draw_y + self.baseline_offset * TERMINAL_TEXT_SCALE;
@@ -2809,6 +2825,17 @@ impl Renderer {
 mod tests {
     use super::*;
     use ronsole_term::{TermConfig, TermIdentity, UnderlineStyle};
+
+    #[test]
+    fn terminal_cell_face_from_flags_selects_bundled_face() {
+        assert_eq!(terminal_cell_face_from_flags(CellFlags::empty()), GLYPH_FACE_REGULAR);
+        assert_eq!(terminal_cell_face_from_flags(CellFlags::BOLD), GLYPH_FACE_BOLD);
+        assert_eq!(terminal_cell_face_from_flags(CellFlags::ITALIC), GLYPH_FACE_ITALIC);
+        assert_eq!(
+            terminal_cell_face_from_flags(CellFlags::BOLD | CellFlags::ITALIC),
+            GLYPH_FACE_BOLD_ITALIC
+        );
+    }
 
     fn test_term(cols: usize, rows: usize) -> Term {
         Term::new(TermConfig {
