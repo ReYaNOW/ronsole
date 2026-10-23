@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, train, validate, and reuse Ronsole PGO profiles on Linux/Wayland."""
+"""Build, train, validate, and reuse Ronsole PGO profiles on Linux."""
 
 from __future__ import annotations
 
@@ -415,29 +415,6 @@ def validate_toolchain(config: PgoConfig, runner: Runner) -> None:
     llvm_profdata_identity(config, runner)
 
 
-def resolve_wayland_socket(environment: Mapping[str, str]) -> Path:
-    display = environment.get("WAYLAND_DISPLAY", "")
-    if not display:
-        raise PgoError("WAYLAND_DISPLAY is required for Ronsole PGO training")
-    display_path = Path(display)
-    if display_path.is_absolute():
-        socket_path = display_path
-    else:
-        runtime = environment.get("XDG_RUNTIME_DIR", "")
-        if not runtime:
-            raise PgoError(
-                "XDG_RUNTIME_DIR is required when WAYLAND_DISPLAY is relative"
-            )
-        socket_path = Path(runtime) / display_path
-    try:
-        mode = socket_path.stat().st_mode
-    except OSError as error:
-        raise PgoError(f"Wayland socket is not accessible: {socket_path}: {error}") from error
-    if not stat.S_ISSOCK(mode):
-        raise PgoError(f"WAYLAND_DISPLAY does not point to a socket: {socket_path}")
-    return socket_path.absolute()
-
-
 def _ensure_private_directory(path: Path) -> None:
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
     path.chmod(0o700)
@@ -455,11 +432,13 @@ def isolated_training_environment(
     config: PgoConfig,
     paths: PgoPaths,
     *,
-    wayland_socket: Path,
     profile_dir: Path,
     private_runtime: Path,
 ) -> dict[str, str]:
     environment = base_environment(config)
+    # Headless training must never reach a Wayland compositor, even when the
+    # launcher inherited a WAYLAND_DISPLAY from the desktop session.
+    environment.pop("WAYLAND_DISPLAY", None)
     home = paths.workspace / "home"
     config_home = paths.workspace / "config"
     cache_home = paths.workspace / "cache"
@@ -477,7 +456,6 @@ def isolated_training_environment(
             "XDG_DATA_HOME": str(data_home),
             "XDG_STATE_HOME": str(state_home),
             "XDG_RUNTIME_DIR": str(private_runtime),
-            "WAYLAND_DISPLAY": str(wayland_socket),
             "SHELL": "/bin/sh",
             "LLVM_PROFILE_FILE": str(profile_dir / PROFILE_PATTERN),
             "RUST_BACKTRACE": "1",
@@ -570,6 +548,7 @@ def create_training_workspace(paths: PgoPaths) -> None:
 def training_command(config: PgoConfig, paths: PgoPaths, executable: Path) -> list[str]:
     return [
         str(executable),
+        "--headless",
         "--pgo-train",
         "--pgo-workspace",
         str(paths.workspace.resolve()),
@@ -676,7 +655,6 @@ def run_training(
     require_profile: bool,
 ) -> tuple[dict[str, object], list[Path]]:
     validate_linux_host()
-    wayland_socket = resolve_wayland_socket(base_environment(config))
     profile_dir.mkdir(parents=True, exist_ok=True)
     before_profiles = _profile_snapshot(profile_dir)
     command = training_command(config, paths, executable)
@@ -684,7 +662,6 @@ def run_training(
         environment = isolated_training_environment(
             config,
             paths,
-            wayland_socket=wayland_socket,
             profile_dir=profile_dir,
             private_runtime=Path(private_runtime_name),
         )
@@ -1135,8 +1112,6 @@ def run_pipeline(config: PgoConfig, *, runner: Runner | None = None) -> Path | N
             executable = validate_instrumented_build(config, paths, runner)
         else:
             executable = existing_run_executable(config, paths)
-        log_stage("preflight Wayland training environment")
-        resolve_wayland_socket(base_environment(config))
         if config.run_executable is None:
             _prepare_instrumented_training_artifacts(paths)
         create_training_workspace(paths)
@@ -1146,7 +1121,7 @@ def run_pipeline(config: PgoConfig, *, runner: Runner | None = None) -> Path | N
         else:
             profile_dir = paths.training_dir / "script-profiles"
             require_profile = False
-        log_stage("automated real Wayland Ronsole training")
+        log_stage("automated headless Ronsole training")
         report, generated_profiles = run_training(
             config,
             paths,
@@ -1176,13 +1151,11 @@ def run_pipeline(config: PgoConfig, *, runner: Runner | None = None) -> Path | N
         return None
 
     if config.mode == "fresh":
-        log_stage("preflight Wayland training environment")
-        resolve_wayland_socket(base_environment(config))
         _prepare_fresh_profile_dir(paths)
         create_training_workspace(paths)
         build_instrumented(config, paths, runner)
         executable = validate_instrumented_build(config, paths, runner)
-        log_stage("automated real Wayland Ronsole training")
+        log_stage("automated headless Ronsole training")
         report, generated_profiles = run_training(
             config,
             paths,
@@ -1389,87 +1362,77 @@ def self_test() -> None:
             lambda: parse_env(["BROKEN"]), "invalid environment was accepted"
         )
 
-        original_runtime = root / "original-runtime"
-        original_runtime.mkdir()
-        socket_path = original_runtime / "wayland-self-test"
-        wayland_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            wayland_socket.bind(str(socket_path))
-            relative_environment = {
-                "WAYLAND_DISPLAY": socket_path.name,
-                "XDG_RUNTIME_DIR": str(original_runtime),
-            }
-            resolved_relative = resolve_wayland_socket(relative_environment)
-            resolved_absolute = resolve_wayland_socket(
-                {"WAYLAND_DISPLAY": str(socket_path)}
-            )
-            if resolved_relative != socket_path or resolved_absolute != socket_path:
-                raise PgoError("absolute Wayland socket resolution self-test failed")
+        long_root = (
+            root
+            / ("long-project-root-" + "x" * 96)
+            / ("nested-project-root-" + "y" * 96)
+        )
+        long_config = replace(config, root=long_root)
+        long_paths = paths_for(long_config)
+        legacy_socket_path = (
+            long_paths.workspace / "runtime" / "ronsole" / "instance.sock"
+        )
+        if len(os.fsencode(legacy_socket_path)) < 200:
+            raise PgoError("long project path regression fixture is too short")
 
-            long_root = (
-                root
-                / ("long-project-root-" + "x" * 96)
-                / ("nested-project-root-" + "y" * 96)
-            )
-            long_config = replace(config, root=long_root)
-            long_paths = paths_for(long_config)
-            legacy_socket_path = (
-                long_paths.workspace / "runtime" / "ronsole" / "instance.sock"
-            )
-            if len(os.fsencode(legacy_socket_path)) < 200:
-                raise PgoError("long project path regression fixture is too short")
-
-            create_training_workspace(paths)
-            first_runtime: Path | None = None
-            with private_training_runtime() as private_runtime_name:
-                first_runtime = Path(private_runtime_name)
+        create_training_workspace(paths)
+        first_runtime: Path | None = None
+        with private_training_runtime() as private_runtime_name:
+            first_runtime = Path(private_runtime_name)
+            # Simulate a desktop session whose WAYLAND_DISPLAY must not leak
+            # into the headless training environment.
+            host_display = os.environ.get("WAYLAND_DISPLAY")
+            os.environ["WAYLAND_DISPLAY"] = "wayland-self-test-host"
+            try:
                 isolated = isolated_training_environment(
                     long_config,
                     long_paths,
-                    wayland_socket=resolved_absolute,
                     profile_dir=long_paths.profile_dir,
                     private_runtime=first_runtime,
                 )
-                private_runtime = Path(isolated["XDG_RUNTIME_DIR"])
-                if private_runtime != first_runtime:
-                    raise PgoError("private XDG_RUNTIME_DIR ownership self-test failed")
-                if stat.S_IMODE(private_runtime.stat().st_mode) != 0o700:
-                    raise PgoError("private XDG_RUNTIME_DIR mode self-test failed")
-                try:
-                    private_runtime.relative_to(long_paths.workspace)
-                except ValueError:
-                    pass
+            finally:
+                if host_display is None:
+                    os.environ.pop("WAYLAND_DISPLAY", None)
                 else:
-                    raise PgoError(
-                        "private XDG_RUNTIME_DIR still depends on the project path"
-                    )
-                if isolated.get("WAYLAND_DISPLAY") != str(socket_path):
-                    raise PgoError("isolated absolute WAYLAND_DISPLAY self-test failed")
-                if isolated.get("HOME") != str(long_paths.workspace / "home"):
-                    raise PgoError("isolated HOME self-test failed")
-                if isolated.get("SHELL") != "/bin/sh":
-                    raise PgoError("deterministic SHELL self-test failed")
+                    os.environ["WAYLAND_DISPLAY"] = host_display
+            if "WAYLAND_DISPLAY" in isolated:
+                raise PgoError("isolated WAYLAND_DISPLAY self-test failed")
+            private_runtime = Path(isolated["XDG_RUNTIME_DIR"])
+            if private_runtime != first_runtime:
+                raise PgoError("private XDG_RUNTIME_DIR ownership self-test failed")
+            if stat.S_IMODE(private_runtime.stat().st_mode) != 0o700:
+                raise PgoError("private XDG_RUNTIME_DIR mode self-test failed")
+            try:
+                private_runtime.relative_to(long_paths.workspace)
+            except ValueError:
+                pass
+            else:
+                raise PgoError(
+                    "private XDG_RUNTIME_DIR still depends on the project path"
+                )
+            if isolated.get("HOME") != str(long_paths.workspace / "home"):
+                raise PgoError("isolated HOME self-test failed")
+            if isolated.get("SHELL") != "/bin/sh":
+                raise PgoError("deterministic SHELL self-test failed")
 
-                ronsole_runtime = private_runtime / "ronsole"
-                ronsole_runtime.mkdir(mode=0o700)
-                instance_socket_path = ronsole_runtime / "instance.sock"
-                instance_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                try:
-                    instance_socket.bind(str(instance_socket_path))
-                finally:
-                    instance_socket.close()
-                    instance_socket_path.unlink(missing_ok=True)
+            ronsole_runtime = private_runtime / "ronsole"
+            ronsole_runtime.mkdir(mode=0o700)
+            instance_socket_path = ronsole_runtime / "instance.sock"
+            instance_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                instance_socket.bind(str(instance_socket_path))
+            finally:
+                instance_socket.close()
+                instance_socket_path.unlink(missing_ok=True)
 
-            if first_runtime is None or first_runtime.exists():
-                raise PgoError("private XDG_RUNTIME_DIR cleanup self-test failed")
-            with private_training_runtime() as second_runtime_name:
-                second_runtime = Path(second_runtime_name)
-                if second_runtime == first_runtime:
-                    raise PgoError("private XDG_RUNTIME_DIR uniqueness self-test failed")
-            if second_runtime.exists():
-                raise PgoError("second private XDG_RUNTIME_DIR cleanup self-test failed")
-        finally:
-            wayland_socket.close()
+        if first_runtime is None or first_runtime.exists():
+            raise PgoError("private XDG_RUNTIME_DIR cleanup self-test failed")
+        with private_training_runtime() as second_runtime_name:
+            second_runtime = Path(second_runtime_name)
+            if second_runtime == first_runtime:
+                raise PgoError("private XDG_RUNTIME_DIR uniqueness self-test failed")
+        if second_runtime.exists():
+            raise PgoError("second private XDG_RUNTIME_DIR cleanup self-test failed")
 
         fixture = paths.workspace / "terminal_fixture.sh"
         fixture_text = fixture.read_text(encoding="utf-8")
@@ -1506,6 +1469,7 @@ def self_test() -> None:
             config, paths, Path("/tmp/ronsole-instrumented")
         )
         expected_contract = [
+            "--headless",
             "--pgo-train",
             "--pgo-workspace",
             str(paths.workspace.resolve()),

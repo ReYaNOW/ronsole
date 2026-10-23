@@ -1571,12 +1571,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl App {
-    pub(crate) fn load_with_automation(options: AutomationOptions) -> Result<Self, String> {
-        let mut app = Self::from_config(crate::config::AppConfig::load());
-        app.automation = Some(AutomationController::new(options)?);
-        Ok(app)
-    }
-
     /// Builds a headless app: config comes from `profile_dir`, clipboard text stays
     /// in memory, and opened links are recorded instead of launched.
     pub(crate) fn load_headless(

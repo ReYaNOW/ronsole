@@ -131,52 +131,25 @@ fn main() -> ExitCode {
     if args.get(1).is_some_and(|arg| arg == "--headless") {
         return headless::main(&args);
     }
-    let (automation_options, initial_launch): (Option<app::AutomationOptions>, _) =
+    if launch::pgo_train_without_headless(&args) {
+        eprintln!("ronsole: --pgo-train requires --headless");
+        return ExitCode::from(2);
+    }
+    let initial_launch =
         match launch::parse_startup_args_with_current_dir(&args, env::current_dir) {
-            Ok(launch::StartupMode::Normal(launch)) => (None, launch),
-            Ok(launch::StartupMode::PgoAutomation) => {
-                let options = match app::automation_options_from_args(&args) {
-                    Ok(options) => options,
-                    Err(error) => {
-                        eprintln!("Ronsole: invalid PGO automation arguments: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                (Some(options), launch::TerminalLaunchSpec::default())
-            }
+            Ok(launch) => launch,
             Err(error) => {
                 eprintln!("Ronsole: invalid arguments: {error}");
                 return ExitCode::FAILURE;
             }
         };
-    let pgo_training = automation_options.is_some();
 
     let single_instance = platform::single_instance::acquire_single_instance(&initial_launch);
     let mut primary_instance = match single_instance {
         Ok(platform::single_instance::SingleInstanceStatus::Primary(primary)) => primary,
-        Ok(platform::single_instance::SingleInstanceStatus::Secondary) => {
-            if let Some(options) = automation_options.as_ref() {
-                let error = "PGO training connected to an existing Ronsole single-instance socket";
-                if let Err(report_error) =
-                    app::write_automation_startup_failure(options, "single-instance", error)
-                {
-                    eprintln!("Ronsole: failed to write PGO startup report: {report_error}");
-                }
-                eprintln!("Ronsole: {error}");
-                return ExitCode::FAILURE;
-            }
-            return ExitCode::SUCCESS;
-        }
+        Ok(platform::single_instance::SingleInstanceStatus::Secondary) => return ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Ronsole: single-instance startup failed: {error}");
-            if let Some(options) = automation_options.as_ref() {
-                let message = format!("single-instance startup failed: {error}");
-                if let Err(report_error) =
-                    app::write_automation_startup_failure(options, "single-instance", &message)
-                {
-                    eprintln!("Ronsole: failed to write PGO startup report: {report_error}");
-                }
-            }
             return ExitCode::FAILURE;
         }
     };
@@ -184,22 +157,9 @@ fn main() -> ExitCode {
     prefer_egl_vendor();
     tune_glibc_allocator();
 
-    let mut app = if let Some(options) = automation_options {
-        match app::App::load_with_automation(options) {
-            Ok(app) => app,
-            Err(error) => {
-                eprintln!("Ronsole: PGO automation startup failed: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        app::App::load()
-    };
+    let mut app = app::App::load();
     if let Err(error) = app.run_direct_wayland(&mut primary_instance, initial_launch) {
         eprintln!("Ronsole: Wayland runtime failed: {error}");
-        if pgo_training {
-            return ExitCode::FAILURE;
-        }
     }
     ExitCode::SUCCESS
 }
@@ -278,18 +238,22 @@ mod tests {
         let classify = source
             .find("launch::parse_startup_args_with_current_dir(&args, env::current_dir)")
             .expect("startup mode classifier must remain present");
-        let pgo = source
-            .find("app::automation_options_from_args(&args)")
-            .expect("PGO parser must consume the captured argv");
+        let headless = source
+            .find("headless::main(&args)")
+            .expect("headless branch must remain present");
+        let pgo_check = source
+            .find("launch::pgo_train_without_headless(&args)")
+            .expect("--pgo-train without --headless check must consume the captured argv");
         let gate = source
             .find("acquire_single_instance(&initial_launch)")
             .expect("single-instance gate must remain present");
         let direct_loop = source
             .find("app.run_direct_wayland(&mut primary_instance, initial_launch)")
             .expect("direct Wayland app loop must remain present");
-        assert!(capture < classify);
-        assert!(classify < pgo);
-        assert!(pgo < gate);
+        assert!(capture < headless);
+        assert!(headless < pgo_check);
+        assert!(pgo_check < classify);
+        assert!(classify < gate);
         assert!(gate < direct_loop);
     }
 

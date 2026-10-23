@@ -187,7 +187,7 @@ pgo-gen:
 	@echo "✅ Instrumented Ronsole: $(PGO_GENERATE_TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)"
 
 pgo-run:
-	@echo "🏃 Автоматическая Wayland-тренировка существующего instrumented Ronsole..."
+	@echo "🏃 Автоматическая headless-тренировка существующего instrumented Ronsole..."
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --run-only
 
 pgo-merge:
@@ -201,20 +201,20 @@ pgo-max:
 	@echo "✅ PGO Ronsole: $(PGO_USE_TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)"
 
 pgo-auto:
-	@echo "🤖 Полный свежий PGO: instrumented MAX → Wayland training → verify/merge → MAX profile-use"
+	@echo "🤖 Полный свежий PGO: instrumented MAX → headless training → verify/merge → MAX profile-use"
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh
 
 pgo-gen-fast:
-	@echo "⚡ Быстрый Ronsole для отладки PGO GUI-сценария (без instrumentation/LTO)..."
+	@echo "⚡ Быстрый Ronsole для отладки PGO-сценария (без instrumentation/LTO)..."
 	@CARGO_NET_OFFLINE=true $(MAKE) fast
 	@echo "✅ Тестовый бинарник: $(PGO_FAST_EXECUTABLE)"
 
 pgo-script:
-	@echo "🎬 Только GUI automation на быстром Ronsole — без instrumented/final PGO build"
+	@echo "🎬 Только headless automation на быстром Ronsole — без instrumented/final PGO build"
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_RUN_ARGS) --mode fresh --run-only --run-executable "$(PGO_FAST_EXECUTABLE)"
 
 pgo-train:
-	@echo "🤖 Свежая instrumented сборка + Wayland training + проверенный merged profile, без final build"
+	@echo "🤖 Свежая instrumented сборка + headless training + проверенный merged profile, без final build"
 	python3 scripts/pgo_pipeline.py $(PGO_PIPELINE_BUILD_ARGS) --mode fresh --train-only
 
 pgo-use:
