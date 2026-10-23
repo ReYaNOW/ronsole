@@ -6,7 +6,9 @@ use crate::terminal_process::{
 use crate::wake::WakeHandle;
 use ronsole_term::{Term, TermConfig, TermIdentity, TermPalette};
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -37,6 +39,128 @@ fn new_term(cols: usize, rows: usize, palette: TermPalette) -> Term {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeds `bytes` into the tab's grid at `now` without a reader, so an
+    /// open synchronized-output block holds them until its deadline.
+    fn hold_in_sync_block(terminal: &Terminal, bytes: &[u8], now: Instant) {
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        grid.advance(bytes, now, &mut sink);
+    }
+
+    fn row_text(terminal: &Terminal) -> String {
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        (0..grid.total_rows())
+            .filter_map(|row| grid.row(row))
+            .flat_map(|line| line.iter().map(|cell| cell.ch()))
+            .collect()
+    }
+
+    #[test]
+    fn sync_flush_expired_bumps_content_generation() {
+        let terminal = Terminal::new_for_test(40, 3, 1);
+        let now = Instant::now();
+        hold_in_sync_block(&terminal, b"\x1b[?2026hX", now);
+        let before = crate::platform::lock_recover(&terminal.grid).content_generation();
+
+        terminal.flush_expired(now + Duration::from_secs(1));
+
+        let after = crate::platform::lock_recover(&terminal.grid).content_generation();
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn background_tab_buffer_flushed_at_deadline() {
+        let background = Terminal::new_for_test(40, 3, 2);
+        let now = Instant::now();
+        hold_in_sync_block(&background, b"\x1b[?2026hX", now);
+        // The 150 ms hold window comes from the synchronized-output spec (5.4).
+        let deadline = background
+            .sync_deadline()
+            .expect("held bytes set a deadline");
+        assert_eq!(deadline, now + Duration::from_millis(150));
+
+        background.flush_expired(deadline - Duration::from_millis(1));
+        assert!(!row_text(&background).contains('X'));
+
+        background.flush_expired(deadline);
+        assert!(row_text(&background).contains('X'));
+    }
+
+    #[test]
+    fn reply_from_flush_reaches_writer() {
+        let mut terminal = Terminal::new_for_test(40, 3, 7);
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
+        terminal.set_reply_sender_for_test(reply_tx);
+        let now = Instant::now();
+        hold_in_sync_block(&terminal, b"\x1b[?2026h\x1b[c\x1b]2;t\x07", now);
+        assert!(reply_rx.try_recv().is_err());
+
+        terminal.flush_expired(now + Duration::from_secs(1));
+
+        // DA1 answer of the VT model (`ESC[?62c`, perform.rs), then the
+        // numbered title `t (7)` from the programmed OSC 2 title.
+        assert_eq!(reply_rx.try_recv().ok(), Some(b"\x1b[?62c".to_vec()));
+        let mut title = String::new();
+        crate::platform::lock_recover(&terminal.title_cache).write_resolved(&mut title);
+        assert_eq!(title, "t (7)");
+    }
+
+    #[test]
+    fn accept_osc7_cwd_host_check() {
+        let path = PathBuf::from("/tmp");
+        assert_eq!(accept_osc7_cwd("", b"/tmp", "myhost"), Some(path.clone()));
+        assert_eq!(
+            accept_osc7_cwd("localhost", b"/tmp", "myhost"),
+            Some(path.clone())
+        );
+        assert_eq!(accept_osc7_cwd("myhost", b"/tmp", "myhost"), Some(path));
+        assert_eq!(accept_osc7_cwd("other", b"/tmp", "myhost"), None);
+    }
+
+    #[test]
+    fn accept_osc7_cwd_takes_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let accepted = accept_osc7_cwd("", b"/tmp/\xff", "myhost").expect("path accepted");
+        assert_eq!(accepted, PathBuf::from(OsStr::from_bytes(b"/tmp/\xff")));
+    }
+
+    #[test]
+    fn accept_osc7_cwd_rejects_bad_paths() {
+        assert_eq!(accept_osc7_cwd("", b"", "myhost"), None);
+        assert_eq!(accept_osc7_cwd("", b"relative/dir", "myhost"), None);
+        assert_eq!(accept_osc7_cwd("", b"/tmp/a\0b", "myhost"), None);
+        // The 4096-byte limit is from the OSC 7 spec (5.8): exactly 4096 is
+        // accepted, one byte more is refused.
+        let at_limit = format!("/{}", "a".repeat(4095));
+        assert!(accept_osc7_cwd("", at_limit.as_bytes(), "myhost").is_some());
+        let over_limit = format!("/{}", "a".repeat(4096));
+        assert_eq!(accept_osc7_cwd("", over_limit.as_bytes(), "myhost"), None);
+    }
+
+    #[test]
+    fn earliest_terminal_deadline_picks_minimum() {
+        let active = Terminal::new_for_test(40, 3, 1);
+        let background = Terminal::new_for_test(40, 3, 2);
+        let now = Instant::now();
+        hold_in_sync_block(&active, b"\x1b[?2026hX", now + Duration::from_secs(1));
+        hold_in_sync_block(&background, b"\x1b[?2026hX", now);
+
+        assert_eq!(
+            earliest_terminal_deadline(&[active, background]),
+            Some(now + Duration::from_millis(150))
+        );
+        assert_eq!(
+            earliest_terminal_deadline(&[Terminal::new_for_test(40, 3, 3)]),
+            None
+        );
+    }
 
     /// Terminal model with the default background palette, as
     /// `Terminal::new_for_test` builds it.
@@ -1396,9 +1520,10 @@ fn write_terminal_spawn_error(term: &mut Term, error: &io::Error) {
 const OSC7_PATH_MAX_BYTES: usize = 4096;
 
 /// Accepts an OSC 7 report only when it names this machine (empty host,
-/// `localhost`, or `local_host`) and carries a usable absolute UTF-8 path
-/// without NUL bytes. Anything else returns `None`, and the previous
-/// directory stays in place.
+/// `localhost`, or `local_host`) and carries a non-empty absolute path
+/// without NUL bytes. The path is taken as raw bytes, so non-UTF-8 names
+/// that Linux filesystems allow are accepted. Anything else returns `None`,
+/// and the previous directory stays in place.
 fn accept_osc7_cwd(host: &str, path: &[u8], local_host: &str) -> Option<PathBuf> {
     if !(host.is_empty() || host == "localhost" || host == local_host) {
         return None;
@@ -1406,8 +1531,7 @@ fn accept_osc7_cwd(host: &str, path: &[u8], local_host: &str) -> Option<PathBuf>
     if path.is_empty() || path.len() > OSC7_PATH_MAX_BYTES || path.contains(&0) {
         return None;
     }
-    let text = std::str::from_utf8(path).ok()?;
-    let path = Path::new(text);
+    let path = Path::new(OsStr::from_bytes(path));
     path.is_absolute().then(|| path.to_path_buf())
 }
 

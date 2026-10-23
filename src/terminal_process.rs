@@ -977,15 +977,18 @@ fn finish_terminal_output_stream(
     }
 
     let outcome = grid.advance(TERMINAL_EXIT_BEFORE_OUTPUT, now, sink);
-    if outcome.grid_changed {
-        // Only the content generation moves here; `dirty` keeps its prior value.
-        let was_dirty = grid.dirty();
-        grid.mark_changed();
-        if !was_dirty {
-            grid.set_dirty(false);
-        }
+    // The exit notice always repaints, even when synchronized output held its
+    // bytes, so the batch reports a grid change and the main loop gets a frame.
+    // Only the content generation moves here; `dirty` keeps its prior value.
+    let was_dirty = grid.dirty();
+    grid.mark_changed();
+    if !was_dirty {
+        grid.set_dirty(false);
     }
-    outcome
+    AdvanceOutcome {
+        grid_changed: true,
+        ..outcome
+    }
 }
 
 fn terminal_read_buffer() -> Vec<u8> {
@@ -1859,6 +1862,111 @@ mod tests {
         let lines = rows_snapshot(&grid);
         assert!(!finish_terminal_output_stream(&mut grid, &mut sink, now).grid_changed);
         assert!(rows_snapshot(&grid) == lines);
+    }
+
+    #[test]
+    fn sync_batch_does_not_bump_content_generation() {
+        let mut grid = test_term(64, 3);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        let before = grid.content_generation();
+
+        advance_terminal_output_batch(
+            &mut grid,
+            &mut sink,
+            &[output_chunk(b"\x1b[?2026hX")],
+            Instant::now(),
+        );
+
+        assert_eq!(grid.content_generation(), before);
+    }
+
+    #[test]
+    fn osc52_pending_value_replaced() {
+        let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
+        let mut grid = test_term(64, 3);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: Some(&pending),
+            wake: None,
+        };
+        // "aGk=" is "hi" and "aGky" is "hi2" in base64; only the later value
+        // survives until the main thread takes it.
+        advance_terminal_output_batch(
+            &mut grid,
+            &mut sink,
+            &[output_chunk(b"\x1b]52;c;aGk=\x07\x1b]52;c;aGky\x07")],
+            Instant::now(),
+        );
+
+        let events = PendingHostEvents::take(&pending);
+        assert_eq!(events.clipboard.as_deref(), Some("hi2"));
+        assert!(PendingHostEvents::take(&pending).clipboard.is_none());
+    }
+
+    #[test]
+    fn new_tab_starts_in_osc7_dir() {
+        let home = PathBuf::from("/home/ronsole-test");
+        let existing = std::env::temp_dir();
+        assert_eq!(
+            terminal_launch_directory(Some(existing.as_path()), &home),
+            existing
+        );
+        let missing = PathBuf::from("/nonexistent/ronsole-osc7-dir");
+        assert_eq!(
+            terminal_launch_directory(Some(missing.as_path()), &home),
+            home
+        );
+        assert_eq!(terminal_launch_directory(None, &home), home);
+    }
+
+    #[test]
+    fn explicit_cli_directory_wins_over_inherited() {
+        // The explicit folder is taken without an `is_dir` check, so a
+        // missing path still wins over an existing inherited one.
+        let explicit = PathBuf::from("/nonexistent/ronsole-cli-dir");
+        let spec = TerminalLaunchSpec {
+            working_directory: Some(explicit.clone()),
+            inherited_directory: Some(std::env::temp_dir()),
+            ..TerminalLaunchSpec::default()
+        };
+
+        let (_, cwd, _, _) =
+            terminal_launch_command(spec, &TabToken::generate()).expect("launch command");
+
+        assert_eq!(cwd, explicit);
+    }
+
+    #[test]
+    fn finish_stream_always_marks_changed() {
+        let mut grid = test_term(64, 3);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        let now = Instant::now();
+        // An open synchronized-output block holds the exit notice, so the
+        // parser itself reports no grid change for it.
+        advance_terminal_output_batch(
+            &mut grid,
+            &mut sink,
+            &[output_chunk(b"\x1b[?2026hX")],
+            now,
+        );
+        assert!(!grid.presentation_ready());
+        let generation_before = grid.content_generation();
+
+        let outcome = finish_terminal_output_stream(&mut grid, &mut sink, now);
+
+        assert!(outcome.grid_changed);
+        assert_ne!(grid.content_generation(), generation_before);
     }
 
     #[test]
