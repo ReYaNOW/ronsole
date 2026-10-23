@@ -1671,6 +1671,24 @@ mod tests {
         assert!(same_image(&with_face.image, &without_face.image));
     }
 
+    // Whitespace with glyph 0 still rasterizes, so without the face gate Inter's .notdef would win.
+    #[test]
+    fn styled_face_missing_whitespace_falls_back_to_regular_chain() {
+        let inter = FontRef::from_index(UI_FONT, 0).expect("bundled UI font parses");
+        let regular = FontRef::from_index(TERMINAL_FONT, 0).expect("bundled Regular font parses");
+        let chain = [FontData::new_static(TERMINAL_FONT)];
+        let mut ctx = ScaleContext::new();
+        let c = '\r';
+        assert!(!font_maps_char(inter, c));
+        assert!(font_maps_char(regular, c));
+        let with_face = rasterize_glyph(&chain, Some(inter), &mut ctx, c, 16.0, false)
+            .expect("whitespace always rasterizes");
+        let without_face = rasterize_glyph(&chain, None, &mut ctx, c, 16.0, false)
+            .expect("Regular chain maps U+000D");
+        assert_eq!(with_face.advance, without_face.advance);
+        assert!(same_image(&with_face.image, &without_face.image));
+    }
+
     #[test]
     fn styled_face_used_when_it_maps_char() {
         let inter = FontRef::from_index(UI_FONT, 0).expect("bundled UI font parses");
