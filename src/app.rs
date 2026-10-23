@@ -1538,6 +1538,10 @@ impl App {
             } else if key_input.state.is_pressed() && self.settings_background_editing {
                 let _ = self.handle_settings_background_key(key_input.physical_key);
             }
+            // Text of the key follows the key, as the former separate text event did.
+            if let Some(text) = key_input.text.as_deref() {
+                self.on_text(text);
+            }
             return false;
         }
         let active = self.active_terminal;

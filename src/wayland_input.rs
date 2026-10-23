@@ -25,7 +25,6 @@ pub(crate) enum WaylandInputEvent {
     Focus(bool),
     Modifiers(Modifiers),
     Key(KeyInput),
-    Text(String),
     ImeCommit(String),
     PointerMotion(PointerPosition),
     PointerLeave,

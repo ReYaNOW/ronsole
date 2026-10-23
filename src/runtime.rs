@@ -1631,13 +1631,18 @@ impl WaylandState {
 
     fn queue_key_event(&mut self, evdev_key: u32, state: KeyState, repeat: bool, now: Instant) {
         let physical_key = physical_key_from_evdev(evdev_key);
-        let text = if should_emit_xkb_text(
+        let preedit_active = self.ime.preedit_active();
+        // A pressed key during an active IME preedit belongs to the composition, so its text is
+        // not delivered. The key itself still reaches the host and is flagged for the encoder.
+        let text = if state.is_pressed() && preedit_active {
+            None
+        } else if should_emit_xkb_text(
             state,
             physical_key,
             self.modifiers,
             self.text_input_enabled,
             repeat,
-            self.ime.preedit_active(),
+            preedit_active,
         ) {
             self.xkb.text_for_key(evdev_key).filter(|text| !text.is_empty())
         } else {
@@ -1649,13 +1654,11 @@ impl WaylandState {
             state,
             physical_key,
             keycode: evdev_key,
-            text: text.clone(),
+            text,
             unshifted: self.xkb.unshifted_char(evdev_key),
             named: named_term_key(evdev_key, level0_keysym, current_keysym),
+            ime_preedit: preedit_active,
         }));
-        if let Some(text) = text {
-            self.push_input(WaylandInputEvent::Text(text));
-        }
         if repeat {
             return;
         }

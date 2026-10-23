@@ -115,7 +115,6 @@ impl App {
                         return true;
                     }
                 }
-                WaylandInputEvent::Text(text) => self.on_text(&text),
                 WaylandInputEvent::ImeCommit(text) => self.on_ime_commit(&text),
                 WaylandInputEvent::PointerMotion(position) => self.on_pointer_motion(position),
                 WaylandInputEvent::PointerLeave => {

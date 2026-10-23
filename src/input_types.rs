@@ -173,6 +173,8 @@ pub(crate) struct KeyInput {
     pub unshifted: Option<char>,
     /// Named key resolved from XKB keysyms (modifiers and keypad).
     pub named: Option<TermKey>,
+    /// An IME preedit was active when the key arrived; the key must not reach the encoder.
+    pub ime_preedit: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

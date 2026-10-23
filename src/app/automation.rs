@@ -1376,6 +1376,7 @@ fn press_key(app: &mut App, modifiers: Modifiers, code: KeyCode) -> Result<(), S
         text: None,
         unshifted: None,
         named: None,
+        ime_preedit: false,
     });
     let released_exit = app.on_key(KeyInput {
         state: KeyState::Released,
@@ -1384,6 +1385,7 @@ fn press_key(app: &mut App, modifiers: Modifiers, code: KeyCode) -> Result<(), S
         text: None,
         unshifted: None,
         named: None,
+        ime_preedit: false,
     });
     app.on_modifiers(Modifiers::empty());
     if pressed_exit || released_exit {
