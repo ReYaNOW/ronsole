@@ -21,6 +21,8 @@ TEST ?=
 # Package selection for cargo test; narrow crate run: make test TEST_PKG='-p ronsole-term'
 TEST_PKG ?= --workspace
 TEST_THREADS ?= 1
+# EGL vendor for GL tests; passed as RONSOLE_EGL_VENDOR, read by prefer_egl_vendor (src/main.rs)
+TEST_EGL_VENDOR ?= mesa
 BUILD_STD_TEST = $(BUILD_STD)
 
 .PHONY: all fast max bloat-max codex_test test test-one test-list test-hunt test-time scroll-bench pgo-bench-tools pgo-bench-self-test pgo-bench-build pgo-bench-run pgo-bench pgo-gen pgo-run pgo-merge pgo-max pgo-auto pgo-gen-fast pgo-script pgo-train pgo-use pgo-clean pgo clean
@@ -82,6 +84,7 @@ codex_test:
 test:
 	@echo "🧪 Запуск тестов (на базе FAST профиля, подробный режим)..."
 	$(FAST_PROFILE_OPTS) \
+	RONSOLE_EGL_VENDOR=$(TEST_EGL_VENDOR) \
 	CARGO_TERM_COLOR=always \
 	RUSTFLAGS="$(COMMON_RUSTFLAGS)" \
 	RUST_BACKTRACE=full \
@@ -113,6 +116,7 @@ test-one:
 	fi
 	@echo "🎯 Запуск одного теста: $(TEST)"
 	$(FAST_PROFILE_OPTS) \
+	RONSOLE_EGL_VENDOR=$(TEST_EGL_VENDOR) \
 	CARGO_TERM_COLOR=always \
 	RUSTFLAGS="$(COMMON_RUSTFLAGS)" \
 	RUST_BACKTRACE=full \
