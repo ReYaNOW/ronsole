@@ -365,6 +365,36 @@ fn osc8_budget_caps_live_links_and_frees_them_on_reset() {
 }
 
 #[test]
+fn osc8_budget_freed_by_clearing_scrollback() {
+    // Same exhaustion as above, but the links leave the screen and sit in scrollback.
+    // `CSI 3 J` drops the scrollback, so the budget is free for a new link.
+    const BUDGET_BYTES: usize = 8 * 1024 * 1024;
+    const URI_BYTES: usize = 1000;
+    let accepted = BUDGET_BYTES / URI_BYTES;
+    let tail = "x".repeat(URI_BYTES - "https://000000/".len());
+    let mut input = Vec::new();
+    for index in 0..=accepted {
+        let link = format!("\x1b]8;;https://{index:06}/{tail}\x1b\\");
+        input.extend_from_slice(link.as_bytes());
+        input.extend_from_slice(b"a\x1b]8;;\x1b\\");
+    }
+    let mut term = term_with(accepted + 16, &input);
+    let mut sink = RecordingSink::new();
+
+    // Three line feeds on a 3-row term scroll the row with the links into scrollback.
+    feed(&mut term, &mut sink, b"\r\n\r\n\r\n");
+    assert_eq!(term.scrollback_len(), 1);
+    // The budget is still full (608 bytes left), so a 1000-byte link is printed without a link.
+    let over = format!("\x1b]8;;https://{accepted:06}/{tail}\x1b\\a");
+    feed(&mut term, &mut sink, over.as_bytes());
+    assert!(uri_at(&term, 2, 0).is_none());
+
+    feed(&mut term, &mut sink, b"\x1b[3J\r\x1b]8;;https://ok\x1b\\a");
+    assert_eq!(term.scrollback_len(), 0);
+    assert_eq!(uri_at(&term, 2, 0).as_deref(), Some("https://ok"));
+}
+
+#[test]
 fn link_at_long_logical_line_finds_url_in_window() {
     // 50 000 cells in one logical line of 100-column rows: 25 000 `x`, a space, the URL
     // at cells 25 001-25 011, a space, then 24 987 `x`. Row 250 holds the URL at columns 1-11.
@@ -379,4 +409,35 @@ fn link_at_long_logical_line_finds_url_in_window() {
             cells: vec![(250, 1..12)],
         })
     );
+}
+
+#[test]
+fn link_at_long_logical_line_reports_url_near_point_not_far_one() {
+    // One logical line of 100-column rows: `https://a/b` at cells 0-10, then 24 988 `x`,
+    // then `https://c/d` at cells 25 001-25 011. The first URL is 25 000 cells from row 250,
+    // far beyond URL_SEARCH_RADIUS, so only the near URL is reported.
+    let mut text = b"https://a/b ".to_vec();
+    text.extend(std::iter::repeat_n(b'x', 24_988));
+    text.extend_from_slice(b" https://c/d ");
+    let term = term_with(100, &text);
+    assert_eq!(
+        term.link_at(250, 5, 0..600),
+        Some(LinkTarget {
+            uri: "https://c/d".into(),
+            cells: vec![(250, 1..12)],
+        })
+    );
+}
+
+#[test]
+fn link_at_long_logical_line_window_edge_is_deterministic() {
+    // `https://` followed by 9 000 `a` in one logical line of 100-column rows. Querying
+    // logical cell 9 000 (row 90): the window starts at cell 808, so the scheme at cell 0
+    // lies outside it and the full URL must not be reported. The same query repeats.
+    let mut text = b"https://".to_vec();
+    text.extend(std::iter::repeat_n(b'a', 9_000));
+    let term = term_with(100, &text);
+    let first = term.link_at(90, 0, 0..600);
+    assert_eq!(first, term.link_at(90, 0, 0..600));
+    assert!(first.is_none_or(|target| !target.uri.starts_with("https://")));
 }

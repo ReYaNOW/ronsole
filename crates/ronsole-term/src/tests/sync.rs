@@ -86,6 +86,36 @@ fn sync_hold_needs_lone_2026_param() {
 }
 
 #[test]
+fn sync_hold_ignores_2026_first_in_combined_set() {
+    // `?2026;25h` has two parameters, so it is not a lone set: nothing is held and
+    // the cursor and text are applied at once.
+    let t0 = Instant::now();
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+
+    term.advance(b"\x1b[?25l", t0, &mut sink);
+    assert!(!term.cursor_visible);
+    let outcome = term.advance(b"\x1b[?2026;25hAB", t0, &mut sink);
+    assert!(outcome.grid_changed);
+    assert_eq!(term.sync_deadline(), None);
+    assert!(term.cursor_visible);
+    assert_eq!(row_chars(&term, 0), "AB");
+}
+
+#[test]
+fn sync_hold_ignores_repeated_2026_param() {
+    // `?2026;2026h` is a combined set too: it holds nothing and shows the text at once.
+    let t0 = Instant::now();
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+
+    let outcome = term.advance(b"\x1b[?2026;2026hAB", t0, &mut sink);
+    assert!(outcome.grid_changed);
+    assert_eq!(term.sync_deadline(), None);
+    assert_eq!(row_chars(&term, 0), "AB");
+}
+
+#[test]
 fn sync_set_alone_reports_new_deadline() {
     let t0 = Instant::now();
     let mut term = Term::new(test_config(10, 3));
