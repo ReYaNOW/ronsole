@@ -8,7 +8,9 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::platform::{KdeActivationWorker, kde_session_active, open_uri, open_uri_allowed};
+use crate::platform::{
+    KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
+};
 use crate::platform::single_instance::BridgeResult;
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit, terminal_palette};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
@@ -384,6 +386,8 @@ pub struct App {
     terminal_tab_drag: Option<TabDragState>,
     pending_tab_reveal: Option<bool>,
     interaction: TerminalInteraction,
+    /// Where Ctrl+click links are sent: the system opener, or a recording sink when headless.
+    open_sink: OpenSink,
     terminal_cleanup: TerminalCleanupWorker,
     kde_activation_worker: Option<KdeActivationWorker>,
     pending_terminal_cleanup: VecDeque<TerminalProcess>,
@@ -422,7 +426,16 @@ impl App {
     }
 
     fn from_config(config: AppConfig) -> Self {
-        let mut interaction = TerminalInteraction::default();
+        Self::from_parts(config, TerminalInteraction::default(), OpenSink::System)
+    }
+
+    /// Shared constructor for the system and headless paths, which differ only in
+    /// the clipboard owner held by `interaction` and in `open_sink`.
+    fn from_parts(
+        config: AppConfig,
+        mut interaction: TerminalInteraction,
+        open_sink: OpenSink,
+    ) -> Self {
         interaction.set_scroll_sensitivity(config.scroll_sensitivity);
         let settings_font_value = format!("{:.0}", config.terminal_font_size);
         let settings_scroll_value = format!("{:.2}", config.scroll_sensitivity);
@@ -446,6 +459,7 @@ impl App {
             terminal_tab_drag: None,
             pending_tab_reveal: None,
             interaction,
+            open_sink,
             terminal_cleanup: TerminalCleanupWorker::new(),
             kde_activation_worker: None,
             pending_terminal_cleanup: VecDeque::with_capacity(TERMINAL_CLEANUP_PENDING_CAPACITY),
@@ -1785,7 +1799,7 @@ impl App {
         if let Some(uri) = self.interaction.take_link_uri()
             && open_uri_allowed(&uri, crate::terminal::local_host_name())
         {
-            open_uri(&uri);
+            open_uri_with(&uri, self.open_sink.clone());
         }
         false
     }
@@ -3119,6 +3133,14 @@ mod tests {
         app.apply_settings_hit(SettingsHit::Tab(SettingsTab::Help));
         assert!(!app.config_dirty);
         assert!(!app.dirty);
+    }
+
+    #[test]
+    fn headless_app_uses_memory_clipboard_and_recording_opener() {
+        let profile = std::env::temp_dir().join(format!("ronsole-headless-{}", std::process::id()));
+        let app = App::load_headless(None, &profile).expect("headless app");
+        assert!(app.interaction.clipboard_is_memory_for_test());
+        assert!(matches!(app.open_sink, OpenSink::Record(_)));
     }
 
     #[test]

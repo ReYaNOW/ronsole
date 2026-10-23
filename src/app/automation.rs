@@ -1559,6 +1559,33 @@ impl App {
         Ok(app)
     }
 
+    /// Builds a headless app: config comes from `profile_dir`, clipboard text stays
+    /// in memory, and opened links are recorded instead of launched.
+    pub(crate) fn load_headless(
+        options: Option<AutomationOptions>,
+        profile_dir: &Path,
+    ) -> Result<Self, String> {
+        let automation = options.map(AutomationController::new).transpose()?;
+        Self::load_headless_with(automation, profile_dir)
+    }
+
+    pub(super) fn load_headless_with(
+        automation: Option<AutomationController>,
+        profile_dir: &Path,
+    ) -> Result<Self, String> {
+        // The receiver is dropped on purpose: no reader of recorded links exists yet,
+        // and a failed send is ignored by the opener.
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let config = crate::config::AppConfig::load_at(profile_dir.join("config"));
+        let mut app = Self::from_parts(
+            config,
+            crate::input::TerminalInteraction::new_with_memory_clipboard(),
+            crate::platform::OpenSink::Record(sender),
+        );
+        app.automation = automation;
+        Ok(app)
+    }
+
     #[cold]
     #[inline(never)]
     pub(super) fn advance_automation(&mut self, now: Instant) -> Option<AutomationTick> {
