@@ -31,11 +31,13 @@ use std::time::Instant;
 
 mod automation;
 mod direct_wayland;
+mod headless_run;
 mod tab_delivery;
 
 pub(crate) use automation::{
     AutomationOptions, automation_options_from_args, write_automation_startup_failure,
 };
+pub(crate) use headless_run::HeadlessRunError;
 
 const TERMINAL_CLEANUP_PENDING_CAPACITY: usize = 16;
 const PENDING_EXTERNAL_LAUNCH_CAPACITY: usize = 32;

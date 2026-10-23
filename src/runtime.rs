@@ -2779,8 +2779,8 @@ impl WindowRuntime {
         )
         .map_err(|error| format!("EGL setup failed at renderer: {error}"))?;
         renderer.resize(physical_width, physical_height);
-        let wake =
-            WakeHandle::new().map_err(|error| format!("eventfd creation failed: {error}"))?;
+        let wake = WakeHandle::new()
+            .map_err(|error| format!("EGL setup failed at eventfd: {error}"))?;
         let runtime = Self {
             renderer,
             target: GlTarget::Offscreen(offscreen),
@@ -2869,7 +2869,8 @@ impl WindowRuntime {
         self.make_target_current();
         self.renderer.update_scale_factor(scale_factor);
         if let RuntimeBackend::Headless(headless) = &mut self.backend {
-            headless.set_scale_factor(scale_factor);
+            // Take the scale the renderer accepted, not the raw input (NaN or zero is rejected there).
+            headless.set_scale_factor(self.renderer.scale_factor());
         }
     }
 
@@ -3675,7 +3676,18 @@ mod tests {
         )
         .err()
         .expect("zero-size pbuffer must not bootstrap");
-        assert!(error.starts_with("EGL setup failed at "), "{error}");
+        assert_eq!(error, "EGL setup failed at CreatePbuffer: zero size");
+    }
+
+    #[test]
+    fn headless_update_scale_factor_keeps_accepted_scale() {
+        let mut runtime = headless_runtime(320, 200);
+        runtime.update_scale_factor(f32::NAN);
+        runtime.update_scale_factor(0.0);
+        let metrics = runtime.wayland_metrics();
+        assert_eq!(metrics.scale_factor, 1.0);
+        assert_eq!((metrics.logical_width, metrics.logical_height), (320, 200));
+        assert_eq!((metrics.physical_width, metrics.physical_height), (320, 200));
     }
 
     #[test]

@@ -127,6 +127,10 @@ fn main() -> ExitCode {
     if args.get(1).is_some_and(|arg| arg == "tab-status") {
         return platform::single_instance::run_tab_status_command();
     }
+    // Headless runs never touch the single-instance socket or Wayland.
+    if args.get(1).is_some_and(|arg| arg == "--headless") {
+        return headless::main(&args);
+    }
     let (automation_options, initial_launch): (Option<app::AutomationOptions>, _) =
         match launch::parse_startup_args_with_current_dir(&args, env::current_dir) {
             Ok(launch::StartupMode::Normal(launch)) => (None, launch),
@@ -247,6 +251,22 @@ mod tests {
             preferred_egl_vendor_path(EglVendorPreference::System, true),
             None
         );
+    }
+
+    #[test]
+    fn headless_branch_precedes_single_instance_and_wayland_startup() {
+        let source = include_str!("main.rs");
+        let headless = source
+            .find("headless::main(&args)")
+            .expect("headless branch must remain present");
+        let classify = source
+            .find("launch::parse_startup_args_with_current_dir(&args, env::current_dir)")
+            .expect("startup mode classifier must remain present");
+        let gate = source
+            .find("acquire_single_instance(&initial_launch)")
+            .expect("single-instance gate must remain present");
+        assert!(headless < classify);
+        assert!(headless < gate);
     }
 
     #[test]

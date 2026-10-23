@@ -570,6 +570,24 @@ pub(super) struct AutomationController {
 
 impl AutomationController {
     pub(super) fn new(options: AutomationOptions) -> Result<Self, String> {
+        Self::with_steps(options, scenario())
+    }
+
+    /// Short scenario for tests: ready, every semantic block once, then the cleanup
+    /// barrier and finish. Blocks are checked in `SemanticBlock::ALL` order.
+    #[cfg(test)]
+    pub(super) fn with_short_scenario(options: AutomationOptions) -> Result<Self, String> {
+        let mut steps = vec![AutomationStep::WaitReady];
+        for block in SemanticBlock::ALL {
+            steps.push(AutomationStep::WaitPresentedFrame);
+            steps.push(AutomationStep::Complete(block));
+        }
+        steps.push(AutomationStep::CleanupBarrierFinal);
+        steps.push(AutomationStep::Finish);
+        Self::with_steps(options, steps)
+    }
+
+    fn with_steps(options: AutomationOptions, steps: Vec<AutomationStep>) -> Result<Self, String> {
         let fixture_path = options.workspace.join(FIXTURE_NAME);
         if let Some(parent) = options.report.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -601,7 +619,7 @@ impl AutomationController {
         Ok(Self {
             options,
             fixture_path,
-            steps: scenario(),
+            steps,
             step_index: 0,
             step_started: started,
             started,
