@@ -27,6 +27,9 @@ pub(crate) struct TerminalInteraction {
     link_uri: Option<Box<str>>,
     /// True from a Ctrl+press on a link until the matching release.
     link_press_pending: bool,
+    /// Key whose press the host consumed as a copy; its repeat and release stay away
+    /// from the encoder until that key is released.
+    held_host_key: Option<PhysicalKey>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,6 +62,7 @@ impl Default for TerminalInteraction {
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
             link_uri: None,
             link_press_pending: false,
+            held_host_key: None,
         }
     }
 }
@@ -475,6 +479,19 @@ impl TerminalInteraction {
             return pressed;
         }
 
+        // A key whose press the host consumed keeps out of the encoder until its release.
+        // A fresh press means an earlier release was lost, so it drops the old hold.
+        if self.held_host_key == Some(key_event.physical_key) {
+            match key_event.state {
+                KeyState::Repeat => return false,
+                KeyState::Released => {
+                    self.held_host_key = None;
+                    return false;
+                }
+                KeyState::Pressed => self.held_host_key = None,
+            }
+        }
+
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         if ctrl
             && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
@@ -483,6 +500,7 @@ impl TerminalInteraction {
             let copied = if pressed {
                 let text = grid.selection_text();
                 grid.set_selection(None);
+                self.held_host_key = Some(key_event.physical_key);
                 Some(text)
             } else {
                 None
@@ -497,8 +515,15 @@ impl TerminalInteraction {
             return pressed;
         }
 
-        // A key consumed by the IME composition never reaches the terminal.
+        // A key consumed by the IME composition never reaches the encoder. Its press text
+        // still goes to the PTY as plain text, because the IME may pass the key through.
         if key_event.ime_preedit {
+            if key_event.state == KeyState::Pressed
+                && let Some(text) = key_event.text.as_deref()
+            {
+                drop(grid);
+                return self.handle_text(text, terminal);
+            }
             return false;
         }
         let Some(key) = terminal_key_event(key_event, self.modifiers) else {
@@ -1650,6 +1675,59 @@ mod tests {
         composing.ime_preedit = true;
         assert!(!interaction.handle_key_event(&composing, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn ime_preedit_press_text_reaches_pty() {
+        // Expected value comes from the I1 ruling: press text still reaches the PTY under preedit.
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
+        press.unshifted = Some('a');
+        press.text = Some("a".to_string());
+        press.ime_preedit = true;
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"a");
+    }
+
+    #[test]
+    fn ime_preedit_repeat_sends_nothing() {
+        // Expected value comes from the I1 ruling: repeat under preedit stays suppressed.
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyA), 30);
+        repeat.unshifted = Some('a');
+        repeat.text = Some("a".to_string());
+        repeat.ime_preedit = true;
+        assert!(!interaction.handle_key_event(&repeat, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_with_selection_press_repeat_release_sends_nothing() {
+        // Expected behaviour comes from the G2-1 ruling: a host-intercepted press keeps
+        // its key away from the encoder until that key's release.
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        crate::platform::lock_recover(&terminal.grid).set_selection(Some((0, 0, 0, 2)));
+        let ctrl_c = |state| {
+            let mut key = raw_key(state, PhysicalKey::Code(KeyCode::KeyC), 46);
+            key.unshifted = Some('c');
+            key
+        };
+        let press = ctrl_c(KeyState::Pressed);
+        let repeat = ctrl_c(KeyState::Repeat);
+        let release = ctrl_c(KeyState::Released);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(crate::platform::lock_recover(&terminal.grid).selection().is_none());
+        assert!(!interaction.handle_key_event(&repeat, &mut terminal));
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // A fresh Ctrl+C press without selection goes to the encoder again (ETX, flags 0).
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x03");
     }
 
     #[test]
