@@ -931,6 +931,7 @@ fn read_external_launch_request(reader: &mut impl Read) -> io::Result<ExternalLa
         activation_token,
         launch: TerminalLaunchSpec {
             working_directory,
+            inherited_directory: None,
             command,
             hold: flags & REQUEST_FLAG_HOLD != 0,
             bridge_launch_id,
@@ -1579,6 +1580,7 @@ mod tests {
             activation_token: Some("wayland-token-123".to_owned()),
             launch: TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/tmp/ronsole session")),
+                inherited_directory: None,
                 command: vec![
                     OsString::from("program"),
                     OsString::from("arg one"),
@@ -1601,6 +1603,7 @@ mod tests {
             activation_token: None,
             launch: TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from(raw_workdir.clone())),
+                inherited_directory: None,
                 command: vec![raw_program.clone(), raw_arg.clone()],
                 hold: false,
                 bridge_launch_id: None,
@@ -1634,6 +1637,7 @@ mod tests {
             activation_token: Some("secret-activation-token".to_owned()),
             launch: TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/secret/cwd")),
+                inherited_directory: None,
                 command: vec![OsString::from("secret-command")],
                 hold: true,
                 bridge_launch_id: None,
@@ -1722,6 +1726,7 @@ mod tests {
             activation_token: None,
             launch: TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: vec![OsString::from_vec(vec![b'x'; MAX_REQUEST_PAYLOAD_BYTES])],
                 hold: false,
                 bridge_launch_id: None,
@@ -2326,6 +2331,7 @@ mod tests {
             activation_token: Some("token".to_owned()),
             launch: TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/tmp")),
+                inherited_directory: None,
                 command: vec![OsString::from("htop")],
                 hold: true,
                 bridge_launch_id: None,
@@ -2376,6 +2382,7 @@ mod tests {
             activation_token: None,
             launch: TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/tmp/secondary")),
+                inherited_directory: None,
                 command: vec![OsString::from("program"), OsString::from("arg one")],
                 hold: true,
                 bridge_launch_id: None,
@@ -2403,6 +2410,7 @@ mod tests {
             activation_token: None,
             launch: TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/tmp/first")),
+                inherited_directory: None,
                 command: vec![OsString::from("first"), OsString::from("arg one")],
                 hold: false,
                 bridge_launch_id: None,
@@ -2412,6 +2420,7 @@ mod tests {
             activation_token: Some("second-token".to_owned()),
             launch: TerminalLaunchSpec {
                 working_directory: Some(PathBuf::from("/tmp/second")),
+                inherited_directory: None,
                 command: vec![OsString::from("second"), OsString::from("--flag")],
                 hold: true,
                 bridge_launch_id: None,

@@ -1956,6 +1956,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         crate::platform::lock_recover(&terminal.grid).advance(
             b"ordinary screen without bridge warning",
@@ -1990,6 +1992,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         crate::platform::lock_recover(&terminal.grid).advance(
             b"WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n\xe2\x9d\xaf 1. I am using this for local development",
@@ -2009,6 +2013,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         grid.advance(bytes.as_bytes(), Instant::now(), &mut sink);
@@ -2438,6 +2444,7 @@ mod tests {
             1,
             TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: vec![OsString::from("/bin/true")],
                 hold: true,
                 bridge_launch_id: None,
@@ -2474,6 +2481,7 @@ mod tests {
             1,
             TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: vec![OsString::from("/bin/true")],
                 hold: false,
                 bridge_launch_id: None,
@@ -2505,6 +2513,7 @@ mod tests {
             1,
             TerminalLaunchSpec {
                 working_directory: Some("/tmp".into()),
+                inherited_directory: None,
                 command: vec!["/definitely/missing/ronsole-test-command".into()],
                 hold: false,
                 bridge_launch_id: None,
@@ -2722,6 +2731,7 @@ mod tests {
     fn focused_custom_workdir_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: Some("/tmp/custom-cwd".into()),
+            inherited_directory: None,
             command: Vec::new(),
             hold: false,
             bridge_launch_id: None,
@@ -2739,6 +2749,7 @@ mod tests {
     fn focused_custom_command_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: vec!["htop".into(), "-d".into(), "10".into()],
             hold: false,
             bridge_launch_id: None,
@@ -2756,6 +2767,7 @@ mod tests {
     fn focused_hold_only_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: Vec::new(),
             hold: true,
             bridge_launch_id: None,
@@ -2773,6 +2785,7 @@ mod tests {
     fn unfocused_custom_command_with_token_opens_requested_tab_and_uses_xdg_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: vec!["htop".into()],
             hold: false,
             bridge_launch_id: None,
@@ -2796,6 +2809,7 @@ mod tests {
     fn unfocused_custom_workdir_on_kde_opens_requested_tab_and_uses_kde_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: Some("/tmp/custom-cwd".into()),
+            inherited_directory: None,
             command: Vec::new(),
             hold: false,
             bridge_launch_id: None,
@@ -2813,6 +2827,7 @@ mod tests {
     fn unfocused_custom_hold_off_kde_opens_requested_tab_and_uses_generic_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: Vec::new(),
             hold: true,
             bridge_launch_id: None,
@@ -2831,6 +2846,7 @@ mod tests {
         let request = external_request(
             TerminalLaunchSpec {
                 working_directory: Some("/tmp/pending-cwd".into()),
+                inherited_directory: None,
                 command: vec!["program".into(), "arg one".into(), "--child-option".into()],
                 hold: true,
                 bridge_launch_id: None,

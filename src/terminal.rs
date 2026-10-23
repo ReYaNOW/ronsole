@@ -1,8 +1,14 @@
+use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
-use crate::terminal_process::SessionSink;
+use crate::terminal_process::{
+    HostChannels, PendingHostEvents, SessionSink, notify_main_loop, terminal_reply_channel,
+};
+use crate::wake::WakeHandle;
 use ronsole_term::{Term, TermConfig, TermIdentity, TermPalette};
 use sha2::{Digest, Sha256};
 use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,6 +54,8 @@ mod tests {
         let mut sink = SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         term.advance(bytes, Instant::now(), &mut sink);
     }
@@ -86,6 +94,10 @@ mod tests {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            osc7_cwd: None,
+            reply_tx: terminal_reply_channel().0,
+            pending: Arc::new(Mutex::new(PendingHostEvents::default())),
+            wake: None,
             test_input: None,
         };
 
@@ -116,6 +128,8 @@ mod tests {
             let mut sink = SessionSink {
                 reply_tx: Some(&reply_tx),
                 title_cache: None,
+                pending: None,
+                wake: None,
             };
             for _ in 0..QUERY_BATCHES {
                 grid.advance(b"\x1b[6n\x1b[c\x1b]10;?\x1b\\", Instant::now(), &mut sink);
@@ -891,6 +905,7 @@ mod tests {
 
         let launch = TerminalLaunchSpec {
             working_directory: Some(root.clone()),
+            inherited_directory: None,
             command: vec![
                 OsString::from("./fixture"),
                 OsString::from("arg one"),
@@ -1351,6 +1366,13 @@ pub struct Terminal {
     bridge_launch: Option<BridgeLaunchState>,
     dev_warning: DevWarningState,
     dev_banner: DevBannerState,
+    /// Working directory from the latest OSC 7 report that passed
+    /// `accept_osc7_cwd`; a new tab inherits it.
+    pub(crate) osc7_cwd: Option<PathBuf>,
+    /// Sender clone kept for `flush_expired`; the parser thread holds another.
+    reply_tx: SyncSender<Vec<u8>>,
+    pending: Arc<Mutex<PendingHostEvents>>,
+    wake: Option<WakeHandle>,
     #[cfg(test)]
     test_input: Option<Arc<Mutex<Vec<u8>>>>,
 }
@@ -1363,9 +1385,56 @@ fn write_terminal_spawn_error(term: &mut Term, error: &io::Error) {
     let mut sink = SessionSink {
         reply_tx: None,
         title_cache: None,
+        pending: None,
+        wake: None,
     };
     term.advance(message.as_bytes(), Instant::now(), &mut sink);
     term.mark_presentation_ready();
+}
+
+/// Longest OSC 7 path, in bytes after percent-decoding, that a tab may adopt.
+const OSC7_PATH_MAX_BYTES: usize = 4096;
+
+/// Accepts an OSC 7 report only when it names this machine (empty host,
+/// `localhost`, or `local_host`) and carries a usable absolute UTF-8 path
+/// without NUL bytes. Anything else returns `None`, and the previous
+/// directory stays in place.
+fn accept_osc7_cwd(host: &str, path: &[u8], local_host: &str) -> Option<PathBuf> {
+    if !(host.is_empty() || host == "localhost" || host == local_host) {
+        return None;
+    }
+    if path.is_empty() || path.len() > OSC7_PATH_MAX_BYTES || path.contains(&0) {
+        return None;
+    }
+    let text = std::str::from_utf8(path).ok()?;
+    let path = Path::new(text);
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// This machine's host name, read once per process on first use.
+fn local_host_name() -> &'static str {
+    static LOCAL_HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LOCAL_HOST.get_or_init(read_host_name)
+}
+
+fn read_host_name() -> String {
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `buffer` is valid for writes of its full length.
+    let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if status != 0 {
+        return String::new();
+    }
+    let len = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..len]).into_owned()
+}
+
+/// Earliest synchronized-output deadline across all tabs; `None` when no tab
+/// holds bytes.
+pub(crate) fn earliest_terminal_deadline(terminals: &[Terminal]) -> Option<Instant> {
+    terminals.iter().filter_map(Terminal::sync_deadline).min()
 }
 
 impl Terminal {
@@ -1397,6 +1466,12 @@ impl Terminal {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            osc7_cwd: None,
+            // No reader exists for test tabs, so replies are dropped unless a
+            // test installs its own sender.
+            reply_tx: terminal_reply_channel().0,
+            pending: Arc::new(Mutex::new(PendingHostEvents::default())),
+            wake: None,
             test_input: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
@@ -1432,11 +1507,18 @@ impl Terminal {
         let grid = Arc::new(Mutex::new(new_term(200, 60, palette)));
         let bridge_screen_lock = Arc::new(Mutex::new(()));
         let tab_token = crate::terminal_process::TabToken::generate();
+        let (reply_tx, reply_rx) = terminal_reply_channel();
+        let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
         let process = match crate::terminal_process::TerminalProcess::spawn(
             grid.clone(),
             bridge_screen_lock.clone(),
             title_cache.clone(),
-            wake,
+            wake.clone(),
+            HostChannels {
+                reply_tx: reply_tx.clone(),
+                reply_rx,
+                pending: pending.clone(),
+            },
             launch,
             &tab_token,
         ) {
@@ -1466,9 +1548,63 @@ impl Terminal {
             bridge_launch,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            osc7_cwd: None,
+            reply_tx,
+            pending,
+            wake,
             #[cfg(test)]
             test_input: None,
         }
+    }
+
+    /// Earliest synchronized-output deadline of this tab, if it holds bytes.
+    /// Takes the grid lock briefly.
+    pub(crate) fn sync_deadline(&self) -> Option<Instant> {
+        crate::platform::lock_recover(&self.grid).sync_deadline()
+    }
+
+    /// Replays held synchronized-output bytes whose deadline has passed at
+    /// `now`, using the same sink as the parser thread. Marks the grid changed
+    /// and wakes the main loop when the replay changed it.
+    pub(crate) fn flush_expired(&self, now: Instant) {
+        let outcome = {
+            // Same lock order as the parser thread: screen lock, then grid.
+            let _screen_guard = crate::platform::lock_recover(&self.bridge_screen_lock);
+            let mut grid = crate::platform::lock_recover(&self.grid);
+            let mut sink = SessionSink {
+                reply_tx: Some(&self.reply_tx),
+                title_cache: Some(&self.title_cache),
+                pending: Some(&self.pending),
+                wake: self.wake.as_ref(),
+            };
+            let outcome = grid.flush_expired(now, &mut sink);
+            if outcome.grid_changed {
+                grid.mark_changed();
+            }
+            outcome
+        };
+        notify_main_loop(self.wake.as_ref(), outcome);
+    }
+
+    /// Applies the clipboard and working-directory events parked by the
+    /// parser thread. Called on the main thread; holds only the pending lock.
+    pub(crate) fn apply_host_events(&mut self, interaction: &mut TerminalInteraction) {
+        let events = PendingHostEvents::take(&self.pending);
+        if let Some(text) = events.clipboard {
+            let _ = interaction.set_clipboard_text(text);
+        }
+        if let Some((host, path)) = events.cwd
+            && let Some(cwd) = accept_osc7_cwd(&host, &path, local_host_name())
+        {
+            self.osc7_cwd = Some(cwd);
+        }
+    }
+
+    /// Replaces the reply sender used by [`Terminal::flush_expired`]; tests
+    /// use it to observe replies without a PTY.
+    #[cfg(test)]
+    pub(crate) fn set_reply_sender_for_test(&mut self, reply_tx: SyncSender<Vec<u8>>) {
+        self.reply_tx = reply_tx;
     }
 
     pub(crate) fn bridge_launch_state(&self) -> Option<&BridgeLaunchState> {

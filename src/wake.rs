@@ -1,10 +1,17 @@
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Cross-thread handle to the main loop's eventfd.
+///
+/// Clones share one eventfd and one frame flag. [`WakeHandle::wake`] asks
+/// for a frame; [`WakeHandle::wake_timer`] only rouses the loop so it can
+/// re-check a deadline.
 #[derive(Clone)]
 pub(crate) struct WakeHandle {
     fd: Arc<OwnedFd>,
+    frame_wake: Arc<AtomicBool>,
 }
 
 impl WakeHandle {
@@ -14,11 +21,34 @@ impl WakeHandle {
             return Err(io::Error::last_os_error());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Self { fd: Arc::new(fd) })
+        Ok(Self {
+            fd: Arc::new(fd),
+            frame_wake: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Wakes the main loop and marks that a frame is wanted.
+    #[inline]
+    pub(crate) fn wake(&self) {
+        self.frame_wake.store(true, Ordering::Release);
+        self.write_eventfd();
+    }
+
+    /// Wakes the main loop without asking for a frame; used when only a
+    /// synchronized-output deadline moved.
+    #[inline]
+    pub(crate) fn wake_timer(&self) {
+        self.write_eventfd();
+    }
+
+    /// Clears and returns the frame flag set by [`WakeHandle::wake`].
+    #[inline]
+    pub(crate) fn take_frame_wake(&self) -> bool {
+        self.frame_wake.swap(false, Ordering::AcqRel)
     }
 
     #[inline]
-    pub(crate) fn wake(&self) {
+    fn write_eventfd(&self) {
         let value = 1_u64.to_ne_bytes();
         loop {
             let written =
@@ -93,5 +123,19 @@ mod tests {
 
         clone.wake();
         assert_eq!(wake.drain().expect("eventfd should be reusable"), 1);
+    }
+
+    #[test]
+    fn wake_timer_does_not_request_frame() {
+        let wake = WakeHandle::new().expect("eventfd should be available on Linux");
+        let clone = wake.clone();
+
+        clone.wake_timer();
+        assert_eq!(wake.drain().expect("timer wake should write the eventfd"), 1);
+        assert!(!wake.take_frame_wake());
+
+        wake.wake();
+        assert!(clone.take_frame_wake());
+        assert!(!wake.take_frame_wake());
     }
 }

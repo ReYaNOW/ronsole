@@ -207,7 +207,15 @@ impl App {
 
             if outcome.woke {
                 let _ = self.drain_external_launches(external_launches);
-                self.request_frame();
+                // Timer-only wakes (synchronized-output deadlines) must not
+                // spend a frame; only frame-requesting wakes do.
+                let frame_wanted = self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.wake_handle().take_frame_wake());
+                if frame_wanted {
+                    self.request_frame();
+                }
             }
 
             if outcome.timed_out {
@@ -232,6 +240,7 @@ mod tests {
                     activation_token: Some(format!("token-{index}")),
                     launch: TerminalLaunchSpec {
                         working_directory: Some(format!("/tmp/session-{index}").into()),
+                        inherited_directory: None,
                         command: vec![format!("command-{index}").into()],
                         hold: index % 2 == 0,
                         bridge_launch_id: None,

@@ -1,6 +1,6 @@
 use crate::launch::TerminalLaunchSpec;
 use crate::platform::{self, ProcessTree};
-use ronsole_term::{TERMINAL_TITLE_MAX_BYTES, Term, TermSink};
+use ronsole_term::{AdvanceOutcome, TERMINAL_TITLE_MAX_BYTES, Term, TermSink};
 use crate::wake::WakeHandle;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::ffi::{OsStr, OsString};
@@ -319,6 +319,7 @@ impl TerminalProcess {
         bridge_screen_lock: Arc<Mutex<()>>,
         title_cache: TerminalTitleCache,
         wake: Option<WakeHandle>,
+        host: HostChannels,
         launch: TerminalLaunchSpec,
         tab_token: &TabToken,
     ) -> io::Result<Self> {
@@ -392,6 +393,7 @@ impl TerminalProcess {
             writer.clone(),
             wake,
             title_cache,
+            host,
         ) {
             let _ = title_stop_tx.send(());
             platform::reap_unit_thread(title_worker);
@@ -837,11 +839,47 @@ fn install_terminal_title_refresh(
     Ok((stop_tx, worker))
 }
 
-/// Host side of the [`Term`] events: replies go to the PTY writer queue and
-/// programmed titles go to the shared title cache.
+/// Host events that the parser thread produces and the main thread drains.
+///
+/// Each slot keeps only the newest value: a second OSC 52 before the drain
+/// replaces the first one.
+#[derive(Default)]
+pub(crate) struct PendingHostEvents {
+    pub(crate) clipboard: Option<String>,
+    pub(crate) cwd: Option<(String, Vec<u8>)>,
+}
+
+impl PendingHostEvents {
+    /// Takes the pending values under a short lock; the caller must not hold
+    /// the grid lock.
+    pub(crate) fn take(shared: &Mutex<Self>) -> Self {
+        std::mem::take(&mut *platform::lock_recover(shared))
+    }
+}
+
+/// Host endpoints created with each terminal and handed to its I/O threads.
+pub(crate) struct HostChannels {
+    pub(crate) reply_tx: SyncSender<Vec<u8>>,
+    pub(crate) reply_rx: Receiver<Vec<u8>>,
+    pub(crate) pending: Arc<Mutex<PendingHostEvents>>,
+}
+
+/// Host side of the [`Term`] events: replies go to the PTY writer queue,
+/// programmed titles go to the shared title cache, and clipboard and
+/// working-directory events are parked in `pending` for the main thread.
 pub(crate) struct SessionSink<'a> {
     pub(crate) reply_tx: Option<&'a SyncSender<Vec<u8>>>,
     pub(crate) title_cache: Option<&'a TerminalTitleCache>,
+    pub(crate) pending: Option<&'a Arc<Mutex<PendingHostEvents>>>,
+    pub(crate) wake: Option<&'a WakeHandle>,
+}
+
+impl SessionSink<'_> {
+    fn notify_pending(&self) {
+        if let Some(wake) = self.wake {
+            wake.wake();
+        }
+    }
 }
 
 impl TermSink for SessionSink<'_> {
@@ -857,21 +895,54 @@ impl TermSink for SessionSink<'_> {
         }
     }
 
-    fn clipboard_set(&mut self, _text: String) {}
+    fn clipboard_set(&mut self, text: String) {
+        if let Some(pending) = self.pending {
+            platform::lock_recover(pending).clipboard = Some(text);
+            self.notify_pending();
+        }
+    }
 
-    fn working_directory(&mut self, _host: &str, _path: &[u8]) {}
+    fn working_directory(&mut self, host: &str, path: &[u8]) {
+        if let Some(pending) = self.pending {
+            platform::lock_recover(pending).cwd = Some((host.to_owned(), path.to_vec()));
+            self.notify_pending();
+        }
+    }
 }
 
+/// Feeds one output batch and reports what it changed. The content generation
+/// moves only when the grid changed, so a batch held by synchronized output
+/// does not repaint.
 fn advance_terminal_output_batch(
     grid: &mut Term,
     sink: &mut SessionSink<'_>,
     chunks: &[OutputChunk],
     now: Instant,
-) {
+) -> AdvanceOutcome {
+    let mut outcome = AdvanceOutcome::default();
     for chunk in chunks {
-        grid.advance(&chunk.bytes[..chunk.len], now, sink);
+        let step = grid.advance(&chunk.bytes[..chunk.len], now, sink);
+        outcome.grid_changed |= step.grid_changed;
+        outcome.new_deadline |= step.new_deadline;
     }
-    grid.mark_changed();
+    if outcome.grid_changed {
+        grid.mark_changed();
+    }
+    outcome
+}
+
+/// Wakes the main loop according to a batch outcome: a grid change asks for a
+/// frame, a new synchronized-output deadline only needs the loop to re-arm its
+/// timeout, and anything else wakes nothing.
+pub(crate) fn notify_main_loop(wake: Option<&WakeHandle>, outcome: AdvanceOutcome) {
+    let Some(wake) = wake else {
+        return;
+    };
+    if outcome.grid_changed {
+        wake.wake();
+    } else if outcome.new_deadline {
+        wake.wake_timer();
+    }
 }
 
 #[inline]
@@ -900,19 +971,21 @@ fn finish_terminal_output_stream(
     grid: &mut Term,
     sink: &mut SessionSink<'_>,
     now: Instant,
-) -> bool {
+) -> AdvanceOutcome {
     if grid.presentation_ready() {
-        return false;
+        return AdvanceOutcome::default();
     }
 
-    grid.advance(TERMINAL_EXIT_BEFORE_OUTPUT, now, sink);
-    // Only the content generation moves here; `dirty` keeps its prior value.
-    let was_dirty = grid.dirty();
-    grid.mark_changed();
-    if !was_dirty {
-        grid.set_dirty(false);
+    let outcome = grid.advance(TERMINAL_EXIT_BEFORE_OUTPUT, now, sink);
+    if outcome.grid_changed {
+        // Only the content generation moves here; `dirty` keeps its prior value.
+        let was_dirty = grid.dirty();
+        grid.mark_changed();
+        if !was_dirty {
+            grid.set_dirty(false);
+        }
     }
-    true
+    outcome
 }
 
 fn terminal_read_buffer() -> Vec<u8> {
@@ -928,7 +1001,7 @@ fn recycle_output_chunks(
     }
 }
 
-fn terminal_reply_channel() -> (
+pub(crate) fn terminal_reply_channel() -> (
     std::sync::mpsc::SyncSender<Vec<u8>>,
     std::sync::mpsc::Receiver<Vec<u8>>,
 ) {
@@ -942,8 +1015,13 @@ fn install_terminal_io_threads(
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     wake: Option<WakeHandle>,
     title_cache: TerminalTitleCache,
+    host: HostChannels,
 ) -> io::Result<()> {
-    let (reply_tx, reply_rx) = terminal_reply_channel();
+    let HostChannels {
+        reply_tx,
+        reply_rx,
+        pending,
+    } = host;
     let (tx, rx) = std::sync::mpsc::sync_channel::<OutputChunk>(TERMINAL_OUTPUT_QUEUE_CAPACITY);
     let (recycle_tx, recycle_rx) =
         std::sync::mpsc::sync_channel::<Vec<u8>>(TERMINAL_OUTPUT_QUEUE_CAPACITY);
@@ -953,11 +1031,6 @@ fn install_terminal_io_threads(
     let parser_bridge_screen_lock = bridge_screen_lock;
     let parser_reader_finished = reader_finished.clone();
     platform::spawn_named("ronsole-terminal-parser", move || {
-        let wake_main_loop = || {
-            if let Some(wake) = wake.as_ref() {
-                wake.wake();
-            }
-        };
         let mut batch = Vec::with_capacity(8);
         let mut first = rx.recv().ok();
 
@@ -980,36 +1053,34 @@ fn install_terminal_io_threads(
                     }
                 };
 
-                {
+                let outcome = {
                     let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
                     let mut grid = platform::lock_recover(&parser_grid);
                     let mut sink = SessionSink {
                         reply_tx: Some(&reply_tx),
                         title_cache: Some(&title_cache),
+                        pending: Some(&pending),
+                        wake: wake.as_ref(),
                     };
-                    advance_terminal_output_batch(&mut grid, &mut sink, &batch, Instant::now());
-                }
+                    advance_terminal_output_batch(&mut grid, &mut sink, &batch, Instant::now())
+                };
                 recycle_output_chunks(&mut batch, &recycle_tx);
+                notify_main_loop(wake.as_ref(), outcome);
 
                 match action {
                     TerminalOutputBatchAction::FlushAndContinue => {
                         let Some(timeout) =
                             terminal_output_batch_receive_timeout(started.elapsed())
                         else {
-                            wake_main_loop();
                             break;
                         };
                         match rx.recv_timeout(timeout) {
                             Ok(next) => batch.push(next),
-                            Err(_) => {
-                                wake_main_loop();
-                                break;
-                            }
+                            Err(_) => break,
                         }
                     }
                     TerminalOutputBatchAction::Collect
                     | TerminalOutputBatchAction::FlushAndRedraw => {
-                        wake_main_loop();
                         break;
                     }
                 }
@@ -1018,16 +1089,18 @@ fn install_terminal_io_threads(
         }
 
         if parser_reader_finished.load(Ordering::Acquire) {
-            let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
-            let mut grid = platform::lock_recover(&parser_grid);
-            let mut sink = SessionSink {
-                reply_tx: Some(&reply_tx),
-                title_cache: Some(&title_cache),
+            let outcome = {
+                let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
+                let mut grid = platform::lock_recover(&parser_grid);
+                let mut sink = SessionSink {
+                    reply_tx: Some(&reply_tx),
+                    title_cache: Some(&title_cache),
+                    pending: Some(&pending),
+                    wake: wake.as_ref(),
+                };
+                finish_terminal_output_stream(&mut grid, &mut sink, Instant::now())
             };
-            if finish_terminal_output_stream(&mut grid, &mut sink, Instant::now()) {
-                drop(grid);
-                wake_main_loop();
-            }
+            notify_main_loop(wake.as_ref(), outcome);
         }
     })
     .map_err(|error| {
@@ -1091,7 +1164,10 @@ fn terminal_launch_command(
 ) -> io::Result<(CommandBuilder, PathBuf, String, &'static str)> {
     let cwd = match launch.working_directory {
         Some(cwd) => cwd,
-        None => terminal_working_directory()?,
+        None => terminal_launch_directory(
+            launch.inherited_directory.as_deref(),
+            &terminal_working_directory()?,
+        ),
     };
     let (mut command, process_title, spawn_target) = if launch.command.is_empty() {
         let shell = resolve_terminal_shell()?;
@@ -1160,6 +1236,15 @@ fn terminal_working_directory() -> io::Result<PathBuf> {
 
 fn terminal_working_directory_with(home: Option<PathBuf>) -> io::Result<PathBuf> {
     home.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "$HOME is not available"))
+}
+
+/// Picks the folder for a session without an explicit directory: the
+/// inherited directory when it still exists, otherwise `home`.
+fn terminal_launch_directory(candidate: Option<&Path>, home: &Path) -> PathBuf {
+    match candidate {
+        Some(candidate) if candidate.is_dir() => candidate.to_path_buf(),
+        _ => home.to_path_buf(),
+    }
 }
 
 fn terminal_shell_title(path: &Path) -> String {
@@ -1471,6 +1556,7 @@ mod tests {
         ];
         let launch = TerminalLaunchSpec {
             working_directory: Some(cwd.clone()),
+            inherited_directory: None,
             command: argv.clone(),
             hold: true,
             bridge_launch_id: None,
@@ -1511,6 +1597,7 @@ mod tests {
 
         let launch = TerminalLaunchSpec {
             working_directory: Some(PathBuf::from("/tmp")),
+            inherited_directory: None,
             command: vec![OsString::from("/bin/true")],
             hold: false,
             bridge_launch_id: None,
@@ -1710,6 +1797,8 @@ mod tests {
         let mut sink = SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         let now = Instant::now();
 
@@ -1742,6 +1831,8 @@ mod tests {
         let mut sink = SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         let now = Instant::now();
         advance_terminal_output_batch(
@@ -1752,7 +1843,7 @@ mod tests {
         );
         assert!(!grid.presentation_ready());
 
-        assert!(finish_terminal_output_stream(&mut grid, &mut sink, now));
+        assert!(finish_terminal_output_stream(&mut grid, &mut sink, now).grid_changed);
         assert!(grid.presentation_ready());
         let text = (0..grid.total_rows())
             .filter_map(|row| grid.row(row))
@@ -1766,7 +1857,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let lines = rows_snapshot(&grid);
-        assert!(!finish_terminal_output_stream(&mut grid, &mut sink, now));
+        assert!(!finish_terminal_output_stream(&mut grid, &mut sink, now).grid_changed);
         assert!(rows_snapshot(&grid) == lines);
     }
 
@@ -1849,6 +1940,8 @@ mod tests {
         let mut sink = SessionSink {
             reply_tx: None,
             title_cache: Some(&cache),
+            pending: None,
+            wake: None,
         };
         grid.advance(b"\x1b]0;~ : htop\x07", now, &mut sink);
         assert_eq!(resolved_title(&platform::lock_recover(&cache)), "~ : htop");
@@ -1864,6 +1957,8 @@ mod tests {
         let mut sink = SessionSink {
             reply_tx: Some(&reply_tx),
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         advance_terminal_output_batch(
             &mut grid,

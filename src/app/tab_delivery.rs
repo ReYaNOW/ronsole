@@ -516,6 +516,7 @@ mod tests {
                           exec cat > out";
             let launch = TerminalLaunchSpec {
                 working_directory: Some(root.clone()),
+                inherited_directory: None,
                 command: vec![
                     OsString::from("/bin/sh"),
                     OsString::from("-c"),

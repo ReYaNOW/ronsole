@@ -575,6 +575,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         grid.advance("é界e\u{0301}needle".as_bytes(), Instant::now(), &mut sink);
 
