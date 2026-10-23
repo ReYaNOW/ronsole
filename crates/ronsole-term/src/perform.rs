@@ -120,7 +120,10 @@ impl Perform for Performer<'_> {
             }
             b"8" => {
                 // A `None` link closes the open hyperlink, as an empty or invalid URI does.
-                let link = with_joined(self.term, |joined| parse_osc8_link(params, joined));
+                let budget = self.term.link_budget.clone();
+                let link = with_joined(self.term, |joined| {
+                    parse_osc8_link(params, joined, &budget)
+                });
                 self.term.pen.set_hyperlink(link);
             }
             _ => {}
@@ -160,9 +163,11 @@ impl Perform for Performer<'_> {
         }
     }
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        // A `CSI ? 2026 h` on its own is the set that starts holding output.
+        // A lone `CSI ? 2026 h` is the set that starts holding output; a combined
+        // `CSI ? … ; 2026 h` applies its modes without holding.
         let sync_only = action == 'h'
             && intermediates == b"?"
+            && params.len() == 1
             && params.iter().all(|param| param.first() == Some(&2026));
         if !sync_only {
             self.applied = true;
@@ -255,8 +260,10 @@ impl Perform for Performer<'_> {
                                 1006 => self.term.mouse_sgr = enable,
                                 2004 => self.term.bracketed_paste = enable,
                                 2026 => {
-                                    // A set during replay or while already holding is a no-op.
+                                    // Only a lone `?2026h` holds (see `sync_only`); a set
+                                    // during replay or while already holding is a no-op.
                                     if enable
+                                        && sync_only
                                         && !self.term.replaying
                                         && self.term.sync_until.is_none()
                                     {

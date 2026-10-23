@@ -72,49 +72,35 @@ impl Term {
 
     /// Plain URL around (`row`, `col`), searched in the logical line holding `row`.
     fn url_link_at(&self, row: usize, col: usize, rows: Range<usize>) -> Option<LinkTarget> {
+        // Walks the logical line only as far as the search window reaches on each side
+        // of `col`. Offsets below are cells from the start of `row`; `before` is the
+        // number of cells in the rows above `row` that are walked.
         let mut first = row;
-        while first > 0 && self.row_soft_wrapped(first - 1) {
+        let mut before = 0;
+        while first > 0 && self.row_soft_wrapped(first - 1) && before + col < URL_SEARCH_RADIUS {
             first -= 1;
+            before += self.row(first)?.len();
         }
+        let window_end = col.saturating_add(URL_SEARCH_RADIUS).saturating_add(1);
         let mut last = row;
-        while self.row_soft_wrapped(last) && self.row(last + 1).is_some() {
+        let mut after = self.row(row)?.len();
+        while self.row_soft_wrapped(last) && after <= window_end {
+            let Some(next) = self.row(last + 1) else {
+                break;
+            };
             last += 1;
+            after += next.len();
         }
-
-        // Each physical row of the logical line: index, offset in the logical line, length.
-        // Only lengths are read for all rows; cells are copied for the rows that the
-        // URL search window touches.
-        let mut segments = Vec::with_capacity(last - first + 1);
-        let mut logical_len = 0;
-        for index in first..=last {
-            let len = self.row(index)?.len();
-            segments.push((index, logical_len, len));
-            logical_len += len;
-        }
-        let base = segments.iter().find(|segment| segment.0 == row)?.1;
-        let target = base + col;
-        let window_start = target.saturating_sub(URL_SEARCH_RADIUS);
-        let window_end = target.saturating_add(URL_SEARCH_RADIUS).saturating_add(1);
-        // The row starting after the window end is copied too, so the copied line
-        // extends past the window unless it ends the logical line.
-        let first_copied = segments
-            .iter()
-            .position(|&(_, offset, len)| offset + len > window_start)?;
-        let last_copied = segments
-            .iter()
-            .rposition(|&(_, offset, _)| offset <= window_end)?;
-        let copied = segments.get(first_copied..=last_copied)?;
-        let origin = copied.first()?.1;
 
         // Copied rows: index, offset in `line`, length.
         let mut line: Vec<Cell> = Vec::new();
-        let mut copied_rows = Vec::with_capacity(copied.len());
-        for &(index, offset, _) in copied {
+        let mut copied_rows = Vec::with_capacity(last - first + 1);
+        for index in first..=last {
             let cells = self.row(index)?;
-            copied_rows.push((index, offset - origin, cells.len()));
+            copied_rows.push((index, line.len(), cells.len()));
             line.extend_from_slice(cells);
         }
-        let range = find_url(&line, target - origin)?;
+        let range = find_url(&line, before + col)?;
 
         let mut uri = String::new();
         for cell in &line[range.clone()] {

@@ -1,6 +1,6 @@
 //! OSC payload handling: titles, colour queries, clipboard writes and working directory.
 
-use crate::cell::Hyperlink;
+use crate::cell::{Hyperlink, LinkBudget};
 use crate::color::{Rgb, TerminalColor};
 use crate::term::Term;
 use crate::url::{base64_decode, percent_decode};
@@ -10,6 +10,9 @@ pub const TERMINAL_TITLE_MAX_BYTES: usize = 256;
 
 /// Largest OSC 8 URI in bytes; longer URIs are ignored.
 const OSC8_MAX_URI_BYTES: usize = 2083;
+
+/// Largest OSC 8 `id` in bytes; a longer `id` voids the whole sequence.
+const OSC8_MAX_ID_BYTES: usize = 256;
 
 /// Largest capacity the shared OSC join buffer keeps between sequences.
 const OSC_JOIN_KEEP_BYTES: usize = 65_536;
@@ -141,37 +144,46 @@ pub(crate) fn parse_osc7_uri(params: &[&[u8]], joined: &mut Vec<u8>) -> Option<(
 }
 
 /// Hyperlink opened by `OSC 8 ; params ; URI`. Returns `None` when the sequence
-/// closes the link (empty URI), and also when the URI is invalid: longer than
-/// [`OSC8_MAX_URI_BYTES`], not UTF-8, or containing a C0 control or DEL. An
-/// invalid URI therefore also closes the open link.
-pub(crate) fn parse_osc8_link(params: &[&[u8]], joined: &mut Vec<u8>) -> Option<Arc<Hyperlink>> {
+/// closes the link (empty URI), and also when the sequence is invalid: a URI
+/// longer than [`OSC8_MAX_URI_BYTES`], an `id` longer than [`OSC8_MAX_ID_BYTES`],
+/// a URI that is not UTF-8 or has a control character (C0, DEL or C1), or a link
+/// that would take the grid over [`LINK_BUDGET_BYTES`]. An invalid sequence
+/// therefore also closes the open link.
+pub(crate) fn parse_osc8_link(
+    params: &[&[u8]],
+    joined: &mut Vec<u8>,
+    budget: &LinkBudget,
+) -> Option<Arc<Hyperlink>> {
     let data = params.get(2..)?;
-    // The joined length is the summed part lengths plus one `;` between parts.
-    let joined_len =
-        data.iter().map(|part| part.len()).sum::<usize>() + data.len().saturating_sub(1);
-    if joined_len > OSC8_MAX_URI_BYTES {
+    // Check the raw length before joining, so an oversized URI is never copied.
+    if joined_len(data) > OSC8_MAX_URI_BYTES {
+        return None;
+    }
+    let id_value = params.get(1).and_then(|options| osc8_id_value(options));
+    if id_value.is_some_and(|value| value.len() > OSC8_MAX_ID_BYTES) {
         return None;
     }
     join_into(joined, data);
-    if joined.is_empty() || joined.iter().any(|&byte| byte < 0x20 || byte == 0x7f) {
+    if joined.is_empty() {
         return None;
     }
+    // Checked on decoded characters, so C1 controls (U+0080-U+009F) are rejected too.
     let uri = std::str::from_utf8(joined).ok()?;
-    let id = params.get(1).and_then(|options| osc8_id(options));
-    Some(Arc::new(Hyperlink {
-        id,
-        uri: uri.into(),
-    }))
+    if uri.chars().any(char::is_control) {
+        return None;
+    }
+    let id = id_value
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .map(Into::into);
+    Hyperlink::new(budget, id, uri.into()).map(Arc::new)
 }
 
-/// Value of the `id=` key in OSC 8 `key=value:key=value` options; empty is `None`.
-fn osc8_id(options: &[u8]) -> Option<Box<str>> {
+/// Raw value of the `id=` key in OSC 8 `key=value:key=value` options; empty is `None`.
+fn osc8_id_value(options: &[u8]) -> Option<&[u8]> {
     options
         .split(|&byte| byte == b':')
         .find_map(|pair| pair.strip_prefix(b"id="))
         .filter(|value| !value.is_empty())
-        .and_then(|value| std::str::from_utf8(value).ok())
-        .map(Into::into)
 }
 
 /// Queues one `OSC 4 ; index ; rgb:…` reply per `index ; ?` pair. Pairs that
