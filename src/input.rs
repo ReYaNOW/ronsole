@@ -1486,6 +1486,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         // Kitty push of flag 1 (disambiguate escape codes) through the grid parser.
         crate::platform::lock_recover(&terminal.grid).advance(
@@ -1605,6 +1607,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         crate::platform::lock_recover(&terminal.grid).advance(
             b"\x1b[>8u",

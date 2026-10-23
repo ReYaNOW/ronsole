@@ -23,7 +23,7 @@ use crate::terminal::{
     Terminal, TerminalPresentationIntent, earliest_terminal_deadline, screen_hash,
 };
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
-use ronsole_term::{TermPalette, focus_report_sequence};
+use ronsole_term::TermPalette;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -2962,6 +2962,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         crate::platform::lock_recover(&terminal.grid).advance(
             b"\x1b[?1004h",
