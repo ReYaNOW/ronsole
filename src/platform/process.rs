@@ -305,7 +305,7 @@ fn resolve_executable_with(program: &OsStr, path: Option<&OsStr>) -> Option<Path
 /// Scheme and host comparisons ignore ASCII case (RFC 3986 sections 3.1 and
 /// 3.2.2). Control characters (C0, DEL, C1) are rejected outright, and a
 /// non-ASCII host is rejected because IDNA is not applied. Non-ASCII path,
-/// query, and fragment are allowed and percent-encoded by [`xdg_open_argument`].
+/// query, and fragment are allowed and percent-encoded by `xdg_open_argument`.
 pub fn open_uri_allowed(uri: &str, local_host: &str) -> bool {
     if uri.chars().any(char::is_control) {
         return false;
@@ -689,6 +689,12 @@ mod tests {
             xdg_open_argument("https://example.org/путь"),
             "https://example.org/%D0%BF%D1%83%D1%82%D1%8C"
         );
+        assert_eq!(
+            xdg_open_argument("https://example.org/?q=путь#фрагмент"),
+            "https://example.org/?q=%D0%BF%D1%83%D1%82%D1%8C#%D1%84%D1%80%D0%B0%D0%B3%D0%BC%D0%B5%D0%BD%D1%82"
+        );
+        // Already encoded input is not encoded twice.
+        assert_eq!(xdg_open_argument("https://a.org/%D0%BF"), "https://a.org/%D0%BF");
     }
 
     #[test]

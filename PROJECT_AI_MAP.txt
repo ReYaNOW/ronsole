@@ -1134,7 +1134,7 @@ F real_pty_shutdown_kills_background_job_in_separate_process_group@549>r2,ru,s0,
 F open_uri_allowed_filters_schemes@633>rd
 F xdg_open_argument_drops_file_host@673>rf
 F open_uri_percent_encodes_non_ascii_path@685>rd,rf
-F open_uri_refuses_non_ascii_host_and_c1_control@695>rd
+F open_uri_refuses_non_ascii_host_and_c1_control@701>rd
 I ProcessTree
 F attach_process_id@178>r2
 F terminate@198>r7,r8
