@@ -345,7 +345,37 @@ def rustc_identity(config: PgoConfig, runner: Runner) -> str:
 
 
 def llvm_profdata_command(*arguments: str | os.PathLike[str]) -> list[str | os.PathLike[str]]:
-    return ["rustup", "run", "nightly", "llvm-profdata", *arguments]
+    return [toolchain_llvm_profdata(), *arguments]
+
+
+_TOOLCHAIN_LLVM_PROFDATA: str | None = None
+
+
+def toolchain_llvm_profdata() -> str:
+    """llvm-profdata from nightly's llvm-tools, matching rustc's raw profile format.
+
+    `rustup run nightly llvm-profdata` resolves to the system LLVM on PATH, whose raw
+    profile version can differ from the one nightly rustc writes.
+    """
+    global _TOOLCHAIN_LLVM_PROFDATA
+    if _TOOLCHAIN_LLVM_PROFDATA is None:
+        nightly = ["rustup", "run", "nightly", "rustc"]
+        sysroot = subprocess.run(
+            [*nightly, "--print", "sysroot"], check=True, capture_output=True, text=True
+        )
+        version = subprocess.run([*nightly, "-vV"], check=True, capture_output=True, text=True)
+        host = next(
+            line.split(":", 1)[1].strip()
+            for line in version.stdout.splitlines()
+            if line.startswith("host:")
+        )
+        candidate = Path(sysroot.stdout.strip()) / "lib" / "rustlib" / host / "bin" / "llvm-profdata"
+        if not candidate.is_file():
+            raise PgoError(
+                f"{candidate} not found; run `rustup component add llvm-tools --toolchain nightly`"
+            )
+        _TOOLCHAIN_LLVM_PROFDATA = str(candidate)
+    return _TOOLCHAIN_LLVM_PROFDATA
 
 
 def llvm_profdata_identity(config: PgoConfig, runner: Runner) -> str:
@@ -1250,6 +1280,9 @@ def _expect_pgo_error(action: object, message: str) -> None:
 
 
 def self_test() -> None:
+    # Pin the toolchain llvm-profdata so self-test never resolves nightly's sysroot.
+    global _TOOLCHAIN_LLVM_PROFDATA
+    _TOOLCHAIN_LLVM_PROFDATA = "/self-test/llvm-profdata"
     with tempfile.TemporaryDirectory(prefix="ronsole-pgo-selftest-") as directory:
         root = Path(directory)
         (root / "src").mkdir()

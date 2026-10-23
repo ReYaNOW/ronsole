@@ -2903,11 +2903,11 @@ impl WindowRuntime {
                 self.renderer.resize(width.get(), height.get());
             }
             (GlTarget::Offscreen(offscreen), RuntimeBackend::Headless(headless)) => {
-                if offscreen.size() != (width, height) {
-                    if let Err(error) = offscreen.resize(width, height) {
-                        headless.set_session_error(format!("resize pbuffer {width}x{height}: {error}"));
-                        return;
-                    }
+                if offscreen.size() != (width, height)
+                    && let Err(error) = offscreen.resize(width, height)
+                {
+                    headless.set_session_error(format!("resize pbuffer {width}x{height}: {error}"));
+                    return;
                 }
                 self.renderer.resize(width, height);
                 headless.set_physical_size(width, height);
@@ -3032,10 +3032,10 @@ impl WindowRuntime {
         let GlTarget::Offscreen(offscreen) = &self.target else {
             return;
         };
-        if let Err(error) = offscreen.make_current() {
-            if let RuntimeBackend::Headless(headless) = &mut self.backend {
-                headless.set_session_error(error);
-            }
+        if let Err(error) = offscreen.make_current()
+            && let RuntimeBackend::Headless(headless) = &mut self.backend
+        {
+            headless.set_session_error(error);
         }
     }
 
