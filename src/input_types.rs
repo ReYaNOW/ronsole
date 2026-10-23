@@ -1,15 +1,19 @@
+use ronsole_term::TermKey;
 use std::ops::{BitOr, BitOrAssign};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyState {
     Pressed,
+    /// Synthetic auto-repeat of a held key; handled exactly like `Pressed`.
+    Repeat,
     Released,
 }
 
 impl KeyState {
+    /// True for `Pressed` and for auto-repeat, which every consumer treats as a press.
     #[inline]
     pub(crate) fn is_pressed(self) -> bool {
-        self == Self::Pressed
+        matches!(self, Self::Pressed | Self::Repeat)
     }
 }
 
@@ -157,10 +161,20 @@ pub(crate) enum PhysicalKey {
     Unidentified,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyInput {
     pub state: KeyState,
     pub physical_key: PhysicalKey,
+    /// Raw evdev keycode as reported by the compositor.
+    pub keycode: u32,
+    /// Text the key produces with the active layout and modifiers.
+    pub text: Option<String>,
+    /// Unshifted character of the key in the active layout (XKB level 0).
+    pub unshifted: Option<char>,
+    /// Named key resolved from XKB keysyms (modifiers and keypad).
+    pub named: Option<TermKey>,
+    /// An IME preedit was active when the key arrived; the key must not reach the encoder.
+    pub ime_preedit: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

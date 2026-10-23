@@ -57,7 +57,7 @@ fn terminal_csi_defaults_scroll_modes_and_sgr_edges_end_to_end() {
         (grid.lines[0][5].ch(), grid.lines[0][5].fg(), grid.lines[0][5].bg()),
         ('F', TerminalColor::indexed(13), TerminalColor::indexed(6))
     );
-    assert!(!grid.cur_bold);
+    assert!(!grid.pen.bold);
 
     feed(&mut grid, &mut sink, b"\x1b[?25l\x1b[?1h\x1b[?1002h");
     assert!(!grid.cursor_visible);
@@ -97,7 +97,7 @@ fn terminal_osc_insert_delete_and_truecolor_edges_end_to_end() {
     let mut grid = Term::new(test_config(8, 4));
     let mut sink = RecordingSink::new();
     feed(&mut grid, &mut sink, b"\x1b]10;?\x1b\\");
-    assert_eq!(sink.bytes, b"\x1B]10;rgb:ffff/ffff/ffff\x1B\\".to_vec());
+    assert_eq!(sink.bytes, b"\x1B]10;rgb:e5e5/e5e5/e5e5\x1B\\".to_vec());
 
     feed(&mut grid, &mut sink, b"\x1b[2;1Habcdefgh\x1b[2;3H\x1b[2P");
     let row1: String = grid.lines[1].iter().map(|cell| cell.ch()).collect();
@@ -127,8 +127,8 @@ fn terminal_osc_insert_delete_and_truecolor_edges_end_to_end() {
     );
 
     feed(&mut grid, &mut sink, b"\x1b[38;2;1;2;3m\x1b[48;5;42mX\x1b[39;49m");
-    assert!(grid.cur_bg.is_default_background());
-    assert!(grid.cur_fg.is_default_foreground());
+    assert!(grid.pen.bg.is_default_background());
+    assert!(grid.pen.fg.is_default_foreground());
     assert_eq!(grid.lines[1][0].bg(), 42);
     assert_eq!(grid.lines[1][0].fg().rgb_value(), Some((1, 2, 3)));
 
@@ -227,13 +227,13 @@ fn terminal_csi_more_erase_cursor_and_reply_edges() {
     assert_eq!((grid.cur_x, grid.cur_y), (2, 1));
 
     feed(&mut grid, &mut sink, b"\x1b]11;?\x1b\\");
-    assert_eq!(sink.bytes, b"\x1B]11;rgb:ffff/ffff/ffff\x1B\\".to_vec());
+    assert_eq!(sink.bytes, b"\x1B]11;rgb:0000/0000/0000\x1B\\".to_vec());
 
     // The sink accumulates every reply, so the second check covers both.
     feed(&mut grid, &mut sink, b"\x1b]10;?\x07");
     assert_eq!(
         sink.bytes,
-        b"\x1B]11;rgb:ffff/ffff/ffff\x1B\\\x1B]10;rgb:ffff/ffff/ffff\x1B\\".to_vec()
+        b"\x1B]11;rgb:0000/0000/0000\x1B\\\x1B]10;rgb:e5e5/e5e5/e5e5\x07".to_vec()
     );
 
     feed(&mut grid, &mut sink, b"\x1b[38;5;123m\x1b[48;2;9;8;7mQ\x1b[999m");
@@ -643,12 +643,12 @@ fn common_dec_modes_cover_wrap_origin_insert_tabs_mouse_focus_and_paste() {
 }
 
 fn assert_terminal_modes_reset(grid: &Term) {
-    assert!(grid.cur_fg.is_default_foreground());
-    assert!(grid.cur_bg.is_default_background());
-    assert!(!grid.cur_bold);
-    assert!(!grid.cur_dim);
-    assert_eq!(grid.cur_underline, UnderlineStyle::None);
-    assert!(!grid.cur_inverse);
+    assert!(grid.pen.fg.is_default_foreground());
+    assert!(grid.pen.bg.is_default_background());
+    assert!(!grid.pen.bold);
+    assert!(!grid.pen.dim);
+    assert_eq!(grid.pen.underline, UnderlineStyle::None);
+    assert!(!grid.pen.inverse);
     assert!(!grid.insert_mode);
     assert!(!grid.origin_mode);
     assert!(grid.autowrap);

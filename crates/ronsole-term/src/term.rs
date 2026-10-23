@@ -1,9 +1,10 @@
 //! The terminal model: state, host-facing API and the parser driver.
 
-use crate::cell::{Cell, UnderlineStyle};
-use crate::color::{TermPalette, TerminalColor};
+use crate::cell::{Cell, LinkBudget, Pen};
+use crate::color::TermPalette;
 use crate::grid::LineMeta;
-use crate::input::MouseTrackingMode;
+use crate::input::{MouseTrackingMode, focus_report_sequence};
+use crate::keys::{self, KeyEvent, KeyOutcome, KeyProtocol};
 use std::ops::Range;
 use std::time::Instant;
 use vte::Parser;
@@ -65,12 +66,7 @@ pub struct Term {
     pub(crate) visible_rows: usize,
     pub(crate) cur_x: usize,
     pub(crate) cur_y: usize,
-    pub(crate) cur_fg: TerminalColor,
-    pub(crate) cur_bg: TerminalColor,
-    pub(crate) cur_bold: bool,
-    pub(crate) cur_dim: bool,
-    pub(crate) cur_underline: UnderlineStyle,
-    pub(crate) cur_inverse: bool,
+    pub(crate) pen: Pen,
     pub(crate) dirty: bool,
     pub(crate) content_generation: u64,
     pub(crate) presentation_ready: bool,
@@ -91,6 +87,8 @@ pub struct Term {
     pub(crate) origin_mode: bool,
     pub(crate) tab_stops: Vec<bool>,
     pub(crate) join_next: bool,
+    /// Kitty keyboard flag stacks and the sent-key set.
+    pub(crate) key_protocol: KeyProtocol,
     pub(crate) scrollback_storage_cols: usize,
     /// Rows ever appended to `scrollback` (wrapping); lets a scan find the
     /// rows that entered it since an earlier scan.
@@ -99,12 +97,34 @@ pub struct Term {
     pub(crate) scrollback_limit: usize,
     pub(crate) identity: TermIdentity,
     pub(crate) palette: TermPalette,
+    /// Replies queued during the current `advance` call; flushed to the sink
+    /// as one `reply` at its end and cleared, keeping the capacity.
+    pub(crate) reply_buf: Vec<u8>,
+    /// Scratch for OSC payloads whose `;`-split parts are glued back together;
+    /// empty between sequences, see `osc::with_joined`.
+    pub(crate) osc_join: Vec<u8>,
+    /// Bytes of the live OSC 8 hyperlinks in the grid; see `cell::LINK_BUDGET_BYTES`.
+    pub(crate) link_budget: LinkBudget,
+    /// Bytes held back while synchronized output is on; empty and unallocated otherwise.
+    pub(crate) sync_buf: Vec<u8>,
+    /// Replay deadline of the held bytes; `None` while synchronized output is off.
+    pub(crate) sync_until: Option<Instant>,
+    /// Set while held bytes are replayed, so a nested set is a no-op.
+    pub(crate) replaying: bool,
 }
+
+/// Upper bound on the bytes of replies queued by one `advance` call.
+const REPLY_BUF_LIMIT: usize = 65_536;
 
 /// Drives the vte parser over a [`Term`] and forwards events to a sink.
 pub(crate) struct Performer<'a> {
     pub(crate) term: &'a mut Term,
     pub(crate) sink: &'a mut dyn TermSink,
+    /// Set by a `CSI ? 2026 h` that starts holding output; read by `terminated`.
+    pub(crate) sync_set: bool,
+    /// Set by each callback that applies output to the grid; the bytes of a
+    /// `CSI ? 2026 h` that starts holding output do not set it.
+    pub(crate) applied: bool,
 }
 
 impl Term {
@@ -136,12 +156,7 @@ impl Term {
             visible_rows: rows,
             cur_x: 0,
             cur_y: 0,
-            cur_fg: TerminalColor::default_foreground(),
-            cur_bg: TerminalColor::default_background(),
-            cur_bold: false,
-            cur_dim: false,
-            cur_underline: UnderlineStyle::None,
-            cur_inverse: false,
+            pen: Pen::default(),
             dirty: true,
             content_generation: 0,
             presentation_ready: false,
@@ -162,41 +177,82 @@ impl Term {
             origin_mode: false,
             tab_stops: crate::grid::default_tab_stops(cols),
             join_next: false,
+            key_protocol: KeyProtocol::default(),
             scrollback_storage_cols: cols,
             scrollback_pushed: 0,
             pool: Vec::with_capacity(128),
             scrollback_limit: scrollback_lines,
             identity,
             palette,
+            reply_buf: Vec::new(),
+            osc_join: Vec::new(),
+            link_budget: LinkBudget::default(),
+            sync_buf: Vec::new(),
+            sync_until: None,
+            replaying: false,
         }
     }
 
-    /// Parses `bytes` and applies them to the grid.
-    ///
-    /// `_now` is reserved for the synchronized-output deadline (Task 6).
+    /// Parses `bytes` and applies them to the grid. While synchronized output
+    /// (mode 2026) is on, the bytes are held until its reset or deadline.
     pub fn advance(
         &mut self,
         bytes: &[u8],
-        _now: Instant,
+        now: Instant,
         sink: &mut dyn TermSink,
     ) -> AdvanceOutcome {
+        let held_before = self.sync_until.is_some();
         // Take the parser out so the performer can borrow the rest of `self`;
         // it is put back below, so no parser is built per batch.
         let mut parser = self.parser.take().unwrap_or_default();
-        {
-            let mut performer = Performer { term: self, sink };
-            parser.advance(&mut performer, bytes);
-        }
+        let grid_changed = self.apply_bytes(&mut parser, bytes, now, sink);
         self.parser = Some(parser);
+        self.flush_replies(sink);
         AdvanceOutcome {
-            grid_changed: !bytes.is_empty(),
+            grid_changed,
+            new_deadline: !held_before && self.sync_until.is_some(),
+        }
+    }
+
+    /// Replays held bytes whose synchronized-output deadline has passed.
+    pub fn flush_expired(&mut self, now: Instant, sink: &mut dyn TermSink) -> AdvanceOutcome {
+        let expired = self.sync_until.is_some_and(|deadline| now >= deadline);
+        let mut grid_changed = false;
+        if expired {
+            let end = self.sync_buf.len();
+            let mut parser = self.parser.take().unwrap_or_default();
+            grid_changed = self.replay_sync(&mut parser, end, sink);
+            self.parser = Some(parser);
+        }
+        self.flush_replies(sink);
+        AdvanceOutcome {
+            grid_changed,
             new_deadline: false,
         }
     }
 
+    /// Deadline after which the held bytes are replayed; `None` when
+    /// synchronized output is off.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.sync_until
+    }
+
+    /// Sends the queued replies to the sink as one `reply` call and clears
+    /// the buffer, keeping its capacity.
+    fn flush_replies(&mut self, sink: &mut dyn TermSink) {
+        if !self.reply_buf.is_empty() {
+            sink.reply(&self.reply_buf);
+            self.reply_buf.clear();
+        }
+    }
+
+    /// Appends one reply to the batch buffer; a reply that would take the
+    /// buffer past `REPLY_BUF_LIMIT` is dropped whole.
     #[inline]
-    pub(crate) fn try_queue_reply(&self, sink: &mut dyn TermSink, reply: Vec<u8>) {
-        sink.reply(&reply);
+    pub(crate) fn queue_reply(&mut self, reply: &[u8]) {
+        if self.reply_buf.len() + reply.len() <= REPLY_BUF_LIMIT {
+            self.reply_buf.extend_from_slice(reply);
+        }
     }
 
     pub fn cols(&self) -> usize {
@@ -273,6 +329,26 @@ impl Term {
 
     pub fn focus_reporting(&self) -> bool {
         self.focus_reporting
+    }
+
+    /// Kitty keyboard flags of the active screen, limited to the supported bits.
+    pub fn kitty_flags(&self) -> u8 {
+        self.key_protocol.flags()
+    }
+
+    /// Encodes a key event into `out` using the active DECCKM and Kitty flags,
+    /// and tells the host whether to send the bytes, the text, or nothing.
+    pub fn encode_key(&mut self, event: &KeyEvent<'_>, out: &mut Vec<u8>) -> KeyOutcome {
+        let flags = self.kitty_flags();
+        keys::encode_key(&mut self.key_protocol, flags, self.app_cursor_keys, event, out)
+    }
+
+    /// Reports a focus change from the host. Returns `CSI I` or `CSI O` when
+    /// focus reporting (mode 1004) is on, otherwise `None`. Every focus change
+    /// clears the sent-key set, so releases of keys held across it are ignored.
+    pub fn focus_changed(&mut self, focused: bool) -> Option<&'static [u8]> {
+        self.key_protocol.clear_sent();
+        focus_report_sequence(self.focus_reporting, focused)
     }
 
     pub fn bracketed_paste(&self) -> bool {

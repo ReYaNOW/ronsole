@@ -1,8 +1,14 @@
 mod csi;
 mod edges;
+mod keys;
+mod keys_legacy;
+mod links;
 mod osc;
+mod queries;
 mod reflow;
+mod sgr;
 mod support;
+mod sync;
 
 use crate::term::Term;
 use support::{RecordingSink, feed, test_config};

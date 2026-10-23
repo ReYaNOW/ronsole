@@ -179,7 +179,7 @@ In render, frame, glyph, input, PTY-output, and animation paths:
 - `src/platform/process.rs` — Linux-only `/proc` process/session helper.
 - Dynamic-title discovery must stay bounded to the foreground process group.
 - Full `/proc` enumeration is allowed only during terminal shutdown/cleanup to reap remaining groups in the owned PTY session.
-- Every session starts in `$HOME`; do not add workspace/current-process CWD heuristics.
+- Every session starts in `$HOME`, unless the active tab's shell reported its directory via OSC 7 (a new tab then starts there if it exists); no other CWD heuristics.
 
 ### Interaction and state
 

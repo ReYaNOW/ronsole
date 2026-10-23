@@ -8,7 +8,7 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::platform::{KdeActivationWorker, kde_session_active};
+use crate::platform::{KdeActivationWorker, kde_session_active, open_uri, open_uri_allowed};
 use crate::platform::single_instance::BridgeResult;
 use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit, terminal_palette};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
@@ -19,9 +19,11 @@ use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
 };
-use crate::terminal::{Terminal, TerminalPresentationIntent, screen_hash};
+use crate::terminal::{
+    Terminal, TerminalPresentationIntent, earliest_terminal_deadline, screen_hash,
+};
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
-use ronsole_term::focus_report_sequence;
+use ronsole_term::TermPalette;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -324,22 +326,6 @@ fn external_launch_plan(
 }
 
 #[inline]
-fn terminal_focus_transition_plan(
-    window_focused: bool,
-    identity_changed: bool,
-    old_reporting: bool,
-    new_reporting: bool,
-) -> (Option<&'static [u8]>, Option<&'static [u8]>) {
-    if !window_focused || !identity_changed {
-        return (None, None);
-    }
-    (
-        focus_report_sequence(old_reporting, false),
-        focus_report_sequence(new_reporting, true),
-    )
-}
-
-#[inline]
 fn drag_threshold_passed(start_x: f32, current_x: f32, scale: f32) -> bool {
     (current_x - start_x).abs() > 5.0 * scale.max(0.1)
 }
@@ -542,12 +528,15 @@ impl App {
         }
     }
 
-    fn send_terminal_focus_state(&self, index: usize, focused: bool) {
+    /// Reports a focus change to one terminal. `Term::focus_changed` clears that
+    /// terminal's sent-key set on every change, so the call always runs; the
+    /// mode 1004 report is written only when `report` is set (terminal presented).
+    fn send_terminal_focus_state(&self, index: usize, focused: bool, report: bool) {
         let Some(terminal) = self.terminals.get(index) else {
             return;
         };
-        let reporting = crate::platform::lock_recover(&terminal.grid).focus_reporting();
-        if let Some(sequence) = focus_report_sequence(reporting, focused) {
+        let sequence = crate::platform::lock_recover(&terminal.grid).focus_changed(focused);
+        if let Some(sequence) = sequence.filter(|_| report) {
             let _ = terminal.write_input(sequence);
         }
     }
@@ -556,23 +545,11 @@ impl App {
         if !self.focused || old == new {
             return;
         }
-        let old_reporting = old
-            .and_then(|index| self.terminals.get(index))
-            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting());
-        let new_reporting = new
-            .and_then(|index| self.terminals.get(index))
-            .is_some_and(|terminal| crate::platform::lock_recover(&terminal.grid).focus_reporting());
-        let (focus_out, focus_in) =
-            terminal_focus_transition_plan(self.focused, true, old_reporting, new_reporting);
-        if let (Some(index), Some(sequence)) = (old, focus_out)
-            && let Some(terminal) = self.terminals.get(index)
-        {
-            let _ = terminal.write_input(sequence);
+        if let Some(index) = old {
+            self.send_terminal_focus_state(index, false, true);
         }
-        if let (Some(index), Some(sequence)) = (new, focus_in)
-            && let Some(terminal) = self.terminals.get(index)
-        {
-            let _ = terminal.write_input(sequence);
+        if let Some(index) = new {
+            self.send_terminal_focus_state(index, true, true);
         }
     }
 
@@ -634,7 +611,15 @@ impl App {
     }
 
     fn add_terminal(&mut self) -> Option<usize> {
-        self.add_terminal_with_launch(TerminalLaunchSpec::default())
+        // A new tab starts where the active tab's shell reported it is (OSC 7).
+        let inherited_directory = self
+            .terminals
+            .get(self.active_terminal)
+            .and_then(|terminal| terminal.osc7_cwd.clone());
+        self.add_terminal_with_launch(TerminalLaunchSpec {
+            inherited_directory,
+            ..TerminalLaunchSpec::default()
+        })
     }
 
     fn add_terminal_with_launch(&mut self, launch: TerminalLaunchSpec) -> Option<usize> {
@@ -645,7 +630,7 @@ impl App {
             Some(wake),
             display_number,
             launch,
-            terminal_palette(self.config.terminal_background),
+            self.new_terminal_palette(),
         );
         let index = self.terminals.len();
         self.terminals.push(terminal);
@@ -655,6 +640,12 @@ impl App {
         self.request_terminal_activation(index, true);
         self.request_frame();
         Some(index)
+    }
+
+    /// Palette a tab created now starts with: the configured background, with
+    /// the renderer's default foreground, ANSI colours and cursor.
+    fn new_terminal_palette(&self) -> TermPalette {
+        terminal_palette(self.config.terminal_background)
     }
 
     pub(crate) fn find_terminal_by_bridge_launch_id(&self, id: [u8; 16]) -> Option<usize> {
@@ -960,9 +951,9 @@ impl App {
         self.unfocused_redraw_pending = !focused;
         self.modifiers = Modifiers::empty();
         self.interaction.set_modifiers(Modifiers::empty());
-        if self.active_terminal_presented {
-            self.send_terminal_focus_state(self.active_terminal, focused);
-        }
+        self.interaction.cancel_link_press();
+        self.update_link_hover();
+        self.send_terminal_focus_state(self.active_terminal, focused, self.active_terminal_presented);
         if !focused {
             self.cancel_pointer_interactions();
             self.settings_background_dragging = false;
@@ -1015,6 +1006,11 @@ impl App {
             return false;
         }
         self.config.terminal_background = color;
+        for terminal in &self.terminals {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            grid.set_palette(terminal_palette(color));
+        }
+        self.request_frame();
         if let Some(runtime) = self.runtime.as_mut() {
             let _ = runtime.set_terminal_background(color);
         }
@@ -1248,14 +1244,38 @@ impl App {
                     runtime.terminal_tab_hit_test(self.pointer_x, self.pointer_y)
                 })
         };
-        ui_cursor_icon(
+        let icon = ui_cursor_icon(
             settings_modal_active,
             settings_hit,
             self.settings_background_dragging,
             search_hit,
             tab_hit,
             self.terminal_tab_drag.is_some(),
-        )
+        );
+        let link_hovered = self
+            .terminals
+            .get(self.active_terminal)
+            .is_some_and(|terminal| terminal.hovered_link().is_some());
+        if icon == CursorKind::Default && link_hovered {
+            CursorKind::Pointer
+        } else {
+            icon
+        }
+    }
+
+    /// Recomputes the Ctrl+hover link of the active tab and refreshes the cursor.
+    /// Called on pointer motion and on modifier changes.
+    fn update_link_hover(&mut self) {
+        let settings_modal_active = self.settings_modal_active();
+        let (x, y) = (self.pointer_x, self.pointer_y);
+        if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
+            if settings_modal_active {
+                terminal.set_hovered_link(None);
+            } else {
+                self.interaction.update_link_hover(terminal, x, y);
+            }
+        }
+        self.refresh_cursor_icon();
     }
 
     fn refresh_cursor_icon(&mut self) {
@@ -1314,6 +1334,7 @@ impl App {
                 .filter(|deadline| *deadline > now)
                 .into_iter()
                 .chain(self.tab_input.next_deadline())
+                .chain(earliest_terminal_deadline(&self.terminals))
                 .chain(
                     self.terminals
                         .get(self.active_terminal)
@@ -1499,6 +1520,7 @@ impl App {
     fn on_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
         self.interaction.set_modifiers(modifiers);
+        self.update_link_hover();
     }
 
     fn on_ime_commit(&mut self, text: &str) {
@@ -1518,6 +1540,9 @@ impl App {
     }
 
     fn on_key(&mut self, key_input: KeyInput) -> bool {
+        // Before the early returns below, so modifier presses and releases seen while the
+        // settings modal or a global shortcut owns the key still update the held state.
+        self.interaction.note_modifier_key(&key_input);
         if key_input.state.is_pressed()
             && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
         {
@@ -1537,6 +1562,10 @@ impl App {
                 self.close_settings();
             } else if key_input.state.is_pressed() && self.settings_background_editing {
                 let _ = self.handle_settings_background_key(key_input.physical_key);
+            }
+            // Text of the key follows the key, as the former separate text event did.
+            if let Some(text) = key_input.text.as_deref() {
+                self.on_text(text);
             }
             return false;
         }
@@ -1578,6 +1607,7 @@ impl App {
         let previous_y = self.pointer_y;
         self.pointer_x = position.x;
         self.pointer_y = position.y;
+        self.update_link_hover();
         if self.settings_modal_active() {
             let previous_hit = self.settings_hit_test(previous_x, previous_y);
             let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
@@ -1750,6 +1780,11 @@ impl App {
                 self.request_frame();
             }
         }
+        if let Some(uri) = self.interaction.take_link_uri()
+            && open_uri_allowed(&uri, crate::terminal::local_host_name())
+        {
+            open_uri(&uri);
+        }
         false
     }
 
@@ -1876,7 +1911,26 @@ impl App {
         Ok(true)
     }
 
+    /// Applies host events parked by each tab's parser thread and replays
+    /// synchronized-output buffers whose deadline has passed. Takes its own
+    /// clock so the about-to-wait body keeps its clock after the early return.
+    fn drain_terminal_host_events(&mut self) {
+        let now = Instant::now();
+        for terminal in &mut self.terminals {
+            // Only the pending-events lock is held while clipboard text is set;
+            // grid locks are taken briefly inside the facade calls.
+            terminal.apply_host_events(&mut self.interaction);
+            if terminal
+                .sync_deadline()
+                .is_some_and(|deadline| deadline <= now)
+            {
+                terminal.flush_expired(now);
+            }
+        }
+    }
+
     fn on_about_to_wait(&mut self) -> AppLoopControl {
+        self.drain_terminal_host_events();
         self.advance_dev_channel_warnings(Instant::now());
         self.advance_bridge_launches(Instant::now());
         self.advance_due_tab_deliveries();
@@ -1956,6 +2010,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         crate::platform::lock_recover(&terminal.grid).advance(
             b"ordinary screen without bridge warning",
@@ -1990,6 +2046,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         crate::platform::lock_recover(&terminal.grid).advance(
             b"WARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n\xe2\x9d\xaf 1. I am using this for local development",
@@ -2009,6 +2067,8 @@ mod tests {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
+            pending: None,
+            wake: None,
         };
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         grid.advance(bytes.as_bytes(), Instant::now(), &mut sink);
@@ -2280,6 +2340,86 @@ mod tests {
         assert!(app.active_terminal_presented);
     }
 
+    /// Holds `bytes` in a synchronized-output block seen at `now`, as the
+    /// parser thread does, without a PTY.
+    fn hold_sync_block_at(terminal: &Terminal, bytes: &[u8], now: Instant) {
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        grid.advance(bytes, now, &mut sink);
+    }
+
+    #[test]
+    fn background_change_updates_live_and_new_tabs() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        assert!(app.set_terminal_background(RgbColor::new(0x11, 0x22, 0x33)));
+
+        // Live tab: an OSC 11 colour query is answered with the new background.
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
+        {
+            let mut grid = crate::platform::lock_recover(&app.terminals[0].grid);
+            let mut sink = crate::terminal_process::SessionSink {
+                reply_tx: Some(&reply_tx),
+                title_cache: None,
+                pending: None,
+                wake: None,
+            };
+            grid.advance(b"\x1b]11;?\x1b\\", Instant::now(), &mut sink);
+        }
+        let reply = reply_rx.try_recv().expect("OSC 11 query is answered");
+        assert!(String::from_utf8_lossy(&reply).contains("rgb:1111/2222/3333"));
+
+        // New tabs start from the palette of the current configured background.
+        let palette = app.new_terminal_palette();
+        assert_eq!(
+            (palette.background.r, palette.background.g, palette.background.b),
+            (0x11, 0x22, 0x33)
+        );
+    }
+
+    #[test]
+    fn drain_flushes_only_expired_sync_blocks() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(40, 3, 1));
+        app.terminals.push(Terminal::new_for_test(40, 3, 2));
+        // Negative: the deadline is an hour ahead, so the held bytes stay.
+        let future = Instant::now() + std::time::Duration::from_secs(3600);
+        hold_sync_block_at(&app.terminals[0], b"\x1b[?2026hX", future);
+        let before = crate::platform::lock_recover(&app.terminals[0].grid).content_generation();
+        app.drain_terminal_host_events();
+        assert!(app.terminals[0].sync_deadline().is_some());
+        let after = crate::platform::lock_recover(&app.terminals[0].grid).content_generation();
+        assert_eq!(after, before);
+
+        // Positive: the deadline passed a second ago, so the drain replays the block.
+        let past = Instant::now() - std::time::Duration::from_secs(1);
+        hold_sync_block_at(&app.terminals[1], b"\x1b[?2026hX", past);
+        let before = crate::platform::lock_recover(&app.terminals[1].grid).content_generation();
+        app.drain_terminal_host_events();
+        assert!(app.terminals[1].sync_deadline().is_none());
+        let after = crate::platform::lock_recover(&app.terminals[1].grid).content_generation();
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn background_tab_sync_deadline_sets_loop_timeout() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let now = Instant::now();
+        hold_sync_block_at(&app.terminals[1], b"\x1b[?2026hX", now);
+        let deadline = app.terminals[1]
+            .sync_deadline()
+            .expect("held bytes set a deadline");
+        app.dirty = false;
+        assert_eq!(app.loop_control(), AppLoopControl::WaitUntil(deadline));
+    }
+
     #[test]
     fn reorder_preserves_presented_active_terminal_identity_without_recommit() {
         let mut app = App::new();
@@ -2307,9 +2447,7 @@ mod tests {
 
         assert_eq!(production.matches("Terminal::spawn(").count(), 1);
         assert_eq!(production.matches("fn add_terminal_with_launch").count(), 1);
-        assert!(
-            production.contains("self.add_terminal_with_launch(TerminalLaunchSpec::default())")
-        );
+        assert!(production.contains("self.add_terminal_with_launch(TerminalLaunchSpec {"));
         assert_eq!(production.matches("self.add_terminal()").count(), 2);
         let startup = production
             .split("    fn on_runtime_ready")
@@ -2438,6 +2576,7 @@ mod tests {
             1,
             TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: vec![OsString::from("/bin/true")],
                 hold: true,
                 bridge_launch_id: None,
@@ -2474,6 +2613,7 @@ mod tests {
             1,
             TerminalLaunchSpec {
                 working_directory: None,
+                inherited_directory: None,
                 command: vec![OsString::from("/bin/true")],
                 hold: false,
                 bridge_launch_id: None,
@@ -2505,6 +2645,7 @@ mod tests {
             1,
             TerminalLaunchSpec {
                 working_directory: Some("/tmp".into()),
+                inherited_directory: None,
                 command: vec!["/definitely/missing/ronsole-test-command".into()],
                 hold: false,
                 bridge_launch_id: None,
@@ -2722,6 +2863,7 @@ mod tests {
     fn focused_custom_workdir_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: Some("/tmp/custom-cwd".into()),
+            inherited_directory: None,
             command: Vec::new(),
             hold: false,
             bridge_launch_id: None,
@@ -2739,6 +2881,7 @@ mod tests {
     fn focused_custom_command_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: vec!["htop".into(), "-d".into(), "10".into()],
             hold: false,
             bridge_launch_id: None,
@@ -2756,6 +2899,7 @@ mod tests {
     fn focused_hold_only_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: Vec::new(),
             hold: true,
             bridge_launch_id: None,
@@ -2773,6 +2917,7 @@ mod tests {
     fn unfocused_custom_command_with_token_opens_requested_tab_and_uses_xdg_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: vec!["htop".into()],
             hold: false,
             bridge_launch_id: None,
@@ -2796,6 +2941,7 @@ mod tests {
     fn unfocused_custom_workdir_on_kde_opens_requested_tab_and_uses_kde_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: Some("/tmp/custom-cwd".into()),
+            inherited_directory: None,
             command: Vec::new(),
             hold: false,
             bridge_launch_id: None,
@@ -2813,6 +2959,7 @@ mod tests {
     fn unfocused_custom_hold_off_kde_opens_requested_tab_and_uses_generic_activation() {
         let launch = TerminalLaunchSpec {
             working_directory: None,
+            inherited_directory: None,
             command: Vec::new(),
             hold: true,
             bridge_launch_id: None,
@@ -2831,6 +2978,7 @@ mod tests {
         let request = external_request(
             TerminalLaunchSpec {
                 working_directory: Some("/tmp/pending-cwd".into()),
+                inherited_directory: None,
                 command: vec!["program".into(), "arg one".into(), "--child-option".into()],
                 hold: true,
                 bridge_launch_id: None,
@@ -2844,38 +2992,99 @@ mod tests {
         assert_eq!(app.pending_external_launches.front(), Some(&request));
     }
 
-    #[test]
-    fn focus_reporting_uses_xterm_sequences_only_when_enabled() {
-        assert_eq!(focus_report_sequence(false, true), None);
-        assert_eq!(focus_report_sequence(false, false), None);
-        assert_eq!(
-            focus_report_sequence(true, true),
-            Some(b"\x1b[I".as_slice())
-        );
-        assert_eq!(
-            focus_report_sequence(true, false),
-            Some(b"\x1b[O".as_slice())
+    /// Turns on focus reporting (DECSET 1004) through the same grid path the PTY uses.
+    fn enable_focus_reporting_for_test(terminal: &Terminal) {
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[?1004h",
+            Instant::now(),
+            &mut sink,
         );
     }
 
     #[test]
-    fn committed_tab_focus_transition_plans_xterm_out_then_in_only_when_app_is_focused() {
-        assert_eq!(
-            terminal_focus_transition_plan(true, true, true, true),
-            (Some(b"\x1b[O".as_slice()), Some(b"\x1b[I".as_slice()))
-        );
-        assert_eq!(
-            terminal_focus_transition_plan(true, true, false, true),
-            (None, Some(b"\x1b[I".as_slice()))
-        );
-        assert_eq!(
-            terminal_focus_transition_plan(true, false, true, true),
-            (None, None)
-        );
-        assert_eq!(
-            terminal_focus_transition_plan(false, true, true, true),
-            (None, None)
-        );
+    fn focus_loss_reports_1004() {
+        let mut app = App::new();
+        let terminal = Terminal::new_for_test(8, 2, 1);
+        enable_focus_reporting_for_test(&terminal);
+        app.terminals.push(terminal);
+        app.active_terminal_presented = true;
+        app.on_focus_changed(false);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
+    }
+
+    #[test]
+    fn focus_loss_without_1004_sends_nothing() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.active_terminal_presented = true;
+        app.on_focus_changed(false);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+    }
+
+    /// A focus loss clears the sent-key set even when the terminal is not presented;
+    /// only the mode 1004 report is gated on presentation.
+    #[test]
+    fn focus_loss_clears_sent_keys_when_terminal_not_presented() {
+        let mut app = App::new();
+        let terminal = Terminal::new_for_test(8, 2, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        let ctrl_press = ronsole_term::KeyEvent {
+            physical: 1,
+            key: ronsole_term::TermKey::Modifier(ronsole_term::ModKey::LeftCtrl),
+            base: None,
+            mods: ronsole_term::KeyMods { shift: false, ctrl: true, alt: false, super_key: false },
+            kind: ronsole_term::KeyKind::Press,
+            text: None,
+        };
+        let ctrl_release = ronsole_term::KeyEvent {
+            mods: ronsole_term::KeyMods::default(),
+            kind: ronsole_term::KeyKind::Release,
+            ..ctrl_press
+        };
+        {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            // Flags 8+2: modifier events are reported and the press is remembered.
+            grid.advance(b"\x1b[=10u", Instant::now(), &mut sink);
+            let mut out = Vec::new();
+            assert_eq!(grid.encode_key(&ctrl_press, &mut out), ronsole_term::KeyOutcome::Sent);
+        }
+        app.terminals.push(terminal);
+        app.active_terminal_presented = false;
+        app.on_focus_changed(false);
+        let mut grid = crate::platform::lock_recover(&app.terminals[0].grid);
+        let mut out = Vec::new();
+        assert_eq!(grid.encode_key(&ctrl_release, &mut out), ronsole_term::KeyOutcome::Ignore);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tab_focus_transition_reports_out_then_in_only_when_focused() {
+        let mut app = App::new();
+        for display_number in [1, 2] {
+            let terminal = Terminal::new_for_test(8, 2, display_number);
+            enable_focus_reporting_for_test(&terminal);
+            app.terminals.push(terminal);
+        }
+        app.focused = false;
+        app.send_terminal_focus_transition(Some(0), Some(1));
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        app.focused = true;
+        app.send_terminal_focus_transition(Some(0), Some(1));
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
     }
 
     #[test]
@@ -3355,6 +3564,24 @@ mod tests {
             ),
             CursorKind::Default
         );
+    }
+
+    #[test]
+    fn global_shortcut_fires_on_repeat() {
+        let mut app = App::new();
+        let f1 = |state| KeyInput {
+            state,
+            physical_key: PhysicalKey::Code(KeyCode::F1),
+            keycode: 59,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        };
+        app.on_key(f1(KeyState::Released));
+        assert!(!app.settings_open);
+        app.on_key(f1(KeyState::Repeat));
+        assert!(app.settings_open);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use unicode_width::UnicodeWidthChar;
-use vte::Params;
 
 use crate::color::TerminalColor;
 
@@ -61,20 +61,198 @@ pub enum UnderlineStyle {
     Dashed = 5,
 }
 
+/// Largest total of `uri` and `id` bytes over the live hyperlinks of one terminal.
+pub(crate) const LINK_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of the live hyperlinks of one terminal, shared by their [`LinkCharge`]s.
+pub(crate) type LinkBudget = Arc<AtomicUsize>;
+
+/// Bytes one live [`Hyperlink`] holds against its terminal's [`LinkBudget`];
+/// released when the link is dropped.
+pub(crate) struct LinkCharge {
+    budget: LinkBudget,
+    bytes: usize,
+}
+
+impl LinkCharge {
+    /// Charges `bytes` to `budget`, or returns `None` when that would take the
+    /// budget over [`LINK_BUDGET_BYTES`].
+    pub(crate) fn reserve(budget: &LinkBudget, bytes: usize) -> Option<Self> {
+        let used = budget.load(Ordering::Relaxed);
+        if used.checked_add(bytes)? > LINK_BUDGET_BYTES {
+            return None;
+        }
+        budget.fetch_add(bytes, Ordering::Relaxed);
+        Some(Self {
+            budget: Arc::clone(budget),
+            bytes,
+        })
+    }
+}
+
+impl Clone for LinkCharge {
+    /// A clone is a second live link, so it takes its own charge.
+    fn clone(&self) -> Self {
+        self.budget.fetch_add(self.bytes, Ordering::Relaxed);
+        Self {
+            budget: Arc::clone(&self.budget),
+            bytes: self.bytes,
+        }
+    }
+}
+
+impl Drop for LinkCharge {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for LinkCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkCharge")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// The charge is bookkeeping, not part of a link's identity, so it never makes
+/// two hyperlinks differ.
+impl PartialEq for LinkCharge {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LinkCharge {}
+
 /// OSC 8 hyperlink target attached to a cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hyperlink {
     pub id: Option<Box<str>>,
     pub uri: Box<str>,
+    /// Budget charge for `id` and `uri`, released when the link is dropped.
+    charge: LinkCharge,
+}
+
+impl Hyperlink {
+    /// Creates a link charged to `budget`, or `None` when the budget has no room.
+    pub(crate) fn new(budget: &LinkBudget, id: Option<Box<str>>, uri: Box<str>) -> Option<Self> {
+        let bytes = uri.len() + id.as_deref().map_or(0, str::len);
+        let charge = LinkCharge::reserve(budget, bytes)?;
+        Some(Self { id, uri, charge })
+    }
 }
 
 /// Maximum number of zero-width characters stored in one cell's extra data;
 /// further ones are dropped by `Cell::push_zero_width`.
 pub const TERMINAL_CELL_EXTRA_MAX_CHARS: usize = 24;
 
+/// Per-cell data that is rare: zero-width characters, and the underline colour
+/// and hyperlink of the pen that wrote the cell. Cells written by one pen share
+/// one `Arc`; `zero_width` is copied on write.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CellExtra {
+pub(crate) struct CellExtra {
     zero_width: Vec<char>,
+    underline_color: Option<TerminalColor>,
+    hyperlink: Option<Arc<Hyperlink>>,
+}
+
+/// SGR and hyperlink state that the next written cells take over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Pen {
+    pub(crate) fg: TerminalColor,
+    pub(crate) bg: TerminalColor,
+    pub(crate) bold: bool,
+    pub(crate) dim: bool,
+    pub(crate) italic: bool,
+    pub(crate) inverse: bool,
+    pub(crate) conceal: bool,
+    pub(crate) strike: bool,
+    pub(crate) underline: UnderlineStyle,
+    pub(crate) extra: Option<Arc<CellExtra>>,
+}
+
+impl Default for Pen {
+    fn default() -> Self {
+        Self {
+            fg: TerminalColor::default_foreground(),
+            bg: TerminalColor::default_background(),
+            bold: false,
+            dim: false,
+            italic: false,
+            inverse: false,
+            conceal: false,
+            strike: false,
+            underline: UnderlineStyle::None,
+            extra: None,
+        }
+    }
+}
+
+impl Pen {
+    /// SGR 0 and the empty `CSI m`. The open hyperlink is kept because OSC 8
+    /// owns it, not SGR.
+    pub(crate) fn reset_sgr(&mut self) {
+        self.fg = TerminalColor::default_foreground();
+        self.bg = TerminalColor::default_background();
+        self.bold = false;
+        self.dim = false;
+        self.italic = false;
+        self.inverse = false;
+        self.conceal = false;
+        self.strike = false;
+        self.underline = UnderlineStyle::None;
+        self.set_underline_color(None);
+    }
+
+    pub(crate) fn underline_color(&self) -> Option<TerminalColor> {
+        self.extra.as_deref().and_then(|extra| extra.underline_color)
+    }
+
+    pub(crate) fn hyperlink(&self) -> Option<&Arc<Hyperlink>> {
+        self.extra.as_deref().and_then(|extra| extra.hyperlink.as_ref())
+    }
+
+    /// Sets the underline colour for cells written from now on.
+    pub(crate) fn set_underline_color(&mut self, color: Option<TerminalColor>) {
+        if self.underline_color() != color {
+            let hyperlink = self.hyperlink().cloned();
+            self.set_extra(color, hyperlink);
+        }
+    }
+
+    /// Opens (`Some`) or closes (`None`) the hyperlink for cells written from now on.
+    pub(crate) fn set_hyperlink(&mut self, hyperlink: Option<Arc<Hyperlink>>) {
+        // Compare by identity: each OSC 8 opening makes its own `Arc`, so two
+        // openings with equal URIs and no id stay separate links.
+        let same = match (self.hyperlink(), hyperlink.as_ref()) {
+            (Some(current), Some(new)) => Arc::ptr_eq(current, new),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            let underline_color = self.underline_color();
+            self.set_extra(underline_color, hyperlink);
+        }
+    }
+
+    /// Replaces the shared extra. It is `None` when neither field is set, so
+    /// plain text is written without allocating.
+    fn set_extra(
+        &mut self,
+        underline_color: Option<TerminalColor>,
+        hyperlink: Option<Arc<Hyperlink>>,
+    ) {
+        self.extra = if underline_color.is_none() && hyperlink.is_none() {
+            None
+        } else {
+            Some(Arc::new(CellExtra {
+                zero_width: Vec::new(),
+                underline_color,
+                hyperlink,
+            }))
+        };
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,14 +333,18 @@ impl Cell {
         }
     }
 
-    /// Underline colour is not stored yet; it is added with SGR 58 support.
+    /// Underline colour set by SGR 58; `None` means the default colour.
     pub fn underline_color(&self) -> Option<TerminalColor> {
-        None
+        self.extra.as_deref().and_then(|extra| extra.underline_color)
     }
 
-    /// Hyperlinks are not stored yet; OSC 8 support adds the storage.
+    /// OSC 8 hyperlink the cell was written under, if any.
     pub fn hyperlink(&self) -> Option<&Arc<Hyperlink>> {
-        None
+        self.extra.as_deref().and_then(|extra| extra.hyperlink.as_ref())
+    }
+
+    pub(crate) fn extra(&self) -> Option<&Arc<CellExtra>> {
+        self.extra.as_ref()
     }
 
     pub fn is_wide(&self) -> bool {
@@ -221,16 +403,25 @@ impl Cell {
         self.presentation = presentation;
     }
 
-    pub(crate) fn set_sgr_style(&mut self, inverse: bool, underline: UnderlineStyle, dim: bool) {
+    /// Copies the pen's style and shared extra into the cell. Keeps the wide
+    /// bits and clears HOST_HIDDEN, which only the host sets.
+    pub(crate) fn set_sgr_style(&mut self, pen: &Pen) {
         let mut bits = self.flags.0 & WIDE_FLAGS;
-        if inverse {
-            bits |= CellFlags::INVERSE.0;
+        for (set, flag) in [
+            (pen.bold, CellFlags::BOLD),
+            (pen.dim, CellFlags::DIM),
+            (pen.italic, CellFlags::ITALIC),
+            (pen.inverse, CellFlags::INVERSE),
+            (pen.conceal, CellFlags::CONCEAL),
+            (pen.strike, CellFlags::STRIKE),
+        ] {
+            if set {
+                bits |= flag.0;
+            }
         }
-        bits |= underline_bits(underline);
-        if dim {
-            bits |= CellFlags::DIM.0;
-        }
+        bits |= underline_bits(pen.underline);
         self.flags = CellFlags(bits);
+        self.extra = pen.extra.clone();
     }
 
     pub(crate) fn set_hidden(&mut self, hidden: bool) {
@@ -248,6 +439,8 @@ impl Cell {
         let extra = self.extra.get_or_insert_with(|| {
             Arc::new(CellExtra {
                 zero_width: Vec::with_capacity(4),
+                underline_color: None,
+                hyperlink: None,
             })
         });
         Arc::make_mut(extra).zero_width.push(c);
@@ -318,184 +511,9 @@ pub(crate) fn terminal_effective_foreground(
     }
 }
 
-pub(crate) fn apply_ansi_sgr(
-    params: &Params,
-    fg: &mut TerminalColor,
-    bg: &mut TerminalColor,
-    bold: &mut bool,
-    dim: &mut bool,
-    underline: &mut UnderlineStyle,
-    inverse: &mut bool,
-) {
-    if params.is_empty() {
-        *fg = TerminalColor::default_foreground();
-        *bg = TerminalColor::default_background();
-        *bold = false;
-        *dim = false;
-        *underline = UnderlineStyle::None;
-        *inverse = false;
-        return;
-    }
-
-    let mut params = params.iter();
-    while let Some(param) = params.next() {
-        let Some(value) = param.first().copied() else {
-            continue;
-        };
-        match value {
-            0 => {
-                *fg = TerminalColor::default_foreground();
-                *bg = TerminalColor::default_background();
-                *bold = false;
-                *dim = false;
-                *underline = UnderlineStyle::None;
-                *inverse = false;
-            }
-            1 => *bold = true,
-            2 => *dim = true,
-            4 => {
-                *underline = if param.get(1).copied() == Some(0) {
-                    UnderlineStyle::None
-                } else {
-                    UnderlineStyle::Single
-                }
-            }
-            7 => *inverse = true,
-            22 => {
-                *bold = false;
-                *dim = false;
-            }
-            24 => *underline = UnderlineStyle::None,
-            27 => *inverse = false,
-            30..=37 => *fg = TerminalColor::indexed((value - 30) as u8),
-            40..=47 => *bg = TerminalColor::indexed((value - 40) as u8),
-            90..=97 => *fg = TerminalColor::indexed((value - 90 + 8) as u8),
-            100..=107 => *bg = TerminalColor::indexed((value - 100 + 8) as u8),
-            39 => *fg = TerminalColor::default_foreground(),
-            49 => *bg = TerminalColor::default_background(),
-            38 | 48 => {
-                if let Some(color) = extended_color(param, &mut params) {
-                    if value == 38 {
-                        *fg = color;
-                    } else {
-                        *bg = color;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn extended_color<'a, I>(first: &[u16], params: &mut I) -> Option<TerminalColor>
-where
-    I: Iterator<Item = &'a [u16]>,
-{
-    if first.len() > 1 {
-        return extended_color_from_subparams(&first[1..]);
-    }
-
-    let mode = params.next()?.first().copied()?;
-    match mode {
-        5 => Some(TerminalColor::indexed(
-            params.next()?.first().copied()?.min(u8::MAX as u16) as u8,
-        )),
-        2 => {
-            let red = params.next()?.first().copied()?;
-            let green = params.next()?.first().copied()?;
-            let blue = params.next()?.first().copied()?;
-            Some(TerminalColor::rgb(
-                red.min(255) as u8,
-                green.min(255) as u8,
-                blue.min(255) as u8,
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn extended_color_from_subparams(params: &[u16]) -> Option<TerminalColor> {
-    match params.first().copied()? {
-        5 => Some(TerminalColor::indexed(
-            params.get(1).copied()?.min(255) as u8,
-        )),
-        2 => {
-            let components = if params.len() >= 5 {
-                &params[params.len() - 3..]
-            } else {
-                params.get(1..4)?
-            };
-            Some(TerminalColor::rgb(
-                components[0].min(255) as u8,
-                components[1].min(255) as u8,
-                components[2].min(255) as u8,
-            ))
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vte::{Parser, Perform};
-
-    struct SgrProbe {
-        fg: TerminalColor,
-        bg: TerminalColor,
-        bold: bool,
-        dim: bool,
-        underline: bool,
-        inverse: bool,
-    }
-
-    impl Perform for SgrProbe {
-        fn csi_dispatch(
-            &mut self,
-            params: &Params,
-            _intermediates: &[u8],
-            _ignore: bool,
-            action: char,
-        ) {
-            if action == 'm' {
-                // The probe keeps a bool; the style is mapped in and out around the call.
-                let mut underline = if self.underline {
-                    UnderlineStyle::Single
-                } else {
-                    UnderlineStyle::None
-                };
-                apply_ansi_sgr(
-                    params,
-                    &mut self.fg,
-                    &mut self.bg,
-                    &mut self.bold,
-                    &mut self.dim,
-                    &mut underline,
-                    &mut self.inverse,
-                );
-                self.underline = underline != UnderlineStyle::None;
-            }
-        }
-    }
-
-    #[test]
-    fn sgr_truecolor_and_extended_palette_are_compact_and_lossless() {
-        let mut probe = SgrProbe {
-            fg: TerminalColor::indexed(7),
-            bg: TerminalColor::indexed(0),
-            bold: false,
-            dim: false,
-            underline: false,
-            inverse: false,
-        };
-        Parser::new().advance(
-            &mut probe,
-            b"\x1b[38;2;1;2;3;48;5;200m\x1b[38:2::4:5:6m",
-        );
-        assert_eq!(probe.fg.rgb_value(), Some((4, 5, 6)));
-        assert_eq!(probe.bg.indexed_value(), Some(200));
-        assert_eq!(std::mem::size_of::<TerminalColor>(), 4);
-    }
 
     #[test]
     fn sgr_intensity_preserves_logical_default_and_explicit_bright_colors() {
@@ -516,53 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn sgr_common_style_state_toggles_and_reset_are_independent() {
-        let mut probe = SgrProbe {
-            fg: TerminalColor::default_foreground(),
-            bg: TerminalColor::default_background(),
-            bold: false,
-            dim: false,
-            underline: false,
-            inverse: false,
-        };
-        Parser::new().advance(&mut probe, b"\x1b[1;2;4;7m");
-        assert!(probe.bold);
-        assert!(probe.dim);
-        assert!(probe.underline);
-        assert!(probe.inverse);
-        Parser::new().advance(&mut probe, b"\x1b[22;24;27m");
-        assert!(!probe.bold);
-        assert!(!probe.dim);
-        assert!(!probe.underline);
-        assert!(!probe.inverse);
-        Parser::new().advance(&mut probe, b"\x1b[1;2;4;7;31;44m\x1b[0m");
-        assert!(probe.fg.is_default_foreground());
-        assert!(probe.bg.is_default_background());
-        assert!(!probe.bold && !probe.dim && !probe.underline && !probe.inverse);
-    }
-
-    #[test]
-    fn sgr_colon_underline_zero_cancels_underline_without_disabling_supported_styles() {
-        let mut probe = SgrProbe {
-            fg: TerminalColor::default_foreground(),
-            bg: TerminalColor::default_background(),
-            bold: false,
-            dim: false,
-            underline: false,
-            inverse: false,
-        };
-        let mut parser = Parser::new();
-        parser.advance(&mut probe, b"\x1b[4m");
-        assert!(probe.underline);
-        parser.advance(&mut probe, b"\x1b[4:0m");
-        assert!(!probe.underline);
-        parser.advance(&mut probe, b"\x1b[4:2m");
-        assert!(probe.underline);
-        parser.advance(&mut probe, b"\x1b[24m");
-        assert!(!probe.underline);
-    }
-
-    #[test]
     fn cell_style_flags_share_compact_storage_with_wide_state() {
         let mut cell = Cell::default();
         cell.set_char(
@@ -571,7 +542,13 @@ mod tests {
             TerminalColor::indexed(4),
             true,
         );
-        cell.set_sgr_style(true, UnderlineStyle::Single, true);
+        let pen = Pen {
+            inverse: true,
+            underline: UnderlineStyle::Single,
+            dim: true,
+            ..Pen::default()
+        };
+        cell.set_sgr_style(&pen);
         assert!(cell.is_wide());
         assert!(cell.is_inverse());
         assert!(cell.underline() == UnderlineStyle::Single);
@@ -590,46 +567,6 @@ mod tests {
     #[test]
     fn cell_size_fits_24_bytes() {
         assert!(std::mem::size_of::<Cell>() <= 24);
-    }
-
-    struct UnderlineProbe {
-        underline: UnderlineStyle,
-    }
-
-    impl Perform for UnderlineProbe {
-        fn csi_dispatch(
-            &mut self,
-            params: &Params,
-            _intermediates: &[u8],
-            _ignore: bool,
-            action: char,
-        ) {
-            if action == 'm' {
-                let mut fg = TerminalColor::default_foreground();
-                let mut bg = TerminalColor::default_background();
-                let (mut bold, mut dim, mut inverse) = (false, false, false);
-                apply_ansi_sgr(
-                    params,
-                    &mut fg,
-                    &mut bg,
-                    &mut bold,
-                    &mut dim,
-                    &mut self.underline,
-                    &mut inverse,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn sgr_underline_sets_single_style() {
-        let mut probe = UnderlineProbe {
-            underline: UnderlineStyle::None,
-        };
-        Parser::new().advance(&mut probe, b"\x1b[4m");
-        assert_eq!(probe.underline, UnderlineStyle::Single);
-        Parser::new().advance(&mut probe, b"\x1b[24m");
-        assert_eq!(probe.underline, UnderlineStyle::None);
     }
 
     #[test]

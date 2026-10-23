@@ -2,11 +2,13 @@ use crate::input_types::{
     KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton, ScrollDelta,
 };
 use crate::platform::Clipboard;
-use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target};
+use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target, visible_row_range};
 use crate::search::{SearchRefreshCause, TerminalSearchHit, TerminalSearchState};
 use crate::terminal::{MouseTrackingMode, Terminal};
+use crate::wayland_input::us_base_char_from_evdev;
 use ronsole_term::{
-    MouseButton, MouseEventKind, Term, bracketed_paste_bytes, mouse_report,
+    KeyEvent, KeyKind, KeyMods, KeyOutcome, KpKey, LinkTarget, MouseButton, MouseEventKind, Term,
+    TermKey, bracketed_paste_bytes, mouse_report, ModKey,
 };
 use std::path::{Path, PathBuf};
 
@@ -21,6 +23,15 @@ pub(crate) struct TerminalInteraction {
     pointer_capture: PointerCapture,
     terminal_selection_anchor: Option<(usize, usize)>,
     scroll_sensitivity: f32,
+    /// URI of the last Ctrl+click on a link, until `take_link_uri` hands it out.
+    link_uri: Option<Box<str>>,
+    /// True from a Ctrl+press on a link until the matching release.
+    link_press_pending: bool,
+    /// Key whose press the host consumed as a copy; its repeat and release stay away
+    /// from the encoder until that key is released.
+    held_host_key: Option<PhysicalKey>,
+    /// Physical modifier keys held now, one bit per key as given by `modifier_key_bits`.
+    held_modifier_keys: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,21 +42,6 @@ enum PointerCapture {
     TerminalScrollbar,
     SearchInput,
     SearchControl,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalCtrlCAction {
-    CopySelection,
-    SendInterrupt,
-}
-
-#[inline]
-fn terminal_ctrl_c_action(has_selection: bool) -> TerminalCtrlCAction {
-    if has_selection {
-        TerminalCtrlCAction::CopySelection
-    } else {
-        TerminalCtrlCAction::SendInterrupt
-    }
 }
 
 #[inline]
@@ -66,13 +62,82 @@ impl Default for TerminalInteraction {
             pointer_capture: PointerCapture::None,
             terminal_selection_anchor: None,
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
+            link_uri: None,
+            link_press_pending: false,
+            held_host_key: None,
+            held_modifier_keys: 0,
         }
     }
 }
 
 impl TerminalInteraction {
     pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {
+        // No host modifier means no modifier key is down, so a release that never
+        // arrived (for example after focus loss) must not leave its key marked held.
+        if modifiers.is_empty() {
+            self.held_modifier_keys = 0;
+        }
         self.modifiers = modifiers;
+    }
+
+    /// Records a physical modifier key as held or released. `App::on_key` calls it before
+    /// any of its early returns (settings modal, global shortcuts), because the held state is physical.
+    pub(crate) fn note_modifier_key(&mut self, key: &KeyInput) {
+        let Some(TermKey::Modifier(modifier)) = key.named else {
+            return;
+        };
+        let Some((bit, _, _)) = modifier_key_bits(modifier) else {
+            return;
+        };
+        if key.state.is_pressed() {
+            self.held_modifier_keys |= bit;
+        } else {
+            self.held_modifier_keys &= !bit;
+        }
+    }
+
+    /// Modifiers for the encoder event of `key`. The host learns the state after a key
+    /// only from the following `wl_keyboard.modifiers`, so a modifier key's own flag is
+    /// set here: on press and repeat, and on release only while its other key is held.
+    fn event_modifiers(&self, key: &KeyInput) -> Modifiers {
+        let Some(TermKey::Modifier(modifier)) = key.named else {
+            return self.modifiers;
+        };
+        let Some((_, flag, family)) = modifier_key_bits(modifier) else {
+            return self.modifiers;
+        };
+        let on = key.state.is_pressed() || self.held_modifier_keys & family != 0;
+        let own = |candidate: Modifiers| candidate == flag;
+        let current = self.modifiers;
+        Modifiers::new(
+            if own(Modifiers::SHIFT) { on } else { current.shift_key() },
+            if own(Modifiers::CONTROL) { on } else { current.control_key() },
+            if own(Modifiers::ALT) { on } else { current.alt_key() },
+            if own(Modifiers::SUPER) { on } else { current.super_key() },
+        )
+    }
+
+    /// Forgets a Ctrl+press on a link whose release will never be delivered,
+    /// for example after a focus change.
+    pub(crate) fn cancel_link_press(&mut self) {
+        self.link_press_pending = false;
+    }
+
+    /// Recomputes the hovered link for the pointer at (`x`, `y`). The link is
+    /// kept only while Ctrl is held and the pointer is over the terminal body.
+    pub(crate) fn update_link_hover(&self, terminal: &mut Terminal, x: f32, y: f32) {
+        let link = if self.modifiers.control_key() && self.layout.body.contains(x, y) {
+            link_under_pointer(self.layout, terminal, x, y)
+        } else {
+            None
+        };
+        terminal.set_hovered_link(link);
+    }
+
+    /// Takes the URI of the last Ctrl+click on a link; the caller decides
+    /// whether to open it.
+    pub(crate) fn take_link_uri(&mut self) -> Option<Box<str>> {
+        self.link_uri.take()
     }
 
     pub(crate) fn set_scroll_sensitivity(&mut self, sensitivity: f32) {
@@ -112,6 +177,9 @@ impl TerminalInteraction {
         self.pressed_mouse_buttons = 0;
         self.pointer_capture = PointerCapture::None;
         self.terminal_selection_anchor = None;
+        // Hover is only refreshed for the active tab, so drop the left tab's
+        // link to keep it from showing a stale pointer when it is reactivated.
+        terminal.set_hovered_link(None);
     }
 
     pub(crate) fn cancel_pointer_interaction(&mut self, terminal: &mut Terminal) {
@@ -317,7 +385,7 @@ impl TerminalInteraction {
     }
 
     fn handle_search_key(&mut self, key_event: &KeyInput, terminal: &mut Terminal) -> bool {
-        if !search_owns_keyboard(&self.search) || key_event.state != KeyState::Pressed {
+        if !search_owns_keyboard(&self.search) || !key_event.state.is_pressed() {
             return false;
         }
         if search_key_falls_through_to_terminal(
@@ -422,59 +490,107 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
     ) -> bool {
         if self.handle_search_key(key_event, terminal) {
-            return true;
-        }
-        if key_event.state != KeyState::Pressed {
-            return false;
-        }
-        let ctrl = self.modifiers.control_key();
-        let shift = self.modifiers.shift_key();
-        let alt = self.modifiers.alt_key();
-
-        if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV) {
-            let file_list = self
-                .clipboard()
-                .and_then(|clipboard| clipboard.get_file_list().ok());
-            let paste = terminal_clipboard_paste_bytes(file_list.as_deref(), None).or_else(|| {
-                self.clipboard()
-                    .and_then(|clipboard| clipboard.get_text().ok())
-                    .and_then(|text| terminal_clipboard_paste_bytes(None, Some(&text)))
-            });
-            if let Some(bytes) = paste {
-                write_terminal_paste(terminal, bytes);
+            if let Some(text) = key_event.text.as_deref() {
+                self.handle_text(text, terminal);
             }
             return true;
+        }
+        // Pressed covers auto-repeat. A release still reaches the encoder while search
+        // owns the keyboard: it is ignored unless its press was sent to the terminal.
+        let pressed = key_event.state.is_pressed();
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let super_key = self.modifiers.super_key();
+
+        // Host shortcuts act on press and repeat. Their release is dropped here, so
+        // neither a repeat nor a release of an intercepted key reaches the encoder.
+        if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV) {
+            if pressed {
+                let file_list = self
+                    .clipboard()
+                    .and_then(|clipboard| clipboard.get_file_list().ok());
+                let paste = terminal_clipboard_paste_bytes(file_list.as_deref(), None).or_else(|| {
+                    self.clipboard()
+                        .and_then(|clipboard| clipboard.get_text().ok())
+                        .and_then(|text| terminal_clipboard_paste_bytes(None, Some(&text)))
+                });
+                if let Some(bytes) = paste {
+                    write_terminal_paste(terminal, bytes);
+                }
+            }
+            return pressed;
+        }
+
+        // A key whose press the host consumed keeps out of the encoder until its release.
+        // A fresh press means an earlier release was lost, so it drops the old hold.
+        if self.held_host_key == Some(key_event.physical_key) {
+            match key_event.state {
+                KeyState::Repeat => return false,
+                KeyState::Released => {
+                    self.held_host_key = None;
+                    return false;
+                }
+                KeyState::Pressed => self.held_host_key = None,
+            }
         }
 
         let mut grid = crate::platform::lock_recover(&terminal.grid);
-        if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyC) {
-            match terminal_ctrl_c_action(grid.selection().is_some()) {
-                TerminalCtrlCAction::CopySelection => {
-                    let text = grid.selection_text();
-                    grid.set_selection(None);
-                    drop(grid);
-                    if !text.is_empty()
-                        && let Some(clipboard) = self.clipboard()
-                    {
-                        let _ = clipboard.set_text(text);
-                    }
-                }
-                TerminalCtrlCAction::SendInterrupt => {
-                    drop(grid);
-                    terminal.write_user_input(&[0x03]);
-                }
-            }
-            return true;
-        }
-        let app_cursor = grid.app_cursor_keys();
-        drop(grid);
-        if let Some(bytes) =
-            terminal_key_sequence(key_event.physical_key, shift, ctrl, alt, app_cursor)
+        if ctrl
+            && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
+            && grid.selection().is_some()
         {
-            terminal.write_user_input(&bytes);
-            return true;
+            let copied = if pressed {
+                let text = grid.selection_text();
+                grid.set_selection(None);
+                self.held_host_key = Some(key_event.physical_key);
+                Some(text)
+            } else {
+                None
+            };
+            drop(grid);
+            if let Some(text) = copied
+                && !text.is_empty()
+                && let Some(clipboard) = self.clipboard()
+            {
+                let _ = clipboard.set_text(text);
+            }
+            return pressed;
         }
-        false
+
+        // A key consumed by the IME composition never reaches the encoder. Its press text
+        // still goes to the PTY as plain text, because the IME may pass the key through.
+        if key_event.ime_preedit {
+            if key_event.state == KeyState::Pressed
+                && let Some(text) = key_event.text.as_deref()
+            {
+                drop(grid);
+                return self.handle_text(text, terminal);
+            }
+            return false;
+        }
+        let Some(key) = terminal_key_event(key_event, self.event_modifiers(key_event)) else {
+            return false;
+        };
+        let mut out = Vec::new();
+        let outcome = grid.encode_key(&key, &mut out);
+        drop(grid);
+        match outcome {
+            KeyOutcome::Sent => {
+                terminal.write_user_input(&out);
+                true
+            }
+            KeyOutcome::Text => {
+                let Some(bytes) = key
+                    .text
+                    .and_then(|text| terminal_text_sequence(text, ctrl, alt, super_key))
+                else {
+                    return false;
+                };
+                terminal.write_user_input(&bytes);
+                true
+            }
+            KeyOutcome::Ignore => false,
+        }
     }
 
     pub(crate) fn handle_text(&mut self, text: &str, terminal: &mut Terminal) -> bool {
@@ -578,6 +694,10 @@ impl TerminalInteraction {
         let x = self.mouse_x;
         let y = self.mouse_y;
         update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, state);
+        if state == KeyState::Pressed && button == PointerButton::Left {
+            // A new press supersedes a link press whose release never arrived.
+            self.link_press_pending = false;
+        }
 
         if state == KeyState::Released && self.pointer_capture != PointerCapture::None {
             self.finish_terminal_selection(terminal);
@@ -586,6 +706,11 @@ impl TerminalInteraction {
             if capture == PointerCapture::TerminalScrollbar {
                 terminal.scroll_y.end_drag();
             }
+            return true;
+        }
+
+        if state == KeyState::Released && button == PointerButton::Left && self.link_press_pending {
+            self.link_press_pending = false;
             return true;
         }
 
@@ -650,6 +775,24 @@ impl TerminalInteraction {
 
         if !self.layout.body.contains(x, y) {
             return false;
+        }
+        // Ctrl+click on a link opens it and never reaches the PTY, even under
+        // mouse tracking, and never starts a selection.
+        if state == KeyState::Pressed
+            && button == PointerButton::Left
+            && self.modifiers.control_key()
+            && let Some((link, _)) = link_under_pointer(self.layout, terminal, x, y)
+        {
+            self.link_uri = Some(link.uri);
+            self.link_press_pending = true;
+            // The press is not forwarded to the PTY, so the button must not
+            // count as held for motion reports (drag) until it is released.
+            update_pressed_mouse_buttons(
+                &mut self.pressed_mouse_buttons,
+                PointerButton::Left,
+                KeyState::Released,
+            );
+            return true;
         }
         if state == KeyState::Pressed {
             let search_owned_selection = self.search.owns_grid_selection();
@@ -730,6 +873,26 @@ impl TerminalInteraction {
         terminal.scroll_y.clamp_target(0.0, self.layout.max_scroll);
         true
     }
+}
+
+/// Link under (`x`, `y`) among the visible rows, with the grid's content
+/// generation at search time. The grid lock is held only for the search.
+fn link_under_pointer(
+    layout: TerminalUiLayout,
+    terminal: &Terminal,
+    x: f32,
+    y: f32,
+) -> Option<(LinkTarget, u64)> {
+    let grid = crate::platform::lock_recover(&terminal.grid);
+    let (col, row) = terminal_cell_from_grid(layout, &grid, x, y, layout.scroll_offset, false)?;
+    let rows = visible_row_range(
+        grid.total_rows(),
+        layout.visible_rows,
+        layout.scroll_offset,
+        layout.char_h,
+    );
+    let link = grid.link_at(row, col, rows)?;
+    Some((link, grid.content_generation()))
 }
 
 fn terminal_cell_at(
@@ -1085,103 +1248,6 @@ fn terminal_shell_escape_path(path: &Path, out: &mut Vec<u8>) {
     }
 }
 
-fn terminal_key_sequence(
-    physical_key: PhysicalKey,
-    shift: bool,
-    ctrl: bool,
-    alt: bool,
-    app_cursor_keys: bool,
-) -> Option<Vec<u8>> {
-    let seq = match physical_key {
-        // Shift+Enter sends ESC CR like Alt+Enter, so TUIs (Claude Code, fish) insert a newline instead of submitting.
-        PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
-            terminal_alt_prefixed(b"\r", alt || shift)
-        }
-        PhysicalKey::Code(KeyCode::Backspace) if ctrl => terminal_alt_prefixed(b"\x17", alt),
-        PhysicalKey::Code(KeyCode::Backspace) if shift => terminal_alt_prefixed(b"\x08", alt),
-        PhysicalKey::Code(KeyCode::Backspace) => terminal_alt_prefixed(b"\x7f", alt),
-        PhysicalKey::Code(KeyCode::Tab) if shift => b"\x1b[Z".to_vec(),
-        PhysicalKey::Code(KeyCode::Tab) => terminal_alt_prefixed(b"\t", alt),
-        PhysicalKey::Code(KeyCode::Escape) => b"\x1b".to_vec(),
-        PhysicalKey::Code(KeyCode::Insert) => terminal_tilde_key(2, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::Delete) => terminal_tilde_key(3, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::PageUp) => terminal_tilde_key(5, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::PageDown) => terminal_tilde_key(6, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::Home) => {
-            terminal_cursor_key(b'H', app_cursor_keys, shift, alt, ctrl)
-        }
-        PhysicalKey::Code(KeyCode::End) => {
-            terminal_cursor_key(b'F', app_cursor_keys, shift, alt, ctrl)
-        }
-        PhysicalKey::Code(KeyCode::ArrowUp) => {
-            terminal_cursor_key(b'A', app_cursor_keys, shift, alt, ctrl)
-        }
-        PhysicalKey::Code(KeyCode::ArrowDown) => {
-            terminal_cursor_key(b'B', app_cursor_keys, shift, alt, ctrl)
-        }
-        PhysicalKey::Code(KeyCode::ArrowRight) => {
-            terminal_cursor_key(b'C', app_cursor_keys, shift, alt, ctrl)
-        }
-        PhysicalKey::Code(KeyCode::ArrowLeft) => {
-            terminal_cursor_key(b'D', app_cursor_keys, shift, alt, ctrl)
-        }
-        PhysicalKey::Code(KeyCode::F1) => terminal_function_key(11, b'P', shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F2) => terminal_function_key(12, b'Q', shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F3) => terminal_function_key(13, b'R', shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F4) => terminal_function_key(14, b'S', shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F5) => terminal_function_key(15, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F6) => terminal_function_key(17, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F7) => terminal_function_key(18, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F8) => terminal_function_key(19, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F9) => terminal_function_key(20, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F10) => terminal_function_key(21, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F11) => terminal_function_key(23, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::F12) => terminal_function_key(24, 0, shift, alt, ctrl),
-        PhysicalKey::Code(KeyCode::Space) | PhysicalKey::Code(KeyCode::Digit2) if ctrl => {
-            terminal_alt_prefixed(b"\x00", alt)
-        }
-        PhysicalKey::Code(KeyCode::Digit6) if ctrl => terminal_alt_prefixed(b"\x1e", alt),
-        PhysicalKey::Code(KeyCode::Minus) | PhysicalKey::Code(KeyCode::Slash) if ctrl => {
-            terminal_alt_prefixed(b"\x1f", alt)
-        }
-        PhysicalKey::Code(KeyCode::BracketLeft) if ctrl => terminal_alt_prefixed(b"\x1b", alt),
-        PhysicalKey::Code(KeyCode::Backslash) if ctrl => terminal_alt_prefixed(b"\x1c", alt),
-        PhysicalKey::Code(KeyCode::BracketRight) if ctrl => terminal_alt_prefixed(b"\x1d", alt),
-        PhysicalKey::Code(code) if ctrl => {
-            let control = match code {
-                KeyCode::KeyA => 0x01,
-                KeyCode::KeyB => 0x02,
-                KeyCode::KeyC => 0x03,
-                KeyCode::KeyD => 0x04,
-                KeyCode::KeyE => 0x05,
-                KeyCode::KeyG => 0x07,
-                KeyCode::KeyH => 0x08,
-                KeyCode::KeyI => 0x09,
-                KeyCode::KeyJ => 0x0a,
-                KeyCode::KeyK => 0x0b,
-                KeyCode::KeyL => 0x0c,
-                KeyCode::KeyM => 0x0d,
-                KeyCode::KeyN => 0x0e,
-                KeyCode::KeyO => 0x0f,
-                KeyCode::KeyP => 0x10,
-                KeyCode::KeyQ => 0x11,
-                KeyCode::KeyR => 0x12,
-                KeyCode::KeyS => 0x13,
-                KeyCode::KeyT => 0x14,
-                KeyCode::KeyU => 0x15,
-                KeyCode::KeyW => 0x17,
-                KeyCode::KeyX => 0x18,
-                KeyCode::KeyY => 0x19,
-                KeyCode::KeyZ => 0x1a,
-                _ => return None,
-            };
-            terminal_alt_prefixed(&[control], alt)
-        }
-        _ => return None,
-    };
-    Some(seq)
-}
-
 fn terminal_text_sequence(text: &str, ctrl: bool, alt: bool, super_key: bool) -> Option<Vec<u8>> {
     if text.is_empty() || ctrl || super_key {
         return None;
@@ -1189,36 +1255,94 @@ fn terminal_text_sequence(text: &str, ctrl: bool, alt: bool, super_key: bool) ->
     Some(terminal_alt_prefixed(text.as_bytes(), alt))
 }
 
-fn terminal_modifier(shift: bool, alt: bool, ctrl: bool) -> Option<u8> {
-    let value = 1 + u8::from(shift) + u8::from(alt) * 2 + u8::from(ctrl) * 4;
-    (value != 1).then_some(value)
+/// Held-key bit, modifier flag, and the bits of both physical keys setting that flag,
+/// for a physical modifier key. Keys that set no `Modifiers` flag give `None`.
+fn modifier_key_bits(modifier: ModKey) -> Option<(u8, Modifiers, u8)> {
+    const SHIFT_KEYS: u8 = 0b0001_0001;
+    const CONTROL_KEYS: u8 = 0b0010_0010;
+    const ALT_KEYS: u8 = 0b0100_0100;
+    const SUPER_KEYS: u8 = 0b1000_1000;
+    Some(match modifier {
+        ModKey::LeftShift => (0b0000_0001, Modifiers::SHIFT, SHIFT_KEYS),
+        ModKey::RightShift => (0b0001_0000, Modifiers::SHIFT, SHIFT_KEYS),
+        ModKey::LeftCtrl => (0b0000_0010, Modifiers::CONTROL, CONTROL_KEYS),
+        ModKey::RightCtrl => (0b0010_0000, Modifiers::CONTROL, CONTROL_KEYS),
+        ModKey::LeftAlt => (0b0000_0100, Modifiers::ALT, ALT_KEYS),
+        ModKey::RightAlt => (0b0100_0000, Modifiers::ALT, ALT_KEYS),
+        ModKey::LeftSuper => (0b0000_1000, Modifiers::SUPER, SUPER_KEYS),
+        ModKey::RightSuper => (0b1000_0000, Modifiers::SUPER, SUPER_KEYS),
+        _ => return None,
+    })
+}
+
+/// Builds the encoder event for one host key. The named key wins over the
+/// physical key, which wins over the layout character.
+fn terminal_key_event(key: &KeyInput, mods: Modifiers) -> Option<KeyEvent<'_>> {
+    // A key with no named, physical, or layout identity has nothing to encode,
+    // so it is dropped instead of being encoded as a placeholder character.
+    let named = key
+        .named
+        .or_else(|| terminal_named_key(key.physical_key))
+        .or(key.unshifted.map(TermKey::Char))?;
+    Some(KeyEvent {
+        physical: u64::from(key.keycode),
+        key: named,
+        base: us_base_char_from_evdev(key.keycode),
+        mods: KeyMods {
+            shift: mods.shift_key(),
+            ctrl: mods.control_key(),
+            alt: mods.alt_key(),
+            super_key: mods.super_key(),
+        },
+        kind: match key.state {
+            KeyState::Pressed => KeyKind::Press,
+            KeyState::Repeat => KeyKind::Repeat,
+            KeyState::Released => KeyKind::Release,
+        },
+        text: key.text.as_deref(),
+    })
+}
+
+/// Named keys that have a fixed terminal meaning independent of the layout.
+fn terminal_named_key(key: PhysicalKey) -> Option<TermKey> {
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+    Some(match code {
+        KeyCode::Enter => TermKey::Enter,
+        KeyCode::NumpadEnter => TermKey::Kp(KpKey::Enter),
+        KeyCode::Tab => TermKey::Tab,
+        KeyCode::Backspace => TermKey::Backspace,
+        KeyCode::Escape => TermKey::Escape,
+        KeyCode::Insert => TermKey::Insert,
+        KeyCode::Delete => TermKey::Delete,
+        KeyCode::PageUp => TermKey::PageUp,
+        KeyCode::PageDown => TermKey::PageDown,
+        KeyCode::Home => TermKey::Home,
+        KeyCode::End => TermKey::End,
+        KeyCode::ArrowUp => TermKey::Up,
+        KeyCode::ArrowDown => TermKey::Down,
+        KeyCode::ArrowLeft => TermKey::Left,
+        KeyCode::ArrowRight => TermKey::Right,
+        KeyCode::F1 => TermKey::F(1),
+        KeyCode::F2 => TermKey::F(2),
+        KeyCode::F3 => TermKey::F(3),
+        KeyCode::F4 => TermKey::F(4),
+        KeyCode::F5 => TermKey::F(5),
+        KeyCode::F6 => TermKey::F(6),
+        KeyCode::F7 => TermKey::F(7),
+        KeyCode::F8 => TermKey::F(8),
+        KeyCode::F9 => TermKey::F(9),
+        KeyCode::F10 => TermKey::F(10),
+        KeyCode::F11 => TermKey::F(11),
+        KeyCode::F12 => TermKey::F(12),
+        _ => return None,
+    })
 }
 
 fn terminal_alt_prefixed(bytes: &[u8], alt: bool) -> Vec<u8> {
     if !alt { return bytes.to_vec(); }
     let mut out = Vec::with_capacity(bytes.len() + 1); out.push(0x1b); out.extend_from_slice(bytes); out
-}
-
-fn terminal_cursor_key(final_byte: u8, app: bool, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8); out.push(0x1b);
-    if let Some(modifier) = terminal_modifier(shift, alt, ctrl) {
-        out.extend_from_slice(b"[1;"); out.push(b'0' + modifier); out.push(final_byte);
-    } else { out.push(if app { b'O' } else { b'[' }); out.push(final_byte); }
-    out
-}
-
-fn terminal_tilde_key(code: u8, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8); out.extend_from_slice(b"\x1b["); out.push(b'0' + code);
-    if let Some(modifier) = terminal_modifier(shift, alt, ctrl) { out.push(b';'); out.push(b'0' + modifier); }
-    out.push(b'~'); out
-}
-
-fn terminal_function_key(code: u8, ss3: u8, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
-    if ss3 != 0 && terminal_modifier(shift, alt, ctrl).is_none() { return vec![0x1b, b'O', ss3]; }
-    let mut out = Vec::with_capacity(9); out.extend_from_slice(b"\x1b[");
-    if ss3 != 0 { out.push(b'1'); } else { if code >= 10 { out.push(b'0' + code / 10); } out.push(b'0' + code % 10); }
-    if let Some(modifier) = terminal_modifier(shift, alt, ctrl) { out.push(b';'); out.push(b'0' + modifier); }
-    if ss3 != 0 { out.push(ss3); } else { out.push(b'~'); } out
 }
 
 #[cfg(test)]
@@ -1228,23 +1352,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn terminal_encoder_keeps_plain_f1_and_ctrl_t_sequences() {
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F1), false, false, false, false), Some(b"\x1bOP".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyT), false, true, false, false), Some(vec![0x14]));
-    }
-
-    #[test]
-    fn terminal_encoder_sends_esc_cr_for_shift_enter() {
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Enter), false, false, false, false), Some(b"\r".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Enter), true, false, false, false), Some(b"\x1b\r".to_vec()));
-    }
-
-    #[test]
     fn project_owned_keyboard_contract_separates_physical_keys_from_text() {
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyA), false, false, false, false,),
-            None,
-        );
         assert_eq!(
             terminal_text_sequence("Ж界", false, false, false),
             Some("Ж界".as_bytes().to_vec()),
@@ -1253,95 +1361,8 @@ mod tests {
             terminal_text_sequence("x", false, true, false),
             Some(b"\x1bx".to_vec()),
         );
-
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyA), false, true, false, false,),
-            Some(vec![0x01]),
-        );
         assert_eq!(terminal_text_sequence("a", true, false, false), None);
         assert_eq!(terminal_text_sequence("a", false, false, true), None);
-    }
-
-    #[test]
-    fn project_owned_keyboard_contract_covers_navigation_modifiers_and_release() {
-        assert_eq!(
-            terminal_key_sequence(
-                PhysicalKey::Code(KeyCode::ArrowUp),
-                true,
-                false,
-                false,
-                false,
-            ),
-            Some(b"\x1b[1;2A".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(
-                PhysicalKey::Code(KeyCode::ArrowLeft),
-                false,
-                false,
-                true,
-                false,
-            ),
-            Some(b"\x1b[1;3D".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::Home), false, true, false, false,),
-            Some(b"\x1b[1;5H".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::End), false, false, false, false,),
-            Some(b"\x1b[F".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(
-                PhysicalKey::Code(KeyCode::PageUp),
-                false,
-                false,
-                false,
-                false,
-            ),
-            Some(b"\x1b[5~".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(
-                PhysicalKey::Code(KeyCode::PageDown),
-                false,
-                false,
-                false,
-                false,
-            ),
-            Some(b"\x1b[6~".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::F5), false, false, false, false,),
-            Some(b"\x1b[15~".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::F8), false, false, false, false,),
-            Some(b"\x1b[19~".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::F8), true, false, false, false,),
-            Some(b"\x1b[19;2~".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::F8), false, false, true, false,),
-            Some(b"\x1b[19;3~".to_vec()),
-        );
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::F12), false, true, true, false,),
-            Some(b"\x1b[24;7~".to_vec()),
-        );
-
-        let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(8, 2, 1);
-        assert!(!interaction.handle_key_event(
-            &KeyInput {
-                state: KeyState::Released,
-                physical_key: PhysicalKey::Code(KeyCode::ArrowUp),
-            },
-            &mut terminal,
-        ));
     }
 
     #[test]
@@ -1375,17 +1396,6 @@ mod tests {
             PhysicalKey::Code(KeyCode::KeyT),
             ctrl,
         ));
-        assert_eq!(
-            terminal_key_sequence(
-                PhysicalKey::Code(KeyCode::KeyT),
-                false,
-                true,
-                false,
-                false,
-            ),
-            Some(vec![0x14]),
-        );
-
         assert!(!search_key_falls_through_to_terminal(
             &search,
             PhysicalKey::Code(KeyCode::KeyA),
@@ -1534,32 +1544,479 @@ mod tests {
         assert_eq!(interaction.search.text, "needle");
     }
 
+    fn raw_key(state: KeyState, physical_key: PhysicalKey, keycode: u32) -> KeyInput {
+        KeyInput {
+            state,
+            physical_key,
+            keycode,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        }
+    }
+
     #[test]
-    fn modified_f1_remains_available_to_terminal_layer() {
+    fn key_event_maps_russian_ctrl_c() {
+        let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyC), 46);
+        key.unshifted = Some('с');
+        let event = terminal_key_event(&key, Modifiers::CONTROL).expect("identified key");
+        assert_eq!(event.physical, 46);
+        assert_eq!(event.key, TermKey::Char('с'));
+        assert_eq!(event.base, Some('c'));
+        assert!(event.mods.ctrl);
+        assert_eq!(event.kind, KeyKind::Press);
+    }
+
+    #[test]
+    fn key_event_base_for_punctuation() {
+        let mut semicolon = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 39);
+        semicolon.unshifted = Some('ж');
+        let event = terminal_key_event(&semicolon, Modifiers::empty()).expect("identified key");
+        assert_eq!(event.key, TermKey::Char('ж'));
+        assert_eq!(event.base, Some(';'));
+
+        // Any layout's level-0 character for the digit key is '3', so the fixture carries it.
+        let mut digit = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 4);
+        digit.unshifted = Some('3');
         assert_eq!(
-            terminal_key_sequence(
-                PhysicalKey::Code(KeyCode::F1),
-                false,
-                true,
-                true,
-                false,
-            ),
-            Some(b"\x1b[1;7P".to_vec()),
+            terminal_key_event(&digit, Modifiers::empty()).expect("identified key").base,
+            Some('3')
         );
     }
 
     #[test]
-    fn terminal_key_sequences_cover_navigation_and_modifiers() {
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::ArrowUp), false, false, false, false), Some(b"\x1b[A".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::ArrowUp), false, false, false, true), Some(b"\x1bOA".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::Delete), true, true, false, false), Some(b"\x1b[3;6~".to_vec()));
-        assert_eq!(terminal_key_sequence(PhysicalKey::Code(KeyCode::F12), false, false, false, false), Some(b"\x1b[24~".to_vec()));
+    fn key_event_prefers_named_over_keycode() {
+        let mut enter = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::NumpadEnter), 96);
+        enter.named = Some(TermKey::Kp(KpKey::Enter));
+        assert_eq!(
+            terminal_key_event(&enter, Modifiers::empty()).expect("identified key").key,
+            TermKey::Kp(KpKey::Enter)
+        );
     }
 
     #[test]
-    fn ctrl_c_copies_selection_or_sends_sigint_byte() {
-        assert_eq!(terminal_ctrl_c_action(true), TerminalCtrlCAction::CopySelection);
-        assert_eq!(terminal_ctrl_c_action(false), TerminalCtrlCAction::SendInterrupt);
+    fn ctrl_c_without_selection_sends_etx_flags0() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyC), 46);
+        key.unshifted = Some('c');
+        assert!(interaction.handle_key_event(&key, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), vec![0x03]);
+    }
+
+    #[test]
+    fn ctrl_c_with_selection_release_not_sent() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1, 4, 1)));
+        let mut release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyC), 46);
+        release.unshifted = Some('c');
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(crate::platform::lock_recover(&terminal.grid).selection().is_some());
+    }
+
+    #[test]
+    fn ctrl_c_with_selection_press_copies_and_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        // The selection lies past the grid rows, so its copied text is empty and
+        // the clipboard write is skipped; only selection state and encoder output are checked.
+        crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1000, 4, 1000)));
+        let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyC), 46);
+        press.unshifted = Some('c');
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(crate::platform::lock_recover(&terminal.grid).selection().is_none());
+    }
+
+    #[test]
+    fn ctrl_v_release_not_sent() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn alt_a_flag1_sends_no_separate_text() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::ALT);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        // Kitty push of flag 1 (disambiguate escape codes) through the grid parser.
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[>1u",
+            std::time::Instant::now(),
+            &mut sink,
+        );
+        let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
+        key.unshifted = Some('a');
+        key.text = Some("a".to_string());
+        // Sent means the encoder owns the key, so the text is not handled separately.
+        assert!(interaction.handle_key_event(&key, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[97;3u");
+    }
+
+    #[test]
+    #[ignore = "no clipboard seam: platform::Clipboard wraps arboard directly, so pasted text cannot be injected"]
+    fn ctrl_v_repeat_pastes_release_not_sent() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
+        let repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyV), 47);
+        let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
+        interaction.handle_key_event(&press, &mut terminal);
+        interaction.handle_key_event(&repeat, &mut terminal);
+        interaction.handle_key_event(&release, &mut terminal);
+        // The paste text itself is not checked here; only encoder output is.
+        let bytes = terminal.input_bytes_for_test();
+        assert!(!bytes.contains(&0x16));
+        assert!(!bytes.windows(8).any(|window| window == b"\x1b[118;5u"));
+    }
+
+    #[test]
+    fn ctrl_v_repeat_never_reaches_encoder() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyV), 47);
+        interaction.handle_key_event(&repeat, &mut terminal);
+        // Clipboard contents depend on the environment, so only encoder output is checked.
+        let bytes = terminal.input_bytes_for_test();
+        assert!(!bytes.contains(&0x16));
+        assert!(!bytes.windows(8).any(|window| window == b"\x1b[118;5u"));
+    }
+
+    #[test]
+    fn search_target_gets_text_after_key() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.search.open();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
+        key.unshifted = Some('a');
+        key.text = Some("a".to_string());
+        assert!(interaction.handle_key_event(&key, &mut terminal));
+        assert_eq!(interaction.search.text, "a");
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn repeated_letter_reaches_pty_as_text() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyA), 30);
+        repeat.unshifted = Some('a');
+        repeat.text = Some("a".to_string());
+        assert!(interaction.handle_key_event(&repeat, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"a");
+    }
+
+    #[test]
+    fn ime_preedit_key_not_encoded() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let enter = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::Enter), 28);
+        assert!(interaction.handle_key_event(&enter, &mut terminal));
+        assert!(!terminal.input_bytes_for_test().is_empty());
+
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut composing = enter.clone();
+        composing.ime_preedit = true;
+        assert!(!interaction.handle_key_event(&composing, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn ime_preedit_press_text_reaches_pty() {
+        // Expected value comes from the I1 ruling: press text still reaches the PTY under preedit.
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
+        press.unshifted = Some('a');
+        press.text = Some("a".to_string());
+        press.ime_preedit = true;
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"a");
+    }
+
+    #[test]
+    fn ime_preedit_repeat_sends_nothing() {
+        // Expected value comes from the I1 ruling: repeat under preedit stays suppressed.
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyA), 30);
+        repeat.unshifted = Some('a');
+        repeat.text = Some("a".to_string());
+        repeat.ime_preedit = true;
+        assert!(!interaction.handle_key_event(&repeat, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_with_selection_press_repeat_release_sends_nothing() {
+        // Expected behaviour comes from the G2-1 ruling: a host-intercepted press keeps
+        // its key away from the encoder until that key's release.
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        crate::platform::lock_recover(&terminal.grid).set_selection(Some((0, 0, 0, 2)));
+        let ctrl_c = |state| {
+            let mut key = raw_key(state, PhysicalKey::Code(KeyCode::KeyC), 46);
+            key.unshifted = Some('c');
+            key
+        };
+        let press = ctrl_c(KeyState::Pressed);
+        let repeat = ctrl_c(KeyState::Repeat);
+        let release = ctrl_c(KeyState::Released);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(crate::platform::lock_recover(&terminal.grid).selection().is_none());
+        assert!(!interaction.handle_key_event(&repeat, &mut terminal));
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // A fresh Ctrl+C press without selection goes to the encoder again (ETX, flags 0).
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x03");
+    }
+
+    #[test]
+    fn release_without_flag2_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let up = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::ArrowUp), 103);
+        assert!(!interaction.handle_key_event(&up, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn unidentified_key_without_text_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
+        interaction.handle_key_event(&key, &mut terminal);
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn unidentified_alt_key_sends_nothing_with_or_without_kitty_flags() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.set_modifiers(Modifiers::ALT);
+        let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
+
+        // Flags 0: an encoded placeholder would arrive as ESC NUL.
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        assert!(!interaction.handle_key_event(&key, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // Kitty flag 8 (report all keys as escape codes) through the grid parser.
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[>8u",
+            std::time::Instant::now(),
+            &mut sink,
+        );
+        assert!(!interaction.handle_key_event(&key, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    fn modifier_key(state: KeyState, modifier: ModKey, keycode: u32) -> KeyInput {
+        KeyInput {
+            named: Some(TermKey::Modifier(modifier)),
+            ..raw_key(state, PhysicalKey::Unidentified, keycode)
+        }
+    }
+
+    /// Terminal with Kitty flags 10 (report all keys and report event types) pushed.
+    fn modifier_test_terminal() -> Terminal {
+        let terminal = Terminal::new_for_test(80, 30, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        crate::platform::lock_recover(&terminal.grid).advance(
+            b"\x1b[>10u",
+            std::time::Instant::now(),
+            &mut sink,
+        );
+        terminal
+    }
+
+    // Expected bytes follow the reference "Modifiers" rule (protocol ref line 121) and
+    // the encoder tests in crates/ronsole-term/src/tests/keys.rs, not the host output.
+    #[test]
+    fn left_ctrl_press_sets_own_ctrl_bit_with_empty_host_modifiers() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;5u");
+    }
+
+    #[test]
+    fn left_ctrl_release_clears_ctrl_bit_when_no_other_ctrl_held() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        let release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(interaction.handle_key_event(&release, &mut terminal));
+        assert_eq!(
+            terminal.input_bytes_for_test(),
+            b"\x1b[57442;5u\x1b[57442;1:3u"
+        );
+    }
+
+    #[test]
+    fn left_ctrl_release_keeps_ctrl_bit_while_right_ctrl_held() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let left_press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        let right_press = modifier_key(KeyState::Pressed, ModKey::RightCtrl, 97);
+        let left_release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &left_press, &mut terminal));
+        assert!(send_key(&mut interaction, &right_press, &mut terminal));
+        assert!(send_key(&mut interaction, &left_release, &mut terminal));
+        assert_eq!(
+            terminal.input_bytes_for_test(),
+            b"\x1b[57442;5u\x1b[57448;5u\x1b[57442;5:3u"
+        );
+    }
+
+    #[test]
+    fn modifier_release_without_sent_press_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // A focus change clears the sent set, so the release of a Ctrl pressed before it is dropped.
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        let before = terminal.input_bytes_for_test();
+        let _ = crate::platform::lock_recover(&terminal.grid).focus_changed(true);
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), before);
+    }
+
+    /// Feeds one key the way `App::on_key` does: modifier state is noted first.
+    fn send_key(interaction: &mut TerminalInteraction, key: &KeyInput, terminal: &mut Terminal) -> bool {
+        interaction.note_modifier_key(key);
+        interaction.handle_key_event(key, terminal)
+    }
+
+    /// A Ctrl press sent before search opened still gets its release while search owns the keyboard.
+    #[test]
+    fn ctrl_release_while_search_owns_keyboard_reaches_encoder() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &press, &mut terminal));
+        interaction.search.open();
+        interaction.set_modifiers(Modifiers::empty());
+        let release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;5u\x1b[57442;1:3u");
+    }
+
+    /// A release of a key whose press was never sent stays ignored while search owns the keyboard.
+    #[test]
+    fn letter_release_while_search_owns_keyboard_sends_nothing() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.search.open();
+        let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyA), 30);
+        assert!(!send_key(&mut interaction, &release, &mut terminal));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    /// Modifier events that the settings modal swallows still update the held state,
+    /// so a later Ctrl release does not keep a stale ctrl bit.
+    #[test]
+    fn modifier_state_noted_while_modal_swallows_keys() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        let both = Modifiers::new(true, true, false, false);
+        interaction.set_modifiers(both);
+        let left_press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &left_press, &mut terminal));
+        // The modal returns before the encoder: only the held-state update runs.
+        interaction.set_modifiers(Modifiers::SHIFT);
+        interaction.note_modifier_key(&modifier_key(KeyState::Released, ModKey::LeftCtrl, 29));
+        interaction.set_modifiers(both);
+        let right_press = modifier_key(KeyState::Pressed, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &right_press, &mut terminal));
+        interaction.set_modifiers(Modifiers::SHIFT);
+        let right_release = modifier_key(KeyState::Released, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &right_release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;6u\x1b[57448;6u\x1b[57448;2:3u");
+    }
+
+    /// Empty host modifiers mean no modifier key is down, so the held state is cleared.
+    #[test]
+    fn set_modifiers_empty_clears_held_modifier_keys() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let press = modifier_key(KeyState::Pressed, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &press, &mut terminal));
+        interaction.set_modifiers(Modifiers::empty());
+        assert_eq!(interaction.held_modifier_keys, 0);
+        let release = modifier_key(KeyState::Released, ModKey::RightCtrl, 97);
+        assert!(send_key(&mut interaction, &release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57448;5u\x1b[57448;1:3u");
+    }
+
+    /// Releasing one Ctrl while the other Ctrl and Shift are held keeps shift and drops ctrl.
+    #[test]
+    fn release_of_one_ctrl_keeps_shift_when_both_ctrl_and_shift_held() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::SHIFT);
+        let shift_press = modifier_key(KeyState::Pressed, ModKey::LeftShift, 42);
+        assert!(send_key(&mut interaction, &shift_press, &mut terminal));
+        interaction.set_modifiers(Modifiers::new(true, true, false, false));
+        let ctrl_press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &ctrl_press, &mut terminal));
+        interaction.set_modifiers(Modifiers::SHIFT);
+        let ctrl_release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &ctrl_release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57441;2u\x1b[57442;6u\x1b[57442;2:3u");
+    }
+
+    /// A repeat of a held modifier is a repeat event (type 2) and keeps its own bit.
+    #[test]
+    fn modifier_repeat_is_repeat_event_with_own_bit() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = modifier_test_terminal();
+        interaction.set_modifiers(Modifiers::CONTROL);
+        let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &press, &mut terminal));
+        let repeat = modifier_key(KeyState::Repeat, ModKey::LeftCtrl, 29);
+        assert!(send_key(&mut interaction, &repeat, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;5u\x1b[57442;5:2u");
     }
 
     #[test]
@@ -1615,6 +2072,11 @@ mod tests {
         KeyInput {
             state: KeyState::Pressed,
             physical_key: PhysicalKey::Code(KeyCode::Enter),
+            keycode: 28,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
         }
     }
 
@@ -1636,6 +2098,8 @@ mod tests {
                 &mut crate::terminal_process::SessionSink {
                     reply_tx: None,
                     title_cache: None,
+                    pending: None,
+                    wake: None,
                 },
             );
         }
@@ -1680,6 +2144,7 @@ mod tests {
         let out = root.join("out");
         let launch = crate::launch::TerminalLaunchSpec {
             working_directory: Some(root.clone()),
+            inherited_directory: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -1793,6 +2258,199 @@ mod tests {
             mouse_report(MouseTrackingMode::Press, false, MouseEventKind::Press(MouseButton::Left), 2, 3),
             Some(vec![0x1b, b'[', b'M', 32, 35, 36])
         );
+    }
+
+    /// Test terminal whose bottom row holds a URL at columns 4..25. The point
+    /// (73, 682) is on that URL: column 6, bottom row of the body. With
+    /// `tracking`, SGR mouse tracking (`ESC[?1000h`, `ESC[?1006h`) is on.
+    fn link_test_terminal(tracking: bool) -> Terminal {
+        let mode: &[u8] = if tracking {
+            b"\x1b[?1000h\x1b[?1006h"
+        } else {
+            b""
+        };
+        link_test_terminal_with_modes(mode)
+    }
+
+    /// Like `link_test_terminal`, but writes `modes` before the URL row.
+    fn link_test_terminal_with_modes(modes: &[u8]) -> Terminal {
+        let terminal = selection_test_terminal();
+        let bytes = [modes, b"\x1b[30;1Hsee https://example.com/x"].concat();
+        crate::platform::lock_recover(&terminal.grid).advance(
+            &bytes,
+            std::time::Instant::now(),
+            &mut crate::terminal_process::SessionSink {
+                reply_tx: None,
+                title_cache: None,
+                pending: None,
+                wake: None,
+            },
+        );
+        terminal
+    }
+
+    #[test]
+    fn ctrl_click_with_tracking_not_sent_to_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(true);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(!interaction.terminal_selection_active());
+        assert_eq!(
+            interaction.take_link_uri().as_deref(),
+            Some("https://example.com/x")
+        );
+        assert!(interaction.take_link_uri().is_none());
+    }
+
+    #[test]
+    fn ctrl_click_off_link_with_tracking_still_reports_to_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(true);
+        interaction.layout = mouse_test_layout(0.0);
+        // Column 60 of the same row: no link there.
+        interaction.mouse_x = 613.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(terminal.input_bytes_for_test().starts_with(b"\x1b[<"));
+        assert!(interaction.take_link_uri().is_none());
+    }
+
+    #[test]
+    fn ctrl_hover_sets_pointer_and_range() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        let (link, generation) = terminal.hovered_link().expect("link under pointer");
+        let term = crate::platform::lock_recover(&terminal.grid);
+        // The URL is written on the bottom row, which is the last row of the grid.
+        assert_eq!(&*link.uri, "https://example.com/x");
+        assert_eq!(link.cells, vec![(term.total_rows() - 1, 4..25)]);
+        assert_eq!(*generation, term.content_generation());
+    }
+
+    #[test]
+    fn hover_without_ctrl_keeps_default_cursor() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_none());
+    }
+
+    #[test]
+    fn releasing_ctrl_clears_hovered_link() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_some());
+        interaction.set_modifiers(Modifiers::empty());
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_none());
+    }
+
+    #[test]
+    fn ctrl_press_on_link_under_button_event_mode_does_not_leak_drag_to_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal_with_modes(b"\x1b[?1002h\x1b[?1006h");
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        // The pointer moves one column while the Ctrl+press is still held down.
+        assert!(!interaction.cursor_moved(83.0, 682.0, &mut terminal, |_, _, _| 0));
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(terminal.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn new_left_press_clears_stale_link_press_so_next_release_reaches_pty() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(true);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        // The Release of the link press never reached mouse_input (for example
+        // a modal swallowed it), so the next plain press must clear the pending state.
+        interaction.set_modifiers(Modifiers::empty());
+        interaction.mouse_x = 300.0;
+        interaction.mouse_y = 300.0;
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        // SGR reports: one press (final byte `M`) and one release (final byte `m`).
+        let input = String::from_utf8_lossy(&terminal.input_bytes_for_test()).into_owned();
+        assert_eq!(
+            input.matches("\x1b[<").count(),
+            2,
+            "press and release must both reach the PTY: {input:?}"
+        );
+        assert!(input.ends_with('m'), "release report expected: {input:?}");
+    }
+
+    #[test]
+    fn switching_terminal_clears_hovered_link_of_terminal_left() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        assert!(terminal.hovered_link().is_some());
+        interaction.reset_for_terminal_switch(&mut terminal);
+        assert!(terminal.hovered_link().is_none());
     }
 
     fn mouse_test_layout(scroll_offset: f32) -> TerminalUiLayout {
@@ -2073,6 +2731,8 @@ mod tests {
                 &mut crate::terminal_process::SessionSink {
                     reply_tx: None,
                     title_cache: None,
+                    pending: None,
+                    wake: None,
                 },
             );
         }
@@ -2101,10 +2761,6 @@ mod tests {
         assert!(!search.focused);
         assert!(!search_owns_keyboard(&search));
         assert_eq!(search.text, "needle");
-        assert_eq!(
-            terminal_key_sequence(PhysicalKey::Code(KeyCode::KeyA), false, false, false, false),
-            None
-        );
         assert_eq!(
             terminal_text_sequence("a", false, false, false),
             Some(b"a".to_vec())

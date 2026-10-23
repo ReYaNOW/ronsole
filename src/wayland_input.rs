@@ -3,6 +3,7 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use memmap2::MmapOptions;
+use ronsole_term::{KpKey, ModKey, TermKey};
 use std::collections::VecDeque;
 use std::ffi::c_char;
 use std::os::fd::OwnedFd;
@@ -24,7 +25,6 @@ pub(crate) enum WaylandInputEvent {
     Focus(bool),
     Modifiers(Modifiers),
     Key(KeyInput),
-    Text(String),
     ImeCommit(String),
     PointerMotion(PointerPosition),
     PointerLeave,
@@ -403,7 +403,7 @@ pub(crate) fn should_emit_xkb_text(
     repeat: bool,
     ime_preedit_active: bool,
 ) -> bool {
-    if state != KeyState::Pressed || modifiers.control_key() || modifiers.super_key() {
+    if !state.is_pressed() || modifiers.control_key() || modifiers.super_key() {
         return false;
     }
     if matches!(
@@ -427,6 +427,131 @@ pub(crate) fn should_emit_xkb_text(
         return false;
     }
     true
+}
+
+const XKB_KEYSYM_ISO_LEVEL3_SHIFT: u32 = 0xfe03;
+
+/// US-layout unshifted character of an evdev keycode in the alphanumeric block.
+///
+/// Gives a key event its `base`, so shortcuts resolve by physical position
+/// whatever layout is active.
+pub(crate) fn us_base_char_from_evdev(evdev_key: u32) -> Option<char> {
+    const TOP_ROW: &[u8; 10] = b"qwertyuiop";
+    const HOME_ROW: &[u8; 9] = b"asdfghjkl";
+    const BOTTOM_ROW: &[u8; 7] = b"zxcvbnm";
+    let byte = match evdev_key {
+        2..=10 => b'1' + (evdev_key - 2) as u8,
+        11 => b'0',
+        12 => b'-',
+        13 => b'=',
+        16..=25 => TOP_ROW[(evdev_key - 16) as usize],
+        26 => b'[',
+        27 => b']',
+        30..=38 => HOME_ROW[(evdev_key - 30) as usize],
+        39 => b';',
+        40 => b'\'',
+        41 => b'`',
+        43 => b'\\',
+        44..=50 => BOTTOM_ROW[(evdev_key - 44) as usize],
+        51 => b',',
+        52 => b'.',
+        53 => b'/',
+        57 => b' ',
+        _ => return None,
+    };
+    Some(char::from(byte))
+}
+
+/// Named terminal key for a modifier or keypad evdev keycode; `None` for every other key.
+///
+/// AltGr is decided by `level0_keysym` (the unshifted keysym), because Shift can change
+/// the current keysym of the same key. Keypad keys follow `current_keysym`, so NumLock
+/// selects between digits and navigation meanings.
+pub(crate) fn named_term_key(
+    keycode: u32,
+    level0_keysym: u32,
+    current_keysym: u32,
+) -> Option<TermKey> {
+    match keycode {
+        29 => Some(TermKey::Modifier(ModKey::LeftCtrl)),
+        42 => Some(TermKey::Modifier(ModKey::LeftShift)),
+        54 => Some(TermKey::Modifier(ModKey::RightShift)),
+        56 => Some(TermKey::Modifier(ModKey::LeftAlt)),
+        58 => Some(TermKey::Modifier(ModKey::CapsLock)),
+        69 => Some(TermKey::Modifier(ModKey::NumLock)),
+        97 => Some(TermKey::Modifier(ModKey::RightCtrl)),
+        100 if level0_keysym == XKB_KEYSYM_ISO_LEVEL3_SHIFT => {
+            Some(TermKey::Modifier(ModKey::IsoLevel3Shift))
+        }
+        100 => Some(TermKey::Modifier(ModKey::RightAlt)),
+        125 => Some(TermKey::Modifier(ModKey::LeftSuper)),
+        126 => Some(TermKey::Modifier(ModKey::RightSuper)),
+        _ => keypad_key_from_keycode(keycode).map(|default| {
+            TermKey::Kp(keypad_key_from_keysym(current_keysym).unwrap_or(default))
+        }),
+    }
+}
+
+/// Keypad meaning of an evdev keypad keycode when NumLock is on.
+fn keypad_key_from_keycode(evdev_key: u32) -> Option<KpKey> {
+    Some(match evdev_key {
+        55 => KpKey::Multiply,
+        71 => KpKey::Kp7,
+        72 => KpKey::Kp8,
+        73 => KpKey::Kp9,
+        74 => KpKey::Subtract,
+        75 => KpKey::Kp4,
+        76 => KpKey::Kp5,
+        77 => KpKey::Kp6,
+        78 => KpKey::Add,
+        79 => KpKey::Kp1,
+        80 => KpKey::Kp2,
+        81 => KpKey::Kp3,
+        82 => KpKey::Kp0,
+        83 => KpKey::Decimal,
+        96 => KpKey::Enter,
+        98 => KpKey::Divide,
+        117 => KpKey::Equal,
+        121 => KpKey::Separator,
+        _ => return None,
+    })
+}
+
+/// Keypad key named by an XKB keypad keysym. Keysyms without a `KpKey`
+/// counterpart (KP_Space, KP_Tab, KP_F1..KP_F4) return `None`.
+fn keypad_key_from_keysym(keysym: u32) -> Option<KpKey> {
+    Some(match keysym {
+        0xffb0 => KpKey::Kp0,
+        0xffb1 => KpKey::Kp1,
+        0xffb2 => KpKey::Kp2,
+        0xffb3 => KpKey::Kp3,
+        0xffb4 => KpKey::Kp4,
+        0xffb5 => KpKey::Kp5,
+        0xffb6 => KpKey::Kp6,
+        0xffb7 => KpKey::Kp7,
+        0xffb8 => KpKey::Kp8,
+        0xffb9 => KpKey::Kp9,
+        0xffaa => KpKey::Multiply,
+        0xffab => KpKey::Add,
+        0xffac => KpKey::Separator,
+        0xffad => KpKey::Subtract,
+        0xffae => KpKey::Decimal,
+        0xffaf => KpKey::Divide,
+        0xffbd => KpKey::Equal,
+        0xff8d => KpKey::Enter,
+        0xff95 => KpKey::Home,
+        0xff96 => KpKey::Left,
+        0xff97 => KpKey::Up,
+        0xff98 => KpKey::Right,
+        0xff99 => KpKey::Down,
+        0xff9a => KpKey::PageUp,
+        0xff9b => KpKey::PageDown,
+        0xff9c => KpKey::End,
+        0xff9d => KpKey::Begin,
+        0xff9e => KpKey::Insert,
+        0xff9f => KpKey::Delete,
+        _ => return None,
+    })
 }
 
 pub(crate) fn cursor_shape_for_kind(kind: CursorKind) -> CursorShape {
@@ -604,8 +729,53 @@ impl XkbKeyboard {
             .map(ToOwned::to_owned)
     }
 
+    /// XKB keysym of `evdev_key` at shift level 0 of its active layout group; 0 when unknown.
+    ///
+    /// The group comes from the live state, so latched or depressed group changes are included.
+    pub(crate) fn level0_keysym(&self, evdev_key: u32) -> u32 {
+        let (Some(keymap), Some(state)) = (self.keymap, self.state) else {
+            return 0;
+        };
+        let keycode = evdev_key.saturating_add(XKB_KEYCODE_OFFSET);
+        let layout = unsafe { (self.library.xkb_state_key_get_layout)(state.as_ptr(), keycode) };
+        let mut syms = std::ptr::null::<u32>();
+        let count = unsafe {
+            (self.library.xkb_keymap_key_get_syms_by_level)(
+                keymap.as_ptr(),
+                keycode,
+                layout,
+                0,
+                &mut syms,
+            )
+        };
+        if count < 1 || syms.is_null() {
+            return 0;
+        }
+        // The symbol array is owned by the keymap, which outlives this read.
+        unsafe { *syms }
+    }
+
+    /// XKB keysym of `evdev_key` under the current modifiers and group; 0 when unknown.
+    pub(crate) fn current_keysym(&self, evdev_key: u32) -> u32 {
+        let Some(state) = self.state else {
+            return 0;
+        };
+        let keycode = evdev_key.saturating_add(XKB_KEYCODE_OFFSET);
+        unsafe { (self.library.xkb_state_key_get_one_sym)(state.as_ptr(), keycode) }
+    }
+
+    /// Unshifted character of `evdev_key` in the active layout group; `None` when the key
+    /// has no character at shift level 0.
+    pub(crate) fn unshifted_char(&self, evdev_key: u32) -> Option<char> {
+        let code_point = unsafe { (self.library.xkb_keysym_to_utf32)(self.level0_keysym(evdev_key)) };
+        if code_point == 0 {
+            return None;
+        }
+        char::from_u32(code_point)
+    }
+
     #[cfg(test)]
-    fn set_layouts_for_test(&mut self, layouts: &str) -> Result<(), String> {
+    pub(crate) fn set_layouts_for_test(&mut self, layouts: &str) -> Result<(), String> {
         use std::ffi::CString;
         use xkbcommon_dl::{xkb_keymap_compile_flags, xkb_rule_names};
 
@@ -681,6 +851,128 @@ mod tests {
             physical_key_from_evdev(30),
             PhysicalKey::Code(KeyCode::KeyA)
         );
+    }
+
+    #[test]
+    fn xkb_unshifted_char_follows_active_group() {
+        let mut xkb = XkbKeyboard::new().expect("XKB library must be available for tests");
+        xkb.set_layouts_for_test("us,ru")
+            .expect("test keymap must compile");
+
+        assert_eq!(xkb.unshifted_char(30), Some('a'));
+        assert_eq!(xkb.unshifted_char(39), Some(';'));
+        let _ = xkb.update_modifiers(0, 0, 0, 1);
+        assert_eq!(xkb.unshifted_char(30), Some('ф'));
+        assert_eq!(xkb.unshifted_char(39), Some('ж'));
+    }
+
+    #[test]
+    fn us_base_char_follows_physical_position() {
+        assert_eq!(us_base_char_from_evdev(2), Some('1'));
+        assert_eq!(us_base_char_from_evdev(4), Some('3'));
+        assert_eq!(us_base_char_from_evdev(10), Some('9'));
+        assert_eq!(us_base_char_from_evdev(11), Some('0'));
+        assert_eq!(us_base_char_from_evdev(16), Some('q'));
+        assert_eq!(us_base_char_from_evdev(30), Some('a'));
+        assert_eq!(us_base_char_from_evdev(39), Some(';'));
+        assert_eq!(us_base_char_from_evdev(44), Some('z'));
+        assert_eq!(us_base_char_from_evdev(57), Some(' '));
+        // Unknown and non-alphanumeric evdev codes have no US base character.
+        assert_eq!(us_base_char_from_evdev(0), None);
+        assert_eq!(us_base_char_from_evdev(1), None);
+        assert_eq!(us_base_char_from_evdev(200), None);
+    }
+
+    #[test]
+    fn named_term_key_maps_modifier_keys() {
+        assert_eq!(
+            named_term_key(42, 0, 0),
+            Some(TermKey::Modifier(ModKey::LeftShift))
+        );
+        assert_eq!(
+            named_term_key(100, XKB_KEYSYM_ISO_LEVEL3_SHIFT, 0xffea),
+            Some(TermKey::Modifier(ModKey::IsoLevel3Shift))
+        );
+        // Shift+AltGr: the current keysym differs, the unshifted keysym still decides.
+        assert_eq!(
+            named_term_key(100, XKB_KEYSYM_ISO_LEVEL3_SHIFT, 0x0041),
+            Some(TermKey::Modifier(ModKey::IsoLevel3Shift))
+        );
+        // Alt_R keysym (0xffea) at level 0 means a plain right Alt.
+        assert_eq!(
+            named_term_key(100, 0xffea, 0xffea),
+            Some(TermKey::Modifier(ModKey::RightAlt))
+        );
+        assert_eq!(
+            named_term_key(100, 0, 0),
+            Some(TermKey::Modifier(ModKey::RightAlt))
+        );
+        // A letter keycode is not a named key here.
+        assert_eq!(named_term_key(30, 0, 0), None);
+    }
+
+    #[test]
+    fn named_term_key_maps_keypad() {
+        const KP_7: u32 = 0xffb7;
+        const KP_HOME: u32 = 0xff95;
+        const KP_ENTER: u32 = 0xff8d;
+        assert_eq!(named_term_key(71, 0, KP_7), Some(TermKey::Kp(KpKey::Kp7)));
+        assert_eq!(named_term_key(71, 0, KP_HOME), Some(TermKey::Kp(KpKey::Home)));
+        // Without a current keysym the NumLock meaning is used.
+        assert_eq!(named_term_key(71, 0, 0), Some(TermKey::Kp(KpKey::Kp7)));
+        assert_eq!(named_term_key(96, 0, KP_ENTER), Some(TermKey::Kp(KpKey::Enter)));
+        assert_eq!(named_term_key(96, 0, 0), Some(TermKey::Kp(KpKey::Enter)));
+        assert_eq!(named_term_key(55, 0, 0), Some(TermKey::Kp(KpKey::Multiply)));
+        assert_eq!(named_term_key(83, 0, 0), Some(TermKey::Kp(KpKey::Decimal)));
+        // A non-keypad keycode ignores the keypad keysym.
+        assert_eq!(named_term_key(30, 0, KP_7), None);
+    }
+
+    #[test]
+    fn xkb_text_emitted_on_repeat() {
+        let plain = Modifiers::empty();
+        let key_a = PhysicalKey::Code(KeyCode::KeyA);
+        assert!(should_emit_xkb_text(
+            KeyState::Repeat,
+            key_a,
+            plain,
+            false,
+            true,
+            false,
+        ));
+        assert!(should_emit_xkb_text(
+            KeyState::Repeat,
+            key_a,
+            plain,
+            true,
+            true,
+            false,
+        ));
+        // Repeated text is still suppressed while an IME preedit is active.
+        assert!(!should_emit_xkb_text(
+            KeyState::Repeat,
+            key_a,
+            plain,
+            true,
+            true,
+            true,
+        ));
+        assert!(!should_emit_xkb_text(
+            KeyState::Released,
+            key_a,
+            plain,
+            false,
+            false,
+            false,
+        ));
+        assert!(!should_emit_xkb_text(
+            KeyState::Repeat,
+            key_a,
+            Modifiers::CONTROL,
+            false,
+            true,
+            false,
+        ));
     }
 
     #[test]

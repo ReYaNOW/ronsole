@@ -1,7 +1,7 @@
 //! `vte::Perform` for the terminal: CSI, ESC, control characters, DECSET/DECRST and replies.
 
 use crate::cell::{
-    Cell, apply_ansi_sgr,
+    Cell,
     is_terminal_zero_width_format, terminal_char_width, terminal_is_emoji_modifier,
     terminal_presentation_selector,
 };
@@ -10,12 +10,23 @@ use crate::grid::{
     repair_wide_line_with_blank,
 };
 use crate::input::MouseTrackingMode;
-use crate::osc::terminal_programmed_title;
+use crate::osc::{
+    parse_osc8_link, parse_osc52_text, parse_osc7_uri, queue_dynamic_color_query,
+    queue_palette_queries, terminal_programmed_title, with_joined,
+};
+use crate::sgr::apply_sgr;
 use crate::term::Performer;
 use vte::{Params, Perform};
 
 impl Perform for Performer<'_> {
+    /// Stops the parser right after a set that starts holding output, so the
+    /// rest of the batch can be held instead of applied.
+    fn terminated(&self) -> bool {
+        self.sync_set
+    }
+
     fn print(&mut self, c: char) {
+        self.applied = true;
         if let Some(presentation) = terminal_presentation_selector(c) {
             self.term.apply_presentation_selector(presentation, c);
             return;
@@ -44,6 +55,7 @@ impl Perform for Performer<'_> {
         }
     }
     fn execute(&mut self, byte: u8) {
+        self.applied = true;
         match byte {
             b'\n' | b'\x0B' | b'\x0C' => {
                 self.term.wrap_pending = false;
@@ -75,28 +87,50 @@ impl Perform for Performer<'_> {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        if params.first().is_some_and(|selector| *selector == b"104") {
-            // Ronsole does not expose a mutable OSC 4 palette; reset is therefore a no-op.
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.applied = true;
+        let Some(&selector) = params.first() else {
             return;
-        }
-        if params
-            .first()
-            .is_some_and(|selector| *selector == b"0" || *selector == b"2")
-            && let Some(title) = terminal_programmed_title(&params[1..])
-        {
-            self.sink.title(&title);
-        }
-
-        if params.len() >= 2 && params[1] == b"?" {
-            if params[0] == b"10" || params[0] == b"11" {
-                let prefix = std::str::from_utf8(params[0]).unwrap_or("10");
-                let msg = format!("\x1B]{};rgb:ffff/ffff/ffff\x1B\\", prefix);
-                self.term.try_queue_reply(self.sink, msg.into_bytes());
+        };
+        match selector {
+            // Ronsole has no mutable palette, so setting or resetting colours is a no-op.
+            b"104" | b"110" | b"111" | b"112" => {}
+            b"0" | b"2" => {
+                if let Some(title) = terminal_programmed_title(&params[1..]) {
+                    self.sink.title(&title);
+                }
             }
+            b"4" => queue_palette_queries(self.term, params, bell_terminated),
+            b"10" | b"11" | b"12" => {
+                queue_dynamic_color_query(self.term, selector, params, bell_terminated)
+            }
+            b"52" => {
+                if let Some(text) =
+                    with_joined(self.term, |joined| parse_osc52_text(params, joined))
+                {
+                    self.sink.clipboard_set(text);
+                }
+            }
+            b"7" => {
+                if let Some((host, path)) =
+                    with_joined(self.term, |joined| parse_osc7_uri(params, joined))
+                {
+                    self.sink.working_directory(&host, &path);
+                }
+            }
+            b"8" => {
+                // A `None` link closes the open hyperlink, as an empty or invalid URI does.
+                let budget = self.term.link_budget.clone();
+                let link = with_joined(self.term, |joined| {
+                    parse_osc8_link(params, joined, &budget)
+                });
+                self.term.pen.set_hyperlink(link);
+            }
+            _ => {}
         }
     }
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.applied = true;
         self.term.wrap_pending = false;
         self.term.join_next = false;
         match byte {
@@ -129,7 +163,23 @@ impl Perform for Performer<'_> {
         }
     }
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        if action != 'm' {
+        // A lone `CSI ? 2026 h` is the set that starts holding output; a combined
+        // `CSI ? … ; 2026 h` applies its modes without holding.
+        let sync_only = action == 'h'
+            && intermediates == b"?"
+            && params.len() == 1
+            && params.iter().all(|param| param.first() == Some(&2026));
+        if !sync_only {
+            self.applied = true;
+        }
+        // Queries do not move the cursor, so they keep a pending wrap.
+        let query = match action {
+            'c' | 'q' => intermediates == b">",
+            'p' => intermediates.contains(&b'$'),
+            'u' => matches!(intermediates, [b'?'] | [b'>'] | [b'<'] | [b'=']),
+            _ => false,
+        };
+        if action != 'm' && !query {
             self.term.wrap_pending = false;
             self.term.join_next = false;
         }
@@ -149,6 +199,7 @@ impl Perform for Performer<'_> {
                         if value == 1049 || value == 47 || value == 1047 {
                             if enable && !self.term.is_alt {
                                 self.term.is_alt = true;
+                                self.term.key_protocol.set_alt(true);
                                 self.term.alt_saved_cursor = Some((self.term.cur_x, self.term.cur_y));
                                 let mut alt = std::collections::VecDeque::new();
                                 let mut alt_meta = std::collections::VecDeque::new();
@@ -171,6 +222,7 @@ impl Perform for Performer<'_> {
                                 self.term.dirty = true;
                             } else if !enable && self.term.is_alt {
                                 self.term.is_alt = false;
+                                self.term.key_protocol.set_alt(false);
                                 if let Some(alt) = self.term.alt_lines.take() {
                                     let old_lines = std::mem::replace(&mut self.term.lines, alt);
                                     for mut line in old_lines {
@@ -207,6 +259,17 @@ impl Perform for Performer<'_> {
                                 1004 => self.term.focus_reporting = enable,
                                 1006 => self.term.mouse_sgr = enable,
                                 2004 => self.term.bracketed_paste = enable,
+                                2026 => {
+                                    // Only a lone `?2026h` holds (see `sync_only`); a set
+                                    // during replay or while already holding is a no-op.
+                                    if enable
+                                        && sync_only
+                                        && !self.term.replaying
+                                        && self.term.sync_until.is_none()
+                                    {
+                                        self.sync_set = true;
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -216,12 +279,33 @@ impl Perform for Performer<'_> {
                 }
             }
             's' => self.term.saved_cursor = Some((self.term.cur_x, self.term.cur_y)),
-            'u' => {
-                if let Some((x, y)) = self.term.saved_cursor {
-                    self.term.cur_x = x.min(self.term.cols.saturating_sub(1));
-                    self.term.cur_y = y.min(self.term.visible_rows.saturating_sub(1));
+            'u' => match intermediates {
+                // Restore cursor (DECRC). vte reports an omitted parameter as 0, so
+                // `CSI u` and `CSI 0 u` cannot be told apart and both restore.
+                [] => {
+                    if let Some((x, y)) = self.term.saved_cursor {
+                        self.term.cur_x = x.min(self.term.cols.saturating_sub(1));
+                        self.term.cur_y = y.min(self.term.visible_rows.saturating_sub(1));
+                    }
                 }
-            }
+                // Kitty keyboard protocol; these forms never move the cursor.
+                [b'?'] => self.term.queue_kitty_query(),
+                [b'>'] => {
+                    let flags = params.iter().next().map_or(0, |p| p[0]);
+                    self.term.key_protocol.push(flags);
+                }
+                [b'<'] => {
+                    let count = params.iter().next().map_or(1, |p| p[0]);
+                    self.term.key_protocol.pop(count);
+                }
+                [b'='] => {
+                    let flags = params.iter().next().map_or(0, |p| p[0]);
+                    // An omitted mode is 1 (replace); vte reads an empty mode as 0.
+                    let mode = params.iter().nth(1).map_or(1, |p| p[0]);
+                    self.term.key_protocol.set(flags, mode);
+                }
+                _ => {}
+            },
             'G' | '`' => {
                 let p = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
                 let p = if p == 0 { 1 } else { p };
@@ -234,15 +318,17 @@ impl Perform for Performer<'_> {
             }
             'c' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
-                if param == 0 {
-                    self.term.try_queue_reply(self.sink, b"\x1B[?62c".to_vec());
+                match intermediates {
+                    [] if param == 0 => self.term.queue_reply(b"\x1B[?62c"),
+                    [b'>'] if param == 0 => self.term.queue_da2(),
+                    _ => {}
                 }
             }
             'n' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
                 let private = intermediates.contains(&b'?');
                 if param == 5 && !private {
-                    self.term.try_queue_reply(self.sink, b"\x1B[0n".to_vec());
+                    self.term.queue_reply(b"\x1B[0n");
                 } else if param == 6 {
                     let row = if self.term.origin_mode {
                         self.term.cur_y.saturating_sub(self.term.scroll_region.0) + 1
@@ -251,7 +337,22 @@ impl Perform for Performer<'_> {
                     };
                     let prefix = if private { "?" } else { "" };
                     let msg = format!("\x1B[{prefix}{row};{}R", self.term.cur_x + 1);
-                    self.term.try_queue_reply(self.sink, msg.into_bytes());
+                    self.term.queue_reply(msg.as_bytes());
+                }
+            }
+            'p' => {
+                // vte reads an omitted parameter as 0; mode 0 is unknown and gets `;0$y`.
+                let mode = params.iter().next().map_or(0, |p| p[0]);
+                match (intermediates, mode) {
+                    ([b'?', b'$'], mode) => self.term.queue_decrqm_private(mode),
+                    ([b'$'], mode) => self.term.queue_decrqm_ansi(mode),
+                    _ => {}
+                }
+            }
+            'q' => {
+                let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                if intermediates == b">" && param == 0 {
+                    self.term.queue_xtversion();
                 }
             }
             'H' | 'f' => {
@@ -264,7 +365,7 @@ impl Perform for Performer<'_> {
             }
             'J' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 match param {
                     0 => {
                         if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
@@ -318,7 +419,7 @@ impl Perform for Performer<'_> {
             }
             'K' => {
                 let param = params.iter().next().map(|p| p[0]).unwrap_or(0);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
                     match param {
                         0 => {
@@ -382,7 +483,7 @@ impl Perform for Performer<'_> {
                     return;
                 }
                 let count = csi_count(params, bottom - self.term.cur_y + 1);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 for _ in 0..count {
                     if let Some((mut line, _)) =
                         remove_line_with_meta(&mut self.term.lines, &mut self.term.line_meta, bottom)
@@ -412,7 +513,7 @@ impl Perform for Performer<'_> {
                     return;
                 }
                 let count = csi_count(params, bottom - self.term.cur_y + 1);
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 for _ in 0..count {
                     if let Some((mut line, _)) =
                         remove_line_with_meta(&mut self.term.lines, &mut self.term.line_meta, self.term.cur_y)
@@ -437,7 +538,7 @@ impl Perform for Performer<'_> {
                 }
             }
             'P' => {
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 let mut deleted = 0usize;
                 if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
                     let count = csi_count(params, line.len().saturating_sub(self.term.cur_x));
@@ -459,7 +560,7 @@ impl Perform for Performer<'_> {
                 }
             }
             'X' => {
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 let mut erased_end = None;
                 if let Some(line) = self.term.lines.get_mut(self.term.cur_y) {
                     let start = self.term.cur_x.min(line.len());
@@ -482,15 +583,7 @@ impl Perform for Performer<'_> {
                 }
             }
             'm' => {
-                apply_ansi_sgr(
-                    params,
-                    &mut self.term.cur_fg,
-                    &mut self.term.cur_bg,
-                    &mut self.term.cur_bold,
-                    &mut self.term.cur_dim,
-                    &mut self.term.cur_underline,
-                    &mut self.term.cur_inverse,
-                );
+                apply_sgr(&mut self.term.pen, params);
             }
             'C' => {
                 let p = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
@@ -544,7 +637,7 @@ impl Perform for Performer<'_> {
             }
             '@' => {
                 let count = csi_count(params, self.term.cols.saturating_sub(self.term.cur_x));
-                let blank = Cell::blank_with_background(self.term.cur_bg);
+                let blank = Cell::blank_with_background(self.term.pen.bg);
                 if count > 0
                     && let Some(line) = self.term.lines.get_mut(self.term.cur_y)
                 {

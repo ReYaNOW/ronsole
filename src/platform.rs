@@ -9,7 +9,7 @@ mod process;
 pub(crate) mod single_instance;
 
 pub(crate) use kde_activation::{KdeActivationWorker, kde_session_active};
-pub use process::resolve_executable;
+pub use process::{open_uri, open_uri_allowed, resolve_executable};
 pub(crate) use process::{ProcessSnapshot, ProcessTree, foreground_process_snapshot};
 
 #[inline]
