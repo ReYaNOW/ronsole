@@ -1006,6 +1006,25 @@ mod tests {
     }
 
     #[test]
+    fn set_hovered_link_reports_only_real_changes() {
+        let link = |uri: &str| {
+            Some((
+                LinkTarget {
+                    uri: uri.into(),
+                    cells: vec![(0, 4..25)],
+                },
+                7,
+            ))
+        };
+        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        assert!(terminal.set_hovered_link(link("https://example.com/x")));
+        assert!(!terminal.set_hovered_link(link("https://example.com/x")));
+        assert!(terminal.set_hovered_link(link("https://example.com/y")));
+        assert!(terminal.set_hovered_link(None));
+        assert!(!terminal.set_hovered_link(None));
+    }
+
+    #[test]
     fn direct_pty_command_preserves_argv_cwd_relative_program_and_env() {
         use std::ffi::OsString;
         use std::os::unix::fs::PermissionsExt;
@@ -2020,9 +2039,14 @@ impl Terminal {
         self.hovered_link.as_ref()
     }
 
-    /// Replaces the hover state; `None` clears it.
-    pub(crate) fn set_hovered_link(&mut self, link: Option<(LinkTarget, u64)>) {
+    /// Replaces the hover state; `None` clears it. Returns whether the stored
+    /// link changed, so callers can request a frame only when it is needed.
+    pub(crate) fn set_hovered_link(&mut self, link: Option<(LinkTarget, u64)>) -> bool {
+        if self.hovered_link == link {
+            return false;
+        }
         self.hovered_link = link;
+        true
     }
 
     pub(crate) fn presentation_ready(&self) -> bool {

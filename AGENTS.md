@@ -304,7 +304,7 @@ Core source:
 
 Assets:
 
-- `src/fonts/*` — bundled fonts. Change only for a font task.
+- `src/fonts/*` — bundled fonts: JetBrains Mono Nerd Font Regular, Bold, Italic and BoldItalic (Nerd Fonts 3.4.0), with the SIL OFL license text in `OFL.txt`, plus the bundled UI font. Change only for a font task.
 - `src/icons/*` — bundled SVG icons. Change only for an icon/UI task.
 
 ## 13. Delivery

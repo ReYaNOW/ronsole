@@ -12,7 +12,8 @@ pub struct LinkTarget {
     /// OSC 8 URI, or the URL text found in the logical line.
     pub uri: Box<str>,
     /// Cells of the link inside the requested rows: row index as in [`Term::row`]
-    /// and the column range of that row.
+    /// and the column range of that row. Sorted by row, then by start column;
+    /// the renderer relies on this order.
     pub cells: Vec<(usize, Range<usize>)>,
 }
 
