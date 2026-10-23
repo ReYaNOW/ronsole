@@ -341,12 +341,10 @@ impl Term {
     }
 
     /// Reports a focus change from the host. Returns `CSI I` or `CSI O` when
-    /// focus reporting (mode 1004) is on, otherwise `None`. A focus loss clears
-    /// the sent-key set, so releases of keys held across it are ignored.
+    /// focus reporting (mode 1004) is on, otherwise `None`. Every focus change
+    /// clears the sent-key set, so releases of keys held across it are ignored.
     pub fn focus_changed(&mut self, focused: bool) -> Option<&'static [u8]> {
-        if !focused {
-            self.key_protocol.clear_sent();
-        }
+        self.key_protocol.clear_sent();
         focus_report_sequence(self.focus_reporting, focused)
     }
 

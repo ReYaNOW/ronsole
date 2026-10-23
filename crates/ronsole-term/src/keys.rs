@@ -367,7 +367,8 @@ pub(crate) fn encode_key(
     let events = flags & FLAG_REPORT_EVENTS != 0;
     let disambiguate = all || flags & FLAG_DISAMBIGUATE != 0;
     let release = event.kind == KeyKind::Release;
-    let bits = modifier_bits(event.mods);
+    let enhanced = flags & (FLAG_DISAMBIGUATE | FLAG_REPORT_EVENTS | FLAG_REPORT_ALL) != 0;
+    let bits = reported_bits(event.mods, enhanced);
     // Associated text may not hold control codes, and empty text adds no field (reference, flag 16).
     let text = event.text.filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
     let associated = if all && flags & FLAG_REPORT_TEXT != 0 { text } else { None };
@@ -378,9 +379,20 @@ pub(crate) fn encode_key(
         if !all || (release && !events) {
             return KeyOutcome::Ignore;
         }
-        let own = own_bit(modifier);
-        let bits = if release { bits & !own } else { bits | own };
-        write_csi(out, modifier_code(modifier), 1 + bits, event_field(event.kind, events), None, b'u');
+        // The host passes the modifier state after this event, so the own bit is taken as given.
+        // Only a press that was sent is remembered; a release without one is ignored.
+        let code = modifier_code(modifier);
+        if release {
+            let Some(pair) = protocol.sent_mut().remove(event.physical) else {
+                return KeyOutcome::Ignore;
+            };
+            write_sent(out, pair, 1 + bits, 3, None);
+            return KeyOutcome::Sent;
+        }
+        write_csi(out, code, 1 + bits, event_field(event.kind, events), None, b'u');
+        if events {
+            protocol.sent_mut().insert(SentKey { physical: event.physical, code, form: SentForm::Unicode });
+        }
         return KeyOutcome::Sent;
     }
 
@@ -501,7 +513,16 @@ fn write_legacy(
         _ => {
             // Unmodified cursor keys in cursor-key mode and F1-F4 use SS3.
             let final_byte = ss3_final(key)?;
-            if flags & (FLAG_DISAMBIGUATE | FLAG_REPORT_EVENTS | FLAG_REPORT_ALL) != 0 || modifier_bits(mods) != 0 {
+            if flags & (FLAG_DISAMBIGUATE | FLAG_REPORT_EVENTS | FLAG_REPORT_ALL) != 0 {
+                return None;
+            }
+            let bits = reported_bits(mods, false);
+            if bits != 0 {
+                // Modified F1-F4 keep the `CSI 1 ; mods <P|Q|R|S>` form, F3 included.
+                if let TermKey::F(1..=4) = key {
+                    write_csi(out, 1, 1 + bits, 1, None, final_byte);
+                    return Some(KeyOutcome::Sent);
+                }
                 return None;
             }
             let cursor = matches!(key, TermKey::Up | TermKey::Down | TermKey::Left | TermKey::Right | TermKey::Home | TermKey::End);
@@ -777,15 +798,11 @@ fn modifier_code(key: ModKey) -> u32 {
     }
 }
 
-/// Modifier bit that a modifier key sets on its own press and clears on release.
-fn own_bit(key: ModKey) -> u8 {
-    match key {
-        ModKey::LeftShift | ModKey::RightShift => BIT_SHIFT,
-        ModKey::LeftAlt | ModKey::RightAlt => BIT_ALT,
-        ModKey::LeftCtrl | ModKey::RightCtrl => BIT_CTRL,
-        ModKey::LeftSuper | ModKey::RightSuper => BIT_SUPER,
-        ModKey::CapsLock | ModKey::NumLock | ModKey::IsoLevel3Shift => 0,
-    }
+/// Modifier bits as the modifier field reports them. Without progressive
+/// enhancement Super is not reported, so it is left out of the field.
+fn reported_bits(mods: KeyMods, enhanced: bool) -> u8 {
+    let bits = modifier_bits(mods);
+    if enhanced { bits } else { bits & !BIT_SUPER }
 }
 
 fn modifier_bits(mods: KeyMods) -> u8 {

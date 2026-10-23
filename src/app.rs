@@ -528,14 +528,15 @@ impl App {
         }
     }
 
-    /// Reports focus to one terminal. `Term::focus_changed` also clears that
-    /// terminal's sent-key set on focus loss, so this runs for every change.
-    fn send_terminal_focus_state(&self, index: usize, focused: bool) {
+    /// Reports a focus change to one terminal. `Term::focus_changed` clears that
+    /// terminal's sent-key set on every change, so the call always runs; the
+    /// mode 1004 report is written only when `report` is set (terminal presented).
+    fn send_terminal_focus_state(&self, index: usize, focused: bool, report: bool) {
         let Some(terminal) = self.terminals.get(index) else {
             return;
         };
         let sequence = crate::platform::lock_recover(&terminal.grid).focus_changed(focused);
-        if let Some(sequence) = sequence {
+        if let Some(sequence) = sequence.filter(|_| report) {
             let _ = terminal.write_input(sequence);
         }
     }
@@ -545,10 +546,10 @@ impl App {
             return;
         }
         if let Some(index) = old {
-            self.send_terminal_focus_state(index, false);
+            self.send_terminal_focus_state(index, false, true);
         }
         if let Some(index) = new {
-            self.send_terminal_focus_state(index, true);
+            self.send_terminal_focus_state(index, true, true);
         }
     }
 
@@ -952,9 +953,7 @@ impl App {
         self.interaction.set_modifiers(Modifiers::empty());
         self.interaction.cancel_link_press();
         self.update_link_hover();
-        if self.active_terminal_presented {
-            self.send_terminal_focus_state(self.active_terminal, focused);
-        }
+        self.send_terminal_focus_state(self.active_terminal, focused, self.active_terminal_presented);
         if !focused {
             self.cancel_pointer_interactions();
             self.settings_background_dragging = false;
@@ -3023,6 +3022,47 @@ mod tests {
         app.active_terminal_presented = true;
         app.on_focus_changed(false);
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
+    }
+
+    /// A focus loss clears the sent-key set even when the terminal is not presented;
+    /// only the mode 1004 report is gated on presentation.
+    #[test]
+    fn focus_loss_clears_sent_keys_when_terminal_not_presented() {
+        let mut app = App::new();
+        let terminal = Terminal::new_for_test(8, 2, 1);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        let ctrl_press = ronsole_term::KeyEvent {
+            physical: 1,
+            key: ronsole_term::TermKey::Modifier(ronsole_term::ModKey::LeftCtrl),
+            base: None,
+            mods: ronsole_term::KeyMods { shift: false, ctrl: true, alt: false, super_key: false },
+            kind: ronsole_term::KeyKind::Press,
+            text: None,
+        };
+        let ctrl_release = ronsole_term::KeyEvent {
+            mods: ronsole_term::KeyMods::default(),
+            kind: ronsole_term::KeyKind::Release,
+            ..ctrl_press
+        };
+        {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            // Flags 8+2: modifier events are reported and the press is remembered.
+            grid.advance(b"\x1b[=10u", Instant::now(), &mut sink);
+            let mut out = Vec::new();
+            assert_eq!(grid.encode_key(&ctrl_press, &mut out), ronsole_term::KeyOutcome::Sent);
+        }
+        app.terminals.push(terminal);
+        app.active_terminal_presented = false;
+        app.on_focus_changed(false);
+        let mut grid = crate::platform::lock_recover(&app.terminals[0].grid);
+        let mut out = Vec::new();
+        assert_eq!(grid.encode_key(&ctrl_release, &mut out), ronsole_term::KeyOutcome::Ignore);
+        assert!(out.is_empty());
     }
 
     #[test]
