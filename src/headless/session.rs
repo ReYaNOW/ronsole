@@ -347,7 +347,9 @@ impl HeadlessSession {
             let redraw = self.counters().is_some_and(|counters| counters.redraw_requested);
             let idle = !report.frame
                 && !redraw
-                && report.deadline.is_none_or(|deadline| deadline > now);
+                && report
+                    .deadline
+                    .is_none_or(|deadline| deadline > started + budget);
             if idle {
                 let since = *quiet_since.get_or_insert(step_start);
                 if now.duration_since(since) >= quiet_needed {

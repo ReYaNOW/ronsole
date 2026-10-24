@@ -1054,16 +1054,16 @@ F line@90>p3,p4
 M src/headless/session.rs
 C enum Cause@72
 C struct WakeOutcome@93
-F run_protocol@587>q5,pv
-F serve@607>oi
-F open_profile@646>oe,og
-F write_png@659
-F classify@674
-F flow_name@686
-F flags@695
-F from_flags@699
-F single@703>q1
-F union@709>q0,q1
+F run_protocol@589>q5,pv
+F serve@609>oi
+F open_profile@648>oe,og
+F write_png@661
+F classify@676
+F flow_name@688
+F flags@697
+F from_flags@701
+F single@705>q1
+F union@711>q0,q1
 I Cause
 F name@81
 I HeadlessSession
@@ -1082,21 +1082,21 @@ F resize@289>qw
 F scale_to@306>qw
 F screenshot@313>qr,qw,px
 F settle@334>qr,qs,qu
-F wait@369>qs,qu
-F wake@384>qn,qt,pz
-F idle@398>qn,qs,qt,pz
-F wake_once@433>qr,qu,py
-F info@468
-F move_modifiers@489>np,qq,q0,q1,q2
-F send_key@516
-F counters@524
-F frame_count@528>qr
-F deadline_ms@532
-F step@545>qx
-F forced@551>qx
-F frame@556>qv
-F record@560
-F drop@579
+F wait@371>qs,qu
+F wake@386>qn,qt,pz
+F idle@400>qn,qs,qt,pz
+F wake_once@435>qr,qu,py
+F info@470
+F move_modifiers@491>np,qq,q0,q1,q2
+F send_key@518
+F counters@526
+F frame_count@530>qr
+F deadline_ms@534
+F step@547>qx
+F forced@553>qx
+F frame@558>qv
+F record@562
+F drop@581
 M src/input.rs
 C enum ClipboardOwner@48
 C enum PointerCapture@38
