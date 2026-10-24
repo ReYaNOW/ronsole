@@ -1174,7 +1174,7 @@ fn install_terminal_io_threads(
 fn terminal_launch_command(
     launch: TerminalLaunchSpec,
     tab_token: &TabToken,
-) -> io::Result<(CommandBuilder, PathBuf, String, &'static str)> {
+) -> io::Result<(CommandBuilder, PathBuf, String, String)> {
     let cwd = match launch.working_directory {
         Some(cwd) => cwd,
         None => terminal_launch_directory(
@@ -1184,17 +1184,24 @@ fn terminal_launch_command(
     };
     let (mut command, process_title, spawn_target) = if launch.command.is_empty() {
         let shell = resolve_terminal_shell(launch.shell.as_deref())?;
+        // An explicit override names its program in the spawn error; the default
+        // shell keeps the plain wording.
+        let spawn_target = if launch.shell.is_some() {
+            format!("terminal shell {}", shell.executable.display())
+        } else {
+            "terminal shell".to_string()
+        };
         (
             CommandBuilder::new(&shell.executable),
             shell.title,
-            "terminal shell",
+            spawn_target,
         )
     } else {
         let process_title = terminal_shell_title(Path::new(&launch.command[0]));
         (
             CommandBuilder::from_argv(launch.command),
             process_title,
-            "terminal command",
+            "terminal command".to_string(),
         )
     };
     command.cwd(cwd.as_os_str());
@@ -1614,6 +1621,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sh.executable, PathBuf::from("/bin/sh"));
+    }
+
+    #[test]
+    fn shell_override_names_program_in_spawn_target() {
+        let launch = TerminalLaunchSpec {
+            shell: Some(PathBuf::from("/bin/sh")),
+            working_directory: Some(std::env::temp_dir()),
+            inherited_directory: None,
+            command: Vec::new(),
+            hold: false,
+            bridge_launch_id: None,
+        };
+        let (_command, _cwd, _title, spawn_target) =
+            terminal_launch_command(launch, &TabToken::generate()).unwrap();
+        // The spawn error reads "failed to spawn {spawn_target}: ...", so it must name the program.
+        assert_eq!(spawn_target, "terminal shell /bin/sh");
     }
 
     #[test]

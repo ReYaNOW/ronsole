@@ -83,10 +83,10 @@ impl App {
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.clear_frame_request();
         }
-        let frame = self.on_frame()?;
+        self.on_frame()?;
         let deadline = self.wait_deadline(control);
         Ok(LoopStep::Continue(StepReport {
-            frame,
+            frame: true,
             flow: loop_flow(control),
             deadline,
             poll: None,
@@ -265,12 +265,18 @@ mod tests {
             .expect("headless counters")
     }
 
-    /// Steps until one draws nothing and the app asks to wait, so the next step starts
-    /// from an idle session. A step that draws nothing but still asks to poll is not idle.
+    /// Steps until a step times out with nothing drawn, no pending frame request, and
+    /// the app asking to wait, so the next step starts from an idle session. A step
+    /// that woke from the PTY or left a frame request behind is not idle.
     fn settle(app: &mut App) {
         for _ in 0..200 {
             match app.headless_step(Some(20)).expect("headless step") {
-                LoopStep::Continue(report) if !report.frame && report.flow == LoopFlow::Wait => {
+                LoopStep::Continue(report)
+                    if report.poll.is_some_and(|poll| poll.timed_out)
+                        && !report.frame
+                        && report.flow == LoopFlow::Wait
+                        && !counters(app).redraw_requested =>
+                {
                     return;
                 }
                 LoopStep::Continue(_) => {}

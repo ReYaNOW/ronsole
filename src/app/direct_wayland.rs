@@ -384,4 +384,17 @@ mod tests {
             Err(TrySendError::Full(_))
         ));
     }
+
+    #[test]
+    fn cap_timeout_follows_documented_contract() {
+        // No cap, and a negative cap, both leave the timeout unchanged.
+        assert_eq!(cap_timeout(100, None), 100);
+        assert_eq!(cap_timeout(-1, None), -1);
+        assert_eq!(cap_timeout(100, Some(-1)), 100);
+        assert_eq!(cap_timeout(-1, Some(-1)), -1);
+        // A non-negative cap replaces "no deadline" and limits longer waits only.
+        assert_eq!(cap_timeout(-1, Some(50)), 50);
+        assert_eq!(cap_timeout(10, Some(50)), 10);
+        assert_eq!(cap_timeout(100, Some(50)), 50);
+    }
 }
