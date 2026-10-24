@@ -169,6 +169,40 @@ fn csi_saved_erase_clears_history_without_touching_viewport_or_cursor() {
     );
 }
 
+/// Private or intermediate forms of plain CSI controls are different xterm
+/// controls (`CSI ? r` XTRESTORE, `CSI ? s` XTSAVE, `CSI > T` XTRMTITLE,
+/// `CSI ? S` XTSMGRAPHICS, `CSI SP @` SL, `CSI > H`), so they must not run the
+/// plain handler.
+#[test]
+fn private_marker_forms_do_not_run_plain_csi_handlers() {
+    let mut grid = Term::new(test_config(5, 3));
+    let mut sink = RecordingSink::new();
+    for (row, text) in ["11111", "22222", "33333"].into_iter().enumerate() {
+        set_line(&mut grid, row, text);
+    }
+    feed(&mut grid, &mut sink, b"\x1b[2;3H");
+    let lines = grid.lines.clone();
+    let region = grid.scroll_region;
+    for seq in [
+        &b"\x1b[?1r"[..],
+        b"\x1b[?1s",
+        b"\x1b[>1T",
+        b"\x1b[?1;1;0S",
+        b"\x1b[ @",
+        b"\x1b[>1;1H",
+        b"\x1b[>2J",
+        b"\x1b[>1G",
+    ] {
+        feed(&mut grid, &mut sink, seq);
+        let label = String::from_utf8_lossy(seq);
+        assert_eq!(grid.lines, lines, "{label:?} changed the screen");
+        assert_eq!(grid.cursor(), (2, 1), "{label:?} moved the cursor");
+        assert_eq!(grid.scroll_region, region, "{label:?} changed the scroll region");
+    }
+    // `CSI ? s` must not have saved the cursor for a later `CSI u` restore.
+    assert_eq!(grid.saved_cursor, None);
+}
+
 #[test]
 fn insert_delete_lines_are_noop_outside_scroll_region() {
     let mut grid = Term::new(test_config(5, 5));

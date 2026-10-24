@@ -18,6 +18,23 @@ use crate::sgr::apply_sgr;
 use crate::term::Performer;
 use vte::{Params, Perform};
 
+/// Whether `csi_dispatch` has a handler for this final byte with these
+/// intermediates. A private marker or intermediate turns a plain control into a
+/// different one (`CSI > 4 ; 2 m` is XTMODKEYS, not SGR 4;2; `CSI ? r` is
+/// XTRESTORE, not DECSTBM; `CSI SP @` is SL, not ICH), so only arms that inspect
+/// `intermediates` themselves receive non-empty ones; the rest are ignored.
+fn csi_form_is_handled(action: char, intermediates: &[u8]) -> bool {
+    match action {
+        _ if intermediates.is_empty() => true,
+        'h' | 'l' | 'n' => intermediates == b"?",
+        // DECSED / DECSEL: without DECSCA protection they erase like ED / EL.
+        'J' | 'K' => intermediates == b"?",
+        // These arms match on `intermediates` and ignore unknown forms.
+        'c' | 'p' | 'q' | 'u' => true,
+        _ => false,
+    }
+}
+
 impl Perform for Performer<'_> {
     /// Stops the parser right after a set that starts holding output, so the
     /// rest of the batch can be held instead of applied.
@@ -171,6 +188,9 @@ impl Perform for Performer<'_> {
             && params.iter().all(|param| param.first() == Some(&2026));
         if !sync_only {
             self.applied = true;
+        }
+        if !csi_form_is_handled(action, intermediates) {
+            return;
         }
         // Queries do not move the cursor, so they keep a pending wrap.
         let query = match action {

@@ -206,6 +206,35 @@ fn sgr_common_state_toggles_and_reset_are_independent() {
     assert_eq!(reset.underline(), UnderlineStyle::None);
 }
 
+/// `CSI > 4 ; 2 m` and `CSI > 4 m` are xterm XTMODKEYS (set / reset
+/// modifyOtherKeys), which Claude Code sends; `CSI ? 4 m` is XTQMODKEYS. None of
+/// them is SGR, so they must not turn on underline (4) or faint (2).
+#[test]
+fn private_marker_m_sequences_are_not_sgr() {
+    for seq in [
+        &b"\x1b[>4;2m"[..],
+        b"\x1b[>4m",
+        b"\x1b[>4;1m",
+        b"\x1b[>1m",
+        b"\x1b[?4m",
+        b"\x1b[=4m",
+        b"\x1b[<4m",
+    ] {
+        let mut bytes = seq.to_vec();
+        bytes.push(b'x');
+        let cell = cell_at(&bytes, 0);
+        let label = String::from_utf8_lossy(seq);
+        assert_eq!(cell.underline(), UnderlineStyle::None, "{label:?} set underline");
+        assert!(!cell.is_dim(), "{label:?} set faint");
+        assert_eq!(cell.flags(), CellFlags::empty(), "{label:?} set flags");
+    }
+    // A private form between real SGR keeps the pen as the real SGR left it.
+    let cell = cell_at(b"\x1b[1m\x1b[>4;2m\x1b[>4mx", 0);
+    assert_eq!(cell.flags(), CellFlags::BOLD);
+    assert_eq!(cell.underline(), UnderlineStyle::None);
+    assert!(!cell.is_dim());
+}
+
 #[test]
 fn conceal_survives_host_unhide() {
     let mut term = Term::new(test_config(8, 1));
