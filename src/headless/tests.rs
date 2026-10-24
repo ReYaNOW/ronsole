@@ -101,6 +101,8 @@ pub(crate) fn wait_until(
 }
 
 /// Runs `wake <ms>` and returns its response with the instant the step started.
+// Consumed by the wake tests of later protocol tasks; no test in this task calls it yet.
+#[allow(dead_code)]
 pub(crate) fn native_wake(session: &mut HeadlessSession, ms: u64) -> (String, Instant) {
     let started = Instant::now();
     let lines = run_script(session, format!("wake {ms}\n").as_bytes());

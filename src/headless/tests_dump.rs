@@ -158,10 +158,13 @@ fn dump_row_colors_and_wide() {
         "type printf '\\033[1;38;2;200;10;20mR\\033[0m\u{754c}'; sleep 30".as_bytes(),
     );
     run_ok(&mut session, b"key enter\n");
-    let shown = wait_until(&mut session, 5000, "wide character in terminal.text", |dump| {
-        row_containing(dump, "\u{754c}").is_some()
+    // The echoed command also contains the wide character, but never `R` directly before it,
+    // so the marker `R界` finds the output row and not the typed line.
+    let marker = "R\u{754c}";
+    let shown = wait_until(&mut session, 5000, "R and the wide character in terminal.text", |dump| {
+        row_containing(dump, marker).is_some()
     });
-    let row = row_containing(&shown, "\u{754c}").expect("row with the wide character");
+    let row = row_containing(&shown, marker).expect("row with the output");
 
     let row_dump = dump_row(&mut session, row);
     assert_eq!(row_dump["row"], row);
@@ -333,7 +336,13 @@ fn frame_requests_grow_on_output() {
 #[test]
 fn missing_shell_reports_in_grid() {
     let mut session = session_with_shell(800, 600, Some(PathBuf::from("/nonexistent/sh")));
+    // The message is wider than the 77-column test grid, so the path wraps onto the next row;
+    // the rows are joined without a separator to find it.
     wait_until(&mut session, 5000, "the missing shell path in the grid", |dump| {
-        row_containing(dump, "/nonexistent/sh").is_some()
+        let joined: String = dump["terminal"]["text"]
+            .as_array()
+            .map(|rows| rows.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        joined.contains("/nonexistent/sh")
     });
 }
