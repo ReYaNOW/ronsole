@@ -2803,6 +2803,11 @@ impl WindowRuntime {
         self.wake.clone()
     }
 
+    /// The window's renderer, for readers of its font metrics and palette.
+    pub(crate) fn renderer(&self) -> &Renderer {
+        &self.renderer
+    }
+
     pub(crate) fn request_frame(&self) {
         match &self.backend {
             RuntimeBackend::Wayland(wayland) => wayland.request_frame(),

@@ -3,6 +3,7 @@
 
 use super::Profile;
 use super::backend::HeadlessCounters;
+use super::dump;
 use super::keys::{key_input, modifier_key_input};
 use super::protocol::{
     ClickPhase, Command, KeyCombo, MouseButtonArg, Response, WheelUnit, parse_line,
@@ -99,8 +100,10 @@ struct WakeOutcome {
 /// A running headless app plus the state the protocol commands need.
 pub(crate) struct HeadlessSession {
     app: App,
-    /// Keeps the link-open channel alive; recorded links are never read.
-    _receiver: Receiver<String>,
+    /// Receives the links the app would open instead of launching them; `dump` drains it.
+    receiver: Receiver<String>,
+    /// Newest link drained from `receiver` and not yet reported as `external_request`.
+    last_external: Option<String>,
     /// Declared after `app` so the app is torn down before its profile directory goes.
     profile: Profile,
     /// Modifiers the protocol holds (`mods`), as the app last saw them.
@@ -130,7 +133,8 @@ impl HeadlessSession {
             })?;
         let mut session = Self {
             app,
-            _receiver: receiver,
+            receiver,
+            last_external: None,
             profile,
             mods: Modifiers::empty(),
             pointer: PointerPosition::default(),
@@ -166,10 +170,10 @@ impl HeadlessSession {
             Command::Idle { ms } => self.idle(ms),
             Command::Info => self.info(),
             Command::Quit => Ok(None),
-            Command::Dump(_)
-            | Command::DumpRow(_)
-            | Command::MouseCell { .. }
-            | Command::Bench { .. } => Err("not implemented".to_string()),
+            Command::Dump(path) => self.dump(path.as_deref()),
+            Command::DumpRow(row) => self.dump_row(row),
+            Command::MouseCell { col, row } => self.mouse_cell(col, row),
+            Command::Bench { .. } => Err("not implemented".to_string()),
         };
         match result {
             Ok(payload) => Response::Ok(payload),
@@ -190,6 +194,53 @@ impl HeadlessSession {
     /// The last loop step report of the session, from any step.
     pub(crate) fn last_report(&self) -> Option<StepReport> {
         self.last_report
+    }
+
+    /// The window size in physical pixels, as the session last set it.
+    pub(super) fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The scale factor, as the session last set it.
+    pub(super) fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Drains the link-open channel and returns the newest link not yet reported, so each
+    /// link is reported by one `dump` only.
+    pub(super) fn take_external_request(&mut self) -> Option<String> {
+        while let Ok(arg) = self.receiver.try_recv() {
+            self.last_external = Some(arg);
+        }
+        self.last_external.take()
+    }
+
+    /// `dump [path]`: the state as one JSON line, or written to `path` with its absolute path
+    /// as the payload.
+    fn dump(&mut self, path: Option<&Path>) -> Result<Option<String>, String> {
+        let text = dump::dump_json(self).to_string();
+        let Some(path) = path else {
+            return Ok(Some(text));
+        };
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).map_err(|_| "dump directory failed".to_string())?;
+        }
+        fs::write(path, &text).map_err(|_| "dump write failed".to_string())?;
+        let absolute = std::path::absolute(path).map_err(|_| "dump path failed".to_string())?;
+        Ok(Some(absolute.display().to_string()))
+    }
+
+    /// `dump row <row>`: the non-blank cells of one visible row as one JSON line.
+    fn dump_row(&mut self, row: usize) -> Result<Option<String>, String> {
+        dump::dump_row_json(self, row).map(|value| Some(value.to_string()))
+    }
+
+    /// `mouse_cell <col> <row>`: moves the pointer to the centre of a visible cell, as `mouse_move` does.
+    fn mouse_cell(&mut self, col: usize, row: usize) -> Result<Option<String>, String> {
+        let (x, y) = dump::cell_center_at(self, col, row)
+            .ok_or_else(|| "cell out of range".to_string())?;
+        self.mouse_move(f64::from(x), f64::from(y))?;
+        Ok(Some(format!("{x} {y}")))
     }
 
     fn type_text(&mut self, text: &str) -> Result<Option<String>, String> {
@@ -523,7 +574,7 @@ impl HeadlessSession {
         exit
     }
 
-    fn counters(&self) -> Option<HeadlessCounters> {
+    pub(super) fn counters(&self) -> Option<HeadlessCounters> {
         self.app.runtime().and_then(WindowRuntime::headless_counters)
     }
 
@@ -685,7 +736,7 @@ fn classify(report: StepReport, now: Instant) -> Cause {
     }
 }
 
-fn flow_name(flow: LoopFlow) -> &'static str {
+pub(super) fn flow_name(flow: LoopFlow) -> &'static str {
     match flow {
         LoopFlow::Wait => "wait",
         LoopFlow::Poll => "poll",

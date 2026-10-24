@@ -1,6 +1,7 @@
 //! Headless rendering: the runtime drives frames into an offscreen EGL pbuffer.
 
 pub(crate) mod backend;
+mod dump;
 mod keys;
 mod protocol;
 mod session;

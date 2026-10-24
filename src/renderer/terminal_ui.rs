@@ -1216,7 +1216,7 @@ fn terminal_cell_x_bounds(text_x: f32, cell_index: usize, char_w: f32) -> (f32, 
 }
 
 #[inline]
-fn terminal_render_color(color: TerminalColor, palette: TerminalPalette) -> [f32; 4] {
+pub(crate) fn terminal_render_color(color: TerminalColor, palette: TerminalPalette) -> [f32; 4] {
     if color.is_default_background() {
         palette.bg
     } else {
@@ -1234,7 +1234,7 @@ fn terminal_dim_color(mut color: [f32; 4]) -> [f32; 4] {
 }
 
 #[inline]
-fn terminal_cell_render_colors(
+pub(crate) fn terminal_cell_render_colors(
     cell: &Cell,
     palette: TerminalPalette,
 ) -> ([f32; 4], Option<[f32; 4]>) {

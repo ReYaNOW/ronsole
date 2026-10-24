@@ -1,7 +1,8 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
     SettingsHit, SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
-    terminal_palette, terminal_scrollbar_drag_target, visible_row_range,
+    terminal_cell_render_colors, terminal_palette, terminal_render_color,
+    terminal_scrollbar_drag_target, visible_row_range,
 };
 use glow::HasContext;
 use rustc_hash::FxHashMap;
@@ -157,7 +158,7 @@ fn ui_font_size(scale_factor: f32) -> f32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct TerminalPalette {
+pub(crate) struct TerminalPalette {
     bg: [f32; 4],
     fg: [f32; 4],
     minimap_bg: [f32; 4],
@@ -489,6 +490,29 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Palette the terminal frame is drawn with; `dump row` colours are resolved against it.
+    pub(crate) fn terminal_palette(&self) -> TerminalPalette {
+        self.palette
+    }
+
+    /// Baseline of terminal text in pixels, as the terminal frame places it (spec §5.1).
+    pub(crate) fn terminal_text_baseline(&self) -> f32 {
+        self.baseline_offset * terminal_ui::TERMINAL_TEXT_SCALE
+    }
+
+    /// X-height of the terminal font in pixels.
+    pub(crate) fn terminal_x_height(&self) -> f32 {
+        self.x_height
+    }
+
+    /// Body rectangle `[x, y, w, h]` of tab `index` in the last drawn frame, if it has one.
+    pub(crate) fn terminal_tab_body(&self, index: usize) -> Option<[f32; 4]> {
+        self.terminal_tab_hitboxes
+            .get(index)
+            .and_then(|hitbox| hitbox.body)
+            .map(|rect| [rect.x, rect.y, rect.w, rect.h])
+    }
+
     pub fn new(
         gl: glow::Context,
         scale_factor: f32,
