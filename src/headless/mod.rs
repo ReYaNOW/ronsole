@@ -34,16 +34,34 @@ const PROFILE_SUFFIX_LIMIT: u32 = 1000;
 pub(crate) fn main(args: &[OsString]) -> ExitCode {
     match parse_args(args) {
         Ok(Mode::Pgo(options)) => run_pgo(options),
-        Ok(Mode::Protocol(_)) => {
-            // Replaced by the protocol session driver in the following change.
-            eprintln!("headless: protocol mode is not wired yet");
-            ExitCode::from(1)
-        }
+        Ok(Mode::Protocol(protocol)) => run_protocol_mode(protocol),
         Err(error) => {
             eprintln!("headless: {error}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Runs the command protocol over `--script FILE`, or over stdin when no script is given.
+/// Responses go to stdout; an unreadable script is an input error (exit 1).
+fn run_protocol_mode(protocol: ProtocolArgs) -> ExitCode {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let code = match protocol.script {
+        Some(path) => match fs::File::open(&path) {
+            Ok(file) => session::run_protocol(
+                protocol.options,
+                io::BufReader::new(file),
+                &mut output,
+            ),
+            Err(error) => {
+                eprintln!("headless: script {}: {error}", path.display());
+                1
+            }
+        },
+        None => session::run_protocol(protocol.options, io::stdin().lock(), &mut output),
+    };
+    ExitCode::from(code)
 }
 
 /// Runs the `--pgo-train` automation loop until its own exit.

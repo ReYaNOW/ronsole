@@ -38,6 +38,7 @@ mod tab_delivery;
 pub(crate) use automation::{
     AutomationOptions, automation_options_from_args, write_automation_startup_failure,
 };
+pub(crate) use direct_wayland::{LoopFlow, LoopStep, StepReport};
 pub(crate) use headless_run::HeadlessRunError;
 
 const TERMINAL_CLEANUP_PENDING_CAPACITY: usize = 16;
