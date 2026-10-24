@@ -1,6 +1,223 @@
 //! `bench <frames> [csv=<path>] [action]`: forced frames with per-frame timings,
 //! a CSV of those frames and a JSON summary of the run.
 
+use super::protocol::{BenchAction, Response};
+use super::session::{FrameBudget, HeadlessSession, HzSource};
+use serde_json::{Value, json};
+use std::fs;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Header of the per-frame CSV, in column order. `gpu_ms` is left empty: GPU timer queries are not wired up.
+const CSV_HEADER: &str = "update_ms,draw_cpu_ms,gpu_ms,total_ms,flush_calls,vertices,scroll_y";
+
+/// Number of slowest frames listed in the summary.
+const WORST_FRAMES: usize = 5;
+
+/// Timings and render counters of one forced frame.
+struct FrameRow {
+    frame: u32,
+    update_ms: f64,
+    draw_cpu_ms: f64,
+    total_ms: f64,
+    flush_calls: u32,
+    vertices: u32,
+    scroll_y: f64,
+}
+
+/// `bench <frames> [csv=<path>] [action]` → `ok <json summary>`.
+pub(crate) fn bench(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action: BenchAction) -> Response {
+    match run(session, frames, csv, &action) {
+        Ok(summary) => Response::Ok(Some(summary)),
+        Err(reason) => Response::Err(reason),
+    }
+}
+
+fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action: &BenchAction) -> Result<String, String> {
+    let budget = session.budget();
+    let path = match csv {
+        Some(path) => path,
+        None => default_csv_path(),
+    };
+    let path = std::path::absolute(&path).map_err(|error| format!("csv: {error}"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("csv: {error}"))?;
+    }
+    let file = fs::File::create(&path).map_err(|error| format!("csv: {error}"))?;
+    let mut csv_out = BufWriter::new(file);
+    writeln!(csv_out, "{CSV_HEADER}").map_err(|error| format!("csv: {error}"))?;
+
+    let system_before = system_snapshot();
+    let mut rows = Vec::with_capacity(frames as usize);
+    for frame in 0..frames {
+        let start = Instant::now();
+        let (update, draw) = session.bench_frame(action)?;
+        let total_ms = ms(start.elapsed());
+        let app = session.app_mut();
+        let (flush_calls, vertices) = app
+            .runtime()
+            .map_or((0, 0), |runtime| runtime.renderer().frame_stats());
+        let scroll_y = f64::from(app.interaction().layout.scroll_offset);
+        let row = FrameRow {
+            frame,
+            update_ms: ms(update),
+            draw_cpu_ms: ms(draw),
+            total_ms,
+            flush_calls,
+            vertices,
+            scroll_y,
+        };
+        writeln!(
+            csv_out,
+            "{:.3},{:.3},,{:.3},{},{},{:.1}",
+            row.update_ms, row.draw_cpu_ms, row.total_ms, row.flush_calls, row.vertices, row.scroll_y
+        )
+        .map_err(|error| format!("csv: {error}"))?;
+        rows.push(row);
+    }
+    csv_out.flush().map_err(|error| format!("csv: {error}"))?;
+    let system_after = system_snapshot();
+    let process_cpu = system_after.process_cpu_ms - system_before.process_cpu_ms;
+
+    let summary = summary_json(&rows, budget, &system_before, &system_after, process_cpu, &path);
+    Ok(summary.to_string())
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// `${XDG_RUNTIME_DIR:-/tmp}/ronsole-headless/bench-<unix_ms>.csv`.
+fn default_csv_path() -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    base.join("ronsole-headless").join(format!("bench-{unix_ms}.csv"))
+}
+
+/// Process and machine state read before or after the run.
+struct SystemSnapshot {
+    loadavg_1m: Option<f64>,
+    gpu_util: Option<f64>,
+    process_cpu_ms: f64,
+}
+
+fn system_snapshot() -> SystemSnapshot {
+    SystemSnapshot {
+        loadavg_1m: loadavg_1m(),
+        gpu_util: gpu_util(),
+        process_cpu_ms: process_cpu_ms(),
+    }
+}
+
+/// The one-minute load average from `/proc/loadavg`.
+fn loadavg_1m() -> Option<f64> {
+    let text = fs::read_to_string("/proc/loadavg").ok()?;
+    text.split_whitespace().next()?.parse().ok()
+}
+
+/// GPU utilization in percent from `nvidia-smi`; `None` when the tool is missing or fails.
+fn gpu_util() -> Option<f64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.lines().next()?.trim().parse().ok()
+}
+
+/// User plus system CPU time of this process. `/proc/self/stat` counts in clock ticks, assumed
+/// to be 100 per second (`USER_HZ` on Linux), so one tick is 10 ms.
+fn process_cpu_ms() -> f64 {
+    let Ok(text) = fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    // Fields after the parenthesized command name start at field 3 (`state`); utime and stime are fields 14 and 15.
+    let Some(after_comm) = text.rsplit_once(')').map(|(_, rest)| rest) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let ticks = |index: usize| -> f64 {
+        fields.get(index).and_then(|field| field.parse::<f64>().ok()).unwrap_or(0.0)
+    };
+    (ticks(11) + ticks(12)) * 10.0
+}
+
+/// Nearest-rank percentile of `sorted`, which must be non-empty and ascending.
+fn percentile(sorted: &[f64], percent: usize) -> f64 {
+    let rank = (sorted.len() * percent).div_ceil(100).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+/// `p50`/`p95`/`p99`/`max` of `values`, or `null` when there are no values.
+fn percentiles(mut values: Vec<f64>) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    values.sort_by(f64::total_cmp);
+    json!({
+        "p50": percentile(&values, 50),
+        "p95": percentile(&values, 95),
+        "p99": percentile(&values, 99),
+        "max": values[values.len() - 1],
+    })
+}
+
+fn summary_json(
+    rows: &[FrameRow],
+    budget: FrameBudget,
+    before: &SystemSnapshot,
+    after: &SystemSnapshot,
+    process_cpu_ms: f64,
+    csv: &std::path::Path,
+) -> Value {
+    let mut worst: Vec<&FrameRow> = rows.iter().collect();
+    worst.sort_by(|a, b| b.total_ms.total_cmp(&a.total_ms));
+    let worst: Vec<Value> = worst
+        .into_iter()
+        .take(WORST_FRAMES)
+        .map(|row| {
+            json!({
+                "frame": row.frame,
+                "total_ms": row.total_ms,
+                "update_ms": row.update_ms,
+                "draw_cpu_ms": row.draw_cpu_ms,
+            })
+        })
+        .collect();
+    let over_budget = rows.iter().filter(|row| row.total_ms > budget.budget_ms).count();
+    json!({
+        "frames": rows.len(),
+        "budget_ms": budget.budget_ms,
+        "hz": budget.hz,
+        "hz_source": match budget.source {
+            HzSource::Arg => "arg",
+            HzSource::Default => "default",
+        },
+        "total_ms": percentiles(rows.iter().map(|row| row.total_ms).collect()),
+        "gpu_ms": Value::Null,
+        "draw_cpu_ms": percentiles(rows.iter().map(|row| row.draw_cpu_ms).collect()),
+        "over_budget": over_budget,
+        "worst": worst,
+        "system": {
+            "loadavg_before": before.loadavg_1m,
+            "loadavg_after": after.loadavg_1m,
+            "cpus": std::thread::available_parallelism().map_or(Value::Null, |count| json!(count.get())),
+            "gpu_util_before": before.gpu_util,
+            "gpu_util_after": after.gpu_util,
+            "process_cpu_ms": process_cpu_ms,
+        },
+        "csv": csv.display().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::session::HeadlessSession;

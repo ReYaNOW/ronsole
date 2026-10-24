@@ -452,6 +452,10 @@ pub struct Renderer {
     alpha_texture: glow::Texture,
     color_texture: Option<glow::Texture>,
     vertices: Vec<Vertex>,
+    /// Flushes drawn since the current frame began; reset by `render_terminal_app`.
+    frame_flushes: u32,
+    /// Vertices drawn since the current frame began; reset by `render_terminal_app`.
+    frame_vertices: u32,
     fonts: Vec<FontData>,
     ui_fonts: Vec<FontData>,
     faces: TerminalFaces,
@@ -580,6 +584,8 @@ impl Renderer {
             alpha_texture,
             color_texture: None,
             vertices: Vec::with_capacity(MAX_VERTICES),
+            frame_flushes: 0,
+            frame_vertices: 0,
             fonts,
             ui_fonts,
             faces: TerminalFaces::default(),
@@ -628,6 +634,11 @@ impl Renderer {
 
     pub(crate) fn reset_fps_counter(&mut self) {
         self.presented_fps.reset();
+    }
+
+    /// Flush calls and vertices of the current frame, as counted since its start.
+    pub(crate) fn frame_stats(&self) -> (u32, u32) {
+        (self.frame_flushes, self.frame_vertices)
     }
 
     pub(crate) fn record_presented_frame(&mut self, now: Instant) {
@@ -1008,6 +1019,8 @@ impl Renderer {
             return;
         }
         let vertex_count = self.vertices.len().min(MAX_VERTICES);
+        self.frame_flushes = self.frame_flushes.saturating_add(1);
+        self.frame_vertices = self.frame_vertices.saturating_add(vertex_count as u32);
         let projection = [
             2.0 / self.width.max(1.0),
             0.0,

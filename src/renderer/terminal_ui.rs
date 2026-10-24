@@ -2706,6 +2706,8 @@ impl Renderer {
         settings_background_input: &mut SingleLineInput,
         settings_background_editing: bool,
     ) -> TerminalUiLayout {
+        self.frame_flushes = 0;
+        self.frame_vertices = 0;
         let layout = if let Some(terminal) = terminals.get(active_terminal) {
             self.render_terminal_body(
                 terminal,
