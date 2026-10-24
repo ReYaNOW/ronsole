@@ -301,4 +301,6 @@ impl Drop for Profile {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_dump;
+#[cfg(test)]
 mod tests_protocol;
