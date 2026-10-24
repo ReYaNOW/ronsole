@@ -3,10 +3,11 @@
 
 use super::Profile;
 use super::backend::HeadlessCounters;
+use super::bench;
 use super::dump;
 use super::keys::{key_input, modifier_key_input};
 use super::protocol::{
-    ClickPhase, Command, KeyCombo, MouseButtonArg, Response, WheelUnit, parse_line,
+    BenchAction, ClickPhase, Command, KeyCombo, MouseButtonArg, Response, WheelUnit, parse_line,
 };
 use crate::app::{App, HeadlessRunError, LoopFlow, LoopStep, StepReport};
 use crate::input_types::{KeyInput, KeyState, Modifiers, PointerButton, PointerPosition, ScrollDelta};
@@ -173,7 +174,9 @@ impl HeadlessSession {
             Command::Dump(path) => self.dump(path.as_deref()),
             Command::DumpRow(row) => self.dump_row(row),
             Command::MouseCell { col, row } => self.mouse_cell(col, row),
-            Command::Bench { .. } => Err("not implemented".to_string()),
+            Command::Bench { frames, csv, action } => {
+                return bench::bench(self, frames, csv, action);
+            }
         };
         match result {
             Ok(payload) => Response::Ok(payload),
@@ -608,6 +611,32 @@ impl HeadlessSession {
 
     fn frame(&mut self) -> Result<(), String> {
         self.forced().map(|_| ())
+    }
+
+    /// The frame budget the session was started with.
+    pub(super) fn budget(&self) -> FrameBudget {
+        self.budget
+    }
+
+    /// Applies one bench action, then draws one forced frame. Returns the time of the action
+    /// (including any frame the action draws by itself) and the time of the forced step.
+    pub(super) fn bench_frame(&mut self, action: &BenchAction) -> Result<(Duration, Duration), String> {
+        let start = Instant::now();
+        match action {
+            BenchAction::None => {}
+            BenchAction::Wheel { dx, dy } => self.app.on_scroll(ScrollDelta::Line {
+                x: *dx as f32,
+                y: *dy as f32,
+            }),
+            BenchAction::Type(text) => self.app.on_ime_commit(text),
+            BenchAction::Key(combo) => self.key(*combo, 0)?,
+        }
+        let action_time = start.elapsed();
+        let step_start = Instant::now();
+        if self.forced()?.is_none() {
+            return Err("app exited during bench".to_string());
+        }
+        Ok((action_time, step_start.elapsed()))
     }
 
     fn record(&mut self, step: LoopStep) -> Result<Option<StepReport>, String> {

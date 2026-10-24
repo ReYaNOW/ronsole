@@ -1,0 +1,21 @@
+# Self-test for the headless protocol. Every shared command appears once and must answer `ok`.
+# Run: env -u WAYLAND_DISPLAY python3 scripts/ronsole_headless.py run scripts/headless_selftest.txt --shell /bin/sh
+settle 500
+info
+type echo headless
+key enter
+key --char ж a
+mouse_move 100 100
+mouse_cell 5 5
+click
+wheel 0 -3
+resize 1024x768
+scale 1.5
+dump row 0
+dump
+screenshot /tmp/ronsole-headless/selftest.png
+mods ctrl
+wait 50
+wake 10
+idle 10
+quit

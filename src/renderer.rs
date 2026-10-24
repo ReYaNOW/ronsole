@@ -452,6 +452,12 @@ pub struct Renderer {
     alpha_texture: glow::Texture,
     color_texture: Option<glow::Texture>,
     vertices: Vec<Vertex>,
+    /// Flushes drawn since the current frame began; reset by `render_terminal_app`.
+    frame_flushes: u32,
+    /// Vertices drawn since the current frame began; reset by `render_terminal_app`.
+    frame_vertices: u32,
+    /// Whether the context can time frames with `GL_TIME_ELAPSED`; decided once in `new`.
+    gpu_timer_supported: bool,
     fonts: Vec<FontData>,
     ui_fonts: Vec<FontData>,
     faces: TerminalFaces,
@@ -570,6 +576,7 @@ impl Renderer {
         ui_fonts.extend(fonts.iter().cloned());
 
         let palette = load_terminal_palette(terminal_background);
+        let gpu_timer_supported = gpu_timer_supported(&gl, is_gles);
         let mut renderer = Self {
             gl,
             diagnostics,
@@ -580,6 +587,9 @@ impl Renderer {
             alpha_texture,
             color_texture: None,
             vertices: Vec::with_capacity(MAX_VERTICES),
+            frame_flushes: 0,
+            frame_vertices: 0,
+            gpu_timer_supported,
             fonts,
             ui_fonts,
             faces: TerminalFaces::default(),
@@ -628,6 +638,36 @@ impl Renderer {
 
     pub(crate) fn reset_fps_counter(&mut self) {
         self.presented_fps.reset();
+    }
+
+    /// Flush calls and vertices of the current frame, as counted since its start.
+    pub(crate) fn frame_stats(&self) -> (u32, u32) {
+        (self.frame_flushes, self.frame_vertices)
+    }
+
+    /// Starts a `GL_TIME_ELAPSED` query around one frame, or `None` when the context has no
+    /// timer queries. Only `bench` calls this; the normal render path issues no queries.
+    pub(crate) fn begin_gpu_timer(&self) -> Option<glow::Query> {
+        if !self.gpu_timer_supported {
+            return None;
+        }
+        unsafe {
+            let query = self.gl.create_query().ok()?;
+            self.gl.begin_query(glow::TIME_ELAPSED, query);
+            Some(query)
+        }
+    }
+
+    /// Ends the query from `begin_gpu_timer` once the frame is finished on the GPU and returns
+    /// the elapsed GPU time in milliseconds. Blocks until the GPU has completed the frame.
+    pub(crate) fn end_gpu_timer(&self, query: glow::Query) -> f64 {
+        unsafe {
+            self.gl.finish();
+            self.gl.end_query(glow::TIME_ELAPSED);
+            let nanos = self.gl.get_query_parameter_u32(query, glow::QUERY_RESULT);
+            self.gl.delete_query(query);
+            f64::from(nanos) / 1_000_000.0
+        }
     }
 
     pub(crate) fn record_presented_frame(&mut self, now: Instant) {
@@ -1008,6 +1048,8 @@ impl Renderer {
             return;
         }
         let vertex_count = self.vertices.len().min(MAX_VERTICES);
+        self.frame_flushes = self.frame_flushes.saturating_add(1);
+        self.frame_vertices = self.frame_vertices.saturating_add(vertex_count as u32);
         let projection = [
             2.0 / self.width.max(1.0),
             0.0,
@@ -1567,6 +1609,12 @@ fn parse_graphics_version(version: &str) -> Option<(u8, u8)> {
         .parse()
         .ok()?;
     Some((major, minor))
+}
+
+/// Desktop GL 3.3 core has `GL_TIME_ELAPSED` queries built in; GLES 3.0 needs
+/// `GL_EXT_disjoint_timer_query`, which provides the same token as `GL_TIME_ELAPSED_EXT`.
+fn gpu_timer_supported(gl: &glow::Context, is_gles: bool) -> bool {
+    !is_gles || gl.supported_extensions().contains("GL_EXT_disjoint_timer_query")
 }
 
 fn graphics_version_supported(version: &str, is_gles: bool) -> bool {
