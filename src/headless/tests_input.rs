@@ -224,7 +224,7 @@ fn ctrl_hover_shows_pointer_and_underline_and_ctrl_click_stays_out_of_the_app() 
     // Without Ctrl the link cell has no underline; this screenshot is the reference.
     run_ok(&mut session, format!("mouse_cell 1 {row}\n").as_bytes());
     let before = dump(&mut session);
-    let (x0, _, x1, bottom) = cell_rect(&before, 1, row);
+    let (x0, top, x1, bottom) = cell_rect(&before, 1, row);
     let plain = screenshot(&mut session);
 
     // Holding Ctrl over the link: the pointer becomes a hand and the underline is drawn.
@@ -233,12 +233,13 @@ fn ctrl_hover_shows_pointer_and_underline_and_ctrl_click_stays_out_of_the_app() 
         state["terminal"]["hovered_link"].is_object() && state["cursor_icon"] == "Pointer"
     });
     let ctrl = screenshot(&mut session);
-    // Threshold: any changed pixel in the two bottom rows of the link cell (the underline band);
-    // the exact underline colour is not in the spec, so only the change is checked.
+    // Threshold: any changed pixel in the lower quarter of the link cell's rect. The spec gives
+    // no colour or exact row for the underline, so only that some pixel there changed is checked.
+    let band_top = bottom - (bottom - top) / 4;
     let underlined = (x0..x1).any(|x| {
-        (bottom - 2..bottom).any(|y| pixel_rgb(&plain, (x, y)) != pixel_rgb(&ctrl, (x, y)))
+        (band_top..bottom).any(|y| pixel_rgb(&plain, (x, y)) != pixel_rgb(&ctrl, (x, y)))
     });
-    assert!(underlined, "Ctrl hover must change the bottom rows of the link cell");
+    assert!(underlined, "Ctrl hover must change the lower quarter of the link cell");
 
     // Ctrl+click opens the link through the open handler and is not sent to the mouse-tracking app.
     run_ok(&mut session, b"click\n");
@@ -253,4 +254,85 @@ fn ctrl_hover_shows_pointer_and_underline_and_ctrl_click_stays_out_of_the_app() 
     run_ok(&mut session, b"mods\n");
     run_ok(&mut session, b"key x\n");
     assert_eq!(finish_reader(&mut session), hex(b"x"));
+}
+
+#[test]
+fn mouse_report_uses_sgr_encoding_of_the_clicked_cell() {
+    let mut session = session_for_test(800, 600);
+    // `?1000` reports presses and releases and `?1006` encodes them as SGR; both are set after
+    // the marker and `dump` shows them once they are active.
+    start_reader(&mut session, "printf '\\033[?1000h\\033[?1006h'\n");
+    wait_until(&mut session, 5000, "mouse tracking with SGR", |state| {
+        state["terminal"]["modes"]["mouse_tracking"] == "press"
+            && state["terminal"]["modes"]["mouse_sgr"] == true
+    });
+
+    // Cell (col 2, row 3) is reported 1-based as column 3, row 4: the press ends in `M`, the
+    // release in `m` (xterm SGR mouse encoding).
+    run_ok(&mut session, b"mouse_cell 2 3\n");
+    run_ok(&mut session, b"click\n");
+    let events = finish_reader(&mut session);
+    assert_eq!(events, hex(b"\x1b[<0;3;4M\x1b[<0;3;4m"));
+}
+
+#[test]
+fn focus_reports_follow_tab_switches() {
+    let mut session = session_for_test(800, 600);
+    // Focus reporting (`?1004`) is set on the first tab after the marker; `dump` shows it.
+    start_reader(&mut session, "printf '\\033[?1004h'\n");
+    wait_until(&mut session, 5000, "focus reporting", |state| {
+        state["terminal"]["modes"]["focus_reporting"] == true
+    });
+
+    // A new tab takes focus, so the reader's tab gets focus-out `ESC [ O`.
+    run_ok(&mut session, b"key ctrl+shift+t\n");
+    wait_until(&mut session, 5000, "the second tab to be active", |state| {
+        state["tabs"][1]["active"] == true
+    });
+
+    // Clicking the first tab's rect returns focus to the reader's tab: focus-in `ESC [ I`.
+    let state = dump(&mut session);
+    let [x, y, w, h] = serde_json::from_value::<[f64; 4]>(state["tabs"][0]["rect"].clone())
+        .expect("first tab rect");
+    run_ok(
+        &mut session,
+        format!("mouse_move {} {}\n", (x + w / 2.0) as i64, (y + h / 2.0) as i64).as_bytes(),
+    );
+    run_ok(&mut session, b"click\n");
+    wait_until(&mut session, 5000, "the first tab to be active", |state| {
+        state["tabs"][0]["active"] == true
+    });
+    let events = finish_reader(&mut session);
+    assert_eq!(events, hex(b"\x1b[O\x1b[I"));
+}
+
+#[test]
+fn drag_selection_copies_and_bracketed_paste_wraps_the_clipboard() {
+    let mut session = session_for_test(800, 600);
+    // The word is split in the typed command, so only its output row contains it.
+    run_ok(&mut session, b"type echo RO''NSOLE\n");
+    run_ok(&mut session, b"key enter\n");
+    let state = wait_until(&mut session, 5000, "the printed word", |state| {
+        row_index(&rows(state), "RONSOLE").is_some()
+    });
+    let row = row_index(&rows(&state), "RONSOLE").expect("word row");
+
+    // Drag from the first to the last letter (the last cell is included), then copy with Ctrl+C.
+    run_ok(&mut session, format!("mouse_cell 0 {row}\n").as_bytes());
+    run_ok(&mut session, b"click left down\n");
+    run_ok(&mut session, format!("mouse_cell 6 {row}\n").as_bytes());
+    run_ok(&mut session, b"click left up\n");
+    run_ok(&mut session, b"key ctrl+c\n");
+    wait_until(&mut session, 5000, "the copied selection", |state| {
+        state["clipboard"]["text"] == "RONSOLE"
+    });
+
+    // Paste is wrapped in `ESC [ 200 ~` and `ESC [ 201 ~` only once the app enables `?2004`.
+    start_reader(&mut session, "printf '\\033[?2004h'\n");
+    wait_until(&mut session, 5000, "bracketed paste", |state| {
+        state["terminal"]["modes"]["bracketed_paste"] == true
+    });
+    run_ok(&mut session, b"key ctrl+v\n");
+    let events = finish_reader(&mut session);
+    assert_eq!(events, hex(b"\x1b[200~RONSOLE\x1b[201~"));
 }
