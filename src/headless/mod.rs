@@ -312,3 +312,5 @@ mod tests_render;
 mod tests_input;
 #[cfg(test)]
 mod tests_links;
+#[cfg(test)]
+mod tests_misc;
