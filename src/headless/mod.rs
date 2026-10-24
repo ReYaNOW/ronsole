@@ -310,3 +310,5 @@ mod tests_protocol;
 mod tests_render;
 #[cfg(test)]
 mod tests_input;
+#[cfg(test)]
+mod tests_links;
