@@ -85,7 +85,7 @@ fn start_script(session: &mut HeadlessSession, dir: &Path, body: &str) {
 }
 
 /// Returns the visible index of the row that contains `marker`, scrolling up first if needed.
-/// The wheel is far larger than the scrollback, so the view stops at the top of the history,
+/// The wheel is far larger than the scrollback, so the view should reach the top of the history,
 /// where the first rows of these scenarios' output are. The final position is confirmed by
 /// `wait_until`, because scrolling is animated.
 fn scroll_to_row(session: &mut HeadlessSession, marker: &str) -> usize {
@@ -95,14 +95,14 @@ fn scroll_to_row(session: &mut HeadlessSession, marker: &str) -> usize {
     }
     run_ok(session, b"mouse_cell 0 0\n");
     run_ok(session, b"wheel 0 100\n");
-    let state = wait_until(session, 5000, "the scrolled row to be visible", |dump| {
-        row_index(&rows(dump), marker).is_some()
+    let state = wait_until(session, 5000, "the viewport at the top of the history", |dump| {
+        dump["terminal"]["viewport"]["top"].as_u64() == Some(0)
     });
     row_index(&rows(&state), marker).expect("marker row is visible")
 }
 
 #[test]
-#[ignore = "bug: wheel up stops at viewport top 1 of 47 lines (scrollback 25); the link on line 0 is not reached"]
+#[ignore = "bug: wheel stops at max_scroll (fractional viewport height in terminal_max_scroll) with viewport top 1; dump floors scroll_offset, so the link on line 0 is not reached"]
 fn osc8_link_survives_scrollback_and_resize() {
     let mut session = session_for_test(800, 600);
     const URI: &str = "https://example.com/ronsole-l4";
