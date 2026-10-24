@@ -401,7 +401,7 @@ fn button_arg(t: &str) -> Option<MouseButtonArg> {
 }
 
 /// Parses `WxH` within `SIZE_MIN..=SIZE_MAX`.
-fn parse_size(s: &str) -> Result<(u32, u32), String> {
+pub(crate) fn parse_size(s: &str) -> Result<(u32, u32), String> {
     let invalid = || format!("invalid size '{}', expected WxH", clip(s));
     let (w, h) = s.split_once('x').ok_or_else(invalid)?;
     let w: u32 = w.parse().map_err(|_| invalid())?;
@@ -416,7 +416,7 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
 }
 
 /// Parses a finite UI scale within `SCALE_MIN..=SCALE_MAX`.
-fn parse_scale(t: &str) -> Result<f32, String> {
+pub(crate) fn parse_scale(t: &str) -> Result<f32, String> {
     let scale = parse_f64(t)?;
     if !(SCALE_MIN..=SCALE_MAX).contains(&scale) {
         return Err(format!("scale must be between {SCALE_MIN} and {SCALE_MAX}"));
