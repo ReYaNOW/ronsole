@@ -307,3 +307,5 @@ mod tests_dump;
 mod tests_protocol;
 #[cfg(test)]
 mod tests_render;
+#[cfg(test)]
+mod tests_input;
