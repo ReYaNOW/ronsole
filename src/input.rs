@@ -2209,6 +2209,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let out = root.join("out");
         let launch = crate::launch::TerminalLaunchSpec {
+            shell: None,
             working_directory: Some(root.clone()),
             inherited_directory: None,
             command: vec![

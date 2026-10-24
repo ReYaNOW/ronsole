@@ -27,6 +27,7 @@ use crate::terminal::{
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
 use ronsole_term::TermPalette;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Instant;
 
 mod automation;
@@ -390,6 +391,8 @@ pub struct App {
     interaction: TerminalInteraction,
     /// Where Ctrl+click links are sent: the system opener, or a recording sink when headless.
     open_sink: OpenSink,
+    /// Shell program every new tab spawns; set only by headless runs, `None` keeps the usual resolution.
+    shell_override: Option<PathBuf>,
     terminal_cleanup: TerminalCleanupWorker,
     kde_activation_worker: Option<KdeActivationWorker>,
     pending_terminal_cleanup: VecDeque<TerminalProcess>,
@@ -462,6 +465,7 @@ impl App {
             pending_tab_reveal: None,
             interaction,
             open_sink,
+            shell_override: None,
             terminal_cleanup: TerminalCleanupWorker::new(),
             kde_activation_worker: None,
             pending_terminal_cleanup: VecDeque::with_capacity(TERMINAL_CLEANUP_PENDING_CAPACITY),
@@ -638,8 +642,9 @@ impl App {
         })
     }
 
-    fn add_terminal_with_launch(&mut self, launch: TerminalLaunchSpec) -> Option<usize> {
+    fn add_terminal_with_launch(&mut self, mut launch: TerminalLaunchSpec) -> Option<usize> {
         let wake = self.runtime.as_ref()?.wake_handle();
+        launch.shell.clone_from(&self.shell_override);
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
         let terminal = Terminal::spawn(
@@ -962,7 +967,7 @@ impl App {
             .is_some_and(|terminal| self.interaction.clear_text_selection(terminal))
     }
 
-    fn on_focus_changed(&mut self, focused: bool) {
+    pub(crate) fn on_focus_changed(&mut self, focused: bool) {
         self.focused = focused;
         self.unfocused_redraw_pending = !focused;
         self.modifiers = Modifiers::empty();
@@ -1502,7 +1507,7 @@ impl App {
         self.shutdown_all();
     }
 
-    fn on_resize_with_logical_size(
+    pub(crate) fn on_resize_with_logical_size(
         &mut self,
         width: u32,
         height: u32,
@@ -1524,7 +1529,7 @@ impl App {
         self.mark_dirty();
     }
 
-    fn on_scale_changed(&mut self, scale_factor: f32, width: u32, height: u32) {
+    pub(crate) fn on_scale_changed(&mut self, scale_factor: f32, width: u32, height: u32) {
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.update_scale_factor(scale_factor);
             if width > 0 && height > 0 {
@@ -1535,13 +1540,13 @@ impl App {
         self.mark_dirty();
     }
 
-    fn on_modifiers(&mut self, modifiers: Modifiers) {
+    pub(crate) fn on_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
         self.interaction.set_modifiers(modifiers);
         self.update_link_hover();
     }
 
-    fn on_ime_commit(&mut self, text: &str) {
+    pub(crate) fn on_ime_commit(&mut self, text: &str) {
         if self.settings_modal_active() {
             if self.settings_background_editing {
                 let _ = self.edit_settings_background_text(text);
@@ -1557,7 +1562,7 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, key_input: KeyInput) -> bool {
+    pub(crate) fn on_key(&mut self, key_input: KeyInput) -> bool {
         // Before the early returns below, so modifier presses and releases seen while the
         // settings modal or a global shortcut owns the key still update the held state.
         self.interaction.note_modifier_key(&key_input);
@@ -1620,7 +1625,7 @@ impl App {
         }
     }
 
-    fn on_pointer_motion(&mut self, position: PointerPosition) {
+    pub(crate) fn on_pointer_motion(&mut self, position: PointerPosition) {
         let previous_x = self.pointer_x;
         let previous_y = self.pointer_y;
         self.pointer_x = position.x;
@@ -1691,7 +1696,7 @@ impl App {
         }
     }
 
-    fn on_pointer_leave(&mut self, width: u32, height: u32) {
+    pub(crate) fn on_pointer_leave(&mut self, width: u32, height: u32) {
         if let Some(next) = cursor_icon_change(self.cursor_icon, CursorKind::Default) {
             self.cursor_icon = next;
             if let Some(runtime) = self.runtime.as_ref() {
@@ -1712,7 +1717,7 @@ impl App {
         }
     }
 
-    fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+    pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
         if button == PointerButton::Left
             && state == KeyState::Pressed
             && self.clear_active_terminal_text_selection()
@@ -1806,7 +1811,7 @@ impl App {
         false
     }
 
-    fn on_scroll(&mut self, delta: ScrollDelta) {
+    pub(crate) fn on_scroll(&mut self, delta: ScrollDelta) {
         if self.settings_modal_active() {
             return;
         }
@@ -2593,6 +2598,7 @@ mod tests {
             None,
             1,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: None,
                 inherited_directory: None,
                 command: vec![OsString::from("/bin/true")],
@@ -2630,6 +2636,7 @@ mod tests {
             None,
             1,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: None,
                 inherited_directory: None,
                 command: vec![OsString::from("/bin/true")],
@@ -2662,6 +2669,7 @@ mod tests {
             None,
             1,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some("/tmp".into()),
                 inherited_directory: None,
                 command: vec!["/definitely/missing/ronsole-test-command".into()],
@@ -2880,6 +2888,7 @@ mod tests {
     #[test]
     fn focused_custom_workdir_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some("/tmp/custom-cwd".into()),
             inherited_directory: None,
             command: Vec::new(),
@@ -2898,6 +2907,7 @@ mod tests {
     #[test]
     fn focused_custom_command_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: None,
             inherited_directory: None,
             command: vec!["htop".into(), "-d".into(), "10".into()],
@@ -2916,6 +2926,7 @@ mod tests {
     #[test]
     fn focused_hold_only_launch_opens_requested_tab_without_activation() {
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: None,
             inherited_directory: None,
             command: Vec::new(),
@@ -2934,6 +2945,7 @@ mod tests {
     #[test]
     fn unfocused_custom_command_with_token_opens_requested_tab_and_uses_xdg_activation() {
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: None,
             inherited_directory: None,
             command: vec!["htop".into()],
@@ -2958,6 +2970,7 @@ mod tests {
     #[test]
     fn unfocused_custom_workdir_on_kde_opens_requested_tab_and_uses_kde_activation() {
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some("/tmp/custom-cwd".into()),
             inherited_directory: None,
             command: Vec::new(),
@@ -2976,6 +2989,7 @@ mod tests {
     #[test]
     fn unfocused_custom_hold_off_kde_opens_requested_tab_and_uses_generic_activation() {
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: None,
             inherited_directory: None,
             command: Vec::new(),
@@ -2995,6 +3009,7 @@ mod tests {
     fn pending_external_launch_before_runtime_ready_preserves_full_request() {
         let request = external_request(
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some("/tmp/pending-cwd".into()),
                 inherited_directory: None,
                 command: vec!["program".into(), "arg one".into(), "--child-option".into()],
@@ -3140,7 +3155,7 @@ mod tests {
     #[test]
     fn headless_app_uses_memory_clipboard_and_recording_opener() {
         let profile = std::env::temp_dir().join(format!("ronsole-headless-{}", std::process::id()));
-        let app = App::load_headless(None, &profile).expect("headless app");
+        let (app, _receiver) = App::load_headless(None, &profile, None).expect("headless app");
         assert!(app.interaction.clipboard_is_memory());
         assert!(matches!(app.open_sink, OpenSink::Record(_)));
     }
@@ -3740,13 +3755,13 @@ mod tests {
         let shared = production
             .split("    fn cancel_pointer_interactions")
             .nth(1)
-            .and_then(|tail| tail.split("    fn on_focus_changed").next())
+            .and_then(|tail| tail.split("    pub(crate) fn on_focus_changed").next())
             .expect("shared pointer cancellation helper must remain present");
         assert!(shared.contains("self.terminal_tab_drag = None;"));
         assert!(shared.contains("self.interaction.cancel_pointer_interaction(terminal);"));
 
         let focus = production
-            .split("    fn on_focus_changed")
+            .split("    pub(crate) fn on_focus_changed")
             .nth(1)
             .and_then(|tail| tail.split("    fn toggle_settings").next())
             .expect("focus lifecycle helper must remain present");
@@ -3786,9 +3801,9 @@ mod tests {
         let source = include_str!("app.rs");
         let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         let mouse = production
-            .split("    fn on_pointer_button")
+            .split("    pub(crate) fn on_pointer_button")
             .nth(1)
-            .and_then(|tail| tail.split("    fn on_scroll").next())
+            .and_then(|tail| tail.split("    pub(crate) fn on_scroll").next())
             .expect("mouse input routing must remain present");
         let clear = mouse
             .find("self.clear_active_terminal_text_selection()")
@@ -3803,15 +3818,15 @@ mod tests {
         assert!(clear < tabs);
 
         let moved = production
-            .split("    fn on_pointer_motion")
+            .split("    pub(crate) fn on_pointer_motion")
             .nth(1)
-            .and_then(|tail| tail.split("    fn on_pointer_leave").next())
+            .and_then(|tail| tail.split("    pub(crate) fn on_pointer_leave").next())
             .expect("cursor moved routing must remain present");
         assert!(moved.contains("!self.interaction.terminal_selection_active()"));
         let left = production
-            .split("    fn on_pointer_leave")
+            .split("    pub(crate) fn on_pointer_leave")
             .nth(1)
-            .and_then(|tail| tail.split("    fn on_pointer_button").next())
+            .and_then(|tail| tail.split("    pub(crate) fn on_pointer_button").next())
             .expect("cursor leave routing must remain present");
         assert!(left.contains(".cursor_left("));
         assert!(left.contains("width as f32"));

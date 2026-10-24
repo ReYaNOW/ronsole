@@ -1,4 +1,4 @@
-use crate::headless::backend::HeadlessBackend;
+use crate::headless::backend::{HeadlessBackend, HeadlessCounters};
 use crate::input_types::{CursorKind, KeyInput, KeyState, Modifiers};
 use crate::platform::offscreen_gl::OffscreenContext;
 use crate::renderer::Renderer;
@@ -2985,8 +2985,9 @@ impl WindowRuntime {
     }
 
     pub(crate) fn set_cursor_kind(&self, kind: CursorKind) {
-        if let RuntimeBackend::Wayland(wayland) = &self.backend {
-            wayland.set_cursor_kind(kind);
+        match &self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.set_cursor_kind(kind),
+            RuntimeBackend::Headless(headless) => headless.set_cursor_kind(kind),
         }
     }
 
@@ -3046,6 +3047,21 @@ impl WindowRuntime {
         }
     }
 
+    /// Headless counters; `None` on the Wayland backend, which has no offscreen target to count.
+    pub(crate) fn headless_counters(&self) -> Option<HeadlessCounters> {
+        match &self.backend {
+            RuntimeBackend::Wayland(_) => None,
+            RuntimeBackend::Headless(headless) => Some(headless.counters()),
+        }
+    }
+
+    /// Drops a pending headless frame request. Only the headless backend keeps such a flag.
+    pub(crate) fn clear_frame_request(&self) {
+        if let RuntimeBackend::Headless(headless) = &self.backend {
+            headless.clear_frame_request();
+        }
+    }
+
     #[cfg(test)]
     pub fn inject_session_error(&mut self, error: String) {
         if let RuntimeBackend::Headless(headless) = &mut self.backend {
@@ -3057,7 +3073,7 @@ impl WindowRuntime {
     pub fn headless_frames(&self) -> Option<u64> {
         match &self.backend {
             RuntimeBackend::Wayland(_) => None,
-            RuntimeBackend::Headless(headless) => Some(headless.frames()),
+            RuntimeBackend::Headless(headless) => Some(headless.counters().frames),
         }
     }
 

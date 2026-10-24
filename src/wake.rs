@@ -47,6 +47,17 @@ impl WakeHandle {
         self.frame_wake.swap(false, Ordering::AcqRel)
     }
 
+    /// True when a wake is queued on the eventfd. Polls with a zero timeout and
+    /// leaves the counter unread, so the loop's own drain still sees it.
+    pub(crate) fn pending(&self) -> bool {
+        let mut fd = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut fd, 1, 0) > 0 }
+    }
+
     #[inline]
     fn write_eventfd(&self) {
         let value = 1_u64.to_ne_bytes();

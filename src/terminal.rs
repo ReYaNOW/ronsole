@@ -1048,6 +1048,7 @@ mod tests {
         std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some(root.clone()),
             inherited_directory: None,
             command: vec![

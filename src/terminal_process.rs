@@ -1183,7 +1183,7 @@ fn terminal_launch_command(
         ),
     };
     let (mut command, process_title, spawn_target) = if launch.command.is_empty() {
-        let shell = resolve_terminal_shell()?;
+        let shell = resolve_terminal_shell(launch.shell.as_deref())?;
         (
             CommandBuilder::new(&shell.executable),
             shell.title,
@@ -1209,25 +1209,39 @@ fn terminal_launch_command(
     Ok((command, cwd, process_title, spawn_target))
 }
 
-pub(crate) fn resolve_terminal_shell() -> io::Result<TerminalShellSpec> {
-    resolve_terminal_shell_with(std::env::var_os("SHELL"), platform::resolve_executable)
+pub(crate) fn resolve_terminal_shell(
+    shell_override: Option<&Path>,
+) -> io::Result<TerminalShellSpec> {
+    resolve_terminal_shell_with(
+        shell_override,
+        std::env::var_os("SHELL"),
+        platform::resolve_executable,
+    )
 }
 
+/// An explicit `shell_override` is the only candidate, so a missing program fails
+/// instead of falling back to `$SHELL` or `/bin/bash`.
 fn resolve_terminal_shell_with(
+    shell_override: Option<&Path>,
     shell_env: Option<OsString>,
     mut resolve: impl FnMut(&OsStr) -> Option<PathBuf>,
 ) -> io::Result<TerminalShellSpec> {
-    for candidate in terminal_shell_candidates_with(shell_env) {
+    let candidates = match shell_override {
+        Some(program) => vec![program.as_os_str().to_os_string()],
+        None => terminal_shell_candidates_with(shell_env),
+    };
+    for candidate in candidates {
         if let Some(executable) = resolve(&candidate) {
             let title = terminal_shell_title(&executable);
             return Ok(TerminalShellSpec { executable, title });
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no supported terminal shell was found",
-    ))
+    let message = match shell_override {
+        Some(program) => format!("no supported terminal shell was found: {}", program.display()),
+        None => "no supported terminal shell was found".to_string(),
+    };
+    Err(io::Error::new(io::ErrorKind::NotFound, message))
 }
 
 fn terminal_shell_candidates_with(shell_env: Option<OsString>) -> Vec<OsString> {
@@ -1562,14 +1576,14 @@ mod tests {
 
     #[test]
     fn shell_resolution_prefers_valid_shell_then_linux_fallbacks() {
-        let fish = resolve_terminal_shell_with(Some(OsString::from("/usr/bin/fish")), |candidate| {
+        let fish = resolve_terminal_shell_with(None, Some(OsString::from("/usr/bin/fish")), |candidate| {
             (candidate == OsStr::new("/usr/bin/fish")).then(|| PathBuf::from("/usr/bin/fish"))
         })
         .unwrap();
         assert_eq!(fish.executable, PathBuf::from("/usr/bin/fish"));
         assert_eq!(fish.title, "fish");
 
-        let bash = resolve_terminal_shell_with(Some(OsString::from("/missing/shell")), |candidate| {
+        let bash = resolve_terminal_shell_with(None, Some(OsString::from("/missing/shell")), |candidate| {
             (candidate == OsStr::new("/bin/bash")).then(|| PathBuf::from("/bin/bash"))
         })
         .unwrap();
@@ -1578,6 +1592,28 @@ mod tests {
             terminal_shell_candidates_with(Some(OsString::from("/bin/bash"))),
             [OsString::from("/bin/bash"), OsString::from("/bin/sh")]
         );
+    }
+
+    #[test]
+    fn shell_override_is_used_without_fallback() {
+        // The fallback candidates would resolve here, so a success would mean the
+        // override silently fell back to `$SHELL` or `/bin/bash`.
+        let error = resolve_terminal_shell_with(
+            Some(Path::new("/nonexistent/sh")),
+            Some(OsString::from("/usr/bin/fish")),
+            |candidate| (candidate != OsStr::new("/nonexistent/sh")).then(|| PathBuf::from(candidate)),
+        )
+        .err()
+        .expect("missing override must not fall back to another shell");
+        assert!(error.to_string().contains("/nonexistent/sh"), "{error}");
+
+        let sh = resolve_terminal_shell_with(
+            Some(Path::new("/bin/sh")),
+            Some(OsString::from("/usr/bin/fish")),
+            |candidate| Some(PathBuf::from(candidate)),
+        )
+        .unwrap();
+        assert_eq!(sh.executable, PathBuf::from("/bin/sh"));
     }
 
     #[test]
@@ -1602,6 +1638,7 @@ mod tests {
             raw_arg,
         ];
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some(cwd.clone()),
             inherited_directory: None,
             command: argv.clone(),
@@ -1643,6 +1680,7 @@ mod tests {
         assert_ne!(first.as_str(), second.as_str());
 
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some(PathBuf::from("/tmp")),
             inherited_directory: None,
             command: vec![OsString::from("/bin/true")],

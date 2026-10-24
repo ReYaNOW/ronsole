@@ -11,6 +11,9 @@ pub(crate) struct TerminalLaunchSpec {
     pub(crate) command: Vec<OsString>,
     pub(crate) hold: bool,
     pub(crate) bridge_launch_id: Option<[u8; 16]>,
+    /// Shell program used when `command` is empty. Unset means the usual
+    /// `$SHELL` and fallback resolution; set means that program and no fallback.
+    pub(crate) shell: Option<PathBuf>,
 }
 
 enum NormalCliToken<'a> {
@@ -200,6 +203,7 @@ mod tests {
         assert_eq!(
             TerminalLaunchSpec::default(),
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: None,
                 inherited_directory: None,
                 command: Vec::new(),
@@ -294,6 +298,7 @@ mod tests {
         assert_eq!(
             parsed,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: None,
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
@@ -307,6 +312,7 @@ mod tests {
         assert_eq!(
             pgo_option,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: None,
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-workspace", "/tmp/x"]),
@@ -322,6 +328,7 @@ mod tests {
         assert_eq!(
             held,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: None,
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
@@ -335,6 +342,7 @@ mod tests {
         assert_eq!(
             workdir,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/tmp")),
                 inherited_directory: None,
                 command: args(&["foo", "--pgo-train"]),
@@ -350,6 +358,7 @@ mod tests {
         assert_eq!(
             parsed,
             TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/launcher/cwd/--pgo-train")),
                 inherited_directory: None,
                 command: Vec::new(),

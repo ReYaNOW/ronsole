@@ -1,17 +1,65 @@
 use super::{App, AppLoopControl};
 use crate::launch::TerminalLaunchSpec;
 use crate::platform::single_instance::{InstanceMessage, PrimaryInstance};
-use crate::runtime::{WaylandRuntimeEvents, WindowRuntime, poll_timeout_millis};
+use crate::runtime::{
+    WaylandPollOutcome, WaylandRuntimeEvents, WindowRuntime, poll_timeout_millis,
+};
 use crate::wayland_input::WaylandInputEvent;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Instant;
 
 const EXTERNAL_LAUNCH_QUEUE_CAPACITY: usize = 32;
 
-/// Outcome of one event-loop iteration: keep looping, or stop with the final result.
-pub(super) enum LoopStep {
-    Continue,
+/// Outcome of one event-loop iteration: keep looping with its report, or stop with the final result.
+#[derive(Debug)]
+pub(crate) enum LoopStep {
+    Continue(StepReport),
     Exit(Result<(), String>),
+}
+
+/// What one event-loop iteration did. The window loop ignores it; the headless
+/// protocol reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepReport {
+    /// The step drew a frame through `on_frame`.
+    pub(crate) frame: bool,
+    /// Flow the app asked for, taken from the step's `AppLoopControl`.
+    pub(crate) flow: LoopFlow,
+    /// Merged app and input deadline the step waited with, before any caller cap.
+    pub(crate) deadline: Option<Instant>,
+    /// Poll result; `None` when the step returned early with a ready frame.
+    pub(crate) poll: Option<WaylandPollOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoopFlow {
+    Wait,
+    Poll,
+    WaitUntil,
+}
+
+/// Maps the app's control to a report flow. `Exit` returns before any report is built,
+/// so it shares `Wait` only to keep the mapping total.
+pub(super) fn loop_flow(control: AppLoopControl) -> LoopFlow {
+    match control {
+        AppLoopControl::Exit | AppLoopControl::Wait => LoopFlow::Wait,
+        AppLoopControl::Poll => LoopFlow::Poll,
+        AppLoopControl::WaitUntil(_) => LoopFlow::WaitUntil,
+    }
+}
+
+/// Caps a poll timeout at `max_wait_ms`. `None` and negative caps leave it unchanged.
+fn cap_timeout(timeout_ms: i32, max_wait_ms: Option<i32>) -> i32 {
+    match max_wait_ms {
+        Some(max) if max >= 0 => {
+            if timeout_ms < 0 {
+                max
+            } else {
+                timeout_ms.min(max)
+            }
+        }
+        _ => timeout_ms,
+    }
 }
 
 impl App {
@@ -152,11 +200,30 @@ impl App {
         );
     }
 
+    /// Earliest of the app's own deadline and the input deadline; `None` waits for an event.
+    pub(super) fn wait_deadline(&self, control: AppLoopControl) -> Option<Instant> {
+        let app_deadline = match control {
+            AppLoopControl::WaitUntil(deadline) => Some(deadline),
+            AppLoopControl::Exit | AppLoopControl::Wait | AppLoopControl::Poll => None,
+        };
+        let input_deadline = self
+            .runtime
+            .as_ref()
+            .and_then(WindowRuntime::wayland_input_deadline);
+        match (app_deadline, input_deadline) {
+            (Some(app), Some(input)) => Some(app.min(input)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+    }
+
     /// Runs one event-loop iteration. `external_launches` is `None` for headless
-    /// runs, which have no single-instance listener.
+    /// runs, which have no single-instance listener. `max_wait_ms` caps the wait
+    /// (`None` or `-1` leaves it to the app and input deadlines).
     pub(super) fn loop_step(
         &mut self,
         external_launches: Option<&Receiver<InstanceMessage>>,
+        max_wait_ms: Option<i32>,
     ) -> Result<LoopStep, String> {
         // A session error (for example a failed pbuffer resize) ends the run before
         // any further work. Wayland runtimes never report one.
@@ -197,26 +264,17 @@ impl App {
                 .runtime
                 .as_ref()
                 .is_some_and(WindowRuntime::take_wayland_frame_ready);
-            if take_frame {
-                self.on_frame()?;
-            }
-            return Ok(LoopStep::Continue);
+            let frame = take_frame && self.on_frame()?;
+            return Ok(LoopStep::Continue(StepReport {
+                frame,
+                flow: loop_flow(control),
+                deadline: None,
+                poll: None,
+            }));
         }
 
-        let app_deadline = match control {
-            AppLoopControl::WaitUntil(deadline) => Some(deadline),
-            AppLoopControl::Exit | AppLoopControl::Wait | AppLoopControl::Poll => None,
-        };
-        let input_deadline = self
-            .runtime
-            .as_ref()
-            .and_then(WindowRuntime::wayland_input_deadline);
-        let deadline = match (app_deadline, input_deadline) {
-            (Some(app), Some(input)) => Some(app.min(input)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        };
-        let timeout_ms = poll_timeout_millis(deadline, Instant::now());
+        let deadline = self.wait_deadline(control);
+        let timeout_ms = cap_timeout(poll_timeout_millis(deadline, Instant::now()), max_wait_ms);
         let outcome = self
             .runtime
             .as_mut()
@@ -247,7 +305,12 @@ impl App {
             }
         }
 
-        Ok(LoopStep::Continue)
+        Ok(LoopStep::Continue(StepReport {
+            frame: false,
+            flow: loop_flow(control),
+            deadline,
+            poll: Some(outcome),
+        }))
     }
 
     fn direct_wayland_loop(
@@ -255,7 +318,7 @@ impl App {
         external_launches: &Receiver<InstanceMessage>,
     ) -> Result<(), String> {
         loop {
-            if let LoopStep::Exit(result) = self.loop_step(Some(external_launches))? {
+            if let LoopStep::Exit(result) = self.loop_step(Some(external_launches), None)? {
                 return result;
             }
         }
@@ -276,6 +339,7 @@ mod tests {
                 .try_send(InstanceMessage::ExternalLaunch(ExternalLaunchRequest {
                     activation_token: Some(format!("token-{index}")),
                     launch: TerminalLaunchSpec {
+                        shell: None,
                         working_directory: Some(format!("/tmp/session-{index}").into()),
                         inherited_directory: None,
                         command: vec![format!("command-{index}").into()],

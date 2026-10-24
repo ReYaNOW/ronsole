@@ -44,8 +44,9 @@ pub(crate) fn main(args: &[OsString]) -> ExitCode {
     };
     crate::prefer_egl_vendor();
     crate::tune_glibc_allocator();
-    let mut app = match App::load_headless(Some(options.clone()), &profile.dir) {
-        Ok(app) => app,
+    // The receiver stays alive for the whole run and is never read: recorded links are discarded.
+    let (mut app, _receiver) = match App::load_headless(Some(options.clone()), &profile.dir, None) {
+        Ok(loaded) => loaded,
         Err(error) => {
             eprintln!("headless: {error}");
             return ExitCode::FAILURE;

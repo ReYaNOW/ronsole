@@ -515,6 +515,7 @@ mod tests {
                           i=$((i+1)); done; printf '%s' \"$1\"; printf __READY__; \
                           exec cat > out";
             let launch = TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(root.clone()),
                 inherited_directory: None,
                 command: vec![
