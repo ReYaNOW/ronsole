@@ -74,10 +74,14 @@ fn write_script(body: &str) -> PathBuf {
     path
 }
 
+/// Clears the visible rows, so that markers left by an earlier reader in the same session cannot
+/// satisfy the waits of this one.
+const SCREEN_CLEAR: &str = "printf '\\033[2J\\033[H'\n";
+
 /// Starts the §9.1 reader in `/bin/sh`: `prelude` runs right after the ready marker, then the
 /// reader waits for input. Returns once the ready marker is on screen.
 fn start_reader(session: &mut HeadlessSession, prelude: &str) {
-    let path = write_script(&format!("{READER_HEAD}{prelude}{READER_TAIL}"));
+    let path = write_script(&format!("{SCREEN_CLEAR}{READER_HEAD}{prelude}{READER_TAIL}"));
     run_ok(session, format!("type sh {}\n", path.display()).as_bytes());
     run_ok(session, b"key enter\n");
     wait_until(session, 5000, "the reader ready marker", |dump| {
@@ -99,6 +103,13 @@ fn finish_reader(session: &mut HeadlessSession) -> String {
     let ready = row_index(&rows, "READY").expect("ready row");
     let end = row_index(&rows, "END").expect("end row");
     rows[ready + 1..end].concat()
+}
+
+/// Waits until the active screen reports Kitty keyboard `flags` in the dump.
+fn wait_for_kitty_flags(session: &mut HeadlessSession, flags: u64) {
+    wait_until(session, 5000, "the kitty keyboard flags", |dump| {
+        dump["terminal"]["modes"]["kitty_flags"] == flags
+    });
 }
 
 #[test]
@@ -131,4 +142,58 @@ fn terminal_identity_and_mode_queries_are_answered() {
     assert!(rest.contains(&hex(b"\x1b]12;rgb:")), "OSC 12 answer in {rest}");
     assert!(rest.contains(&hex(b"\x1b]4;1;rgb:")), "OSC 4 answer in {rest}");
     assert!(rest.ends_with(&hex(b"\x07")), "last answer ends with BEL in {rest}");
+}
+
+#[test]
+fn kitty_flag_stacks_and_queries_are_answered() {
+    let mut session = session_for_test(800, 600);
+    // Each `?u` query is answered with the current flags. Push `CSI > f u` stores the current
+    // flags and sets f; pop `CSI < n u` restores them; set `CSI = f ; mode u` replaces (mode 1),
+    // ORs (mode 2) or clears (mode 3) bits; flag 4 is not supported and is masked out.
+    let prelude = "printf '\\033[?u\\033[>1u\\033[?u\\033[>3u\\033[?u\\033[<1u\\033[?u'\n\
+                   printf '\\033[=6;2u\\033[?u\\033[=2;3u\\033[?u\\033[<9u\\033[?u'\n\
+                   printf '\\033[=2u\\033[?u\\033[=4;1u\\033[?u'\n";
+    start_reader(&mut session, prelude);
+    let answer = finish_reader(&mut session);
+
+    // Expected flags after each query, in order: 0; push 1; push 3; pop to 1; set 6 OR into 1 with
+    // flag 4 masked out (6 becomes 2, 1|2 = 3); clear 2 from 3 = 1; pop past the stack resets to 0;
+    // replace with 2; flag 4 masked to 0.
+    let expected = "\x1b[?0u\x1b[?1u\x1b[?3u\x1b[?1u\x1b[?3u\x1b[?1u\x1b[?0u\x1b[?2u\x1b[?0u";
+    assert_eq!(answer, hex(expected.as_bytes()));
+}
+
+#[test]
+fn kitty_key_encoding_follows_flags() {
+    let mut session = session_for_test(800, 600);
+
+    // Flags 0 keep the legacy bytes: Enter is CR, Shift+Enter is ESC CR (parity spec 5.3),
+    // and Ctrl+С on a Cyrillic layout is ETX because the key is taken from its physical base.
+    start_reader(&mut session, "");
+    run_ok(&mut session, b"key enter\n");
+    run_ok(&mut session, b"key shift+enter\n");
+    run_ok(&mut session, "key --char с ctrl+c\n".as_bytes());
+    let legacy = finish_reader(&mut session);
+    assert_eq!(legacy, hex(b"\r\x1b\r\x03"));
+
+    // Flag 1: Enter stays CR, Shift+Enter is CSI 13;2u and Ctrl+С is CSI 99;5u (parity spec 5.3).
+    start_reader(&mut session, "printf '\\033[=1;1u'\n");
+    wait_for_kitty_flags(&mut session, 1);
+    run_ok(&mut session, b"key enter\n");
+    run_ok(&mut session, b"key shift+enter\n");
+    run_ok(&mut session, "key --char с ctrl+c\n".as_bytes());
+    let disambiguated = finish_reader(&mut session);
+    assert_eq!(disambiguated, hex(b"\r\x1b[13;2u\x1b[99;5u"));
+
+    // Flags 3 (disambiguate and event types): a held Ctrl+C sends press CSI 99;5u, repeats
+    // CSI 99;5:2u and release CSI 99;5:3u, the release carrying the press code. Enter release
+    // sends nothing. IME commit text goes out as UTF-8 at any flags.
+    start_reader(&mut session, "printf '\\033[=3;1u'\n");
+    wait_for_kitty_flags(&mut session, 3);
+    run_ok(&mut session, b"key --repeat 2 ctrl+c\n");
+    run_ok(&mut session, b"key enter\n");
+    run_ok(&mut session, "type привет\n".as_bytes());
+    let events = finish_reader(&mut session);
+    let expected = "\x1b[99;5u\x1b[99;5:2u\x1b[99;5:2u\x1b[99;5:3u\rпривет";
+    assert_eq!(events, hex(expected.as_bytes()));
 }
