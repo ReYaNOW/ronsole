@@ -113,7 +113,7 @@ struct TerminalFontMetrics {
     x_height: f32,
 }
 
-/// Returns the x-height of the bundled Regular face in em units; it is the first face of the Regular chain.
+/// Returns the x-height of the bundled Regular face in em units, used to place SGR decorations.
 fn terminal_regular_x_height_em() -> f32 {
     FontRef::from_index(TERMINAL_FONT, 0)
         .map(|font| {
@@ -334,11 +334,10 @@ impl FontData {
     }
 }
 
-/// Builds the Regular font chain once at renderer creation: the bundled Regular
-/// font first, then the system monospace font, symbol fallbacks and emoji.
+/// Builds the Regular font chain once at renderer creation: the system monospace
+/// font first, then the bundled Regular font, symbol fallbacks and emoji.
 fn load_terminal_fonts() -> Vec<FontData> {
     let mut fonts = Vec::with_capacity(12);
-    fonts.push(FontData::new_static(TERMINAL_FONT));
     if let Some(font) = FontData::map_first(&[
         "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
@@ -346,6 +345,7 @@ fn load_terminal_fonts() -> Vec<FontData> {
     ]) {
         fonts.push(font);
     }
+    fonts.push(FontData::new_static(TERMINAL_FONT));
     FontData::map_all_into(
         &[
             "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
@@ -1663,10 +1663,14 @@ mod tests {
     }
 
     #[test]
-    fn regular_chain_starts_with_bundled_font() {
+    fn regular_chain_puts_system_monospace_before_bundled_font() {
         let chain = load_terminal_fonts();
-        assert!(matches!(chain[0].source, FontSource::Static(_)));
-        assert!(chain[0].data() == TERMINAL_FONT);
+        let bundled = chain
+            .iter()
+            .position(|font| font.data() == TERMINAL_FONT)
+            .expect("bundled font in chain");
+        assert!(bundled <= 1);
+        assert!(chain[..bundled].iter().all(|font| !matches!(font.source, FontSource::Static(_))));
     }
 
     fn same_image(a: &Option<Image>, b: &Option<Image>) -> bool {
