@@ -4,7 +4,10 @@
 //! of the implementation.
 
 use super::session::HeadlessSession;
-use super::tests::{TEST_BACKGROUND, run_script, session_for_test, wait_until};
+use super::tests::{
+    TEST_BACKGROUND, cell_rect, dump, pixel_rgb, run_script, screenshot, session_for_test,
+    wait_until,
+};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -79,9 +82,16 @@ fn write_script(body: &str) -> PathBuf {
 const SCREEN_CLEAR: &str = "printf '\\033[2J\\033[H'\n";
 
 /// Starts the §9.1 reader in `/bin/sh`: `prelude` runs right after the ready marker, then the
-/// reader waits for input. Returns once the ready marker is on screen.
+/// reader waits for input. Returns once the ready marker is on screen. The screen is cleared first.
 fn start_reader(session: &mut HeadlessSession, prelude: &str) {
-    let path = write_script(&format!("{SCREEN_CLEAR}{READER_HEAD}{prelude}{READER_TAIL}"));
+    start_reader_with_setup(session, SCREEN_CLEAR, prelude);
+}
+
+/// Starts the §9.1 reader like `start_reader`, but runs `setup` before the ready marker instead
+/// of clearing the screen, so output of `setup` (such as a hyperlink) stays on screen. That output
+/// lies above the marker, so `finish_reader` does not include it.
+fn start_reader_with_setup(session: &mut HeadlessSession, setup: &str, prelude: &str) {
+    let path = write_script(&format!("{setup}{READER_HEAD}{prelude}{READER_TAIL}"));
     run_ok(session, format!("type sh {}\n", path.display()).as_bytes());
     run_ok(session, b"key enter\n");
     wait_until(session, 5000, "the reader ready marker", |dump| {
@@ -196,4 +206,51 @@ fn kitty_key_encoding_follows_flags() {
     let events = finish_reader(&mut session);
     let expected = "\x1b[99;5u\x1b[99;5:2u\x1b[99;5:2u\x1b[99;5:3u\rпривет";
     assert_eq!(events, hex(expected.as_bytes()));
+}
+
+#[test]
+fn ctrl_hover_shows_pointer_and_underline_and_ctrl_click_stays_out_of_the_app() {
+    let mut session = session_for_test(800, 600);
+    const URI: &str = "https://example.com/ronsole-l9";
+    // The hyperlink is printed before the ready marker: the reader's screen clear would erase it.
+    let link = format!("printf '\\033]8;;{URI}\\007link\\033]8;;\\007'\n");
+    // Press reporting (`?1000`) is set after the marker; `dump` shows it once it is active.
+    start_reader_with_setup(&mut session, &link, "printf '\\033[?1000h'\n");
+    let state = wait_until(&mut session, 5000, "mouse tracking", |state| {
+        state["terminal"]["modes"]["mouse_tracking"] == "press"
+    });
+    let row = row_index(&rows(&state), "link").expect("link row");
+
+    // Without Ctrl the link cell has no underline; this screenshot is the reference.
+    run_ok(&mut session, format!("mouse_cell 1 {row}\n").as_bytes());
+    let before = dump(&mut session);
+    let (x0, _, x1, bottom) = cell_rect(&before, 1, row);
+    let plain = screenshot(&mut session);
+
+    // Holding Ctrl over the link: the pointer becomes a hand and the underline is drawn.
+    run_ok(&mut session, b"mods ctrl\n");
+    wait_until(&mut session, 5000, "the Ctrl hover", |state| {
+        state["terminal"]["hovered_link"].is_object() && state["cursor_icon"] == "Pointer"
+    });
+    let ctrl = screenshot(&mut session);
+    // Threshold: any changed pixel in the two bottom rows of the link cell (the underline band);
+    // the exact underline colour is not in the spec, so only the change is checked.
+    let underlined = (x0..x1).any(|x| {
+        (bottom - 2..bottom).any(|y| pixel_rgb(&plain, (x, y)) != pixel_rgb(&ctrl, (x, y)))
+    });
+    assert!(underlined, "Ctrl hover must change the bottom rows of the link cell");
+
+    // Ctrl+click opens the link through the open handler and is not sent to the mouse-tracking app.
+    run_ok(&mut session, b"click\n");
+    let opened = wait_until(&mut session, 5000, "the open_url request", |state| {
+        !state["external_request"].is_null()
+    });
+    assert_eq!(opened["external_request"]["kind"], "open_url");
+    assert_eq!(opened["external_request"]["arg"], URI);
+
+    // Negative check: after a fixed pause the reader has received nothing but the final `x`.
+    run_ok(&mut session, b"wait 300\n");
+    run_ok(&mut session, b"mods\n");
+    run_ok(&mut session, b"key x\n");
+    assert_eq!(finish_reader(&mut session), hex(b"x"));
 }
