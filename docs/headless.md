@@ -41,7 +41,13 @@ binary unchanged; the binary validates them.
 
 Driver exit codes: `0` every reply was `ok`; `1` an `err` reply or unreadable
 input; `2` bad arguments or no binary; `3` EGL failure (passed through from the
-binary). The app's stderr is inherited unchanged.
+binary). Any other code is the binary's own status (`128+N` when it died on signal
+`N`). The app's stderr is inherited unchanged.
+
+Files: a kept profile (`--keep-profile`) is `${XDG_RUNTIME_DIR:-/tmp}/ronsole-headless-<pid>`;
+`bench` writes its CSV to `${XDG_RUNTIME_DIR:-/tmp}/ronsole-headless/bench-<ms>.csv` unless
+`csv=<path>` is given, and never deletes it. The driver is a script, not a module: to
+import it from another script add `scripts/` to `sys.path` (`python3 -I` does not).
 
 Self-test of the protocol (needs a binary):
 
@@ -97,8 +103,9 @@ still runs. Coordinates of `mouse_move` are physical framebuffer pixels.
 | `dump [out.json]` | `ok <json>` or `ok <abs path>` | Terminal and UI state, spec §5. |
 | `dump row <n>` | `ok <json>` | One visible row, spec §5.2. `err row out of range` outside the visible area. |
 | `settle [ms]` | `ok frames=<n> settled=<bool>` | Default 500. |
-| `wait <ms>` | `ok` | Real time, ≤ 60000. Use only for negative checks. |
-| `wake <ms>`, `idle <ms>` | `ok` | Loop-model timing, spec §3.3. |
+| `wait <ms>` | `ok frames=<n>` | Real time, ≤ 60000. Use only for negative checks. |
+| `wake <ms>` | `ok cause=<c> frame=<bool> flow=<f> deadline_ms=<n\|none>` | Loop-model timing, spec §3.3. |
+| `idle <ms>` | `ok frames=<n> redraws=<n> polls=<n> wakes=<n> deadlines=<n> flow=<f> deadline_ms=<n\|none>` | Loop-model counters, spec §3.3. |
 | `bench <frames> [csv=<path>] [none\|wheel dx dy\|key <combo>\|type <text>]` | `ok <json>` | Summary JSON with `csv`. |
 | `info` | `ok <json>` | GL strings, profile, budget, `hz`. |
 | `quit` | `ok` | EOF does the same. |
@@ -116,7 +123,7 @@ Practical notes:
 * `settle` with a budget of at most 2 × `TERMINAL_OUTPUT_BATCH_IDLE` (16 ms) almost
   always returns `settled=false`. Use the default budget unless you need the value.
 * `bench`: `gpu_ms` may be empty. `bench … wheel` barely moves the scroll
-  animation, because the animation clock is wall time (open question in the ledger).
+  animation, because the animation clock is wall time.
 
 ## Differences from RRiter
 
