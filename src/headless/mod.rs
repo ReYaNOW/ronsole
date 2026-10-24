@@ -1,6 +1,8 @@
 //! Headless rendering: the runtime drives frames into an offscreen EGL pbuffer.
 
 pub(crate) mod backend;
+mod keys;
+mod protocol;
 
 use crate::app::{
     App, AutomationOptions, HeadlessRunError, automation_options_from_args,

@@ -1331,7 +1331,7 @@ fn modifier_key_bits(modifier: ModKey) -> Option<(u8, Modifiers, u8)> {
 
 /// Builds the encoder event for one host key. The named key wins over the
 /// physical key, which wins over the layout character.
-fn terminal_key_event(key: &KeyInput, mods: Modifiers) -> Option<KeyEvent<'_>> {
+pub(crate) fn terminal_key_event(key: &KeyInput, mods: Modifiers) -> Option<KeyEvent<'_>> {
     // A key with no named, physical, or layout identity has nothing to encode,
     // so it is dropped instead of being encoded as a placeholder character.
     let named = key
