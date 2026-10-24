@@ -7,7 +7,7 @@ use super::session::{HeadlessSession, flow_name};
 use crate::app::App;
 use crate::renderer::{
     Renderer, TerminalPalette, TerminalUiLayout, terminal_cell_render_colors,
-    terminal_render_color,
+    terminal_cell_span_x_bounds, terminal_render_color, terminal_row_draw_y,
 };
 use crate::runtime::WindowRuntime;
 use crate::terminal::Terminal;
@@ -46,11 +46,14 @@ fn window(grid: &Term, layout: Option<&TerminalUiLayout>) -> Window {
 ///
 /// The formula matches the frame's text placement, so cell rectangles agree with what is drawn.
 fn cell0(layout: &TerminalUiLayout, window: &Window) -> (f32, f32) {
-    let body = layout.body;
-    let offset_from_bottom = window.total.saturating_sub(1).saturating_sub(window.top);
-    let y = body.y + body.h - layout.bottom_pad - layout.char_h
-        - offset_from_bottom as f32 * layout.char_h
-        + layout.scroll_offset;
+    let y = terminal_row_draw_y(
+        layout.body,
+        layout.bottom_pad,
+        layout.char_h,
+        window.total,
+        window.top,
+        layout.scroll_offset,
+    );
     (layout.text_x, y)
 }
 
@@ -82,8 +85,7 @@ pub(crate) fn cell_center(
         scrollback: 0,
     };
     let (cell0_x, cell0_y) = cell0(layout, &window);
-    let x0 = (cell0_x + col as f32 * layout.char_w).round();
-    let x1 = (cell0_x + (col + 1) as f32 * layout.char_w).round();
+    let (x0, x1) = terminal_cell_span_x_bounds(cell0_x, col, 1, layout.char_w);
     let y0 = cell0_y + row as f32 * layout.char_h;
     let x = ((x0 + x1) / 2.0).floor();
     let y = (y0 + layout.char_h / 2.0).floor();
@@ -185,7 +187,12 @@ fn terminal_state(
             "last": [end_y as i64 - top, end_x],
         })
     });
-    let hovered_link = terminal.hovered_link().map_or(Value::Null, |(link, _)| {
+    // A link found before the latest content change is stale, as the frame treats it.
+    let generation = grid.content_generation();
+    let hovered_link = terminal
+        .hovered_link()
+        .filter(|(_, link_generation)| *link_generation == generation)
+        .map_or(Value::Null, |(link, _)| {
         let ranges: Vec<Value> = link
             .cells
             .iter()
@@ -241,11 +248,11 @@ fn terminal_state(
 fn row_text(grid: &Term, index: usize) -> String {
     let mut text = String::new();
     if let Some(cells) = grid.row(index) {
-        for cell in cells {
+        for cell in cells.iter().take(grid.cols()) {
             cell.append_text_to(&mut text);
         }
     }
-    text.truncate(text.trim_end().len());
+    text.truncate(text.trim_end_matches(' ').len());
     text
 }
 
@@ -270,6 +277,7 @@ pub(crate) fn dump_row_json(session: &mut HeadlessSession, row: usize) -> Result
         .row(window.top + row)
         .unwrap_or(&[])
         .iter()
+        .take(grid.cols())
         .enumerate()
         .filter(|(_, cell)| !is_plain(cell))
         .map(|(col, cell)| cell_json(col, cell, palette))
@@ -308,6 +316,8 @@ fn is_plain(cell: &Cell) -> bool {
 /// underline colour, which the frame takes from the cell's SGR 58 colour and not from `fg`.
 fn cell_json(col: usize, cell: &Cell, palette: TerminalPalette) -> Value {
     let (foreground, background) = terminal_cell_render_colors(cell, palette);
+    let mut ch = String::new();
+    cell.append_text_to(&mut ch);
     let flags = cell.flags();
     let names: Vec<&str> = REPORTED_FLAGS
         .iter()
@@ -316,7 +326,7 @@ fn cell_json(col: usize, cell: &Cell, palette: TerminalPalette) -> Value {
         .collect();
     json!({
         "col": col,
-        "ch": cell.ch().to_string(),
+        "ch": ch,
         "fg": hex(foreground),
         "bg": background.map(hex),
         "flags": names,

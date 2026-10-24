@@ -1198,7 +1198,7 @@ fn terminal_cell_face_from_flags(flags: CellFlags) -> u8 {
 }
 
 #[inline]
-fn terminal_cell_span_x_bounds(
+pub(crate) fn terminal_cell_span_x_bounds(
     text_x: f32,
     cell_index: usize,
     width_cells: usize,
@@ -1432,7 +1432,7 @@ fn terminal_decoration_quads(
 }
 
 #[inline]
-fn terminal_row_draw_y(
+pub(crate) fn terminal_row_draw_y(
     body: Rect,
     bottom_pad: f32,
     char_h: f32,

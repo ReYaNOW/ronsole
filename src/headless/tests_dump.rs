@@ -294,15 +294,83 @@ fn mouse_cell_on_clipped_bottom_row_is_err() {
 }
 
 #[test]
+fn click_selects_from_the_cell_it_addresses() {
+    let mut session = session_for_test(800, 600);
+    // Coordinates come from `mouse_cell`, so the test checks that the pointer goes where the protocol says.
+    let (x, y) = mouse_cell_point(&mut session, 3, 1);
+    run_ok(&mut session, format!("mouse_move {x} {y}\n").as_bytes());
+    run_ok(&mut session, b"click down\n");
+    let (x, y) = mouse_cell_point(&mut session, 5, 1);
+    run_ok(&mut session, format!("mouse_move {x} {y}\n").as_bytes());
+    run_ok(&mut session, b"click up\n");
+    let selection = dump(&mut session)["terminal"]["selection"].clone();
+    // The selection starts at the pressed cell (row 1, column 3) and ends on the row of the release.
+    assert_eq!(selection["start"], serde_json::json!([1, 3]), "selection: {selection}");
+    assert_eq!(selection["last"][0], serde_json::json!(1), "selection: {selection}");
+}
+
+#[test]
+fn ctrl_click_on_link_reports_external_request_once() {
+    const URL: &str = "https://example.com/ronsole";
+    let mut session = session_for_test(800, 600);
+    // The echoed command spells the marker as `LI''NK`, so only the printed text matches `LINK`.
+    run_ok(
+        &mut session,
+        br#"type printf '\033]8;;https://example.com/ronsole\007LI''NK\033]8;;\007'; sleep 30"#,
+    );
+    run_ok(&mut session, b"key enter\n");
+    let shown = wait_until(&mut session, 5000, "the link text on screen", |dump| {
+        row_containing(dump, "LINK").is_some()
+    });
+    let row = row_containing(&shown, "LINK").expect("row with LINK");
+    run_ok(&mut session, b"mods ctrl\n");
+    let (x, y) = mouse_cell_point(&mut session, 1, row);
+    run_ok(&mut session, format!("mouse_move {x} {y}\n").as_bytes());
+    let hovered = dump(&mut session)["terminal"]["hovered_link"].clone();
+    // The printed text starts at column 0 and is four cells wide, so the link covers columns 0..4.
+    assert_eq!(hovered["uri"], serde_json::json!(URL), "hovered: {hovered}");
+    assert_eq!(hovered["ranges"], serde_json::json!([[row, 0, 4]]), "hovered: {hovered}");
+    run_ok(&mut session, b"click\n");
+    let reported = wait_until(&mut session, 5000, "the link reported by external_request", |dump| {
+        dump["external_request"].is_object()
+    });
+    assert_eq!(reported["external_request"]["arg"], serde_json::json!(URL));
+    // The request is drained by the dump that reports it, so the next dump has none.
+    assert!(dump(&mut session)["external_request"].is_null());
+}
+
+#[test]
+fn bracketed_paste_mode_is_reported_when_the_program_sets_it() {
+    let mut session = session_for_test(800, 600);
+    // The shell's line editor may already enable the mode at its prompt, so the script clears it,
+    // sets it one second later, and then sleeps: the prompt cannot re-enable it in between.
+    // The escapes are split so the echoed command does not contain them.
+    run_ok(
+        &mut session,
+        br#"type printf '\033[?200''4l'; sleep 1; printf '\033[?200''4h'; sleep 30"#,
+    );
+    run_ok(&mut session, b"key enter\n");
+    wait_until(&mut session, 5000, "bracketed paste mode off", |dump| {
+        dump["terminal"]["modes"]["bracketed_paste"] == false
+    });
+    wait_until(&mut session, 5000, "bracketed paste mode on", |dump| {
+        dump["terminal"]["modes"]["bracketed_paste"] == true
+    });
+}
+
+#[test]
 fn background_pixel_matches_config() {
     let mut session = session_for_test(800, 600);
+    // The prompt row is recorded first: a prompt of two columns would otherwise match the wait early.
+    let prompt_row = dump(&mut session)["terminal"]["cursor"]["row"].clone();
     run_ok(
         &mut session,
         br#"type printf '\033[48;2;10;200;30m  \033[0m'; sleep 30"#,
     );
     run_ok(&mut session, b"key enter\n");
+    // The printed cells end the new line at column 2; the prompt row itself is excluded.
     let dump = wait_until(&mut session, 5000, "two coloured cells on the cursor row", |dump| {
-        dump["terminal"]["cursor"]["col"] == 2
+        dump["terminal"]["cursor"]["col"] == 2 && dump["terminal"]["cursor"]["row"] != prompt_row
     });
     let row = dump["terminal"]["cursor"]["row"].as_u64().expect("cursor row") as usize;
     let (x0, y0, x1, bottom) = cell_rect(&dump, 0, row);

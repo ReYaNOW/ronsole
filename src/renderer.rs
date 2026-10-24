@@ -1,8 +1,9 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
     SettingsHit, SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
-    terminal_cell_render_colors, terminal_palette, terminal_render_color,
-    terminal_scrollbar_drag_target, visible_row_range,
+    terminal_cell_render_colors, terminal_cell_span_x_bounds, terminal_palette,
+    terminal_render_color, terminal_row_draw_y, terminal_scrollbar_drag_target,
+    visible_row_range,
 };
 use glow::HasContext;
 use rustc_hash::FxHashMap;
@@ -500,9 +501,9 @@ impl Renderer {
         self.baseline_offset * terminal_ui::TERMINAL_TEXT_SCALE
     }
 
-    /// X-height of the terminal font in pixels.
+    /// X-height of the terminal font in pixels, scaled as the terminal frame scales it for decorations.
     pub(crate) fn terminal_x_height(&self) -> f32 {
-        self.x_height
+        self.x_height * terminal_ui::TERMINAL_TEXT_SCALE
     }
 
     /// Body rectangle `[x, y, w, h]` of tab `index` in the last drawn frame, if it has one.
