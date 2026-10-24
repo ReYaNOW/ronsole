@@ -193,6 +193,39 @@ fn kitty_reference_examples() {
     assert_eq!(enc(&mut term, &ev(TermKey::Enter, None, mods(true, false, false), press, None)).1, b"\x1b[13;2u");
 }
 
+/// Word-editing keys in the two modes fish 4 uses: legacy (flags 0) and `CSI = 5 u`,
+/// which masks to flag 1 here. Legacy bytes match the pre-kitty encoder
+/// (`terminal_key_sequence` at 0944987); flag-1 bytes follow the protocol reference
+/// (Ctrl+Backspace → `CSI 127;5u`). fish binds `ctrl-w` (legacy 0x17) and
+/// `ctrl-backspace` (`CSI 127;5u`) to different commands, so the distinction is intended.
+#[test]
+fn word_editing_keys_legacy_and_fish_flags() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let press = KeyKind::Press;
+    let ctrl = mods(false, true, false);
+    let alt = mods(false, false, true);
+    let ctrl_alt = mods(false, true, true);
+    let cases: [(TermKey, KeyMods, &[u8], &[u8]); 7] = [
+        (TermKey::Backspace, ctrl, b"\x17", b"\x1b[127;5u"),
+        (TermKey::Backspace, alt, b"\x1b\x7f", b"\x1b[127;3u"),
+        (TermKey::Backspace, ctrl_alt, b"\x1b\x17", b"\x1b[127;7u"),
+        (TermKey::Backspace, mods(false, false, false), b"\x7f", b"\x7f"),
+        (TermKey::Delete, ctrl, b"\x1b[3;5~", b"\x1b[3;5~"),
+        (TermKey::Left, ctrl, b"\x1b[1;5D", b"\x1b[1;5D"),
+        (TermKey::Right, ctrl, b"\x1b[1;5C", b"\x1b[1;5C"),
+    ];
+    for (key, key_mods, legacy, _) in cases {
+        assert_eq!(enc(&mut term, &ev(key, None, key_mods, press, None)), (KeyOutcome::Sent, legacy.to_vec()), "flags 0: {key:?}");
+    }
+    // fish 4 pushes `CSI = 5 u`; flag 4 is unsupported and masked, leaving flag 1.
+    set_flags(&mut term, &mut sink, 5);
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?u"), b"\x1b[?1u");
+    for (key, key_mods, _, kitty) in cases {
+        assert_eq!(enc(&mut term, &ev(key, None, key_mods, press, None)), (KeyOutcome::Sent, kitty.to_vec()), "flags 1: {key:?}");
+    }
+}
+
 /// Flag 2 alone: the press is the legacy byte, repeat and release are CSI u with the event field.
 #[test]
 fn escape_flag2_only() {
