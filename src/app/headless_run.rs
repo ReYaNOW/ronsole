@@ -8,7 +8,6 @@ use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
 use crate::runtime::WindowRuntime;
 use crate::terminal::Terminal;
-use ronsole_term::TermPalette;
 
 /// Why a headless run stopped with an error. `Egl` means the runtime never started,
 /// so the caller reports it as a startup failure.
@@ -136,11 +135,6 @@ impl App {
     /// Loaded configuration; the session reads the terminal background from it.
     pub(crate) fn config(&self) -> &AppConfig {
         &self.config
-    }
-
-    /// Palette the terminal grid is drawn with.
-    pub(crate) fn terminal_palette(&self) -> TermPalette {
-        self.new_terminal_palette()
     }
 }
 

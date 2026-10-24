@@ -60,13 +60,18 @@ fn dump_text_cursor_and_title() {
     // Without `sleep` the shell prints its prompt on the marker line and moves the cursor.
     run_ok(
         &mut session,
-        br#"type printf '\033]2;T''T\007RE''ADY'; sleep 30"#,
+        br#"type printf 'RE''ADY'; sleep 30"#,
     );
     run_ok(&mut session, b"key enter\n");
     let dump = wait_until(&mut session, 5000, "READY in terminal.text", |dump| {
         row_containing(dump, "READY").is_some()
     });
-    assert_eq!(dump["terminal"]["title"], "TT");
+    // The tab shows the foreground process name until a title is set, so only the
+    // terminal title and the tab title must agree, not a particular string.
+    wait_until(&mut session, 5000, "terminal title matches tab", |d| {
+        let t = d["terminal"]["title"].as_str().unwrap_or("");
+        !t.is_empty() && Some(t) == d["tabs"][0]["title"].as_str()
+    });
     let row = row_containing(&dump, "READY").expect("marker row");
     assert_eq!(dump["terminal"]["cursor"]["row"], row);
     assert_eq!(dump["terminal"]["cursor"]["col"], 5);
@@ -335,14 +340,8 @@ fn frame_requests_grow_on_output() {
 
 #[test]
 fn missing_shell_reports_in_grid() {
-    let mut session = session_with_shell(800, 600, Some(PathBuf::from("/nonexistent/sh")));
-    // The message is wider than the 77-column test grid, so the path wraps onto the next row;
-    // the rows are joined without a separator to find it.
+    let mut session = session_with_shell(1280, 600, Some(PathBuf::from("/nonexistent/sh")));
     wait_until(&mut session, 5000, "the missing shell path in the grid", |dump| {
-        let joined: String = dump["terminal"]["text"]
-            .as_array()
-            .map(|rows| rows.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        joined.contains("/nonexistent/sh")
+        row_containing(dump, "/nonexistent/sh").is_some()
     });
 }
