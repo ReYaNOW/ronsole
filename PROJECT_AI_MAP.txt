@@ -1115,10 +1115,10 @@ F bad_arguments_answer_err@153>qs,qt
 F app_exit_ends_script@167>r1,r3,r4
 F resize_and_screenshot@178>qs,qt,r5,r7
 F idle_session_waits_without_frames@202>qs,qt,r5,r6
-F shell_output_wakes_by_ui_waker@228>qs,qt,r5,r6
-F bad_args_exit_2@249
-F modifier_key_input_uses_each_modifier_keycode@263>np
-F key_spec_maps_names_to_evdev_keycodes@279>nk
+F shell_output_wakes_by_ui_waker@226>qs,qt,r5,r6
+F bad_args_exit_2@263
+F modifier_key_input_uses_each_modifier_keycode@277>np
+F key_spec_maps_names_to_evdev_keycodes@293>nk
 M src/input.rs
 C enum ClipboardOwner@48
 C enum PointerCapture@38

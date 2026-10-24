@@ -220,19 +220,18 @@ fn idle_session_waits_without_frames() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// Repro of the open bug: `wake 5000` after the marker file appears returns `ui_waker`
-// about 150 ms later, before the `printf x` the script waits for (observed
-// `ok cause=ui_waker frame=true`, `took 148ms`).
+// The foreground `sleep` change wakes the eventfd through the title worker about 150 ms after
+// the command starts, as `ui_waker` too; `wait 600` lets that wake pass before `wake 5000`.
 #[test]
-#[ignore = "bug: wake returns ui_waker ~150 ms after settle, before the printf output"]
 fn shell_output_wakes_by_ui_waker() {
     let dir = scratch_dir("waker");
     let marker = dir.join("r");
     let mut session = session_for_test(640, 400);
-    let script = format!("type : > {}; sleep 2; printf x\\n\n", marker.display());
+    let script = format!("type : > {}; sleep 3; printf 'x\\\\n'\\n\n", marker.display());
     let lines = run_script(&mut session, script.as_bytes());
     assert_eq!(lines, vec!["ok"]);
     assert!(wait_for(&mut session, Duration::from_secs(5), || marker.exists()));
+    run_script(&mut session, b"wait 600\n");
     run_script(&mut session, b"settle\n");
     let started = Instant::now();
     let wake = run_script(&mut session, b"wake 5000\n");
@@ -242,6 +241,21 @@ fn shell_output_wakes_by_ui_waker() {
         elapsed >= Duration::from_millis(1000),
         "wake returned after {elapsed:?}"
     );
+    // The echoed command contains `printf 'x\n'`, so only a row that is exactly `x` proves the output.
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    let printed = loop {
+        let found = session.app_mut().active_terminal().is_some_and(|terminal| {
+            terminal
+                .screen_tail_text(usize::MAX)
+                .iter()
+                .any(|line| line.trim() == "x")
+        });
+        if found || Instant::now() >= deadline {
+            break found;
+        }
+        run_script(&mut session, b"wait 50\n");
+    };
+    assert!(printed, "no screen row equal to `x` after wake");
     let _ = fs::remove_dir_all(&dir);
 }
 
