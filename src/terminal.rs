@@ -1,7 +1,8 @@
 use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
 use crate::terminal_process::{
-    HostChannels, PendingHostEvents, SessionSink, notify_main_loop, terminal_reply_channel,
+    HostChannels, PendingHostEvents, SessionSink, flush_expired_sync, notify_main_loop,
+    terminal_reply_channel,
 };
 use crate::wake::WakeHandle;
 use ronsole_term::{LinkTarget, Term, TermConfig, TermIdentity, TermPalette};
@@ -11,7 +12,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 pub(crate) use ronsole_term::{
@@ -43,14 +44,7 @@ mod tests {
     /// Feeds `bytes` into the tab's grid at `now` without a reader, so an
     /// open synchronized-output block holds them until its deadline.
     fn hold_in_sync_block(terminal: &Terminal, bytes: &[u8], now: Instant) {
-        let mut grid = crate::platform::lock_recover(&terminal.grid);
-        let mut sink = SessionSink {
-            reply_tx: None,
-            title_cache: None,
-            pending: None,
-            wake: None,
-        };
-        grid.advance(bytes, now, &mut sink);
+        terminal.hold_sync_block_for_test(bytes, now);
     }
 
     fn row_text(terminal: &Terminal) -> String {
@@ -68,7 +62,7 @@ mod tests {
         hold_in_sync_block(&terminal, b"\x1b[?2026hX", now);
         let before = crate::platform::lock_recover(&terminal.grid).content_generation();
 
-        terminal.flush_expired(now + Duration::from_secs(1));
+        terminal.try_flush_expired(now + Duration::from_secs(1));
 
         let after = crate::platform::lock_recover(&terminal.grid).content_generation();
         assert_ne!(after, before);
@@ -85,10 +79,10 @@ mod tests {
             .expect("held bytes set a deadline");
         assert_eq!(deadline, now + Duration::from_millis(150));
 
-        background.flush_expired(deadline - Duration::from_millis(1));
+        background.try_flush_expired(deadline - Duration::from_millis(1));
         assert!(!row_text(&background).contains('X'));
 
-        background.flush_expired(deadline);
+        background.try_flush_expired(deadline);
         assert!(row_text(&background).contains('X'));
     }
 
@@ -101,7 +95,7 @@ mod tests {
         hold_in_sync_block(&terminal, b"\x1b[?2026h\x1b[c\x1b]2;t\x07", now);
         assert!(reply_rx.try_recv().is_err());
 
-        terminal.flush_expired(now + Duration::from_secs(1));
+        terminal.try_flush_expired(now + Duration::from_secs(1));
 
         // DA1 answer of the VT model (`ESC[?62c`, perform.rs), then the
         // numbered title `t (7)` from the programmed OSC 2 title.
@@ -159,6 +153,63 @@ mod tests {
         assert_eq!(
             earliest_terminal_deadline(&[Terminal::new_for_test(40, 3, 3)]),
             None
+        );
+    }
+
+    #[test]
+    fn sync_deadline_reads_published_value_without_grid_lock() {
+        let terminal = Terminal::new_for_test(40, 3, 4);
+        let now = Instant::now();
+        terminal.hold_sync_block_for_test(b"\x1b[?2026hX", now);
+        let pending = terminal.pending.clone();
+        // The grid lock stays held: a read that needed it would never return.
+        let _grid = crate::platform::lock_recover(&terminal.grid);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(PendingHostEvents::sync_deadline(&pending));
+        });
+        let read = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("deadline read must not wait for the grid lock");
+        // The 150 ms hold window comes from the synchronized-output spec (5.4).
+        assert_eq!(read, Some(now + Duration::from_millis(150)));
+    }
+
+    #[test]
+    fn try_flush_expired_yields_to_busy_grid_lock() {
+        let terminal = Terminal::new_for_test(40, 3, 5);
+        let now = Instant::now();
+        terminal.hold_sync_block_for_test(b"\x1b[?2026hX", now);
+        let late = now + Duration::from_secs(1);
+        {
+            // Stands for the parser thread holding the grid: the main thread
+            // must give up instead of waiting.
+            let _busy = crate::platform::lock_recover(&terminal.grid);
+            terminal.try_flush_expired(late);
+        }
+        assert!(terminal.sync_deadline().is_some());
+        assert!(!row_text(&terminal).contains('X'));
+
+        terminal.try_flush_expired(late);
+        assert!(terminal.sync_deadline().is_none());
+        assert!(row_text(&terminal).contains('X'));
+    }
+
+    #[test]
+    fn sync_reserve_wake_waits_grace_then_retries() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(150);
+        // A live deadline is left to the parser thread until a 50 ms grace passes
+        // (grace value from the task brief).
+        assert_eq!(
+            sync_reserve_wake(deadline, now),
+            deadline + Duration::from_millis(50)
+        );
+        // An overdue deadline is retried after 10 ms, never in the past
+        // (retry value from the task brief).
+        assert_eq!(
+            sync_reserve_wake(now - Duration::from_secs(1), now),
+            now + Duration::from_millis(10)
         );
     }
 
@@ -1586,6 +1637,35 @@ pub(crate) fn earliest_terminal_deadline(terminals: &[Terminal]) -> Option<Insta
     terminals.iter().filter_map(Terminal::sync_deadline).min()
 }
 
+/// Grace the main thread gives the parser thread after a held deadline before
+/// it replays the block itself.
+pub(crate) const SYNC_RESERVE_GRACE: Duration = Duration::from_millis(50);
+/// Retry period of the main-thread replay while a lock it needs is busy.
+const SYNC_RESERVE_RETRY: Duration = Duration::from_millis(10);
+
+/// When the main loop must look at a held synchronized-output deadline. The
+/// parser thread replays the block at the deadline, so the main thread waits
+/// out `SYNC_RESERVE_GRACE` first; an overdue deadline is retried every
+/// `SYNC_RESERVE_RETRY` until the locks are free.
+pub(crate) fn sync_reserve_wake(deadline: Instant, now: Instant) -> Instant {
+    let wake = deadline + SYNC_RESERVE_GRACE;
+    if wake > now {
+        wake
+    } else {
+        now + SYNC_RESERVE_RETRY
+    }
+}
+
+/// Non-blocking [`crate::platform::lock_recover`]: `None` while the lock is
+/// held elsewhere.
+fn try_lock_recover<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 impl Terminal {
     #[cfg(test)]
     pub(crate) fn new_for_test(cols: usize, rows: usize, display_number: u64) -> Self {
@@ -1708,10 +1788,10 @@ impl Terminal {
         }
     }
 
-    /// Earliest synchronized-output deadline of this tab, if it holds bytes.
-    /// Takes the grid lock briefly.
+    /// Earliest synchronized-output deadline of this tab, if it holds bytes,
+    /// as the parser thread last published it. Takes only the pending lock.
     pub(crate) fn sync_deadline(&self) -> Option<Instant> {
-        crate::platform::lock_recover(&self.grid).sync_deadline()
+        PendingHostEvents::sync_deadline(&self.pending)
     }
 
     /// Locks the screen bridge, then the grid, the same order the parser thread uses,
@@ -1723,24 +1803,25 @@ impl Terminal {
     }
 
     /// Replays held synchronized-output bytes whose deadline has passed at
-    /// `now`, using the same sink as the parser thread. Marks the grid changed
-    /// and wakes the main loop when the replay changed it.
-    pub(crate) fn flush_expired(&self, now: Instant) {
+    /// `now`, as the fallback for a stalled parser thread. Never waits: when
+    /// the screen or grid lock is busy, the parser thread is alive and does
+    /// the replay itself, so nothing is done and the main loop retries later.
+    pub(crate) fn try_flush_expired(&self, now: Instant) {
         let outcome = {
             // Same lock order as the parser thread: screen lock, then grid.
-            let _screen_guard = crate::platform::lock_recover(&self.bridge_screen_lock);
-            let mut grid = crate::platform::lock_recover(&self.grid);
+            let Some(_screen_guard) = try_lock_recover(&self.bridge_screen_lock) else {
+                return;
+            };
+            let Some(mut grid) = try_lock_recover(&self.grid) else {
+                return;
+            };
             let mut sink = SessionSink {
                 reply_tx: Some(&self.reply_tx),
                 title_cache: Some(&self.title_cache),
                 pending: Some(&self.pending),
                 wake: self.wake.as_ref(),
             };
-            let outcome = grid.flush_expired(now, &mut sink);
-            if outcome.grid_changed {
-                grid.mark_changed();
-            }
-            outcome
+            flush_expired_sync(&mut grid, &mut sink, now)
         };
         notify_main_loop(self.wake.as_ref(), outcome);
     }
@@ -1759,11 +1840,26 @@ impl Terminal {
         }
     }
 
-    /// Replaces the reply sender used by [`Terminal::flush_expired`]; tests
+    /// Replaces the reply sender used by [`Terminal::try_flush_expired`]; tests
     /// use it to observe replies without a PTY.
     #[cfg(test)]
     pub(crate) fn set_reply_sender_for_test(&mut self, reply_tx: SyncSender<Vec<u8>>) {
         self.reply_tx = reply_tx;
+    }
+
+    /// Feeds `bytes` at `now` without a reader and publishes the deadline, as
+    /// the parser thread does after each batch, so the block is held.
+    #[cfg(test)]
+    pub(crate) fn hold_sync_block_for_test(&self, bytes: &[u8], now: Instant) {
+        let mut grid = crate::platform::lock_recover(&self.grid);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        grid.advance(bytes, now, &mut sink);
+        crate::terminal_process::publish_sync_deadline(&grid, Some(&self.pending));
     }
 
     pub(crate) fn bridge_launch_state(&self) -> Option<&BridgeLaunchState> {

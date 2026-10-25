@@ -22,7 +22,8 @@ use crate::tabs::{
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
 };
 use crate::terminal::{
-    Terminal, TerminalPresentationIntent, earliest_terminal_deadline, screen_hash,
+    SYNC_RESERVE_GRACE, Terminal, TerminalPresentationIntent, earliest_terminal_deadline,
+    screen_hash, sync_reserve_wake,
 };
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
 use ronsole_term::TermPalette;
@@ -1358,7 +1359,10 @@ impl App {
                 .filter(|deadline| *deadline > now)
                 .into_iter()
                 .chain(self.tab_input.next_deadline())
-                .chain(earliest_terminal_deadline(&self.terminals))
+                .chain(
+                    earliest_terminal_deadline(&self.terminals)
+                        .map(|deadline| sync_reserve_wake(deadline, now)),
+                )
                 .chain(
                     self.terminals
                         .get(self.active_terminal)
@@ -1935,20 +1939,22 @@ impl App {
         Ok(true)
     }
 
-    /// Applies host events parked by each tab's parser thread and replays
-    /// synchronized-output buffers whose deadline has passed. Takes its own
-    /// clock so the about-to-wait body keeps its clock after the early return.
+    /// Applies host events parked by each tab's parser thread and, as a
+    /// fallback for a stalled parser thread, replays synchronized-output
+    /// buffers that are overdue by `SYNC_RESERVE_GRACE`, when the locks are
+    /// free. Takes its own clock so the about-to-wait body keeps its clock
+    /// after the early return.
     fn drain_terminal_host_events(&mut self) {
         let now = Instant::now();
         for terminal in &mut self.terminals {
             // Only the pending-events lock is held while clipboard text is set;
-            // grid locks are taken briefly inside the facade calls.
+            // the published deadline is read from the same pending state.
             terminal.apply_host_events(&mut self.interaction);
             if terminal
                 .sync_deadline()
-                .is_some_and(|deadline| deadline <= now)
+                .is_some_and(|deadline| deadline + SYNC_RESERVE_GRACE <= now)
             {
-                terminal.flush_expired(now);
+                terminal.try_flush_expired(now);
             }
         }
     }
@@ -2367,14 +2373,7 @@ mod tests {
     /// Holds `bytes` in a synchronized-output block seen at `now`, as the
     /// parser thread does, without a PTY.
     fn hold_sync_block_at(terminal: &Terminal, bytes: &[u8], now: Instant) {
-        let mut grid = crate::platform::lock_recover(&terminal.grid);
-        let mut sink = crate::terminal_process::SessionSink {
-            reply_tx: None,
-            title_cache: None,
-            pending: None,
-            wake: None,
-        };
-        grid.advance(bytes, now, &mut sink);
+        terminal.hold_sync_block_for_test(bytes, now);
     }
 
     #[test]
@@ -2441,7 +2440,12 @@ mod tests {
             .sync_deadline()
             .expect("held bytes set a deadline");
         app.dirty = false;
-        assert_eq!(app.loop_control(), AppLoopControl::WaitUntil(deadline));
+        // The main loop wakes 50 ms after the deadline, the grace the parser
+        // thread gets to replay the block itself (value from the task brief).
+        assert_eq!(
+            app.loop_control(),
+            AppLoopControl::WaitUntil(deadline + std::time::Duration::from_millis(50))
+        );
     }
 
     #[test]

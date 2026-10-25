@@ -104,9 +104,13 @@ fn synchronized_output_deadline_wakes_the_loop() {
         state["terminal"]["modes"]["sync_pending"] == true
     });
 
-    // The 2026 deadline ends the buffer inside this window, so the loop wakes on it.
+    // The parser thread releases the buffer at its deadline and wakes the loop through
+    // `ui_waker`, so the wake may be counted as a plain wake or as a deadline.
     let idle = run_ok(&mut session, b"idle 400\n");
-    assert!(counter(&idle[0], "deadlines") >= 1, "{idle:?}");
+    assert!(counter(&idle[0], "wakes") + counter(&idle[0], "deadlines") >= 1, "{idle:?}");
+    wait_until(&mut session, 5000, "the released synchronized update", |state| {
+        state["terminal"]["modes"]["sync_pending"] == false
+    });
 }
 
 #[test]

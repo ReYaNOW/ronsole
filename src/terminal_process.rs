@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, SyncSender, TryRecvError, TrySendError},
+    mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -839,21 +839,35 @@ fn install_terminal_title_refresh(
     Ok((stop_tx, worker))
 }
 
-/// Host events that the parser thread produces and the main thread drains.
+/// Host events that the parser thread produces and the main thread drains,
+/// plus the synchronized-output deadline the parser thread publishes.
 ///
-/// Each slot keeps only the newest value: a second OSC 52 before the drain
-/// replaces the first one.
+/// Each event slot keeps only the newest value: a second OSC 52 before the
+/// drain replaces the first one. `sync_deadline` is state, not an event: it is
+/// rewritten after every grid change, so the main thread reads it without the
+/// grid lock.
 #[derive(Default)]
 pub(crate) struct PendingHostEvents {
     pub(crate) clipboard: Option<String>,
     pub(crate) cwd: Option<(String, Vec<u8>)>,
+    pub(crate) sync_deadline: Option<Instant>,
 }
 
 impl PendingHostEvents {
-    /// Takes the pending values under a short lock; the caller must not hold
-    /// the grid lock.
+    /// Takes the pending events under a short lock and copies the published
+    /// deadline, which stays in place; the caller must not hold the grid lock.
     pub(crate) fn take(shared: &Mutex<Self>) -> Self {
-        std::mem::take(&mut *platform::lock_recover(shared))
+        let mut pending = platform::lock_recover(shared);
+        Self {
+            clipboard: pending.clipboard.take(),
+            cwd: pending.cwd.take(),
+            sync_deadline: pending.sync_deadline,
+        }
+    }
+
+    /// Reads the published synchronized-output deadline under a short lock.
+    pub(crate) fn sync_deadline(shared: &Mutex<Self>) -> Option<Instant> {
+        platform::lock_recover(shared).sync_deadline
     }
 }
 
@@ -927,6 +941,12 @@ fn advance_terminal_output_batch(
     now: Instant,
 ) -> AdvanceOutcome {
     let mut outcome = AdvanceOutcome::default();
+    // Held bytes past their deadline are replayed before newer bytes are
+    // parsed, so a late batch cannot extend a synchronized-output block.
+    if grid.sync_deadline().is_some_and(|deadline| now >= deadline) {
+        let flushed = flush_expired_sync(grid, sink, now);
+        merge_advance_outcome(&mut outcome, flushed);
+    }
     for chunk in chunks {
         let step = grid.advance(&chunk.bytes[..chunk.len], now, sink);
         merge_advance_outcome(&mut outcome, step);
@@ -934,7 +954,57 @@ fn advance_terminal_output_batch(
     if outcome.grid_changed {
         grid.mark_changed();
     }
+    publish_sync_deadline(grid, sink.pending);
     outcome
+}
+
+/// Copies the grid's held synchronized-output deadline into `pending`, so the
+/// main thread reads it without the grid lock. Callers hold the grid lock and
+/// take the pending lock after it, the same order as [`SessionSink`].
+pub(crate) fn publish_sync_deadline(
+    grid: &Term,
+    pending: Option<&Arc<Mutex<PendingHostEvents>>>,
+) {
+    if let Some(pending) = pending {
+        platform::lock_recover(pending).sync_deadline = grid.sync_deadline();
+    }
+}
+
+/// Replays the held synchronized-output bytes whose deadline has passed at
+/// `now`, then publishes the deadline that is left. Callers hold the screen
+/// and grid locks and wake the main loop from the returned outcome.
+pub(crate) fn flush_expired_sync(
+    grid: &mut Term,
+    sink: &mut SessionSink<'_>,
+    now: Instant,
+) -> AdvanceOutcome {
+    let outcome = grid.flush_expired(now, sink);
+    if outcome.grid_changed {
+        grid.mark_changed();
+    }
+    publish_sync_deadline(grid, sink.pending);
+    outcome
+}
+
+/// Receives the next output item. While synchronized output holds bytes, the
+/// wait ends at their deadline and `flush` replays them, so an idle parser
+/// releases the block without the main thread. `flush` returns the deadline
+/// still held afterwards, which becomes the new `held_until`.
+fn recv_output_chunk<T>(
+    rx: &Receiver<T>,
+    held_until: &mut Option<Instant>,
+    mut flush: impl FnMut(Instant) -> Option<Instant>,
+) -> Option<T> {
+    loop {
+        let Some(deadline) = *held_until else {
+            return rx.recv().ok();
+        };
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(item) => return Some(item),
+            Err(RecvTimeoutError::Timeout) => *held_until = flush(Instant::now()),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
 }
 
 /// Wakes the main loop according to a batch outcome: a grid change asks for a
@@ -991,6 +1061,7 @@ fn finish_terminal_output_stream(
     if !was_dirty {
         grid.set_dirty(false);
     }
+    publish_sync_deadline(grid, sink.pending);
     AdvanceOutcome {
         grid_changed: true,
         ..outcome
@@ -1041,7 +1112,27 @@ fn install_terminal_io_threads(
     let parser_reader_finished = reader_finished.clone();
     platform::spawn_named("ronsole-terminal-parser", move || {
         let mut batch = Vec::with_capacity(8);
-        let mut first = rx.recv().ok();
+        // Deadline of the held synchronized-output bytes as this thread last
+        // saw it; the grid is only changed by this thread or by the main
+        // thread's fallback, which leaves the deadline at most stale.
+        let mut held_until: Option<Instant> = None;
+        let mut flush_held_sync = |now: Instant| -> Option<Instant> {
+            let (outcome, deadline) = {
+                let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
+                let mut grid = platform::lock_recover(&parser_grid);
+                let mut sink = SessionSink {
+                    reply_tx: Some(&reply_tx),
+                    title_cache: Some(&title_cache),
+                    pending: Some(&pending),
+                    wake: wake.as_ref(),
+                };
+                let outcome = flush_expired_sync(&mut grid, &mut sink, now);
+                (outcome, grid.sync_deadline())
+            };
+            notify_main_loop(wake.as_ref(), outcome);
+            deadline
+        };
+        let mut first = recv_output_chunk(&rx, &mut held_until, &mut flush_held_sync);
 
         while let Some(first_chunk) = first {
             batch.push(first_chunk);
@@ -1065,7 +1156,7 @@ fn install_terminal_io_threads(
                     }
                 };
 
-                let outcome = {
+                let (outcome, deadline) = {
                     let _screen_guard = platform::lock_recover(&parser_bridge_screen_lock);
                     let mut grid = platform::lock_recover(&parser_grid);
                     let mut sink = SessionSink {
@@ -1074,8 +1165,11 @@ fn install_terminal_io_threads(
                         pending: Some(&pending),
                         wake: wake.as_ref(),
                     };
-                    advance_terminal_output_batch(&mut grid, &mut sink, &batch, Instant::now())
+                    let outcome =
+                        advance_terminal_output_batch(&mut grid, &mut sink, &batch, Instant::now());
+                    (outcome, grid.sync_deadline())
                 };
+                held_until = deadline;
                 recycle_output_chunks(&mut batch, &recycle_tx);
                 merge_advance_outcome(&mut batch_outcome, outcome);
 
@@ -1098,7 +1192,7 @@ fn install_terminal_io_threads(
                 }
             }
             notify_main_loop(wake.as_ref(), batch_outcome);
-            first = rx.recv().ok();
+            first = recv_output_chunk(&rx, &mut held_until, &mut flush_held_sync);
         }
 
         if parser_reader_finished.load(Ordering::Acquire) {
@@ -1511,6 +1605,83 @@ mod tests {
         assert_ne!(shell_stat.process_group, job_stat.process_group);
         assert_eq!(shell_stat.session_id, job_stat.session_id);
         (process, shell_pid, job_pid, pid_path)
+    }
+
+    /// Feeds one batch of output through the parser's batch path, so the
+    /// deadline is published exactly as the parser thread publishes it.
+    fn feed_parser_batch(
+        grid: &mut Term,
+        pending: &Arc<Mutex<PendingHostEvents>>,
+        bytes: &[u8],
+        now: Instant,
+    ) {
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: Some(pending),
+            wake: None,
+        };
+        advance_terminal_output_batch(grid, &mut sink, &[output_chunk(bytes)], now);
+    }
+
+    #[test]
+    fn parser_releases_held_sync_block_at_deadline_without_main_thread() {
+        let grid = Mutex::new(test_term(40, 3));
+        let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
+        let now = Instant::now();
+        feed_parser_batch(
+            &mut platform::lock_recover(&grid),
+            &pending,
+            b"\x1b[?2026hX",
+            now,
+        );
+        // The 150 ms hold window comes from the synchronized-output spec (5.4).
+        let deadline =
+            PendingHostEvents::sync_deadline(&pending).expect("held bytes publish a deadline");
+        assert_eq!(deadline, now + Duration::from_millis(150));
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u8>(1);
+        let mut held_until = Some(deadline);
+        let mut flushed_at = None;
+        // Only the parser's own wait runs here: the flush closure is the
+        // parser-side replay, and the channel gets one item after it.
+        let next = recv_output_chunk(&rx, &mut held_until, |at| {
+            flushed_at = Some(at);
+            {
+                let mut grid = platform::lock_recover(&grid);
+                let mut sink = SessionSink {
+                    reply_tx: None,
+                    title_cache: None,
+                    pending: Some(&pending),
+                    wake: None,
+                };
+                flush_expired_sync(&mut grid, &mut sink, at);
+            }
+            tx.send(7).expect("channel has room for one item");
+            PendingHostEvents::sync_deadline(&pending)
+        });
+
+        assert_eq!(next, Some(7));
+        assert!(flushed_at.expect("the wait ends at the deadline") >= deadline);
+        assert_eq!(held_until, None);
+        assert!(PendingHostEvents::sync_deadline(&pending).is_none());
+        let guard = platform::lock_recover(&grid);
+        assert_eq!(guard.visible_row(0).expect("screen row")[0].ch(), 'X');
+    }
+
+    #[test]
+    fn late_parser_batch_replays_expired_sync_block_before_newer_bytes() {
+        let mut grid = test_term(40, 3);
+        let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
+        let now = Instant::now();
+        feed_parser_batch(&mut grid, &pending, b"\x1b[?2026hA", now);
+        // The batch arrives after the 150 ms window: the held A is replayed
+        // first, so the newer B lands after it.
+        feed_parser_batch(&mut grid, &pending, b"B", now + Duration::from_secs(1));
+
+        let row = grid.visible_row(0).expect("screen row");
+        assert_eq!((row[0].ch(), row[1].ch()), ('A', 'B'));
+        assert!(PendingHostEvents::sync_deadline(&pending).is_none());
     }
 
     fn output_chunk(bytes: &[u8]) -> OutputChunk {
@@ -1930,7 +2101,9 @@ mod tests {
         let source = include_str!("terminal_process.rs");
         let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(!production.contains("TERMINAL_PRESENTATION_FALLBACK"));
-        assert!(production.contains("let mut first = rx.recv().ok();"));
+        assert!(production.contains(
+            "let mut first = recv_output_chunk(&rx, &mut held_until, &mut flush_held_sync);"
+        ));
     }
 
     #[test]
