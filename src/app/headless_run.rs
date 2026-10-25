@@ -8,6 +8,7 @@ use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
 use crate::runtime::WindowRuntime;
 use crate::terminal::Terminal;
+use std::time::Instant;
 
 /// Why a headless run stopped with an error. `Egl` means the runtime never started,
 /// so the caller reports it as a startup failure.
@@ -75,21 +76,29 @@ impl App {
     /// Draws a frame now, without waiting for the frame pace. Used after an input
     /// command so the session sees the state that command produced.
     pub(crate) fn forced_step(&mut self) -> Result<LoopStep, String> {
+        self.forced_step_timed().map(|(step, _)| step)
+    }
+
+    /// `forced_step` that also returns the instant `about_to_wait` ended and the frame began,
+    /// so `bench` can time the two parts apart.
+    pub(crate) fn forced_step_timed(&mut self) -> Result<(LoopStep, Instant), String> {
         let control = self.on_about_to_wait();
+        let draw_start = Instant::now();
         if control == AppLoopControl::Exit {
-            return Ok(LoopStep::Exit(self.take_automation_exit_result()));
+            return Ok((LoopStep::Exit(self.take_automation_exit_result()), draw_start));
         }
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.clear_frame_request();
         }
-        self.on_frame()?;
+        let frame = self.on_frame()?;
         let deadline = self.wait_deadline(control);
-        Ok(LoopStep::Continue(StepReport {
-            frame: true,
+        let step = LoopStep::Continue(StepReport {
+            frame,
             flow: loop_flow(control),
             deadline,
             poll: None,
-        }))
+        });
+        Ok((step, draw_start))
     }
 
     /// Ends a headless session: the teardown that `run_headless` runs after its loop.

@@ -199,6 +199,30 @@ fn resize_and_screenshot() {
 }
 
 #[test]
+fn dump_to_file_answers_canonical_path_and_io_errors() {
+    let dir = scratch_dir("dump-path");
+    let real = dir.join("real");
+    fs::create_dir_all(&real).expect("real directory");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink to the real directory");
+    let mut session = session_for_test(640, 400);
+    let lines = run_script(&mut session, format!("dump {}\n", link.join("d.json").display()).as_bytes());
+    let written = fs::canonicalize(real.join("d.json")).expect("dump file exists");
+    assert_eq!(lines, vec![format!("ok {}", written.display())]);
+    let text = fs::read_to_string(&written).expect("dump file");
+    assert!(serde_json::from_str::<serde_json::Value>(&text).is_ok(), "dump file is JSON: {text}");
+
+    // A parent that is a regular file cannot be created; the answer names it and the io error.
+    let file = dir.join("plain");
+    fs::write(&file, "x").expect("plain file");
+    let lines = run_script(&mut session, format!("dump {}\n", file.join("d.json").display()).as_bytes());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let prefix = format!("err create {}: ", file.display());
+    assert!(lines[0].starts_with(&prefix), "{lines:?} starts with {prefix}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn idle_session_waits_without_frames() {
     let dir = scratch_dir("idle");
     let marker = dir.join("r");

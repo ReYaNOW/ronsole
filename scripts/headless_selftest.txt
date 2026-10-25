@@ -18,4 +18,5 @@ mods ctrl
 wait 50
 wake 10
 idle 10
+bench 3 csv=/tmp/ronsole-headless/selftest.csv
 quit

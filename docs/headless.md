@@ -122,8 +122,27 @@ Practical notes:
   may land outside the body.
 * `settle` with a budget of at most 2 × `TERMINAL_OUTPUT_BATCH_IDLE` (16 ms) almost
   always returns `settled=false`. Use the default budget unless you need the value.
-* `bench`: `gpu_ms` may be empty. `bench … wheel` barely moves the scroll
-  animation, because the animation clock is wall time.
+* `bench`: `gpu_ms` may be empty. `bench … wheel` moves the scroll animation
+  only a little per frame, because the animation runs on the real frame `dt`
+  and bench frames follow each other at once.
+
+## Bench
+
+`bench <frames> [csv=<path>] [action]` draws exactly `frames` forced frames and
+applies the action before each one, as events with no frame in between: `none`
+(default), `wheel <dx> <dy>` (line delta), `key <combo>` (press and release,
+with the combo's modifiers that `mods` does not hold) or `type <text>`. One CSV
+row per frame, columns in this order (RRiter's, without `root_*`/`chrome_*`):
+
+| Column | Meaning |
+|---|---|
+| `frame` | frame index, from 0 |
+| `update_ms` | action + `about_to_wait` (CPU) |
+| `draw_cpu_ms` | the forced frame only (`on_frame`) |
+| `gpu_ms` | `GL_TIME_ELAPSED` around action and frame; empty when timer queries are unsupported |
+| `total_ms` | the whole step |
+| `flush_calls`, `vertices` | renderer flushes and vertices of the frame |
+| `scroll_y` | the active tab's scroll animation offset (`scroll_y.current`), not rounded |
 
 ## Differences from RRiter
 

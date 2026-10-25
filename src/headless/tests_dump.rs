@@ -263,19 +263,39 @@ fn mouse_cell_on_clipped_bottom_row_is_err() {
     let initial = wait_until(&mut session, 10_000, "scrollback from seq", |dump| {
         dump["terminal"]["viewport"]["scrollback"].as_u64().unwrap_or(0) > 0
     });
-    let rows = initial["terminal"]["rows"].as_u64().expect("rows") as usize;
-    let layout = &initial["terminal"]["layout"];
-    let char_h = layout["char_h"].as_f64().expect("char_h");
-    let body = &layout["body"];
-    let body_bottom = body[1].as_f64().expect("body y") + body[3].as_f64().expect("body h");
-    let cell0_y = layout["cell0"][1].as_f64().expect("cell0 y");
-    // Scroll up by the distance that moves the centre of the bottom row to the bottom edge of
-    // the body; the scroll stays below one row, so the bottom row is the same row as before.
-    let bottom_centre = cell0_y + (rows - 1) as f64 * char_h + char_h / 2.0;
-    let shift = (body_bottom - bottom_centre).ceil();
+    // Geometry with no scroll: the rows end at the bottom of the text viewport, the bottom pad
+    // lies below it, and the text viewport is taller than the rows by `spare`, the gap above
+    // the top row. Top and bottom pads are equal (`terminal_text_padding`).
+    let geometry = |dump: &serde_json::Value| {
+        let rows = dump["terminal"]["rows"].as_u64().expect("rows") as usize;
+        let layout = &dump["terminal"]["layout"];
+        let char_h = layout["char_h"].as_f64().expect("char_h");
+        let body = &layout["body"];
+        let body_y = body[1].as_f64().expect("body y");
+        let body_bottom = body_y + body[3].as_f64().expect("body h");
+        let cell0_y = layout["cell0"][1].as_f64().expect("cell0 y");
+        let bottom_pad = body_bottom - (cell0_y + rows as f64 * char_h);
+        let spare = cell0_y - (body_y + bottom_pad);
+        (rows, char_h, body_bottom, bottom_pad, spare)
+    };
+    // Q24 keeps the top row while the scroll stays below `char_h − spare`, and the centre of the
+    // bottom row reaches the body bottom at a scroll of `bottom_pad + char_h / 2`. Shrinking the
+    // window by the whole pixels of `spare` lets one scroll value do both.
+    let (_, _, _, _, spare) = geometry(&initial);
+    let trim = spare.floor() as u32;
+    if trim > 0 {
+        let height = 600 - trim;
+        run_ok(&mut session, format!("resize 800x{height}\n").as_bytes());
+    }
+    let resized = wait_until(&mut session, 5000, "the layout after resize", |dump| {
+        dump["terminal"]["layout"]["body"][3].as_f64()
+            == initial["terminal"]["layout"]["body"][3].as_f64().map(|h| h - f64::from(trim))
+    });
+    let (rows, char_h, body_bottom, bottom_pad, spare) = geometry(&resized);
+    let shift = (bottom_pad + char_h / 2.0).ceil();
     assert!(
-        shift > 0.0 && shift < char_h,
-        "precondition: the scroll shift {shift} lies within one row ({char_h})"
+        shift > 0.0 && shift < char_h - spare,
+        "precondition: the scroll shift {shift} keeps the top row (char_h {char_h}, spare {spare})"
     );
     run_ok(&mut session, b"mouse_cell 0 0\n");
     run_ok(&mut session, format!("wheel 0 {shift} px\n").as_bytes());
@@ -304,9 +324,10 @@ fn click_selects_from_the_cell_it_addresses() {
     run_ok(&mut session, format!("mouse_move {x} {y}\n").as_bytes());
     run_ok(&mut session, b"click up\n");
     let selection = dump(&mut session)["terminal"]["selection"].clone();
-    // The selection starts at the pressed cell (row 1, column 3) and ends on the row of the release.
+    // The selection starts at the pressed cell (row 1, column 3), and `last` is the released
+    // cell itself, inclusive (spec §5.1): the pointer is at the centre of column 5.
     assert_eq!(selection["start"], serde_json::json!([1, 3]), "selection: {selection}");
-    assert_eq!(selection["last"][0], serde_json::json!(1), "selection: {selection}");
+    assert_eq!(selection["last"], serde_json::json!([1, 5]), "selection: {selection}");
 }
 
 #[test]

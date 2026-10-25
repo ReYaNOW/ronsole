@@ -22,9 +22,17 @@ const EMOJI_FONT_PATHS: [&str; 3] = [
 /// One letter per SGR row of parity spec table 5.1 (L1); `Z` is printed after every reset.
 const SGR_BODY: &str = r"\033[1mB\033[22m\033[3mI\033[23m\033[2mD\033[22m\033[7mV\033[27m\033[8mC\033[28m\033[9mS\033[29m\033[4:1mU\033[4:0m\033[4:2mW\033[4:0m\033[4:3mY\033[4:0m\033[4:4mG\033[4:0m\033[4:5mH\033[4:0m\033[21mJ\033[24m\033[4m\033[58;2;10;200;30mK\033[59m\033[24m\033[4m\033[58:2::10:200:30mR\033[59m\033[24mZ";
 
-/// Five blank cells: underlined with default colour, underlined with the foreground colour,
-/// underlined with SGR 58 (semicolon and colon forms), and struck through in red (L12, L13).
-const DECORATED_BODY: &str = r"\033[4m \033[0m\033[4;38;2;200;10;20m \033[0m\033[4m\033[58;2;10;200;30m \033[59m\033[0m\033[4m\033[58:2::10:200:30m \033[59m\033[0m\033[9;38;2;200;10;20m \033[0m";
+/// Seven cells: blanks underlined with default colour, underlined with the foreground colour,
+/// underlined with SGR 58 (semicolon and colon forms), struck through in red, an inverse
+/// underlined blank, and a dim underlined struck `x` (L12, L13).
+const DECORATED_BODY: &str = r"\033[4m \033[0m\033[4;38;2;200;10;20m \033[0m\033[4m\033[58;2;10;200;30m \033[59m\033[0m\033[4m\033[58:2::10:200:30m \033[59m\033[0m\033[9;38;2;200;10;20m \033[0m\033[7;4m \033[0m\033[2;4;9mx\033[0m";
+
+/// Number of cells `DECORATED_BODY` prints.
+const DECORATED_CELLS: u64 = 7;
+
+/// Default foreground under SGR 2: `ANSI_16_COLORS[7]` (0.90) times the renderer's dim factor
+/// 0.66, in f32, times 255 gives 151.47, so every channel is 0x97.
+const DIM_DEFAULT_FG: &str = "#979797";
 
 /// Runs `script` and asserts that no response is an `err`; returns the responses.
 fn run_ok(session: &mut HeadlessSession, script: &[u8]) -> Vec<String> {
@@ -195,6 +203,11 @@ fn l1_sgr_attributes_reach_the_cell_model() {
     }
     let plain = cell_by_char(&line, "Z");
     assert!(plain["flags"].as_array().expect("flags").is_empty(), "Z has no flags: {plain}");
+    // SGR 59 before Z resets the underline colour.
+    assert_eq!(plain["underline_color"], Value::Null, "Z has no underline colour: {plain}");
+    // Dim scales the default foreground.
+    let dim = cell_by_char(&line, "D");
+    assert_eq!(dim["fg"], DIM_DEFAULT_FG, "dim foreground: {dim}");
 
     // Inverse swaps the default colours: the foreground becomes the terminal background
     // (#123456, the configured background) and the background becomes the default foreground.
@@ -232,14 +245,17 @@ fn l11_bold_face_draws_more_ink_than_regular() {
 #[test]
 fn l12_decorations_follow_baseline_and_colour_rules() {
     let mut session = session_for_test(800, 600);
-    let (shown, row) = print_cells(&mut session, "l12", DECORATED_BODY, 5);
+    let (shown, row) = print_cells(&mut session, "l12", DECORATED_BODY, DECORATED_CELLS);
     let line = dump_row(&mut session, row);
     let image = screenshot(&mut session);
 
     // Underlines: the topmost underline pixel is not above the cell baseline, and it has the
-    // underline colour (SGR 58 when set, otherwise the foreground colour).
+    // underline colour (SGR 58 when set, otherwise the foreground colour). The inverse blank
+    // in column 5 has the terminal background as its foreground, so its underline has it too.
     let baseline = baseline_y(&shown, row);
-    for col in 0..4u64 {
+    let inverse = cell_by_col(&line, 5);
+    assert_eq!(inverse["fg"], "#123456", "inverse foreground: {inverse}");
+    for col in [0, 1, 2, 3, 5u64] {
         let cell = cell_by_col(&line, col);
         let expected = expected_underline(cell);
         let rect = cell_rect(&shown, col as usize, row);
@@ -269,12 +285,37 @@ fn l12_decorations_follow_baseline_and_colour_rules() {
         })
         .count();
     assert!(band_rows > 0, "no strikethrough band of colour {expected:?} in column 4");
+
+    // The dim `x` in column 6: underline and strikethrough are both bands across the cell in
+    // its dimmed foreground, the underline at or below the baseline and the strike above it.
+    let dim = cell_by_col(&line, 6);
+    assert_eq!(dim["fg"], DIM_DEFAULT_FG, "dim foreground: {dim}");
+    assert_eq!(dim["underline_color"], Value::Null, "dim cell has no SGR 58: {dim}");
+    let expected = rgb(DIM_DEFAULT_FG);
+    let rect = cell_rect(&shown, 6, row);
+    let width = f64::from(rect.2 - rect.0);
+    let bands: Vec<i32> = (rect.1..rect.3)
+        .filter(|&y| {
+            let matching = (rect.0..rect.2)
+                .filter(|&x| close(pixel_rgb(&image, (x, y)), expected))
+                .count();
+            matching as f64 >= 0.9 * width
+        })
+        .collect();
+    assert!(
+        bands.iter().any(|&y| y >= baseline),
+        "no underline band of colour {expected:?} at or below the baseline {baseline} in column 6: {bands:?}"
+    );
+    assert!(
+        bands.iter().any(|&y| y < baseline),
+        "no strikethrough band of colour {expected:?} above the baseline {baseline} in column 6: {bands:?}"
+    );
 }
 
 #[test]
 fn l13_underline_stays_inside_its_row() {
     let mut session = session_for_test(800, 600);
-    let (shown, row) = print_cells(&mut session, "l13", DECORATED_BODY, 5);
+    let (shown, row) = print_cells(&mut session, "l13", DECORATED_BODY, DECORATED_CELLS);
     let mut current = shown;
     for scale in ["1.0", "1.333"] {
         let previous = current["terminal"]["layout"]["char_h"].clone();
@@ -289,19 +330,24 @@ fn l13_underline_stays_inside_its_row() {
         };
         let image = screenshot(&mut session);
         let first = cell_rect(&current, 0, row);
-        let right = cell_rect(&current, 4, row).2;
+        let right = cell_rect(&current, DECORATED_CELLS as usize - 1, row).2;
         let row_rect = (first.0, first.1, right, first.3);
         assert!(
             ink(&image, row_rect) > 0,
             "decorations are drawn in the row at scale {scale}"
         );
-        // The row below must stay empty, so no underline can reach y >= row_bottom.
+        // The row below must stay empty, so no underline can reach y >= row_bottom. Column 5 is
+        // left out: its inverse background fills the cell up to the next row's snapped top edge,
+        // which can lie below `row_bottom`, and its underline has the background colour anyway.
         let below_bottom = cell_rect(&current, 0, row + 1).3;
-        let below = (first.0, first.3, right, below_bottom);
-        let stray = pixels(below)
-            .filter(|&point| is_ink(pixel_rgb(&image, point)))
-            .count();
-        assert_eq!(stray, 0, "pixels below the row at scale {scale}");
+        for (from, to) in [(0, 4), (6, 6)] {
+            let span = span_rect(&current, from, to, row);
+            let below = (span.0, span.3, span.2, below_bottom);
+            let stray = pixels(below)
+                .filter(|&point| is_ink(pixel_rgb(&image, point)))
+                .count();
+            assert_eq!(stray, 0, "pixels below columns {from}..={to} at scale {scale}");
+        }
     }
 }
 

@@ -1,13 +1,14 @@
 //! Readers of the headless session state: `dump`, `dump row` and `mouse_cell`. Each reads the
 //! active terminal under one `lock_snapshot`, so its `terminal` section is internally consistent.
-//! Coordinates follow Q24: the visible area is `rows` rows ending at `bottom`, and rows are
-//! counted from its top.
+//! Coordinates follow Q24: the visible area is `rows` rows from `top`, the top row the frame
+//! draws, and rows are counted from it.
 
 use super::session::{HeadlessSession, flow_name};
 use crate::app::App;
 use crate::renderer::{
     Renderer, TerminalPalette, TerminalUiLayout, terminal_cell_render_colors,
     terminal_cell_span_x_bounds, terminal_render_color, terminal_row_draw_y,
+    terminal_text_viewport_height,
 };
 use crate::runtime::WindowRuntime;
 use crate::terminal::Terminal;
@@ -29,17 +30,31 @@ struct Window {
 fn window(grid: &Term, layout: Option<&TerminalUiLayout>) -> Window {
     let total = grid.total_rows();
     let rows = grid.rows();
-    let scrolled = layout
-        .filter(|layout| layout.char_h > 0.0)
-        .map_or(0, |layout| (layout.scroll_offset.max(0.0) / layout.char_h).floor() as usize);
-    let bottom = total.saturating_sub(1).saturating_sub(scrolled);
-    let top = (bottom + 1).saturating_sub(rows);
     Window {
-        top,
+        top: window_top(total, rows, layout),
         rows,
         total,
         scrollback: grid.scrollback_len(),
     }
+}
+
+/// Absolute row the frame draws at the top of the text viewport (Q24):
+/// `max(0, total − floor((viewport_h + scroll_offset) / char_h))`. `viewport_h` is the text
+/// height that `rows` and `max_scroll` come from, so a view scrolled to `max_scroll` reaches
+/// row 0 even when that height is not a whole number of rows. Before the first frame the view
+/// is at the bottom: `total − rows`.
+///
+/// `scroll_offset` is the frame's offset, rounded to whole pixels
+/// (`terminal_render_scroll_offset`). When `max_scroll` has a fraction below one half, the
+/// rounded offset at the top of the history is below `max_scroll`, and `top` is 1 although the
+/// frame draws row 0 less than a pixel above the text viewport.
+fn window_top(total: usize, rows: usize, layout: Option<&TerminalUiLayout>) -> usize {
+    let Some(layout) = layout.filter(|layout| layout.char_h > 0.0) else {
+        return total.saturating_sub(rows);
+    };
+    let viewport_h = terminal_text_viewport_height(layout.body.h, layout.scale);
+    let reach = ((viewport_h + layout.scroll_offset.max(0.0)) / layout.char_h).floor() as usize;
+    total.saturating_sub(reach)
 }
 
 /// Top-left corner `(x, y)` of cell `(0, 0)` of the visible area, unrounded (spec §5.1).
@@ -357,5 +372,49 @@ fn underline_name(style: UnderlineStyle) -> &'static str {
         UnderlineStyle::Curly => "curly",
         UnderlineStyle::Dotted => "dotted",
         UnderlineStyle::Dashed => "dashed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_top;
+    use crate::renderer::TerminalUiLayout;
+    use crate::search::Rect;
+
+    /// The geometry of `fractional_terminal_viewport_drives_exact_max_scroll_and_top_geometry`
+    /// (renderer/terminal_ui.rs): body 584 px, text viewport 568 px, char_h 20, 28 rows and
+    /// 40 lines, so `max_scroll` is 232, not a whole number of rows.
+    fn fractional_layout(scroll_offset: f32) -> TerminalUiLayout {
+        TerminalUiLayout {
+            body: Rect { x: 0.0, y: 0.0, w: 800.0, h: 584.0 },
+            char_h: 20.0,
+            total_lines: 40,
+            visible_rows: 28,
+            max_scroll: 232.0,
+            scroll_offset,
+            bottom_pad: 8.0,
+            scale: 1.0,
+            ..TerminalUiLayout::default()
+        }
+    }
+
+    #[test]
+    fn window_top_reaches_row_zero_at_fractional_max_scroll() {
+        // At max_scroll the frame draws row 0 at the text top, so the window starts there.
+        assert_eq!(window_top(40, 28, Some(&fractional_layout(232.0))), 0);
+        // Whole-row offsets: floor(568 / 20) = 28 rows reach from the bottom, then one more.
+        assert_eq!(window_top(40, 28, Some(&fractional_layout(0.0))), 12);
+        assert_eq!(window_top(40, 28, Some(&fractional_layout(20.0))), 11);
+    }
+
+    #[test]
+    fn window_top_without_frame_or_cell_height_is_the_bottom_view() {
+        assert_eq!(window_top(40, 28, None), 12);
+        let mut layout = fractional_layout(232.0);
+        layout.char_h = 0.0;
+        assert_eq!(window_top(40, 28, Some(&layout)), 12);
+        // Fewer lines than rows: the window starts at row 0.
+        assert_eq!(window_top(10, 28, None), 0);
+        assert_eq!(window_top(10, 28, Some(&fractional_layout(0.0))), 0);
     }
 }

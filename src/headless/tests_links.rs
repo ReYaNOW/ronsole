@@ -62,10 +62,13 @@ fn dump_row(session: &mut HeadlessSession, row: usize) -> Value {
     serde_json::from_str(json).expect("dump row payload is JSON")
 }
 
-/// Hyperlink URI of cell `col` of a `dump row` payload, if the cell has one.
+/// Hyperlink URI of the cell at column `col` of a `dump row` payload, if the cell has one.
+/// Blank cells are left out of `cells`, so the cell is found by its `col` field.
 fn cell_link(row: &Value, col: usize) -> Option<String> {
     row["cells"]
-        .get(col)
+        .as_array()?
+        .iter()
+        .find(|cell| cell["col"].as_u64() == Some(col as u64))
         .and_then(|cell| cell["link"].as_str())
         .map(str::to_string)
 }
@@ -85,9 +88,9 @@ fn start_script(session: &mut HeadlessSession, dir: &Path, body: &str) {
 }
 
 /// Returns the visible index of the row that contains `marker`, scrolling up first if needed.
-/// The wheel is far larger than the scrollback, so the view should reach the top of the history,
-/// where the first rows of these scenarios' output are. The final position is confirmed by
-/// `wait_until`, because scrolling is animated.
+/// The wheel is far larger than the scrollback, so the view goes to the top of the history,
+/// where the first rows of these scenarios' output are. Scrolling is animated, so `wait_until`
+/// waits for the marker with the loop idle (no deadline), which means the animation ended.
 fn scroll_to_row(session: &mut HeadlessSession, marker: &str) -> usize {
     let state = dump(session);
     if let Some(row) = row_index(&rows(&state), marker) {
@@ -95,24 +98,42 @@ fn scroll_to_row(session: &mut HeadlessSession, marker: &str) -> usize {
     }
     run_ok(session, b"mouse_cell 0 0\n");
     run_ok(session, b"wheel 0 100\n");
-    let state = wait_until(session, 5000, "the viewport at the top of the history", |dump| {
-        dump["terminal"]["viewport"]["top"].as_u64() == Some(0)
+    let state = wait_until(session, 5000, "the marker with the scroll at rest", |dump| {
+        row_index(&rows(dump), marker).is_some()
+            && dump["event_loop"]["control_flow"] == "wait"
+            && dump["event_loop"]["deadline_ms"].is_null()
     });
     row_index(&rows(&state), marker).expect("marker row is visible")
 }
 
+/// Asserts that columns `0..len` of `line` carry the link `uri` and column `len` does not.
+fn assert_link_cells(line: &Value, len: usize, uri: &str, what: &str) {
+    for col in 0..len {
+        assert_eq!(
+            cell_link(line, col).as_deref(),
+            Some(uri),
+            "{what}: column {col} of {line}"
+        );
+    }
+    assert_eq!(cell_link(line, len), None, "{what}: column {len} after the link in {line}");
+}
+
 #[test]
-#[ignore = "bug: wheel stops at max_scroll (fractional viewport height in terminal_max_scroll) with viewport top 1; dump floors scroll_offset, so the link on line 0 is not reached"]
 fn osc8_link_survives_scrollback_and_resize() {
     let mut session = session_for_test(800, 600);
     const URI: &str = "https://example.com/ronsole-l4";
     let dir = fresh_dir("l4");
-    let rows_before = dump(&mut session)["terminal"]["rows"]
-        .as_u64()
-        .expect("visible rows");
-    // The link line, then two screens of plain lines push it into the scrollback.
+    let before = dump(&mut session);
+    let rows_before = before["terminal"]["rows"].as_u64().expect("visible rows");
+    let cols_before = before["terminal"]["cols"].as_u64().expect("visible columns") as usize;
+    // The link text fits one row of the start width; the narrower width below wraps it.
+    let len = cols_before - 4;
+    let text = format!("lnk{}", "-".repeat(len - 3));
+    // A plain line, the link line, then two screens of plain lines push it into the scrollback.
+    // The link is not on history row 0: at the top of the history the rounded render offset can
+    // stop the window one row short of row 0 (see the Q24 note in `dump::window_top`).
     let body = format!(
-        "printf '\\033]8;;{URI}\\007lnk\\033]8;;\\007\\n'\n\
+        "echo head\nprintf '\\033]8;;{URI}\\007{text}\\033]8;;\\007\\n'\n\
          i=0\nwhile [ $i -lt {} ]; do echo filler; i=$((i+1)); done\n",
         2 * rows_before
     );
@@ -120,24 +141,31 @@ fn osc8_link_survives_scrollback_and_resize() {
 
     let row = scroll_to_row(&mut session, "lnk");
     let line = dump_row(&mut session, row);
-    assert_eq!(
-        cell_link(&line, 0).as_deref(),
-        Some(URI),
-        "link cell after scrolling up: {line}"
-    );
+    assert_link_cells(&line, len, URI, "link row after scrolling up");
 
-    // After a resize the link is still in the output and keeps its hyperlink.
-    run_ok(&mut session, b"resize 800x400\n");
-    wait_until(&mut session, 5000, "the layout after resize", |dump| {
-        dump["terminal"]["rows"].as_u64() != Some(rows_before)
+    // A narrower window reflows the link into two rows; every wrapped cell keeps the link.
+    run_ok(&mut session, b"resize 480x600\n");
+    let resized = wait_until(&mut session, 5000, "the layout after resize", |dump| {
+        dump["terminal"]["cols"].as_u64() != Some(cols_before as u64)
     });
-    let row = scroll_to_row(&mut session, "lnk");
-    let line = dump_row(&mut session, row);
-    assert_eq!(
-        cell_link(&line, 0).as_deref(),
-        Some(URI),
-        "link cell after resize: {line}"
+    let cols_after = resized["terminal"]["cols"].as_u64().expect("visible columns") as usize;
+    assert!(
+        len > cols_after && len <= 2 * cols_after,
+        "precondition: the {len}-cell link wraps into exactly two rows of {cols_after}"
     );
+    let row = scroll_to_row(&mut session, "lnk");
+    let rows_after = dump(&mut session)["terminal"]["rows"].as_u64().expect("visible rows") as usize;
+    assert!(row + 1 < rows_after, "precondition: the wrapped row {} is visible", row + 1);
+    let head = dump_row(&mut session, row);
+    for col in 0..cols_after {
+        assert_eq!(
+            cell_link(&head, col).as_deref(),
+            Some(URI),
+            "first wrapped row after resize: column {col} of {head}"
+        );
+    }
+    let tail = dump_row(&mut session, row + 1);
+    assert_link_cells(&tail, len - cols_after, URI, "second wrapped row after resize");
     let _ = fs::remove_dir_all(&dir);
 }
 

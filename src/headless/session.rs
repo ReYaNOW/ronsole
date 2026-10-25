@@ -189,6 +189,18 @@ impl HeadlessSession {
         self.exited
     }
 
+    /// Removes the profile directory when the session is dropped, after the app's teardown
+    /// has written to it. Tests use it for the caller-owned directories they create.
+    #[cfg(test)]
+    pub(super) fn remove_profile_on_drop(&mut self) {
+        self.profile.remove_on_drop = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn profile_dir(&self) -> &Path {
+        &self.profile.dir
+    }
+
     /// The app, for `dump` and other readers of its state.
     pub(crate) fn app_mut(&mut self) -> &mut App {
         &mut self.app
@@ -226,10 +238,12 @@ impl HeadlessSession {
             return Ok(Some(text));
         };
         if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).map_err(|_| "dump directory failed".to_string())?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
         }
-        fs::write(path, &text).map_err(|_| "dump write failed".to_string())?;
-        let absolute = std::path::absolute(path).map_err(|_| "dump path failed".to_string())?;
+        fs::write(path, &text).map_err(|error| format!("write {}: {error}", path.display()))?;
+        let absolute = fs::canonicalize(path)
+            .map_err(|error| format!("resolve {}: {error}", path.display()))?;
         Ok(Some(absolute.display().to_string()))
     }
 
@@ -618,25 +632,46 @@ impl HeadlessSession {
         self.budget
     }
 
-    /// Applies one bench action, then draws one forced frame. Returns the time of the action
-    /// (including any frame the action draws by itself) and the time of the forced step.
+    /// Applies one bench action as events only, then draws one forced frame, so each call
+    /// draws exactly one frame. Returns the time of the action plus `about_to_wait`
+    /// (`update_ms`) and the time of the frame (`draw_cpu_ms`).
     pub(super) fn bench_frame(&mut self, action: &BenchAction) -> Result<(Duration, Duration), String> {
         let start = Instant::now();
-        match action {
-            BenchAction::None => {}
-            BenchAction::Wheel { dx, dy } => self.app.on_scroll(ScrollDelta::Line {
-                x: *dx as f32,
-                y: *dy as f32,
-            }),
-            BenchAction::Type(text) => self.app.on_ime_commit(text),
-            BenchAction::Key(combo) => self.key(*combo, 0)?,
-        }
-        let action_time = start.elapsed();
-        let step_start = Instant::now();
-        if self.forced()?.is_none() {
+        let exit = match action {
+            BenchAction::None => false,
+            BenchAction::Wheel { dx, dy } => {
+                self.app.on_scroll(ScrollDelta::Line {
+                    x: *dx as f32,
+                    y: *dy as f32,
+                });
+                false
+            }
+            BenchAction::Type(text) => {
+                self.app.on_ime_commit(text);
+                false
+            }
+            BenchAction::Key(combo) => self.press_release(*combo),
+        };
+        if exit {
             return Err("app exited during bench".to_string());
         }
-        Ok((action_time, step_start.elapsed()))
+        let (step, draw_start) = self.app.forced_step_timed()?;
+        let draw_end = Instant::now();
+        if self.record(step)?.is_none() {
+            return Err("app exited during bench".to_string());
+        }
+        Ok((draw_start - start, draw_end - draw_start))
+    }
+
+    /// Presses and releases `combo`, with its modifiers that `mods` does not hold, and draws
+    /// no frame between the events. Returns `true` if the app asked to exit.
+    fn press_release(&mut self, combo: KeyCombo) -> bool {
+        let base = self.mods;
+        let target = union(base, combo.mods);
+        self.move_modifiers(target)
+            || self.send_key(key_input(&combo.key, KeyState::Pressed, target))
+            || self.send_key(key_input(&combo.key, KeyState::Released, target))
+            || self.move_modifiers(base)
     }
 
     fn record(&mut self, step: LoopStep) -> Result<Option<StepReport>, String> {
@@ -693,6 +728,10 @@ pub(crate) fn serve(
 ) -> u8 {
     let mut code = 0;
     let mut line = Vec::new();
+    // The app may have ended before the first command, e.g. during the start `settle`.
+    if session.exited() {
+        return code;
+    }
     loop {
         line.clear();
         match input.read_until(b'\n', &mut line) {

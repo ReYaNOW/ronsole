@@ -9,8 +9,9 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Header of the per-frame CSV, in column order. `gpu_ms` is empty when the context has no GPU timer queries.
-const CSV_HEADER: &str = "update_ms,draw_cpu_ms,gpu_ms,total_ms,flush_calls,vertices,scroll_y";
+/// Header of the per-frame CSV, in column order: RRiter's columns without `root_*`/`chrome_*`.
+/// `gpu_ms` is empty when the context has no GPU timer queries.
+const CSV_HEADER: &str = "frame,update_ms,draw_cpu_ms,gpu_ms,total_ms,flush_calls,vertices,scroll_y";
 
 /// Number of slowest frames listed in the summary.
 const WORST_FRAMES: usize = 5;
@@ -72,7 +73,10 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
         let (flush_calls, vertices) = app
             .runtime()
             .map_or((0, 0), |runtime| runtime.renderer().frame_stats());
-        let scroll_y = f64::from(app.interaction().layout.scroll_offset);
+        // The animation's own offset, not the frame's pixel-rounded `layout.scroll_offset`.
+        let scroll_y = app
+            .active_terminal()
+            .map_or(0.0, |terminal| f64::from(terminal.scroll_y.current));
         let row = FrameRow {
             frame,
             update_ms: ms(update),
@@ -85,7 +89,8 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
         };
         writeln!(
             csv_out,
-            "{:.3},{:.3},{},{:.3},{},{},{:.1}",
+            "{},{:.3},{:.3},{},{:.3},{},{},{}",
+            row.frame,
             row.update_ms,
             row.draw_cpu_ms,
             row.gpu_ms.map_or_else(String::new, |gpu_ms| format!("{gpu_ms:.3}")),
@@ -241,14 +246,15 @@ fn summary_json(
 
 #[cfg(test)]
 mod tests {
+    use super::CSV_HEADER;
     use super::super::session::HeadlessSession;
     use super::super::tests::{dump, run_script, session_for_test, wait_until};
     use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
 
-    /// Header of the per-frame CSV, in column order.
-    const CSV_HEADER: &str = "update_ms,draw_cpu_ms,gpu_ms,total_ms,flush_calls,vertices,scroll_y";
+    /// Column of `scroll_y` in a CSV row.
+    const SCROLL_Y: usize = 7;
 
     /// Fresh scratch directory whose name is unique to this test process and tag.
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -289,24 +295,53 @@ mod tests {
         assert!(summary["total_ms"]["p50"].as_f64().expect("total_ms p50") > 0.0);
         let rows = csv_rows(&csv);
         assert_eq!(rows.len(), 5, "one csv row per frame");
-        for row in &rows {
-            assert_eq!(row.len(), 7, "seven columns per row: {row:?}");
-            let flush_calls: u64 = row[4].parse().expect("flush_calls");
-            let vertices: u64 = row[5].parse().expect("vertices");
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), 8, "eight columns per row: {row:?}");
+            assert_eq!(row[0], index.to_string(), "frame column: {row:?}");
+            let flush_calls: u64 = row[5].parse().expect("flush_calls");
+            let vertices: u64 = row[6].parse().expect("vertices");
             assert!(flush_calls >= 1, "every frame flushes: {row:?}");
             assert!(vertices > 0, "every frame has vertices: {row:?}");
         }
     }
 
-    #[test]
-    fn bench_type_action_runs_all_frames() {
+    /// Runs `bench <frames> csv=<scratch> <action>` and asserts that it draws exactly `frames`
+    /// frames and writes one CSV row per frame.
+    fn assert_exact_frames(tag: &str, frames: u64, action: &str) {
         let mut session = session_for_test(800, 600);
-        let summary = bench_summary(&mut session, "bench 3 type x");
-        assert_eq!(summary["frames"], 3);
+        let csv = scratch_dir(tag).join("b.csv");
+        let before = dump(&mut session)["event_loop"]["frames"].as_u64().expect("frames");
+        let summary = bench_summary(&mut session, &format!("bench {frames} csv={} {action}", csv.display()));
+        let after = dump(&mut session)["event_loop"]["frames"].as_u64().expect("frames");
+        assert_eq!(summary["frames"], frames, "summary of {action}");
+        assert_eq!(after - before, frames, "frames drawn by bench {frames} {action}");
+        assert_eq!(csv_rows(&csv).len() as u64, frames, "csv rows of {action}");
     }
 
     #[test]
-    #[ignore = "bug: scroll_y advances by min(wall-clock gap, 16 ms) per forced frame (app.rs animation_dt, scroll.rs ScrollState::update), so back-to-back bench frames barely move it"]
+    fn bench_type_action_runs_all_frames() {
+        assert_exact_frames("type", 3, "type x");
+    }
+
+    #[test]
+    fn bench_key_action_draws_one_frame_per_bench_frame() {
+        assert_exact_frames("key", 4, "key a");
+        assert_exact_frames("key-mods", 2, "key ctrl+shift+a");
+    }
+
+    #[test]
+    fn bench_rejects_csv_path_under_a_file() {
+        let mut session = session_for_test(800, 600);
+        let file = scratch_dir("csv-file").join("plain");
+        fs::write(&file, "x").expect("plain file");
+        let lines = run_script(&mut session, format!("bench 2 csv={}/b.csv\n", file.display()).as_bytes());
+        assert!(
+            lines.first().is_some_and(|line| line.starts_with("err csv: ")),
+            "bench with a csv under a file answers err: {lines:?}"
+        );
+    }
+
+    #[test]
     fn bench_wheel_action_moves_scroll_y_between_rows() {
         let mut session = session_for_test(800, 600);
         let rows = dump(&mut session)["terminal"]["rows"].as_u64().expect("rows") as usize;
@@ -319,12 +354,14 @@ mod tests {
         run_script(&mut session, b"mouse_cell 0 0\n");
         let dir = scratch_dir("wheel");
         let csv = dir.join("wheel.csv");
-        let lines = run_script(&mut session, format!("bench 2 csv={} wheel 0 1\n", csv.display()).as_bytes());
+        let lines = run_script(&mut session, format!("bench 60 csv={} wheel 0 1\n", csv.display()).as_bytes());
         assert!(lines.first().is_some_and(|line| line.starts_with("ok ")), "bench answers ok: {lines:?}");
         let rows = csv_rows(&csv);
-        assert_eq!(rows.len(), 2, "one csv row per frame");
-        let first = &rows[0][6];
-        let second = &rows[1][6];
-        assert_ne!(first, second, "scroll_y changes between frames: {rows:?}");
+        assert_eq!(rows.len(), 60, "one csv row per frame");
+        // The animation runs on the real frame `dt`, so the frames move it by small amounts;
+        // over the run it still moves.
+        let first = &rows[0][SCROLL_Y];
+        let last = &rows[rows.len() - 1][SCROLL_Y];
+        assert_ne!(first, last, "scroll_y changes over the run: {rows:?}");
     }
 }

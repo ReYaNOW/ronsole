@@ -52,9 +52,10 @@ pub(crate) fn session_with_shell(
             source: HzSource::Default,
         },
     };
-    let session = HeadlessSession::start(options).expect("test session starts");
-    // The app reads its config while loading, so the directory is not needed after start.
-    let _ = fs::remove_dir_all(&dir);
+    let mut session = HeadlessSession::start(options).expect("test session starts");
+    // The app writes its config to the profile until its teardown, so the directory goes
+    // only after the session is dropped.
+    session.remove_profile_on_drop();
     session
 }
 
@@ -273,4 +274,26 @@ fn headless_profile_removed_on_drop() {
     drop(profile);
     assert!(!dir.exists());
     let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn test_session_profile_outlives_the_app_and_goes_with_the_session() {
+    let mut session = session_for_test(640, 400);
+    let dir = session.profile_dir().to_path_buf();
+    run_script(&mut session, b"resize 800x600\n");
+    assert!(dir.is_dir(), "the profile stays while the app runs: {}", dir.display());
+    drop(session);
+    assert!(!dir.exists(), "the profile is removed after the session: {}", dir.display());
+}
+
+#[test]
+fn session_that_exited_before_a_command_answers_none() {
+    // `/bin/true` exits at once, so the app ends during or soon after the start `settle`.
+    let mut session = session_with_shell(640, 400, Some(PathBuf::from("/bin/true")));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !session.exited() {
+        assert!(Instant::now() < deadline, "the app exits after its shell");
+        run_script(&mut session, b"wait 50\n");
+    }
+    assert_eq!(run_script(&mut session, b"info\n"), Vec::<String>::new());
 }

@@ -140,18 +140,27 @@ fn terminal_identity_and_mode_queries_are_answered() {
         "\x1b[>1;{};0c\x1bP>|ronsole({version})\x1b\\\x1b[?2026;2$y\x1b[?9999;0$y\x1b[20;0$y\x1b]11;rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}\x07",
         da2_version()
     );
-    let known_hex = hex(known.as_bytes());
-    assert!(
-        answer.starts_with(&known_hex),
-        "answer {answer} must start with {known_hex}"
+    // OSC 10, 12 and 4;1 answer the default foreground, the cursor colour and ANSI red of the
+    // palette every tab starts with (`terminal_palette` of the configured background), in the
+    // same `rgb:` form, one reply per query in query order.
+    let palette = crate::renderer::terminal_palette(crate::config::RgbColor {
+        r: red,
+        g: green,
+        b: blue,
+    });
+    let spec = |rgb: ronsole_term::Rgb| {
+        format!(
+            "rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}",
+            rgb.r, rgb.g, rgb.b
+        )
+    };
+    let expected = format!(
+        "{known}\x1b]10;{}\x07\x1b]12;{}\x07\x1b]4;1;{}\x07",
+        spec(palette.foreground),
+        spec(palette.cursor),
+        spec(palette.ansi[1])
     );
-    // OSC 10, 12 and 4 are only checked by shape: their colours are render constants that the spec
-    // does not fix (parity spec §5.2 and the TermPalette note in its section 4), so no value is asserted.
-    let rest = &answer[known_hex.len()..];
-    assert!(rest.starts_with(&hex(b"\x1b]10;rgb:")), "OSC 10 answer in {rest}");
-    assert!(rest.contains(&hex(b"\x1b]12;rgb:")), "OSC 12 answer in {rest}");
-    assert!(rest.contains(&hex(b"\x1b]4;1;rgb:")), "OSC 4 answer in {rest}");
-    assert!(rest.ends_with(&hex(b"\x07")), "last answer ends with BEL in {rest}");
+    assert_eq!(answer, hex(expected.as_bytes()), "whole answer of the queries");
 }
 
 #[test]
