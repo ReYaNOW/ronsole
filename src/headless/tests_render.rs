@@ -337,8 +337,7 @@ fn l13_underline_stays_inside_its_row() {
             "decorations are drawn in the row at scale {scale}"
         );
         // The row below must stay empty, so no underline can reach y >= row_bottom. Column 5 is
-        // left out: its inverse background fills the cell up to the next row's snapped top edge,
-        // which can lie below `row_bottom`, and its underline has the background colour anyway.
+        // checked separately below: its inverse background spills one row.
         let below_bottom = cell_rect(&current, 0, row + 1).3;
         for (from, to) in [(0, 4), (6, 6)] {
             let span = span_rect(&current, from, to, row);
@@ -348,6 +347,21 @@ fn l13_underline_stays_inside_its_row() {
                 .count();
             assert_eq!(stray, 0, "pixels below columns {from}..={to} at scale {scale}");
         }
+        // Column 5 is inverse: its background runs down to the next row's snapped top edge, one
+        // pixel row below `row_bottom` (measured at scales 1.0 and 1.333). That row may hold only
+        // the background colour; the rest of the next row must stay empty.
+        let span5 = span_rect(&current, 5, 5, row);
+        let fill = pixel_rgb(&image, (span5.0 + 1, span5.1 + 1));
+        let spill = (span5.0, span5.3, span5.2, span5.3 + 1);
+        let off_fill = pixels(spill)
+            .filter(|&point| is_ink(pixel_rgb(&image, point)) && !close(pixel_rgb(&image, point), fill))
+            .count();
+        assert_eq!(off_fill, 0, "non-background pixels one row below column 5 at scale {scale}");
+        let beyond = (span5.0, span5.3 + 1, span5.2, below_bottom);
+        let stray5 = pixels(beyond)
+            .filter(|&point| is_ink(pixel_rgb(&image, point)))
+            .count();
+        assert_eq!(stray5, 0, "pixels below column 5 past its spill row at scale {scale}");
     }
 }
 

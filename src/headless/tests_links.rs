@@ -129,17 +129,21 @@ fn osc8_link_survives_scrollback_and_resize() {
     // The link text fits one row of the start width; the narrower width below wraps it.
     let len = cols_before - 4;
     let text = format!("lnk{}", "-".repeat(len - 3));
-    // A plain line, the link line, then two screens of plain lines push it into the scrollback.
-    // The link is not on history row 0: at the top of the history the rounded render offset can
-    // stop the window one row short of row 0 (see the Q24 note in `dump::window_top`).
+    // The link line, then two screens of plain lines push it into the scrollback, where it is the
+    // first history row. The view scrolled to the top of the history shows it at row 0.
     let body = format!(
-        "echo head\nprintf '\\033]8;;{URI}\\007{text}\\033]8;;\\007\\n'\n\
+        "printf '\\033]8;;{URI}\\007{text}\\033]8;;\\007\\n'\n\
          i=0\nwhile [ $i -lt {} ]; do echo filler; i=$((i+1)); done\n",
         2 * rows_before
     );
     start_script(&mut session, &dir, &body);
 
     let row = scroll_to_row(&mut session, "lnk");
+    assert_eq!(
+        dump(&mut session)["terminal"]["viewport"]["top"],
+        0,
+        "the view at the top of the history starts at history row 0"
+    );
     let line = dump_row(&mut session, row);
     assert_link_cells(&line, len, URI, "link row after scrolling up");
 
@@ -166,6 +170,26 @@ fn osc8_link_survives_scrollback_and_resize() {
     }
     let tail = dump_row(&mut session, row + 1);
     assert_link_cells(&tail, len - cols_after, URI, "second wrapped row after resize");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn history_top_window_starts_at_row_zero_at_max_scroll() {
+    // At 800x600 the window shows 22 rows. `seq 1 45`, the ready line and the cursor row make
+    // 47 rows in total. The view scrolled to the top has its rounded offset equal to max_scroll,
+    // so the window must start at history row 0, which holds the first printed line.
+    let mut session = session_for_test(800, 600);
+    let dir = fresh_dir("top");
+    start_script(&mut session, &dir, "seq 1 45\n");
+    run_ok(&mut session, b"mouse_cell 0 0\n");
+    run_ok(&mut session, b"wheel 0 100\n");
+    let state = wait_until(&mut session, 5000, "the view at the top of the history", |dump| {
+        dump["terminal"]["viewport"]["top"] == 0
+            && dump["event_loop"]["control_flow"] == "wait"
+            && dump["event_loop"]["deadline_ms"].is_null()
+    });
+    assert_eq!(state["terminal"]["viewport"]["total"], 47, "precondition: total rows");
+    assert_eq!(rows(&state)[0], "1", "visible row 0 is the first history line");
     let _ = fs::remove_dir_all(&dir);
 }
 

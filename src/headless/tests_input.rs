@@ -140,25 +140,13 @@ fn terminal_identity_and_mode_queries_are_answered() {
         "\x1b[>1;{};0c\x1bP>|ronsole({version})\x1b\\\x1b[?2026;2$y\x1b[?9999;0$y\x1b[20;0$y\x1b]11;rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}\x07",
         da2_version()
     );
-    // OSC 10, 12 and 4;1 answer the default foreground, the cursor colour and ANSI red of the
-    // palette every tab starts with (`terminal_palette` of the configured background), in the
-    // same `rgb:` form, one reply per query in query order.
-    let palette = crate::renderer::terminal_palette(crate::config::RgbColor {
-        r: red,
-        g: green,
-        b: blue,
-    });
-    let spec = |rgb: ronsole_term::Rgb| {
-        format!(
-            "rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}",
-            rgb.r, rgb.g, rgb.b
-        )
-    };
+    // OSC 10, 12 and 4;1 answer the default foreground, the cursor colour and ANSI red, one reply
+    // per query in query order. The values are written out, not read from `terminal_palette`, so
+    // the test fails if the palette changes. Foreground `ANSI_16_COLORS[7]` is 0.90 per channel,
+    // which is 230 (0xe6); the cursor follows it. ANSI red `ANSI_16_COLORS[1]` is (0.95, 0.30,
+    // 0.30), which is (242, 77, 77) = (0xf2, 0x4d, 0x4d). Each channel is written twice in `rgb:`.
     let expected = format!(
-        "{known}\x1b]10;{}\x07\x1b]12;{}\x07\x1b]4;1;{}\x07",
-        spec(palette.foreground),
-        spec(palette.cursor),
-        spec(palette.ansi[1])
+        "{known}\x1b]10;rgb:e6e6/e6e6/e6e6\x07\x1b]12;rgb:e6e6/e6e6/e6e6\x07\x1b]4;1;rgb:f2f2/4d4d/4d4d\x07"
     );
     assert_eq!(answer, hex(expected.as_bytes()), "whole answer of the queries");
 }

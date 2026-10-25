@@ -39,22 +39,26 @@ fn window(grid: &Term, layout: Option<&TerminalUiLayout>) -> Window {
 }
 
 /// Absolute row the frame draws at the top of the text viewport (Q24):
-/// `max(0, total − floor((viewport_h + scroll_offset) / char_h))`. `viewport_h` is the text
-/// height that `rows` and `max_scroll` come from, so a view scrolled to `max_scroll` reaches
-/// row 0 even when that height is not a whole number of rows. Before the first frame the view
-/// is at the bottom: `total − rows`.
+/// `max(0, total − floor((viewport_h + scroll_offset) / char_h))`, never past `total − rows`.
+/// `viewport_h` is the text height that `rows` and `max_scroll` come from, so a view scrolled to
+/// `max_scroll` reaches row 0 even when that height is not a whole number of rows. Before the
+/// first frame the view is at the bottom: `total − rows`.
 ///
 /// `scroll_offset` is the frame's offset, rounded to whole pixels
-/// (`terminal_render_scroll_offset`). When `max_scroll` has a fraction below one half, the
-/// rounded offset at the top of the history is below `max_scroll`, and `top` is 1 although the
-/// frame draws row 0 less than a pixel above the text viewport.
+/// (`terminal_render_scroll_offset`), so it can fall short of `max_scroll` by less than half a
+/// pixel. At that offset the frame draws row 0 within the same margin of the text top, and the
+/// window is clamped to start at row 0. A zero offset is never clamped, so a view at the bottom
+/// keeps its last row.
 fn window_top(total: usize, rows: usize, layout: Option<&TerminalUiLayout>) -> usize {
     let Some(layout) = layout.filter(|layout| layout.char_h > 0.0) else {
         return total.saturating_sub(rows);
     };
     let viewport_h = terminal_text_viewport_height(layout.body.h, layout.scale);
     let reach = ((viewport_h + layout.scroll_offset.max(0.0)) / layout.char_h).floor() as usize;
-    total.saturating_sub(reach)
+    if layout.scroll_offset > 0.0 && layout.scroll_offset + 0.5 >= layout.max_scroll {
+        return 0;
+    }
+    total.saturating_sub(reach).min(total.saturating_sub(rows))
 }
 
 /// Top-left corner `(x, y)` of cell `(0, 0)` of the visible area, unrounded (spec §5.1).
@@ -416,5 +420,43 @@ mod tests {
         // Fewer lines than rows: the window starts at row 0.
         assert_eq!(window_top(10, 28, None), 0);
         assert_eq!(window_top(10, 28, Some(&fractional_layout(0.0))), 0);
+    }
+
+    #[test]
+    fn window_top_clamps_to_row_zero_within_half_a_pixel_of_max_scroll() {
+        // Real geometry from the 800x600 frame: body 562 px, text viewport 546 px, char_h 24.15,
+        // 47 lines, rows 22. The rounded offset 589 is 0.05 px short of max_scroll 589.05, so the
+        // frame draws row 0 at the text top and the window starts at row 0. Unclamped, the
+        // formula gives floor((546 + 589) / 24.15) = 46 and top 1.
+        let layout = TerminalUiLayout {
+            body: Rect { x: 0.0, y: 0.0, w: 800.0, h: 562.0 },
+            char_h: 24.15,
+            max_scroll: 589.05,
+            scroll_offset: 589.0,
+            ..fractional_layout(589.0)
+        };
+        assert_eq!(window_top(47, 22, Some(&layout)), 0);
+    }
+
+    #[test]
+    fn window_top_zero_offset_keeps_bottom_view_even_with_tiny_max_scroll() {
+        // Offset 0 is never clamped to row 0, so a view at the bottom keeps its last row.
+        let layout = TerminalUiLayout {
+            max_scroll: 0.3,
+            ..fractional_layout(0.0)
+        };
+        assert_eq!(window_top(40, 28, Some(&layout)), 12);
+    }
+
+    #[test]
+    fn window_top_short_body_starts_at_bottom_view_not_past_it() {
+        // Body 40 px gives a text viewport of 24 px: reach is 1 row, below the 28 visible rows.
+        // The window must still stay inside the 40 lines, so it starts at total - rows.
+        let layout = TerminalUiLayout {
+            body: Rect { x: 0.0, y: 0.0, w: 800.0, h: 40.0 },
+            max_scroll: 0.0,
+            ..fractional_layout(0.0)
+        };
+        assert_eq!(window_top(40, 28, Some(&layout)), 12);
     }
 }

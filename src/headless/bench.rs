@@ -330,6 +330,11 @@ mod tests {
     }
 
     #[test]
+    fn bench_wheel_action_draws_one_frame_per_bench_frame() {
+        assert_exact_frames("wheel", 3, "wheel 0 1");
+    }
+
+    #[test]
     fn bench_rejects_csv_path_under_a_file() {
         let mut session = session_for_test(800, 600);
         let file = scratch_dir("csv-file").join("plain");

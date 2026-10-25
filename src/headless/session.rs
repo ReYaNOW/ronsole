@@ -242,9 +242,7 @@ impl HeadlessSession {
                 .map_err(|error| format!("create {}: {error}", parent.display()))?;
         }
         fs::write(path, &text).map_err(|error| format!("write {}: {error}", path.display()))?;
-        let absolute = fs::canonicalize(path)
-            .map_err(|error| format!("resolve {}: {error}", path.display()))?;
-        Ok(Some(absolute.display().to_string()))
+        Ok(Some(resolved_path(path)?.display().to_string()))
     }
 
     /// `dump row <row>`: the non-blank cells of one visible row as one JSON line.
@@ -268,27 +266,35 @@ impl HeadlessSession {
 
     /// Presses the combo's missing modifiers, then the key, then releases both.
     fn key(&mut self, combo: KeyCombo, repeats: u32) -> Result<(), String> {
-        let base = self.mods;
-        let target = union(base, combo.mods);
-        if self.move_modifiers(target) {
-            return Ok(());
-        }
-        if self.send_key(key_input(&combo.key, KeyState::Pressed, target)) {
-            return Ok(());
-        }
-        for _ in 0..repeats {
-            if self.send_key(key_input(&combo.key, KeyState::Repeat, target)) {
-                return Ok(());
-            }
-        }
-        self.frame()?;
-        if self.send_key(key_input(&combo.key, KeyState::Released, target)) {
-            return Ok(());
-        }
-        if self.move_modifiers(base) {
+        if self.press_release_events(combo, repeats, true)? {
             return Ok(());
         }
         self.frame()
+    }
+
+    /// Presses the combo's missing modifiers, then the key, then `repeats` repeat events, then
+    /// releases the key and restores the held modifiers. Draws a frame before the release when
+    /// `frame_between` is set. Returns `true` if the app asked to exit.
+    fn press_release_events(
+        &mut self,
+        combo: KeyCombo,
+        repeats: u32,
+        frame_between: bool,
+    ) -> Result<bool, String> {
+        let base = self.mods;
+        let target = union(base, combo.mods);
+        if self.move_modifiers(target) || self.send_key(key_input(&combo.key, KeyState::Pressed, target)) {
+            return Ok(true);
+        }
+        for _ in 0..repeats {
+            if self.send_key(key_input(&combo.key, KeyState::Repeat, target)) {
+                return Ok(true);
+            }
+        }
+        if frame_between {
+            self.frame()?;
+        }
+        Ok(self.send_key(key_input(&combo.key, KeyState::Released, target)) || self.move_modifiers(base))
     }
 
     /// Sets the held modifiers to `mods` with one event per changed modifier, then draws.
@@ -392,9 +398,7 @@ impl HeadlessSession {
                 .map_err(|error| format!("create {}: {error}", parent.display()))?;
         }
         write_png(path, width, height, &pixels)?;
-        let absolute = fs::canonicalize(path)
-            .map_err(|error| format!("resolve {}: {error}", path.display()))?;
-        Ok(Some(format!("{} {width}x{height}", absolute.display())))
+        Ok(Some(format!("{} {width}x{height}", resolved_path(path)?.display())))
     }
 
     /// Steps until output has been quiet for two output batch idle periods on the clock,
@@ -650,28 +654,20 @@ impl HeadlessSession {
                 self.app.on_ime_commit(text);
                 false
             }
-            BenchAction::Key(combo) => self.press_release(*combo),
+            BenchAction::Key(combo) => self.press_release_events(*combo, 0, false)?,
         };
         if exit {
             return Err("app exited during bench".to_string());
         }
         let (step, draw_start) = self.app.forced_step_timed()?;
         let draw_end = Instant::now();
-        if self.record(step)?.is_none() {
+        let Some(report) = self.record(step)? else {
             return Err("app exited during bench".to_string());
+        };
+        if !report.frame {
+            return Err("bench step drew no frame".to_string());
         }
         Ok((draw_start - start, draw_end - draw_start))
-    }
-
-    /// Presses and releases `combo`, with its modifiers that `mods` does not hold, and draws
-    /// no frame between the events. Returns `true` if the app asked to exit.
-    fn press_release(&mut self, combo: KeyCombo) -> bool {
-        let base = self.mods;
-        let target = union(base, combo.mods);
-        self.move_modifiers(target)
-            || self.send_key(key_input(&combo.key, KeyState::Pressed, target))
-            || self.send_key(key_input(&combo.key, KeyState::Released, target))
-            || self.move_modifiers(base)
     }
 
     fn record(&mut self, step: LoopStep) -> Result<Option<StepReport>, String> {
@@ -696,6 +692,11 @@ impl Drop for HeadlessSession {
     fn drop(&mut self) {
         self.app.headless_exit();
     }
+}
+
+/// Absolute form of `path` after the file was written, for the `ok` response.
+fn resolved_path(path: &Path) -> Result<PathBuf, String> {
+    fs::canonicalize(path).map_err(|error| format!("resolve {}: {error}", path.display()))
 }
 
 /// Runs the protocol over `input` and writes one response line per answered command.
@@ -730,6 +731,7 @@ pub(crate) fn serve(
     let mut line = Vec::new();
     // The app may have ended before the first command, e.g. during the start `settle`.
     if session.exited() {
+        eprintln!("headless: app exited");
         return code;
     }
     loop {
