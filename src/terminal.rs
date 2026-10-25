@@ -11,7 +11,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub(crate) use ronsole_term::{
@@ -1048,6 +1048,7 @@ mod tests {
         std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some(root.clone()),
             inherited_directory: None,
             command: vec![
@@ -1711,6 +1712,14 @@ impl Terminal {
     /// Takes the grid lock briefly.
     pub(crate) fn sync_deadline(&self) -> Option<Instant> {
         crate::platform::lock_recover(&self.grid).sync_deadline()
+    }
+
+    /// Locks the screen bridge, then the grid, the same order the parser thread uses,
+    /// so a reader sees one consistent state of the screen and the grid.
+    pub(crate) fn lock_snapshot(&self) -> (MutexGuard<'_, ()>, MutexGuard<'_, Term>) {
+        let screen = crate::platform::lock_recover(&self.bridge_screen_lock);
+        let grid = crate::platform::lock_recover(&self.grid);
+        (screen, grid)
     }
 
     /// Replays held synchronized-output bytes whose deadline has passed at

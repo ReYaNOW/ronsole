@@ -1198,7 +1198,7 @@ fn terminal_cell_face_from_flags(flags: CellFlags) -> u8 {
 }
 
 #[inline]
-fn terminal_cell_span_x_bounds(
+pub(crate) fn terminal_cell_span_x_bounds(
     text_x: f32,
     cell_index: usize,
     width_cells: usize,
@@ -1216,7 +1216,7 @@ fn terminal_cell_x_bounds(text_x: f32, cell_index: usize, char_w: f32) -> (f32, 
 }
 
 #[inline]
-fn terminal_render_color(color: TerminalColor, palette: TerminalPalette) -> [f32; 4] {
+pub(crate) fn terminal_render_color(color: TerminalColor, palette: TerminalPalette) -> [f32; 4] {
     if color.is_default_background() {
         palette.bg
     } else {
@@ -1234,7 +1234,7 @@ fn terminal_dim_color(mut color: [f32; 4]) -> [f32; 4] {
 }
 
 #[inline]
-fn terminal_cell_render_colors(
+pub(crate) fn terminal_cell_render_colors(
     cell: &Cell,
     palette: TerminalPalette,
 ) -> ([f32; 4], Option<[f32; 4]>) {
@@ -1432,7 +1432,7 @@ fn terminal_decoration_quads(
 }
 
 #[inline]
-fn terminal_row_draw_y(
+pub(crate) fn terminal_row_draw_y(
     body: Rect,
     bottom_pad: f32,
     char_h: f32,
@@ -2706,6 +2706,8 @@ impl Renderer {
         settings_background_input: &mut SingleLineInput,
         settings_background_editing: bool,
     ) -> TerminalUiLayout {
+        self.frame_flushes = 0;
+        self.frame_vertices = 0;
         let layout = if let Some(terminal) = terminals.get(active_terminal) {
             self.render_terminal_body(
                 terminal,

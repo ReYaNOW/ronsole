@@ -1581,18 +1581,20 @@ impl App {
     pub(crate) fn load_headless(
         options: Option<AutomationOptions>,
         profile_dir: &Path,
-    ) -> Result<Self, String> {
+        shell: Option<std::path::PathBuf>,
+    ) -> Result<(Self, std::sync::mpsc::Receiver<String>), String> {
         let automation = options.map(AutomationController::new).transpose()?;
-        Self::load_headless_with(automation, profile_dir)
+        Self::load_headless_with(automation, profile_dir, shell)
     }
 
+    /// The returned receiver gets every link the app records instead of launching. Callers
+    /// that do not read it must keep it alive, because a dropped receiver makes the send fail.
     pub(super) fn load_headless_with(
         automation: Option<AutomationController>,
         profile_dir: &Path,
-    ) -> Result<Self, String> {
-        // The receiver is dropped on purpose: no reader of recorded links exists yet,
-        // and a failed send is ignored by the opener.
-        let (sender, _receiver) = std::sync::mpsc::channel();
+        shell: Option<std::path::PathBuf>,
+    ) -> Result<(Self, std::sync::mpsc::Receiver<String>), String> {
+        let (sender, receiver) = std::sync::mpsc::channel();
         let config = crate::config::AppConfig::load_at(profile_dir.join("config"));
         let mut app = Self::from_parts(
             config,
@@ -1600,7 +1602,8 @@ impl App {
             crate::platform::OpenSink::Record(sender),
         );
         app.automation = automation;
-        Ok(app)
+        app.shell_override = shell;
+        Ok((app, receiver))
     }
 
     #[cold]
@@ -1940,7 +1943,8 @@ mod tests {
         };
         let mut controller =
             AutomationController::with_steps(options, Vec::new()).expect("controller");
-        let mut app = App::load_headless(None, &profile).expect("headless app");
+        let (mut app, _receiver) =
+            App::load_headless(None, &profile, None).expect("headless app");
         app.terminals
             .push(crate::terminal::Terminal::new_for_test(16, 2, 1));
         app.active_terminal = 0;

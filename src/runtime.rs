@@ -1,4 +1,4 @@
-use crate::headless::backend::HeadlessBackend;
+use crate::headless::backend::{HeadlessBackend, HeadlessCounters};
 use crate::input_types::{CursorKind, KeyInput, KeyState, Modifiers};
 use crate::platform::offscreen_gl::OffscreenContext;
 use crate::renderer::Renderer;
@@ -2803,6 +2803,11 @@ impl WindowRuntime {
         self.wake.clone()
     }
 
+    /// The window's renderer, for readers of its font metrics and palette.
+    pub(crate) fn renderer(&self) -> &Renderer {
+        &self.renderer
+    }
+
     pub(crate) fn request_frame(&self) {
         match &self.backend {
             RuntimeBackend::Wayland(wayland) => wayland.request_frame(),
@@ -2985,8 +2990,9 @@ impl WindowRuntime {
     }
 
     pub(crate) fn set_cursor_kind(&self, kind: CursorKind) {
-        if let RuntimeBackend::Wayland(wayland) = &self.backend {
-            wayland.set_cursor_kind(kind);
+        match &self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.set_cursor_kind(kind),
+            RuntimeBackend::Headless(headless) => headless.set_cursor_kind(kind),
         }
     }
 
@@ -3046,6 +3052,78 @@ impl WindowRuntime {
         }
     }
 
+    /// Replaces the offscreen pbuffer, the renderer and the backend size together. A failed
+    /// pbuffer creation leaves all three unchanged.
+    pub(crate) fn resize_offscreen(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let GlTarget::Offscreen(offscreen) = &mut self.target else {
+            return Err("headless resize needs the offscreen target".to_string());
+        };
+        if offscreen.size() != (width, height) {
+            offscreen.resize(width, height)?;
+        }
+        self.renderer.resize(width, height);
+        if let RuntimeBackend::Headless(headless) = &mut self.backend {
+            headless.set_physical_size(width, height);
+        }
+        Ok(())
+    }
+
+    /// RGBA8 pixels of the offscreen target, top row first, as the last drawn frame left them.
+    pub(crate) fn read_pixels(&self) -> Result<(u32, u32, Vec<u8>), String> {
+        use glow::HasContext as _;
+        let GlTarget::Offscreen(offscreen) = &self.target else {
+            return Err("screenshot needs the offscreen target".to_string());
+        };
+        offscreen.make_current()?;
+        let (width, height) = offscreen.size();
+        let row_bytes = width as usize * 4;
+        let mut pixels = vec![0_u8; row_bytes * height as usize];
+        let gl = offscreen.glow();
+        // SAFETY: the pbuffer context is current on this thread, and `pixels` holds exactly
+        // width * height RGBA8 texels as requested.
+        unsafe {
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        // GL returns the rows bottom-up; the protocol and PNG output are top-down.
+        let mut top_down = Vec::with_capacity(pixels.len());
+        for row in pixels.chunks_exact(row_bytes).rev() {
+            top_down.extend_from_slice(row);
+        }
+        Ok((width, height, top_down))
+    }
+
+    /// GL strings of the offscreen context; `None` on the Wayland backend.
+    pub(crate) fn gl_strings(&self) -> Option<&crate::platform::offscreen_gl::GlStrings> {
+        match &self.target {
+            GlTarget::Offscreen(offscreen) => Some(offscreen.gl_strings()),
+            GlTarget::Window { .. } => None,
+        }
+    }
+
+    /// Headless counters; `None` on the Wayland backend, which has no offscreen target to count.
+    pub(crate) fn headless_counters(&self) -> Option<HeadlessCounters> {
+        match &self.backend {
+            RuntimeBackend::Wayland(_) => None,
+            RuntimeBackend::Headless(headless) => Some(headless.counters()),
+        }
+    }
+
+    /// Drops a pending headless frame request. Only the headless backend keeps such a flag.
+    pub(crate) fn clear_frame_request(&self) {
+        if let RuntimeBackend::Headless(headless) = &self.backend {
+            headless.clear_frame_request();
+        }
+    }
+
     #[cfg(test)]
     pub fn inject_session_error(&mut self, error: String) {
         if let RuntimeBackend::Headless(headless) = &mut self.backend {
@@ -3057,7 +3135,7 @@ impl WindowRuntime {
     pub fn headless_frames(&self) -> Option<u64> {
         match &self.backend {
             RuntimeBackend::Wayland(_) => None,
-            RuntimeBackend::Headless(headless) => Some(headless.frames()),
+            RuntimeBackend::Headless(headless) => Some(headless.counters().frames),
         }
     }
 

@@ -930,6 +930,7 @@ fn read_external_launch_request(reader: &mut impl Read) -> io::Result<ExternalLa
     Ok(ExternalLaunchRequest {
         activation_token,
         launch: TerminalLaunchSpec {
+            shell: None,
             working_directory,
             inherited_directory: None,
             command,
@@ -1579,6 +1580,7 @@ mod tests {
         let request = ExternalLaunchRequest {
             activation_token: Some("wayland-token-123".to_owned()),
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/tmp/ronsole session")),
                 inherited_directory: None,
                 command: vec![
@@ -1602,6 +1604,7 @@ mod tests {
         let request = ExternalLaunchRequest {
             activation_token: None,
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from(raw_workdir.clone())),
                 inherited_directory: None,
                 command: vec![raw_program.clone(), raw_arg.clone()],
@@ -1636,6 +1639,7 @@ mod tests {
         let request = ExternalLaunchRequest {
             activation_token: Some("secret-activation-token".to_owned()),
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/secret/cwd")),
                 inherited_directory: None,
                 command: vec![OsString::from("secret-command")],
@@ -1725,6 +1729,7 @@ mod tests {
         let request = ExternalLaunchRequest {
             activation_token: None,
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: None,
                 inherited_directory: None,
                 command: vec![OsString::from_vec(vec![b'x'; MAX_REQUEST_PAYLOAD_BYTES])],
@@ -2330,6 +2335,7 @@ mod tests {
         let expected = ExternalLaunchRequest {
             activation_token: Some("token".to_owned()),
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/tmp")),
                 inherited_directory: None,
                 command: vec![OsString::from("htop")],
@@ -2381,6 +2387,7 @@ mod tests {
         let expected = ExternalLaunchRequest {
             activation_token: None,
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/tmp/secondary")),
                 inherited_directory: None,
                 command: vec![OsString::from("program"), OsString::from("arg one")],
@@ -2409,6 +2416,7 @@ mod tests {
         let first = ExternalLaunchRequest {
             activation_token: None,
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/tmp/first")),
                 inherited_directory: None,
                 command: vec![OsString::from("first"), OsString::from("arg one")],
@@ -2419,6 +2427,7 @@ mod tests {
         let second = ExternalLaunchRequest {
             activation_token: Some("second-token".to_owned()),
             launch: TerminalLaunchSpec {
+                shell: None,
                 working_directory: Some(PathBuf::from("/tmp/second")),
                 inherited_directory: None,
                 command: vec![OsString::from("second"), OsString::from("--flag")],

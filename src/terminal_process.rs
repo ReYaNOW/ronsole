@@ -22,7 +22,7 @@ const INITIAL_ROWS: u16 = 60;
 const TERMINAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const TERMINAL_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 const TERMINAL_TITLE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-const TERMINAL_OUTPUT_BATCH_IDLE: Duration = Duration::from_millis(8);
+pub(crate) const TERMINAL_OUTPUT_BATCH_IDLE: Duration = Duration::from_millis(8);
 const TERMINAL_OUTPUT_BATCH_MAX: Duration = Duration::from_millis(32);
 const TERMINAL_OUTPUT_BATCH_MAX_CHUNKS: usize = 32;
 const TERMINAL_OUTPUT_QUEUE_CAPACITY: usize = 16;
@@ -1174,7 +1174,7 @@ fn install_terminal_io_threads(
 fn terminal_launch_command(
     launch: TerminalLaunchSpec,
     tab_token: &TabToken,
-) -> io::Result<(CommandBuilder, PathBuf, String, &'static str)> {
+) -> io::Result<(CommandBuilder, PathBuf, String, String)> {
     let cwd = match launch.working_directory {
         Some(cwd) => cwd,
         None => terminal_launch_directory(
@@ -1183,18 +1183,25 @@ fn terminal_launch_command(
         ),
     };
     let (mut command, process_title, spawn_target) = if launch.command.is_empty() {
-        let shell = resolve_terminal_shell()?;
+        let shell = resolve_terminal_shell(launch.shell.as_deref())?;
+        // An explicit override names its program in the spawn error; the default
+        // shell keeps the plain wording.
+        let spawn_target = if launch.shell.is_some() {
+            format!("terminal shell {}", shell.executable.display())
+        } else {
+            "terminal shell".to_string()
+        };
         (
             CommandBuilder::new(&shell.executable),
             shell.title,
-            "terminal shell",
+            spawn_target,
         )
     } else {
         let process_title = terminal_shell_title(Path::new(&launch.command[0]));
         (
             CommandBuilder::from_argv(launch.command),
             process_title,
-            "terminal command",
+            "terminal command".to_string(),
         )
     };
     command.cwd(cwd.as_os_str());
@@ -1209,25 +1216,39 @@ fn terminal_launch_command(
     Ok((command, cwd, process_title, spawn_target))
 }
 
-pub(crate) fn resolve_terminal_shell() -> io::Result<TerminalShellSpec> {
-    resolve_terminal_shell_with(std::env::var_os("SHELL"), platform::resolve_executable)
+pub(crate) fn resolve_terminal_shell(
+    shell_override: Option<&Path>,
+) -> io::Result<TerminalShellSpec> {
+    resolve_terminal_shell_with(
+        shell_override,
+        std::env::var_os("SHELL"),
+        platform::resolve_executable,
+    )
 }
 
+/// An explicit `shell_override` is the only candidate, so a missing program fails
+/// instead of falling back to `$SHELL` or `/bin/bash`.
 fn resolve_terminal_shell_with(
+    shell_override: Option<&Path>,
     shell_env: Option<OsString>,
     mut resolve: impl FnMut(&OsStr) -> Option<PathBuf>,
 ) -> io::Result<TerminalShellSpec> {
-    for candidate in terminal_shell_candidates_with(shell_env) {
+    let candidates = match shell_override {
+        Some(program) => vec![program.as_os_str().to_os_string()],
+        None => terminal_shell_candidates_with(shell_env),
+    };
+    for candidate in candidates {
         if let Some(executable) = resolve(&candidate) {
             let title = terminal_shell_title(&executable);
             return Ok(TerminalShellSpec { executable, title });
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no supported terminal shell was found",
-    ))
+    let message = match shell_override {
+        Some(program) => format!("no supported terminal shell was found: {}", program.display()),
+        None => "no supported terminal shell was found".to_string(),
+    };
+    Err(io::Error::new(io::ErrorKind::NotFound, message))
 }
 
 fn terminal_shell_candidates_with(shell_env: Option<OsString>) -> Vec<OsString> {
@@ -1562,14 +1583,14 @@ mod tests {
 
     #[test]
     fn shell_resolution_prefers_valid_shell_then_linux_fallbacks() {
-        let fish = resolve_terminal_shell_with(Some(OsString::from("/usr/bin/fish")), |candidate| {
+        let fish = resolve_terminal_shell_with(None, Some(OsString::from("/usr/bin/fish")), |candidate| {
             (candidate == OsStr::new("/usr/bin/fish")).then(|| PathBuf::from("/usr/bin/fish"))
         })
         .unwrap();
         assert_eq!(fish.executable, PathBuf::from("/usr/bin/fish"));
         assert_eq!(fish.title, "fish");
 
-        let bash = resolve_terminal_shell_with(Some(OsString::from("/missing/shell")), |candidate| {
+        let bash = resolve_terminal_shell_with(None, Some(OsString::from("/missing/shell")), |candidate| {
             (candidate == OsStr::new("/bin/bash")).then(|| PathBuf::from("/bin/bash"))
         })
         .unwrap();
@@ -1578,6 +1599,44 @@ mod tests {
             terminal_shell_candidates_with(Some(OsString::from("/bin/bash"))),
             [OsString::from("/bin/bash"), OsString::from("/bin/sh")]
         );
+    }
+
+    #[test]
+    fn shell_override_is_used_without_fallback() {
+        // The fallback candidates would resolve here, so a success would mean the
+        // override silently fell back to `$SHELL` or `/bin/bash`.
+        let error = resolve_terminal_shell_with(
+            Some(Path::new("/nonexistent/sh")),
+            Some(OsString::from("/usr/bin/fish")),
+            |candidate| (candidate != OsStr::new("/nonexistent/sh")).then(|| PathBuf::from(candidate)),
+        )
+        .err()
+        .expect("missing override must not fall back to another shell");
+        assert!(error.to_string().contains("/nonexistent/sh"), "{error}");
+
+        let sh = resolve_terminal_shell_with(
+            Some(Path::new("/bin/sh")),
+            Some(OsString::from("/usr/bin/fish")),
+            |candidate| Some(PathBuf::from(candidate)),
+        )
+        .unwrap();
+        assert_eq!(sh.executable, PathBuf::from("/bin/sh"));
+    }
+
+    #[test]
+    fn shell_override_names_program_in_spawn_target() {
+        let launch = TerminalLaunchSpec {
+            shell: Some(PathBuf::from("/bin/sh")),
+            working_directory: Some(std::env::temp_dir()),
+            inherited_directory: None,
+            command: Vec::new(),
+            hold: false,
+            bridge_launch_id: None,
+        };
+        let (_command, _cwd, _title, spawn_target) =
+            terminal_launch_command(launch, &TabToken::generate()).unwrap();
+        // The spawn error reads "failed to spawn {spawn_target}: ...", so it must name the program.
+        assert_eq!(spawn_target, "terminal shell /bin/sh");
     }
 
     #[test]
@@ -1602,6 +1661,7 @@ mod tests {
             raw_arg,
         ];
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some(cwd.clone()),
             inherited_directory: None,
             command: argv.clone(),
@@ -1643,6 +1703,7 @@ mod tests {
         assert_ne!(first.as_str(), second.as_str());
 
         let launch = TerminalLaunchSpec {
+            shell: None,
             working_directory: Some(PathBuf::from("/tmp")),
             inherited_directory: None,
             command: vec![OsString::from("/bin/true")],

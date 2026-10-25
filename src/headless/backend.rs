@@ -7,18 +7,29 @@ use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
+use crate::input_types::CursorKind;
 use crate::runtime::{WaylandPollOutcome, WaylandWindowMetrics};
 use crate::wake::WakeHandle;
 
 /// Minimum interval between two headless frames.
 pub(crate) const HEADLESS_FRAME_PACE: Duration = Duration::from_millis(8);
 
+/// Counters the headless session reads back to see what the runtime did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadlessCounters {
+    pub(crate) frames: u64,
+    pub(crate) frame_requests: u64,
+    pub(crate) redraw_requested: bool,
+    pub(crate) cursor_kind: CursorKind,
+}
+
 pub(crate) struct HeadlessBackend {
     metrics: WaylandWindowMetrics,
     frame_requested: Cell<bool>,
     last_frame: Cell<Option<Instant>>,
-    #[cfg(test)]
     frames: u64,
+    frame_requests: Cell<u64>,
+    cursor_kind: Cell<CursorKind>,
     session_error: Option<String>,
 }
 
@@ -34,8 +45,9 @@ impl HeadlessBackend {
             },
             frame_requested: Cell::new(false),
             last_frame: Cell::new(None),
-            #[cfg(test)]
             frames: 0,
+            frame_requests: Cell::new(0),
+            cursor_kind: Cell::new(CursorKind::default()),
             session_error: None,
         };
         backend.recompute_logical_size();
@@ -65,6 +77,13 @@ impl HeadlessBackend {
 
     pub(crate) fn request_frame(&self) {
         self.frame_requested.set(true);
+        self.frame_requests
+            .set(self.frame_requests.get().saturating_add(1));
+    }
+
+    /// Drops a pending frame request without drawing, used by the forced step.
+    pub(crate) fn clear_frame_request(&self) {
+        self.frame_requested.set(false);
     }
 
     /// True when a frame is requested and the pace interval since the last frame has elapsed.
@@ -111,10 +130,7 @@ impl HeadlessBackend {
     /// Records a presented frame; the next frame is paced from `now`.
     pub(crate) fn finish_frame(&mut self, now: Instant) {
         self.last_frame.set(Some(now));
-        #[cfg(test)]
-        {
-            self.frames += 1;
-        }
+        self.frames += 1;
     }
 
     /// Waits on the wake eventfd only, for at most `timeout_ms` (`-1` waits without a deadline).
@@ -164,9 +180,17 @@ impl HeadlessBackend {
         self.session_error.take()
     }
 
-    #[cfg(test)]
-    pub(crate) fn frames(&self) -> u64 {
-        self.frames
+    pub(crate) fn set_cursor_kind(&self, kind: CursorKind) {
+        self.cursor_kind.set(kind);
+    }
+
+    pub(crate) fn counters(&self) -> HeadlessCounters {
+        HeadlessCounters {
+            frames: self.frames,
+            frame_requests: self.frame_requests.get(),
+            redraw_requested: self.frame_requested.get(),
+            cursor_kind: self.cursor_kind.get(),
+        }
     }
 }
 
