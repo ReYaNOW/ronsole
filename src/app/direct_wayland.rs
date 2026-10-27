@@ -1,5 +1,6 @@
 use super::{App, AppLoopControl};
 use crate::launch::TerminalLaunchSpec;
+use crate::platform::signals;
 use crate::platform::single_instance::{InstanceMessage, PrimaryInstance};
 use crate::runtime::{
     WaylandPollOutcome, WaylandRuntimeEvents, WindowRuntime, poll_timeout_millis,
@@ -81,6 +82,11 @@ impl App {
         primary_instance: &mut PrimaryInstance,
         initial_launch: TerminalLaunchSpec,
     ) -> Result<(), String> {
+        // Installed before the first tab exists. Failure leaves the loop without
+        // signal handling, reported once here.
+        if let Err(error) = signals::install() {
+            eprintln!("Ronsole: signal shutdown unavailable: {error}");
+        }
         let runtime = WindowRuntime::bootstrap_wayland(
             self.config.window_width,
             self.config.window_height,
@@ -280,6 +286,13 @@ impl App {
             .as_mut()
             .ok_or_else(|| "Wayland runtime disappeared from application state".to_string())?
             .poll_wayland(timeout_ms)?;
+        // Signal shutdown skips the close-request path on purpose: it runs the
+        // shared teardown directly and never asks for confirmation.
+        if signals::take_shutdown_request() {
+            self.interrupt_automation("terminated by signal");
+            self.finish_terminal_session();
+            return Ok(LoopStep::Exit(self.take_automation_exit_result()));
+        }
         let events = self
             .runtime
             .as_mut()

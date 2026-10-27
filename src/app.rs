@@ -1508,6 +1508,13 @@ impl App {
     }
 
     fn on_close_requested(&mut self) {
+        self.finish_terminal_session();
+    }
+
+    /// Persists config and reaps every owned PTY session. Called directly by the
+    /// window-close path and the signal shutdown path, so a future close prompt
+    /// stays on the close request only and never blocks a signal.
+    fn finish_terminal_session(&mut self) {
         self.prepare_exit();
         self.shutdown_all();
     }

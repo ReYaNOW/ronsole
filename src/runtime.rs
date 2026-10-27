@@ -2502,6 +2502,13 @@ impl DirectWaylandBackend {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                // Shutdown self-pipe; `-1` when signal handling is not installed.
+                // The loop drains it through `signals::take_shutdown_request`.
+                libc::pollfd {
+                    fd: crate::platform::signals::wait_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
 
             let poll_result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
