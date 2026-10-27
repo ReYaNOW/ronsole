@@ -299,7 +299,7 @@ pub(crate) fn dump_row_json(session: &mut HeadlessSession, row: usize) -> Result
         .take(grid.cols())
         .enumerate()
         .filter(|(_, cell)| !is_plain(cell))
-        .map(|(col, cell)| cell_json(col, cell, palette))
+        .map(|(col, cell)| cell_json(col, cell, &palette))
         .collect();
     Ok(json!({"row": row, "cells": cells}))
 }
@@ -333,7 +333,7 @@ fn is_plain(cell: &Cell) -> bool {
 
 /// One cell of `dump row`. Colours are resolved as the frame resolves them, including the
 /// underline colour, which the frame takes from the cell's SGR 58 colour and not from `fg`.
-fn cell_json(col: usize, cell: &Cell, palette: TerminalPalette) -> Value {
+fn cell_json(col: usize, cell: &Cell, palette: &TerminalPalette) -> Value {
     let (foreground, background) = terminal_cell_render_colors(cell, palette);
     let mut ch = String::new();
     cell.append_text_to(&mut ch);

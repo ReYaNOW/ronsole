@@ -240,7 +240,7 @@ mod tests {
         new_term(
             cols,
             rows,
-            crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
         )
     }
 
@@ -382,7 +382,7 @@ mod tests {
             None,
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
-            crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
         );
         terminal.resize_pty(120, 40);
         terminal
@@ -1137,7 +1137,7 @@ mod tests {
             None,
             1,
             launch,
-            crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
         );
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1704,7 +1704,7 @@ impl Terminal {
             grid: Arc::new(Mutex::new(new_term(
                 cols,
                 rows,
-                crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+                crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
             ))),
             bridge_screen_lock: Arc::new(Mutex::new(())),
             process: None,

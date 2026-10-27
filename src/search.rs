@@ -537,7 +537,7 @@ mod tests {
                 name: "ronsole",
                 version: "test",
             },
-            palette: crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            palette: crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
         })
     }
 

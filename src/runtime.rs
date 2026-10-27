@@ -2910,6 +2910,11 @@ impl WindowRuntime {
         self.renderer.set_terminal_background(background)
     }
 
+    pub(crate) fn set_terminal_colors(&mut self, config: &crate::config::AppConfig) -> bool {
+        self.make_target_current();
+        self.renderer.set_terminal_colors(config)
+    }
+
     pub(crate) fn reset_fps_counter(&mut self) {
         self.make_target_current();
         self.renderer.reset_fps_counter();

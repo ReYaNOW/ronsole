@@ -93,6 +93,7 @@ pub(crate) fn test_config(cols: usize, rows: usize) -> TermConfig {
             background: dark,
             cursor: light,
             ansi: [dark; 16],
+            bold_foreground: None,
         },
     }
 }

@@ -14,66 +14,38 @@ use ronsole_term::{
     Cell, CellFlags, Rgb, Term, TermPalette, terminal_force_text_presentation, xterm_256_rgb,
 };
 
-const ANSI_16_COLORS: [[f32; 4]; 16] = [
-    [0.10, 0.10, 0.10, 1.0],
-    [0.95, 0.30, 0.30, 1.0],
-    [0.30, 0.85, 0.30, 1.0],
-    [0.90, 0.85, 0.20, 1.0],
-    [0.30, 0.60, 1.00, 1.0],
-    [0.90, 0.35, 0.90, 1.0],
-    [0.20, 0.85, 0.85, 1.0],
-    [0.90, 0.90, 0.90, 1.0],
-    [0.45, 0.45, 0.45, 1.0],
-    [1.00, 0.40, 0.40, 1.0],
-    [0.40, 1.00, 0.40, 1.0],
-    [1.00, 1.00, 0.40, 1.0],
-    [0.50, 0.70, 1.00, 1.0],
-    [1.00, 0.50, 1.00, 1.0],
-    [0.40, 1.00, 1.00, 1.0],
-    [1.00, 1.00, 1.00, 1.0],
-];
-
-/// Builds the terminal palette the renderer draws with: default foreground
-/// is `ANSI_16_COLORS[7]`, default background is the configured colour, and
-/// the cursor has no palette colour of its own, so it follows the foreground.
-pub(crate) fn terminal_palette(background: crate::config::RgbColor) -> TermPalette {
-    let foreground = palette_rgb(ANSI_16_COLORS[7]);
+/// Builds the terminal palette the renderer draws with from the configured
+/// colours. The cursor has no palette colour of its own, so it follows the
+/// foreground.
+pub(crate) fn terminal_palette(config: &crate::config::AppConfig) -> TermPalette {
+    let foreground = config_rgb(config.terminal_foreground);
     TermPalette {
         foreground,
-        background: Rgb {
-            r: background.r,
-            g: background.g,
-            b: background.b,
-        },
+        background: config_rgb(config.terminal_background),
         cursor: foreground,
-        ansi: std::array::from_fn(|index| palette_rgb(ANSI_16_COLORS[index])),
+        ansi: config.terminal_palette.map(config_rgb),
+        bold_foreground: config.terminal_bold_foreground.map(config_rgb),
     }
 }
 
-fn palette_rgb(rgba: [f32; 4]) -> Rgb {
+fn config_rgb(color: crate::config::RgbColor) -> Rgb {
     Rgb {
-        r: terminal_palette_channel(rgba[0]),
-        g: terminal_palette_channel(rgba[1]),
-        b: terminal_palette_channel(rgba[2]),
+        r: color.r,
+        g: color.g,
+        b: color.b,
     }
 }
 
-/// Converts one unit-range channel to a byte, rounding half away from zero
-/// in f32 arithmetic.
-fn terminal_palette_channel(value: f32) -> u8 {
-    (value * 255.0).round() as u8
-}
-
-fn terminal_color_rgba(color: TerminalColor) -> [f32; 4] {
+fn terminal_color_rgba(palette: &TerminalPalette, color: TerminalColor) -> [f32; 4] {
     if color.is_default_foreground() {
-        return ANSI_16_COLORS[7];
+        return palette.term_fg;
     }
     if color.is_default_background() {
-        return ANSI_16_COLORS[0];
+        return palette.ansi[0];
     }
     if let Some(index) = color.indexed_value() {
         if index < 16 {
-            return ANSI_16_COLORS[index as usize];
+            return palette.ansi[index as usize];
         }
         if let Some(rgb) = xterm_256_rgb(index) {
             return rgb_rgba(rgb.r, rgb.g, rgb.b);
@@ -1220,11 +1192,11 @@ fn terminal_cell_x_bounds(text_x: f32, cell_index: usize, char_w: f32) -> (f32, 
 }
 
 #[inline]
-pub(crate) fn terminal_render_color(color: TerminalColor, palette: TerminalPalette) -> [f32; 4] {
+pub(crate) fn terminal_render_color(color: TerminalColor, palette: &TerminalPalette) -> [f32; 4] {
     if color.is_default_background() {
         palette.bg
     } else {
-        terminal_color_rgba(color)
+        terminal_color_rgba(palette, color)
     }
 }
 
@@ -1240,15 +1212,19 @@ fn terminal_dim_color(mut color: [f32; 4]) -> [f32; 4] {
 #[inline]
 pub(crate) fn terminal_cell_render_colors(
     cell: &Cell,
-    palette: TerminalPalette,
+    palette: &TerminalPalette,
 ) -> ([f32; 4], Option<[f32; 4]>) {
     let source_fg = terminal_render_color(cell.fg(), palette);
     let source_bg = terminal_render_color(cell.bg(), palette);
     let (mut foreground, background) = if cell.is_inverse() {
         (source_bg, Some(source_fg))
     } else {
+        // Bold text in the default foreground takes the configured bold colour.
+        let bold_default_fg = palette.term_bold_fg.filter(|_| {
+            cell.flags().contains(CellFlags::BOLD) && cell.fg().is_default_foreground()
+        });
         (
-            source_fg,
+            bold_default_fg.unwrap_or(source_fg),
             (!cell.bg().is_default_background()).then_some(source_bg),
         )
     };
@@ -1290,7 +1266,7 @@ const MAX_DECORATION_QUADS: usize = 3;
 /// with a single one across a hovered link; strikethrough and underline colour are kept.
 fn terminal_cell_decoration(
     cell: &Cell,
-    palette: TerminalPalette,
+    palette: &TerminalPalette,
     link_underline: bool,
 ) -> Option<TerminalCellDecoration> {
     if cell.is_hidden() || cell.flags().contains(CellFlags::CONCEAL) {
@@ -2848,7 +2824,7 @@ impl Renderer {
                                 } else {
                                     cell_index
                                 };
-                                let (_, mut bg) = terminal_cell_render_colors(cell, palette);
+                                let (_, mut bg) = terminal_cell_render_colors(cell, &palette);
                                 if let Some((sx, sy, ex, ey)) = grid.selection() {
                                     let (start_x, start_y, end_x, end_y) =
                                         normalized_selection_bounds(sx, sy, ex, ey);
@@ -2901,7 +2877,7 @@ impl Renderer {
                                     cell_index,
                                 );
                                 let Some(decoration) =
-                                    terminal_cell_decoration(cell, palette, link_underline)
+                                    terminal_cell_decoration(cell, &palette, link_underline)
                                 else {
                                     continue;
                                 };
@@ -2939,7 +2915,7 @@ impl Renderer {
                                 else {
                                     continue;
                                 };
-                                let (fg, _) = terminal_cell_render_colors(cell, palette);
+                                let (fg, _) = terminal_cell_render_colors(cell, &palette);
                                 let face = terminal_cell_face(cell);
                                 if let Some(glyph) =
                                     self.terminal_glyph(cell.ch(), cell.presentation(), face)
@@ -3094,7 +3070,7 @@ mod tests {
                 name: "ronsole",
                 version: "test",
             },
-            palette: terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            palette: terminal_palette(&crate::config::AppConfig::default()),
         })
     }
 
@@ -3111,8 +3087,11 @@ mod tests {
 
     #[test]
     fn terminal_palette_from_config() {
-        let background = crate::config::RgbColor::new(0x12, 0xAB, 0xEF);
-        let palette = terminal_palette(background);
+        let config = crate::config::AppConfig {
+            terminal_background: crate::config::RgbColor::new(0x12, 0xAB, 0xEF),
+            ..crate::config::AppConfig::default()
+        };
+        let palette = terminal_palette(&config);
         let grey = Rgb {
             r: 230,
             g: 230,
@@ -3137,7 +3116,15 @@ mod tests {
                 b: 255,
             }
         );
-        assert_eq!(terminal_palette_channel(0.70), 179);
+        // Configured colours replace the defaults in the built TermPalette.
+        let mut config = crate::config::AppConfig::default();
+        config.terminal_palette[1] = crate::config::RgbColor::new(0x12, 0x34, 0x56);
+        config.terminal_bold_foreground = Some(crate::config::RgbColor::new(0xAB, 0xCD, 0xEF));
+        let built = terminal_palette(&config);
+        assert_eq!(built.ansi[1], Rgb { r: 0x12, g: 0x34, b: 0x56 });
+        assert_eq!(built.bold_foreground, Some(Rgb { r: 0xAB, g: 0xCD, b: 0xEF }));
+        assert_eq!(built.foreground, Rgb { r: 0xE6, g: 0xE6, b: 0xE6 });
+        assert_eq!(built.cursor, built.foreground);
     }
 
     fn test_glyph(width: f32, height: f32, mode: f32) -> GlyphInfo {
@@ -3440,9 +3427,12 @@ mod tests {
             ronsole_term::CellFlags::INVERSE,
             UnderlineStyle::None,
         );
-        let (default_fg, default_bg) = terminal_cell_render_colors(&default_cell, palette);
+        let (default_fg, default_bg) = terminal_cell_render_colors(&default_cell, &palette);
         assert_eq!(default_fg, palette.bg);
-        assert_eq!(default_bg, Some(terminal_color_rgba(TerminalColor::default_foreground())));
+        assert_eq!(
+            default_bg,
+            Some(terminal_color_rgba(&palette, TerminalColor::default_foreground()))
+        );
 
         let explicit = Cell::new_for_test(
             'X',
@@ -3451,17 +3441,21 @@ mod tests {
             ronsole_term::CellFlags::INVERSE,
             UnderlineStyle::None,
         );
-        let (fg, bg) = terminal_cell_render_colors(&explicit, palette);
-        assert_eq!(fg, terminal_color_rgba(TerminalColor::indexed(4)));
-        assert_eq!(bg, Some(terminal_color_rgba(TerminalColor::indexed(1))));
-        assert_ne!(default_fg, terminal_color_rgba(TerminalColor::indexed(0)));
+        let (fg, bg) = terminal_cell_render_colors(&explicit, &palette);
+        assert_eq!(fg, terminal_color_rgba(&palette, TerminalColor::indexed(4)));
+        assert_eq!(bg, Some(terminal_color_rgba(&palette, TerminalColor::indexed(1))));
+        assert_ne!(default_fg, terminal_color_rgba(&palette, TerminalColor::indexed(0)));
     }
 
     #[test]
     fn xterm_palette_mapping_covers_cube_and_grayscale() {
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(16)), [0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(231)), [1.0, 1.0, 1.0, 1.0]);
-        let gray = terminal_color_rgba(TerminalColor::indexed(232));
+        let palette = TerminalPalette::new(crate::config::DEFAULT_TERMINAL_BACKGROUND, [0.0; 4]);
+        assert_eq!(terminal_color_rgba(&palette, TerminalColor::indexed(16)), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            terminal_color_rgba(&palette, TerminalColor::indexed(231)),
+            [1.0, 1.0, 1.0, 1.0]
+        );
+        let gray = terminal_color_rgba(&palette, TerminalColor::indexed(232));
         assert!((gray[0] - 8.0 / 255.0).abs() < f32::EPSILON);
         assert_eq!(gray[0], gray[1]);
         assert_eq!(gray[1], gray[2]);
@@ -3472,7 +3466,11 @@ mod tests {
         let cell = Cell::default();
         assert!(cell.bg().is_default_background());
         assert!(!TerminalColor::indexed(0).is_default_background());
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(0)), ANSI_16_COLORS[0]);
+        let palette = TerminalPalette::new(crate::config::DEFAULT_TERMINAL_BACKGROUND, [0.0; 4]);
+        assert_eq!(
+            terminal_color_rgba(&palette, TerminalColor::indexed(0)),
+            crate::config::DEFAULT_TERMINAL_PALETTE[0].to_rgba()
+        );
     }
 
     #[test]
@@ -3488,13 +3486,53 @@ mod tests {
             ronsole_term::CellFlags::DIM,
             UnderlineStyle::None,
         );
-        let (fg, bg) = terminal_cell_render_colors(&cell, palette);
-        let source = terminal_color_rgba(TerminalColor::rgb(150, 120, 90));
+        let (fg, bg) = terminal_cell_render_colors(&cell, &palette);
+        let source = terminal_color_rgba(&palette, TerminalColor::rgb(150, 120, 90));
         assert!((fg[0] - source[0] * 0.66).abs() < 0.0001);
         assert!((fg[1] - source[1] * 0.66).abs() < 0.0001);
         assert!((fg[2] - source[2] * 0.66).abs() < 0.0001);
         assert_eq!(fg[3], source[3]);
-        assert_eq!(bg, Some(terminal_color_rgba(TerminalColor::indexed(4))));
+        assert_eq!(bg, Some(terminal_color_rgba(&palette, TerminalColor::indexed(4))));
+    }
+
+    #[test]
+    fn bold_colour_replaces_default_foreground_only_outside_inverse() {
+        let mut palette = decoration_test_palette();
+        let bold = crate::config::RgbColor::new(0xFA, 0xFB, 0xFC).to_rgba();
+        palette.term_bold_fg = Some(bold);
+
+        let bold_default = Cell::new_for_test(
+            'x',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            CellFlags::BOLD,
+            UnderlineStyle::None,
+        );
+        let (fg, _) = terminal_cell_render_colors(&bold_default, &palette);
+        assert_eq!(fg, bold);
+
+        // Inverse takes the foreground from the cell background, so the bold colour stays out.
+        let inverse_bold = Cell::new_for_test(
+            'x',
+            TerminalColor::default_foreground(),
+            TerminalColor::indexed(4),
+            CellFlags::BOLD | CellFlags::INVERSE,
+            UnderlineStyle::None,
+        );
+        let (fg, bg) = terminal_cell_render_colors(&inverse_bold, &palette);
+        assert_eq!(fg, terminal_color_rgba(&palette, TerminalColor::indexed(4)));
+        assert_eq!(bg, Some(palette.term_fg));
+
+        // An explicit indexed foreground is not the default, so bold keeps it.
+        let explicit_bold = Cell::new_for_test(
+            'x',
+            TerminalColor::indexed(1),
+            TerminalColor::default_background(),
+            CellFlags::BOLD,
+            UnderlineStyle::None,
+        );
+        let (fg, _) = terminal_cell_render_colors(&explicit_bold, &palette);
+        assert_eq!(fg, palette.ansi[1]);
     }
 
     /// Sink that drops every reply; the decoration tests only read grid contents.
@@ -3513,6 +3551,9 @@ mod tests {
             fg: [1.0; 4],
             minimap_bg: [0.0; 4],
             accent: [0.0; 4],
+            term_fg: [1.0; 4],
+            term_bold_fg: None,
+            ansi: crate::config::DEFAULT_TERMINAL_PALETTE.map(|c| c.to_rgba()),
         }
     }
 
@@ -3724,11 +3765,11 @@ mod tests {
             ronsole_term::CellFlags::INVERSE,
             UnderlineStyle::Single,
         );
-        let decoration = terminal_cell_decoration(&inverse, palette, false).expect("underlined");
-        let expected = terminal_color_rgba(TerminalColor::indexed(4));
+        let decoration = terminal_cell_decoration(&inverse, &palette, false).expect("underlined");
+        let expected = terminal_color_rgba(&palette, TerminalColor::indexed(4));
         assert_eq!(decoration.underline_color, expected);
         assert_eq!(decoration.strike_color, expected);
-        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&inverse, palette).0);
+        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&inverse, &palette).0);
 
         // DIM scales the rendered foreground RGB by 0.66, as in dim_affects_only_effective_foreground_rgb.
         let dim = Cell::new_for_test(
@@ -3738,14 +3779,14 @@ mod tests {
             ronsole_term::CellFlags::DIM,
             UnderlineStyle::Single,
         );
-        let decoration = terminal_cell_decoration(&dim, palette, false).expect("underlined");
-        let source = terminal_color_rgba(TerminalColor::rgb(150, 120, 90));
+        let decoration = terminal_cell_decoration(&dim, &palette, false).expect("underlined");
+        let source = terminal_color_rgba(&palette, TerminalColor::rgb(150, 120, 90));
         let expected = [source[0] * 0.66, source[1] * 0.66, source[2] * 0.66, source[3]];
         for channel in 0..4 {
             assert!((decoration.underline_color[channel] - expected[channel]).abs() < 0.0001);
         }
         assert_eq!(decoration.strike_color, decoration.underline_color);
-        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&dim, palette).0);
+        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&dim, &palette).0);
     }
 
     #[test]
@@ -3758,7 +3799,7 @@ mod tests {
         );
         let cell = &term.row(0).expect("row 0 exists")[0];
         let decoration =
-            terminal_cell_decoration(cell, decoration_test_palette(), false).expect("underlined");
+            terminal_cell_decoration(cell, &decoration_test_palette(),false).expect("underlined");
         assert_eq!(decoration.underline, UnderlineStyle::Single);
         // SGR 58 red wins for the underline; SGR 38 green stays on the strikethrough colour.
         assert_eq!(decoration.underline_color[0], 1.0);
@@ -3772,7 +3813,7 @@ mod tests {
         let palette = decoration_test_palette();
         for flags in [ronsole_term::CellFlags::CONCEAL, ronsole_term::CellFlags::HOST_HIDDEN] {
             let cell = decoration_test_cell(flags, UnderlineStyle::Single);
-            assert_eq!(terminal_cell_decoration(&cell, palette, true), None);
+            assert_eq!(terminal_cell_decoration(&cell, &palette, true), None);
             assert_eq!(terminal_glyph_cell_geometry(0.0, 0, &cell, 8.0), None);
         }
     }
@@ -3833,19 +3874,19 @@ mod tests {
         assert_eq!(hovered_covered_cols(hovered, 8, 0, 8), Vec::<usize>::new());
 
         let plain = decoration_test_cell(ronsole_term::CellFlags::empty(), UnderlineStyle::None);
-        let decoration = terminal_cell_decoration(&plain, decoration_test_palette(), true)
+        let decoration = terminal_cell_decoration(&plain, &decoration_test_palette(),true)
             .expect("hovered link adds an underline");
         assert_eq!(decoration.underline, UnderlineStyle::Single);
 
         // A cell with its own curly underline and strikethrough inside the link range:
         // the link replaces the underline with Single and keeps the strikethrough.
         let curly = decoration_test_cell(ronsole_term::CellFlags::STRIKE, UnderlineStyle::Curly);
-        let decoration = terminal_cell_decoration(&curly, decoration_test_palette(), true)
+        let decoration = terminal_cell_decoration(&curly, &decoration_test_palette(),true)
             .expect("hovered link replaces the cell underline");
         assert_eq!(decoration.underline, UnderlineStyle::Single);
         assert!(decoration.strike);
         // Without a matching generation the cell keeps its own Curly underline.
-        let decoration = terminal_cell_decoration(&curly, decoration_test_palette(), false)
+        let decoration = terminal_cell_decoration(&curly, &decoration_test_palette(),false)
             .expect("cell keeps its own decoration outside the hovered link");
         assert_eq!(decoration.underline, UnderlineStyle::Curly);
         assert!(decoration.strike);

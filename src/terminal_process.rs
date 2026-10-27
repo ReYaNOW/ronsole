@@ -1735,6 +1735,7 @@ mod tests {
                     b: 0xe5,
                 },
                 ansi: [ronsole_term::Rgb { r: 0, g: 0, b: 0 }; 16],
+                bold_foreground: None,
             },
         })
     }

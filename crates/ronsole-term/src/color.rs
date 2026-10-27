@@ -134,6 +134,9 @@ pub struct TermPalette {
     pub background: Rgb,
     pub cursor: Rgb,
     pub ansi: [Rgb; 16],
+    /// Foreground for bold text drawn in the default foreground colour. `None`
+    /// keeps the regular foreground for bold text.
+    pub bold_foreground: Option<Rgb>,
 }
 
 /// Resolved colours of one cell, after inverse and dim.
@@ -165,7 +168,17 @@ impl TermPalette {
         if flags.contains(CellFlags::INVERSE) {
             std::mem::swap(&mut fg_source, &mut bg_source);
         }
-        let mut fg = self.rgb(fg_source);
+        // Bold colour replaces only a non-inverse default foreground, as the renderer does.
+        let mut fg = match self.bold_foreground {
+            Some(bold)
+                if flags.contains(CellFlags::BOLD)
+                    && !flags.contains(CellFlags::INVERSE)
+                    && fg_source.is_default_foreground() =>
+            {
+                bold
+            }
+            _ => self.rgb(fg_source),
+        };
         if flags.contains(CellFlags::DIM) {
             fg = Rgb {
                 r: dim_channel(fg.r),
@@ -208,7 +221,57 @@ mod tests {
                 g: 0,
                 b: 0,
             }),
+            bold_foreground: None,
         }
+    }
+
+    #[test]
+    fn bold_default_foreground_uses_bold_colour_when_set() {
+        let mut palette = test_palette();
+        let bold_cell = Cell::new_for_test(
+            'x',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            CellFlags::BOLD,
+            UnderlineStyle::None,
+        );
+        // Unset: bold text keeps the regular default foreground.
+        assert_eq!(palette.cell_colors(&bold_cell).fg, palette.foreground);
+
+        let bold = Rgb {
+            r: 250,
+            g: 251,
+            b: 252,
+        };
+        palette.bold_foreground = Some(bold);
+        assert_eq!(palette.cell_colors(&bold_cell).fg, bold);
+
+        let plain_cell = Cell::new_for_test(
+            'x',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            CellFlags::default(),
+            UnderlineStyle::None,
+        );
+        assert_eq!(palette.cell_colors(&plain_cell).fg, palette.foreground);
+    }
+
+    #[test]
+    fn bold_colour_does_not_replace_explicit_indexed_foreground() {
+        let mut palette = test_palette();
+        palette.bold_foreground = Some(Rgb {
+            r: 250,
+            g: 251,
+            b: 252,
+        });
+        let cell = Cell::new_for_test(
+            'x',
+            TerminalColor::indexed(1),
+            TerminalColor::default_background(),
+            CellFlags::BOLD,
+            UnderlineStyle::None,
+        );
+        assert_eq!(palette.cell_colors(&cell).fg, palette.ansi[1]);
     }
 
     #[test]
@@ -232,6 +295,26 @@ mod tests {
             TerminalColor::rgb(1, 2, 3).kind(),
             ColorKind::Rgb(Rgb { r: 1, g: 2, b: 3 })
         );
+    }
+
+    #[test]
+    fn bold_colour_does_not_replace_default_foreground_under_inverse() {
+        let mut palette = test_palette();
+        palette.bold_foreground = Some(Rgb {
+            r: 250,
+            g: 251,
+            b: 252,
+        });
+        // Inverse takes the foreground from the cell background, which is the default
+        // foreground here, so only the bold-rule guard keeps the bold colour out.
+        let cell = Cell::new_for_test(
+            'x',
+            TerminalColor::indexed(4),
+            TerminalColor::default_foreground(),
+            CellFlags::BOLD | CellFlags::INVERSE,
+            UnderlineStyle::None,
+        );
+        assert_eq!(palette.cell_colors(&cell).fg, palette.foreground);
     }
 
     #[test]

@@ -2458,7 +2458,7 @@ mod tests {
             None,
             1,
             launch,
-            crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
         );
         let read_out = || std::fs::read(&out).unwrap_or_default();
 

@@ -675,7 +675,7 @@ impl App {
     /// Palette a tab created now starts with: the configured background, with
     /// the renderer's default foreground, ANSI colours and cursor.
     fn new_terminal_palette(&self) -> TermPalette {
-        terminal_palette(self.config.terminal_background)
+        terminal_palette(&self.config)
     }
 
     pub(crate) fn find_terminal_by_bridge_launch_id(&self, id: [u8; 16]) -> Option<usize> {
@@ -1041,7 +1041,7 @@ impl App {
         self.config.terminal_background = color;
         for terminal in &self.terminals {
             let mut grid = crate::platform::lock_recover(&terminal.grid);
-            grid.set_palette(terminal_palette(color));
+            grid.set_palette(terminal_palette(&self.config));
         }
         self.request_frame();
         if let Some(runtime) = self.runtime.as_mut() {
@@ -2603,7 +2603,7 @@ mod tests {
             None,
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         );
         terminal
             .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
@@ -2651,7 +2651,7 @@ mod tests {
                 hold: true,
                 bridge_launch_id: None,
             },
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         );
         app.terminals.push(held);
         app.active_terminal = 0;
@@ -2689,7 +2689,7 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             },
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         ));
         app.active_terminal = 0;
 
@@ -2722,7 +2722,7 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             },
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         );
 
         assert!(!terminal.has_process());

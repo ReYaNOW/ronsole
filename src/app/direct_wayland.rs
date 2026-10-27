@@ -186,9 +186,11 @@ impl App {
     /// target. Shared by the Wayland and headless entry points.
     pub(super) fn prepare_bootstrapped_runtime(
         &mut self,
-        runtime: WindowRuntime,
+        mut runtime: WindowRuntime,
         initial_launch: TerminalLaunchSpec,
     ) {
+        // The renderer starts with default colours; apply the configured ones before its first frame.
+        let _ = runtime.set_terminal_colors(&self.config);
         let metrics = runtime.wayland_metrics();
         self.on_runtime_ready(
             runtime,
