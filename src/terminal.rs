@@ -2167,6 +2167,11 @@ impl Terminal {
         self.process.as_ref()?.process_group_leader()
     }
 
+    /// Foreground job name when a job other than the shell is running in this tab.
+    pub(crate) fn busy_foreground_name(&self) -> Option<String> {
+        self.process.as_ref()?.busy_foreground_name()
+    }
+
     /// Text of the last `rows` lines of the current screen (alt grid while in
     /// alt-screen), trailing spaces trimmed.
     pub(crate) fn screen_tail_text(&self, rows: usize) -> Vec<String> {

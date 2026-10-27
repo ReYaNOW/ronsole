@@ -205,6 +205,8 @@ pub(crate) struct TerminalProcess {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master_pty: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Shell pid, which is also its session and initial foreground process group.
+    shell_pid: u32,
     tree: ProcessTree,
     title_stop_tx: Option<std::sync::mpsc::Sender<()>>,
     title_worker: Option<JoinHandle<()>>,
@@ -412,6 +414,7 @@ impl TerminalProcess {
             writer,
             master_pty,
             child,
+            shell_pid: process_id,
             tree,
             title_stop_tx: Some(title_stop_tx),
             title_worker: Some(title_worker),
@@ -449,6 +452,17 @@ impl TerminalProcess {
         platform::lock_recover(&self.master_pty)
             .process_group_leader()
             .and_then(|pid| u32::try_from(pid).ok())
+    }
+
+    /// Name of the foreground job while it is running instead of the shell. Background
+    /// jobs (`&`) leave the shell as the foreground group, so they never report a name.
+    /// Walks `/proc`, so call it only at the moment a close is requested.
+    pub(crate) fn busy_foreground_name(&self) -> Option<String> {
+        busy_job_label(self.process_group_leader(), self.shell_pid, |process_group| {
+            platform::foreground_process_snapshot(process_group)
+                .map(|snapshot| terminal_process_program_name(&snapshot, ""))
+                .filter(|name| !name.is_empty())
+        })
     }
 
     pub(crate) fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -593,6 +607,26 @@ fn bounded_terminal_title(text: &str) -> String {
     let trimmed_len = title.trim_end().len();
     title.truncate(trimmed_len);
     title
+}
+
+/// The shell owns the PTY foreground group when it is idle, so any other group is a job.
+fn foreground_job_is_busy(process_group: u32, shell_pid: u32) -> bool {
+    process_group != shell_pid
+}
+
+/// Labels the job a close dialog shows for a tab. A tab whose foreground group cannot be
+/// read, or is the shell's own group, is idle and yields None. `read_name` runs only for
+/// a busy group; when it finds no name the job is labelled "?".
+fn busy_job_label(
+    process_group: Option<u32>,
+    shell_pid: u32,
+    read_name: impl FnOnce(u32) -> Option<String>,
+) -> Option<String> {
+    let process_group = process_group?;
+    if !foreground_job_is_busy(process_group, shell_pid) {
+        return None;
+    }
+    Some(read_name(process_group).unwrap_or_else(|| "?".to_string()))
 }
 
 fn terminal_process_program_name(snapshot: &platform::ProcessSnapshot, shell_title: &str) -> String {
@@ -1471,6 +1505,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn foreground_job_is_busy_only_when_group_differs_from_shell() {
+        // Idle shell owns the foreground group. Background jobs (`&`) do not move it.
+        assert!(!foreground_job_is_busy(4242, 4242));
+        // A foreground job runs in its own process group.
+        assert!(foreground_job_is_busy(4343, 4242));
+    }
+
+    #[test]
+    fn busy_job_label_treats_unreadable_or_shell_group_as_idle() {
+        let mut name_reads = 0usize;
+        // No readable foreground group: the tab is idle and the name is never read.
+        assert_eq!(
+            busy_job_label(None, 4242, |_| {
+                name_reads += 1;
+                Some("vim".to_string())
+            }),
+            None
+        );
+        // The shell owns its own group: idle.
+        assert_eq!(
+            busy_job_label(Some(4242), 4242, |_| {
+                name_reads += 1;
+                Some("bash".to_string())
+            }),
+            None
+        );
+        assert_eq!(name_reads, 0);
+    }
+
+    #[test]
+    fn busy_job_label_names_a_job_or_marks_an_unreadable_one() {
+        assert_eq!(
+            busy_job_label(Some(4343), 4242, |group| {
+                assert_eq!(group, 4343);
+                Some("vim".to_string())
+            }),
+            Some("vim".to_string())
+        );
+        // A busy group whose name cannot be read is still busy, shown as "?".
+        assert_eq!(
+            busy_job_label(Some(4343), 4242, |_| None),
+            Some("?".to_string())
+        );
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct TestLinuxStat {
         process_group: i32,
@@ -1579,6 +1659,7 @@ mod tests {
             writer,
             master_pty,
             child,
+            shell_pid,
             tree,
             title_stop_tx: None,
             title_worker: None,

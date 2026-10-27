@@ -127,8 +127,7 @@ impl App {
     fn handle_wayland_runtime_events(&mut self, events: WaylandRuntimeEvents) -> bool {
         if events.close_requested {
             self.interrupt_automation("Wayland compositor requested window close");
-            self.on_close_requested();
-            return true;
+            return self.on_close_requested();
         }
 
         if let Some(metrics) = events.scale_changed {

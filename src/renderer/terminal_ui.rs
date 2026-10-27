@@ -495,6 +495,7 @@ const SETTINGS_FONT_LABEL: &str = "Размер шрифта";
 const SETTINGS_SCROLL_LABEL: &str = "Чувствительность прокрутки";
 const SETTINGS_BACKGROUND_LABEL: &str = "Цвет фона";
 const SETTINGS_RESET_LABEL: &str = "Сбросить";
+const SETTINGS_CONFIRM_CLOSE_LABEL: &str = "Спрашивать перед закрытием";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SettingsHit {
@@ -510,6 +511,23 @@ pub(crate) enum SettingsHit {
     ScrollReset,
     BackgroundField,
     BackgroundReset,
+    ConfirmCloseToggle,
+}
+
+/// Text of the close confirmation dialog, cached by the app when the dialog opens.
+pub(crate) struct CloseConfirmView<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) rows: &'a [String],
+    pub(crate) more: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CloseConfirmHit {
+    #[default]
+    None,
+    Outside,
+    Confirm,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -537,6 +555,13 @@ struct SettingsBackgroundRowLayout {
     value: SettingsLine,
     value_max_x: f32,
     reset: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsToggleRowLayout {
+    label: SettingsLine,
+    label_max_x: f32,
+    toggle: Rect,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -568,6 +593,7 @@ struct SettingsLayout {
     font: Option<SettingsRowLayout>,
     scroll: Option<SettingsRowLayout>,
     background: Option<SettingsBackgroundRowLayout>,
+    confirm_close: Option<SettingsToggleRowLayout>,
     help: [Option<SettingsHelpRowLayout>; SETTINGS_HELP_ENTRIES.len()],
 }
 
@@ -610,6 +636,11 @@ impl SettingsLayout {
             if row.reset.contains(x, y) {
                 return SettingsHit::BackgroundReset;
             }
+        }
+        if let Some(row) = self.confirm_close
+            && row.toggle.contains(x, y)
+        {
+            return SettingsHit::ConfirmCloseToggle;
         }
         SettingsHit::None
     }
@@ -704,6 +735,30 @@ fn centered_settings_value_x(left: f32, right: f32, measured_width: f32) -> f32 
     (left + ((right - left - width).max(0.0) * 0.5))
         .round()
         .clamp(left, (right - width).max(left))
+}
+
+fn settings_toggle_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsToggleRowLayout> {
+    let button = (30.0 * scale).round().max(1.0);
+    let gap = (8.0 * scale).round().max(1.0);
+    let toggle_w = (86.0 * scale).round().max(1.0);
+    let label_room = (64.0 * scale).round().max(1.0);
+    if clip.w < toggle_w + gap + label_room || top < clip.y || top + button > clip.y + clip.h {
+        return None;
+    }
+    let toggle = Rect {
+        x: (clip.x + clip.w - toggle_w).round(),
+        y: top.round(),
+        w: toggle_w,
+        h: button,
+    };
+    Some(SettingsToggleRowLayout {
+        label: SettingsLine {
+            x: clip.x.round(),
+            baseline_y: (top + button * 0.70).round(),
+        },
+        label_max_x: (toggle.x - gap).round(),
+        toggle,
+    })
 }
 
 fn settings_background_row_layout(
@@ -929,6 +984,7 @@ fn settings_layout(
     let mut font = None;
     let mut scroll = None;
     let mut background = None;
+    let mut confirm_close = None;
     let mut help = [None; SETTINGS_HELP_ENTRIES.len()];
     match active_tab {
         SettingsTab::General => {
@@ -938,6 +994,8 @@ fn settings_layout(
             scroll = settings_row_layout(content_body, first_top + row_gap, scale);
             background =
                 settings_background_row_layout(content_body, first_top + row_gap * 2.0, scale);
+            confirm_close =
+                settings_toggle_row_layout(content_body, first_top + row_gap * 3.0, scale);
         }
         SettingsTab::Help => {
             for (index, slot) in help.iter_mut().enumerate() {
@@ -958,7 +1016,72 @@ fn settings_layout(
         font,
         scroll,
         background,
+        confirm_close,
         help,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CloseConfirmLayout {
+    panel: Rect,
+    text_x: f32,
+    text_max_x: f32,
+    title_baseline_y: f32,
+    rows_baseline_y: f32,
+    row_step: f32,
+    confirm: Rect,
+    cancel: Rect,
+}
+
+impl CloseConfirmLayout {
+    fn hit_test(self, x: f32, y: f32) -> CloseConfirmHit {
+        if !self.panel.contains(x, y) {
+            return CloseConfirmHit::Outside;
+        }
+        if self.confirm.contains(x, y) {
+            CloseConfirmHit::Confirm
+        } else if self.cancel.contains(x, y) {
+            CloseConfirmHit::Cancel
+        } else {
+            CloseConfirmHit::None
+        }
+    }
+}
+
+/// Centered dialog sized for `line_count` list lines below its title.
+fn close_confirm_layout(width: f32, height: f32, scale: f32, line_count: usize) -> CloseConfirmLayout {
+    let scale = scale.max(0.0);
+    let pad = (24.0 * scale).round();
+    let header_h = (56.0 * scale).round();
+    let row_step = (24.0 * scale).round().max(1.0);
+    let button_h = (36.0 * scale).round().max(1.0);
+    let button_w = (120.0 * scale).round().max(1.0);
+    let gap = (16.0 * scale).round().max(1.0);
+    let panel_w = (460.0 * scale).round();
+    let panel_h = (header_h + row_step * line_count as f32 + pad + button_h + pad).round();
+    let panel = fit_centered_rect(width, height, panel_w, panel_h, pad);
+    let button_y = (panel.y + panel.h - pad - button_h).round();
+    let confirm = Rect {
+        x: (panel.x + panel.w - pad - button_w).round(),
+        y: button_y,
+        w: button_w,
+        h: button_h,
+    };
+    let cancel = Rect {
+        x: (confirm.x - gap - button_w).round(),
+        y: button_y,
+        w: button_w,
+        h: button_h,
+    };
+    CloseConfirmLayout {
+        panel,
+        text_x: (panel.x + pad).round(),
+        text_max_x: (panel.x + panel.w - pad).round(),
+        title_baseline_y: (panel.y + 36.0 * scale).round(),
+        rows_baseline_y: (panel.y + header_h + row_step * 0.70).round(),
+        row_step,
+        confirm,
+        cancel,
     }
 }
 
@@ -2129,6 +2252,7 @@ impl Renderer {
         scroll_value: &str,
         background_input: &mut SingleLineInput,
         background_editing: bool,
+        confirm_close: bool,
     ) {
         let progress = progress.clamp(0.0, 1.0);
         if progress <= 0.0 {
@@ -2333,6 +2457,14 @@ impl Renderer {
                         hovered,
                     );
                 }
+                if let Some(row) = layout.confirm_close {
+                    self.draw_settings_toggle_row(
+                        row,
+                        SETTINGS_CONFIRM_CLOSE_LABEL,
+                        confirm_close,
+                        hovered == SettingsHit::ConfirmCloseToggle,
+                    );
+                }
             }
             SettingsTab::Help => {
                 for (row, entry) in layout.help.iter().zip(SETTINGS_HELP_ENTRIES.iter()) {
@@ -2535,6 +2667,125 @@ impl Renderer {
         self.clear_clip();
     }
 
+    fn draw_settings_toggle_row(
+        &mut self,
+        row: SettingsToggleRowLayout,
+        label: &str,
+        enabled: bool,
+        hovered: bool,
+    ) {
+        let s = self.scale_factor;
+        let fill = if hovered {
+            self.palette.accent_with_alpha(0.55)
+        } else {
+            [0.224, 0.231, 0.251, 1.0]
+        };
+        self.push_rounded_rect(
+            row.toggle.x,
+            row.toggle.y,
+            row.toggle.w,
+            row.toggle.h,
+            (5.0 * s).round().max(1.0),
+            fill,
+        );
+        self.draw_ui_text_clipped(
+            label,
+            row.label.x,
+            row.label_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        let value = if enabled { "Вкл" } else { "Выкл" };
+        let value_width = self.terminal_ui_text_width(value, 0.90);
+        let value_x = centered_settings_value_x(
+            row.toggle.x,
+            row.toggle.x + row.toggle.w,
+            value_width,
+        );
+        self.draw_ui_text_clipped(
+            value,
+            value_x,
+            row.toggle.x + row.toggle.w,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+    }
+
+    /// Draws the close confirmation over the whole window. Its text is cached by the
+    /// caller when the dialog opens, so this only lays out and pushes geometry.
+    fn draw_close_confirm(&mut self, view: CloseConfirmView<'_>) {
+        let s = self.scale_factor;
+        let line_count = view.rows.len() + usize::from(view.more.is_some());
+        let layout = close_confirm_layout(self.width, self.height, s, line_count);
+        let panel = layout.panel;
+        if panel.w <= 0.0 || panel.h <= 0.0 {
+            return;
+        }
+        self.push_rect(0.0, 0.0, self.width, self.height, [0.0, 0.0, 0.0, 0.45]);
+        let radius = (10.0 * s).round().max(1.0);
+        self.push_rounded_rect(
+            panel.x - 1.0,
+            panel.y - 1.0,
+            panel.w + 2.0,
+            panel.h + 2.0,
+            radius,
+            [0.224, 0.231, 0.251, 1.0],
+        );
+        self.push_rounded_rect(panel.x, panel.y, panel.w, panel.h, radius, [0.15, 0.16, 0.20, 1.0]);
+        let button_radius = (5.0 * s).round().max(1.0);
+        let normal = [0.224, 0.231, 0.251, 1.0];
+        let accent = self.palette.accent_with_alpha(0.55);
+        for (rect, fill) in [(layout.cancel, normal), (layout.confirm, accent)] {
+            self.push_rounded_rect(rect.x, rect.y, rect.w, rect.h, button_radius, fill);
+        }
+
+        self.draw_ui_text_clipped(
+            view.title,
+            layout.text_x,
+            layout.text_max_x,
+            layout.title_baseline_y,
+            self.palette.fg,
+            1.1,
+        );
+        for (index, row) in view.rows.iter().enumerate() {
+            let baseline = layout.rows_baseline_y + index as f32 * layout.row_step;
+            self.draw_ui_text_clipped(
+                row,
+                layout.text_x,
+                layout.text_max_x,
+                baseline,
+                self.palette.fg,
+                0.90,
+            );
+        }
+        if let Some(more) = view.more {
+            let baseline = layout.rows_baseline_y + view.rows.len() as f32 * layout.row_step;
+            self.draw_ui_text_clipped(
+                more,
+                layout.text_x,
+                layout.text_max_x,
+                baseline,
+                self.palette.fg,
+                0.90,
+            );
+        }
+        for (rect, label) in [(layout.cancel, "Отмена"), (layout.confirm, "Закрыть")] {
+            let label_width = self.terminal_ui_text_width(label, 0.90);
+            let label_x = centered_settings_value_x(rect.x, rect.x + rect.w, label_width);
+            self.draw_ui_text_clipped(
+                label,
+                label_x,
+                rect.x + rect.w,
+                (rect.y + rect.h * 0.70).round(),
+                self.palette.fg,
+                0.90,
+            );
+        }
+        self.flush();
+    }
+
     fn draw_settings_help_row(&mut self, row: SettingsHelpRowLayout, entry: SettingsHelpEntry) {
         let s = self.scale_factor;
         let radius = (4.0 * s).round().max(1.0);
@@ -2587,6 +2838,16 @@ impl Renderer {
             active_tab,
         )
         .hit_test(x, y)
+    }
+
+    /// Hit-tests the close confirmation. `line_count` must match the rows it was drawn with.
+    pub(crate) fn close_confirm_hit_test(
+        &self,
+        line_count: usize,
+        x: f32,
+        y: f32,
+    ) -> CloseConfirmHit {
+        close_confirm_layout(self.width, self.height, self.scale_factor, line_count).hit_test(x, y)
     }
 
     pub(crate) fn settings_background_cursor_from_x(
@@ -2691,6 +2952,8 @@ impl Renderer {
         settings_scroll_value: &str,
         settings_background_input: &mut SingleLineInput,
         settings_background_editing: bool,
+        settings_confirm_close: bool,
+        close_confirm: Option<CloseConfirmView<'_>>,
     ) -> TerminalUiLayout {
         self.frame_flushes = 0;
         self.frame_vertices = 0;
@@ -2728,7 +2991,11 @@ impl Renderer {
             settings_scroll_value,
             settings_background_input,
             settings_background_editing,
+            settings_confirm_close,
         );
+        if let Some(view) = close_confirm {
+            self.draw_close_confirm(view);
+        }
         if show_fps {
             self.draw_fps_overlay(layout.body);
         }
@@ -4368,6 +4635,37 @@ mod tests {
         assert_eq!(
             clipped_rect(Rect { x: 90.0, y: 6.0, w: 20.0, h: 32.0 }, strip),
             Some(Rect { x: 90.0, y: 6.0, w: 10.0, h: 32.0 })
+        );
+    }
+
+    #[test]
+    fn close_confirm_hit_test_maps_buttons_outside_and_empty_panel_space() {
+        let layout = close_confirm_layout(1100.0, 720.0, 1.0, 2);
+        let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        let (x, y) = center(layout.confirm);
+        assert_eq!(layout.hit_test(x, y), CloseConfirmHit::Confirm);
+        let (x, y) = center(layout.cancel);
+        assert_eq!(layout.hit_test(x, y), CloseConfirmHit::Cancel);
+        assert_eq!(
+            layout.hit_test(layout.panel.x + 1.0, layout.panel.y + 1.0),
+            CloseConfirmHit::None
+        );
+        assert_eq!(
+            layout.hit_test(layout.panel.x - 5.0, layout.panel.y - 5.0),
+            CloseConfirmHit::Outside
+        );
+    }
+
+    #[test]
+    fn confirm_close_toggle_row_hit_tests_its_drawn_control() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let toggle = layout
+            .confirm_close
+            .expect("toggle row must fit the General tab at 1100x720")
+            .toggle;
+        assert_eq!(
+            layout.hit_test(toggle.x + toggle.w * 0.5, toggle.y + toggle.h * 0.5),
+            SettingsHit::ConfirmCloseToggle
         );
     }
 

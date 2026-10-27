@@ -2664,6 +2664,8 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub settings_scroll_value: &'a str,
     pub settings_background_input: &'a mut crate::single_line_input::SingleLineInput,
     pub settings_background_editing: bool,
+    pub settings_confirm_close: bool,
+    pub close_confirm: Option<crate::renderer::CloseConfirmView<'a>>,
 }
 
 /// Field order is destruction order: the renderer goes first while its GL target is
@@ -2969,6 +2971,8 @@ impl WindowRuntime {
             params.settings_scroll_value,
             params.settings_background_input,
             params.settings_background_editing,
+            params.settings_confirm_close,
+            params.close_confirm,
         );
         match (&mut self.target, &self.backend) {
             (GlTarget::Window { context, surface, .. }, RuntimeBackend::Wayland(_)) => {
@@ -3001,6 +3005,15 @@ impl WindowRuntime {
         y: f32,
     ) -> crate::renderer::SettingsHit {
         self.renderer.settings_hit_test(progress, active_tab, x, y)
+    }
+
+    pub(crate) fn close_confirm_hit_test(
+        &self,
+        line_count: usize,
+        x: f32,
+        y: f32,
+    ) -> crate::renderer::CloseConfirmHit {
+        self.renderer.close_confirm_hit_test(line_count, x, y)
     }
 
     pub(crate) fn settings_background_cursor_from_x(
@@ -3764,6 +3777,8 @@ mod tests {
             settings_scroll_value: "",
             settings_background_input: &mut background_input,
             settings_background_editing: false,
+            settings_confirm_close: true,
+            close_confirm: None,
         });
         assert!(result.is_ok(), "render failed: {:?}", result.err());
     }

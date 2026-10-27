@@ -12,7 +12,9 @@ use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
 use crate::platform::single_instance::BridgeResult;
-use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit, terminal_palette};
+use crate::renderer::{
+    CloseConfirmHit, CloseConfirmView, SettingsHit, SettingsTab, TerminalTabHit, terminal_palette,
+};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::TerminalSearchHit;
@@ -167,6 +169,55 @@ struct SettingsBackgroundKeyOutcome {
     visual_changed: bool,
     copy_text: Option<String>,
     finish: bool,
+}
+
+/// Tab rows listed by the close confirmation before the "and N more" line.
+const CLOSE_CONFIRM_MAX_ROWS: usize = 8;
+
+/// What a confirmed close does: the whole window or one tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseTarget {
+    Window,
+    Tab(usize),
+}
+
+/// Open close confirmation. Its text is built once when the dialog opens.
+struct CloseConfirm {
+    target: CloseTarget,
+    title: &'static str,
+    rows: Vec<String>,
+    more: Option<String>,
+}
+
+impl CloseConfirm {
+    fn line_count(&self) -> usize {
+        self.rows.len() + usize::from(self.more.is_some())
+    }
+
+    /// Builds the dialog text from the busy tabs of a target, given as
+    /// (tab title, job name) in tab order. Returns None when nothing is busy.
+    /// Only the first `CLOSE_CONFIRM_MAX_ROWS` tabs get a row; the rest are counted.
+    fn from_busy(target: CloseTarget, busy: &[(String, String)]) -> Option<Self> {
+        if busy.is_empty() {
+            return None;
+        }
+        let rows: Vec<String> = busy
+            .iter()
+            .take(CLOSE_CONFIRM_MAX_ROWS)
+            .map(|(tab_title, process)| format!("{tab_title} — {process}"))
+            .collect();
+        let hidden = busy.len() - rows.len();
+        let title = match target {
+            CloseTarget::Window => "Закрыть окно?",
+            CloseTarget::Tab(_) => "Закрыть вкладку?",
+        };
+        Some(Self {
+            target,
+            title,
+            rows,
+            more: (hidden > 0).then(|| format!("и ещё {hidden}")),
+        })
+    }
 }
 
 fn settings_hex_insert_text(input: &mut SingleLineInput, text: &str) -> bool {
@@ -405,6 +456,7 @@ pub struct App {
     settings_open: bool,
     settings_progress: f32,
     settings_active_tab: SettingsTab,
+    close_confirm: Option<CloseConfirm>,
     show_fps: bool,
     focused: bool,
     unfocused_redraw_pending: bool,
@@ -481,6 +533,7 @@ impl App {
             settings_open: false,
             settings_progress: 0.0,
             settings_active_tab: SettingsTab::General,
+            close_confirm: None,
             show_fps: false,
             focused: true,
             unfocused_redraw_pending: false,
@@ -882,6 +935,9 @@ impl App {
             self.active_terminal_presented = false;
         }
         let mut removed = self.terminals.remove(index);
+        // Removing a tab shifts the indices a `CloseTarget::Tab` points at, so an open
+        // dialog no longer names the tab it was opened for. Cancel it instead.
+        self.cancel_close_dialog();
         if is_final {
             removed.shutdown();
         }
@@ -947,7 +1003,91 @@ impl App {
     }
 
     fn close_active_terminal(&mut self) -> bool {
-        self.close_terminal_tab_at(self.active_terminal)
+        self.request_terminal_close(CloseTarget::Tab(self.active_terminal))
+    }
+
+    /// Closes at once when nothing runs in the target or the prompt is disabled,
+    /// otherwise opens the confirmation. A request made while a dialog is already
+    /// open is ignored, so the open dialog keeps its target. Returns true when the
+    /// event loop must exit.
+    fn request_terminal_close(&mut self, target: CloseTarget) -> bool {
+        if self.close_confirm.is_some() {
+            return false;
+        }
+        if !self.config.confirm_close {
+            return self.perform_terminal_close(target);
+        }
+        let Some(confirm) = CloseConfirm::from_busy(target, &self.busy_close_targets(target))
+        else {
+            return self.perform_terminal_close(target);
+        };
+        self.open_close_dialog(confirm);
+        false
+    }
+
+    /// Shows the dialog. Drag state begun before it opened is dropped, because the
+    /// dialog swallows the release events that would otherwise end that drag.
+    fn open_close_dialog(&mut self, confirm: CloseConfirm) {
+        self.terminal_tab_drag = None;
+        self.settings_background_dragging = false;
+        self.close_confirm = Some(confirm);
+        self.request_frame();
+    }
+
+    fn perform_terminal_close(&mut self, target: CloseTarget) -> bool {
+        match target {
+            CloseTarget::Window => {
+                self.finish_terminal_session();
+                true
+            }
+            CloseTarget::Tab(index) => self.close_terminal_tab_at(index),
+        }
+    }
+
+    /// Reads foreground job names only at the close moment. Returns (tab title, job
+    /// name) for each tab in the target that runs a job; empty when none does, so the
+    /// close proceeds without a dialog.
+    fn busy_close_targets(&self, target: CloseTarget) -> Vec<(String, String)> {
+        let range = match target {
+            CloseTarget::Window => 0..self.terminals.len(),
+            CloseTarget::Tab(index) => index..index.saturating_add(1).min(self.terminals.len()),
+        };
+        let mut busy = Vec::new();
+        for index in range {
+            let Some(terminal) = self.terminals.get(index) else {
+                continue;
+            };
+            let Some(process) = terminal.busy_foreground_name() else {
+                continue;
+            };
+            let mut tab_title = String::new();
+            terminal.write_display_title(&mut tab_title);
+            busy.push((tab_title, process));
+        }
+        busy
+    }
+
+    /// Closes the dialog's target. Returns true when the event loop must exit.
+    fn confirm_close_dialog(&mut self) -> bool {
+        let Some(confirm) = self.close_confirm.take() else {
+            return false;
+        };
+        self.request_frame();
+        self.perform_terminal_close(confirm.target)
+    }
+
+    fn cancel_close_dialog(&mut self) {
+        if self.close_confirm.take().is_some() {
+            self.request_frame();
+        }
+    }
+
+    fn close_confirm_hit_test(&self, x: f32, y: f32) -> CloseConfirmHit {
+        let (Some(confirm), Some(runtime)) = (self.close_confirm.as_ref(), self.runtime.as_ref())
+        else {
+            return CloseConfirmHit::None;
+        };
+        runtime.close_confirm_hit_test(confirm.line_count(), x, y)
     }
 
     fn reorder_terminal_tab(&mut self, from: usize, to: usize) {
@@ -1225,6 +1365,10 @@ impl App {
                     self.settings_scroll_value = format!("{DEFAULT_SCROLL_SENSITIVITY:.2}");
                     true
                 }
+            }
+            SettingsHit::ConfirmCloseToggle => {
+                self.config.confirm_close = !self.config.confirm_close;
+                true
             }
             SettingsHit::BackgroundReset => {
                 let changed = self.set_terminal_background(DEFAULT_TERMINAL_BACKGROUND);
@@ -1517,8 +1661,9 @@ impl App {
         self.mark_dirty();
     }
 
-    fn on_close_requested(&mut self) {
-        self.finish_terminal_session();
+    /// Compositor close request. Returns true when the event loop must exit.
+    fn on_close_requested(&mut self) -> bool {
+        self.request_terminal_close(CloseTarget::Window)
     }
 
     /// Persists config and reaps every owned PTY session. Called directly by the
@@ -1569,6 +1714,9 @@ impl App {
     }
 
     pub(crate) fn on_ime_commit(&mut self, text: &str) {
+        if self.close_confirm.is_some() {
+            return;
+        }
         if self.settings_modal_active() {
             if self.settings_background_editing {
                 let _ = self.edit_settings_background_text(text);
@@ -1588,6 +1736,18 @@ impl App {
         // Before the early returns below, so modifier presses and releases seen while the
         // settings modal or a global shortcut owns the key still update the held state.
         self.interaction.note_modifier_key(&key_input);
+        if self.close_confirm.is_some() {
+            if key_input.state.is_pressed() {
+                match key_input.physical_key {
+                    PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                        return self.confirm_close_dialog();
+                    }
+                    PhysicalKey::Code(KeyCode::Escape) => self.cancel_close_dialog(),
+                    _ => {}
+                }
+            }
+            return false;
+        }
         if key_input.state.is_pressed()
             && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
         {
@@ -1653,6 +1813,10 @@ impl App {
         self.pointer_x = position.x;
         self.pointer_y = position.y;
         self.update_link_hover();
+        // The dialog owns the pointer: tab drag and reorder must not advance under it.
+        if self.close_confirm.is_some() {
+            return;
+        }
         if self.settings_modal_active() {
             let previous_hit = self.settings_hit_test(previous_x, previous_y);
             let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
@@ -1740,6 +1904,18 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        if self.close_confirm.is_some() {
+            if button == PointerButton::Left && state == KeyState::Pressed {
+                match self.close_confirm_hit_test(self.pointer_x, self.pointer_y) {
+                    CloseConfirmHit::Confirm => return self.confirm_close_dialog(),
+                    CloseConfirmHit::Cancel | CloseConfirmHit::Outside => {
+                        self.cancel_close_dialog();
+                    }
+                    CloseConfirmHit::None => {}
+                }
+            }
+            return false;
+        }
         if button == PointerButton::Left
             && state == KeyState::Pressed
             && self.clear_active_terminal_text_selection()
@@ -1776,7 +1952,9 @@ impl App {
                     runtime.terminal_tab_hit_test(self.pointer_x, self.pointer_y)
                 });
             match hit {
-                TerminalTabHit::Close(index) => return self.close_terminal_tab_at(index),
+                TerminalTabHit::Close(index) => {
+                    return self.request_terminal_close(CloseTarget::Tab(index));
+                }
                 TerminalTabHit::Add => {
                     let _ = self.add_terminal();
                     return false;
@@ -1834,7 +2012,7 @@ impl App {
     }
 
     pub(crate) fn on_scroll(&mut self, delta: ScrollDelta) {
-        if self.settings_modal_active() {
+        if self.close_confirm.is_some() || self.settings_modal_active() {
             return;
         }
         if let Some(runtime) = self.runtime.as_ref() {
@@ -1918,6 +2096,12 @@ impl App {
                 settings_scroll_value: &self.settings_scroll_value,
                 settings_background_input: &mut self.settings_background_input,
                 settings_background_editing: self.settings_background_editing,
+                settings_confirm_close: self.config.confirm_close,
+                close_confirm: self.close_confirm.as_ref().map(|confirm| CloseConfirmView {
+                    title: confirm.title,
+                    rows: &confirm.rows,
+                    more: confirm.more.as_deref(),
+                }),
             }))
         } else {
             None
@@ -2552,7 +2736,7 @@ mod tests {
         assert!(close.contains("if self.terminals.is_empty()"));
         assert!(close.contains("return true;"));
         assert!(!close.contains("add_terminal"));
-        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 3);
+        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 2);
 
         let request = production
             .split("    fn request_terminal_activation")
@@ -2809,6 +2993,192 @@ mod tests {
             global_shortcut(PhysicalKey::Code(KeyCode::KeyT), ctrl),
             None
         );
+    }
+
+    #[test]
+    fn close_without_busy_target_skips_the_dialog() {
+        let mut app = App::new();
+        // No terminals means no busy target: the close runs at once.
+        assert!(!app.request_terminal_close(CloseTarget::Tab(0)));
+        assert!(app.close_confirm.is_none());
+        assert!(app.busy_close_targets(CloseTarget::Window).is_empty());
+    }
+
+    #[test]
+    fn disabled_confirm_close_never_opens_the_dialog() {
+        let mut app = App::new();
+        app.apply_settings_hit(SettingsHit::ConfirmCloseToggle);
+        assert!(!app.config.confirm_close);
+        assert!(!app.request_terminal_close(CloseTarget::Tab(0)));
+        assert!(app.close_confirm.is_none());
+    }
+
+    #[test]
+    fn close_confirm_escape_cancels_and_other_keys_are_swallowed() {
+        let key = |physical_key| KeyInput {
+            state: KeyState::Pressed,
+            physical_key,
+            keycode: 0,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        };
+        let open = || CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        };
+        let mut app = App::new();
+        app.close_confirm = Some(open());
+        // F1 would toggle settings, but the open dialog owns every key except Enter and Esc.
+        assert!(!app.on_key(key(PhysicalKey::Code(KeyCode::F1))));
+        assert!(app.close_confirm.is_some());
+        assert!(!app.settings_modal_active());
+        assert!(!app.on_key(key(PhysicalKey::Code(KeyCode::Escape))));
+        assert!(app.close_confirm.is_none());
+    }
+
+    #[test]
+    fn close_confirm_enter_runs_the_close_and_clears_the_dialog() {
+        let key = KeyInput {
+            state: KeyState::Pressed,
+            physical_key: PhysicalKey::Code(KeyCode::Enter),
+            keycode: 0,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        };
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: Some("и ещё 2".to_string()),
+        });
+        // The only tab is the target, so the confirmed close removes it and reports the
+        // exit. Without the close running, the tab would still be there.
+        assert!(app.on_key(key));
+        assert!(app.terminals.is_empty());
+        assert!(app.close_confirm.is_none());
+    }
+
+    #[test]
+    fn close_request_while_dialog_is_open_is_ignored() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        // A window close must neither replace the tab dialog nor exit the event loop.
+        assert!(!app.request_terminal_close(CloseTarget::Window));
+        let confirm = app.close_confirm.as_ref().expect("dialog stays open");
+        assert_eq!(confirm.target, CloseTarget::Tab(0));
+        assert_eq!(confirm.title, "Закрыть вкладку?");
+        assert_eq!(app.terminals.len(), 1);
+    }
+
+    #[test]
+    fn removing_another_tab_cancels_the_open_tab_dialog() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        app.terminals.push(Terminal::new_for_test(80, 24, 2));
+        app.open_close_dialog(CloseConfirm {
+            target: CloseTarget::Tab(1),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        let mut kept_before = String::new();
+        app.terminals[1].write_display_title(&mut kept_before);
+        // Tab 0 closes and tab 1 shifts to index 0; the dialog must not follow it there.
+        assert!(!app.close_terminal_tab_at(0));
+        assert!(app.close_confirm.is_none());
+        assert_eq!(app.terminals.len(), 1);
+        let mut kept_after = String::new();
+        app.terminals[0].write_display_title(&mut kept_after);
+        assert_eq!(kept_before, kept_after);
+    }
+
+    #[test]
+    fn opening_the_dialog_drops_drags_and_motion_leaves_the_tab_drag_alone() {
+        let drag = || TabDragState {
+            start_idx: 0,
+            start_x: 10.0,
+            current_x: 10.0,
+            threshold_passed: true,
+        };
+        let mut app = App::new();
+        app.settings_background_dragging = true;
+        app.terminal_tab_drag = Some(drag());
+        app.open_close_dialog(CloseConfirm {
+            target: CloseTarget::Window,
+            title: "Закрыть окно?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        assert!(app.terminal_tab_drag.is_none());
+        assert!(!app.settings_background_dragging);
+        // A drag that is somehow still set must not advance while the dialog is open.
+        app.terminal_tab_drag = Some(drag());
+        app.on_pointer_motion(PointerPosition { x: 200.0, y: 5.0 });
+        let moved = app.terminal_tab_drag.as_ref().expect("drag untouched");
+        assert_eq!(moved.current_x, 10.0);
+    }
+
+    #[test]
+    fn wheel_is_swallowed_while_the_close_dialog_is_open() {
+        let source = include_str!("app.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        // Source-structure check: the wheel path has no runtime or PTY in unit tests.
+        let scroll = production
+            .split("    pub(crate) fn on_scroll")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn on_frame").next())
+            .expect("wheel routing must remain present");
+        let guard = scroll
+            .find("self.close_confirm.is_some()")
+            .expect("the close dialog must gate the wheel");
+        let strip = scroll
+            .find("terminal_tab_strip_layout")
+            .expect("tab strip wheel routing must remain present");
+        let pty = scroll
+            .find("self.interaction.mouse_wheel")
+            .expect("terminal wheel routing must remain present");
+        assert!(guard < strip);
+        assert!(guard < pty);
+    }
+
+    #[test]
+    fn close_confirm_rows_stop_at_the_limit_and_count_the_rest() {
+        let busy = |count: usize| -> Vec<(String, String)> {
+            (0..count)
+                .map(|index| (format!("tab {index}"), "vim".to_string()))
+                .collect()
+        };
+        let full = CloseConfirm::from_busy(CloseTarget::Window, &busy(8)).expect("busy tabs");
+        assert_eq!(full.rows.len(), 8);
+        assert_eq!(full.more, None);
+        assert_eq!(full.title, "Закрыть окно?");
+        assert_eq!(full.rows[0], "tab 0 — vim");
+
+        let nine = CloseConfirm::from_busy(CloseTarget::Tab(0), &busy(9)).expect("busy tabs");
+        assert_eq!(nine.rows.len(), 8);
+        assert_eq!(nine.more.as_deref(), Some("и ещё 1"));
+        assert_eq!(nine.line_count(), 9);
+        assert_eq!(nine.title, "Закрыть вкладку?");
+
+        let twelve = CloseConfirm::from_busy(CloseTarget::Window, &busy(12)).expect("busy tabs");
+        assert_eq!(twelve.rows.len(), 8);
+        assert_eq!(twelve.more.as_deref(), Some("и ещё 4"));
+
+        assert!(CloseConfirm::from_busy(CloseTarget::Window, &[]).is_none());
     }
 
     #[test]

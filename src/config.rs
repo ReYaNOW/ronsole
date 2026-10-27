@@ -12,6 +12,7 @@ pub(crate) const DEFAULT_SCROLL_SENSITIVITY: f32 = 1.0;
 pub(crate) const MIN_SCROLL_SENSITIVITY: f32 = 0.25;
 pub(crate) const MAX_SCROLL_SENSITIVITY: f32 = 3.0;
 pub(crate) const SCROLL_SENSITIVITY_STEP: f32 = 0.1;
+pub(crate) const DEFAULT_CONFIRM_CLOSE: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RgbColor {
@@ -96,6 +97,8 @@ pub(crate) struct AppConfig {
     /// `None` keeps bold text in the regular foreground.
     pub(crate) terminal_bold_foreground: Option<RgbColor>,
     pub(crate) terminal_palette: [RgbColor; 16],
+    /// Ask before closing a window or tab whose shell runs a foreground job.
+    pub(crate) confirm_close: bool,
     /// File this config was loaded from, which `save` writes back to. `None` writes nothing.
     pub(crate) path: Option<PathBuf>,
 }
@@ -111,6 +114,7 @@ impl Default for AppConfig {
             terminal_foreground: DEFAULT_TERMINAL_FOREGROUND,
             terminal_bold_foreground: DEFAULT_TERMINAL_BOLD_FOREGROUND,
             terminal_palette: DEFAULT_TERMINAL_PALETTE,
+            confirm_close: DEFAULT_CONFIRM_CLOSE,
             path: None,
         }
     }
@@ -258,6 +262,9 @@ fn parse_config_content(content: &str) -> AppConfig {
             "bold_foreground" => {
                 config.terminal_bold_foreground = RgbColor::parse_hex(value);
             }
+            "confirm_close" => {
+                config.confirm_close = value.parse::<bool>().unwrap_or(DEFAULT_CONFIRM_CLOSE);
+            }
             key => {
                 if let Some(index) = key
                     .strip_prefix("palette_")
@@ -292,7 +299,7 @@ fn format_config_content(config: &AppConfig) -> String {
         .map(|(index, color)| format!("palette_{index}={}\n", color.to_hex()))
         .collect();
     format!(
-        "window_width={:.3}\nwindow_height={:.3}\nterminal_font_size={:.2}\nscroll_sensitivity={:.2}\nterminal_background={}\nforeground={}\nbold_foreground={}\n{}",
+        "window_width={:.3}\nwindow_height={:.3}\nterminal_font_size={:.2}\nscroll_sensitivity={:.2}\nterminal_background={}\nforeground={}\nbold_foreground={}\n{}confirm_close={}\n",
         config.window_width,
         config.window_height,
         config.terminal_font_size,
@@ -301,6 +308,7 @@ fn format_config_content(config: &AppConfig) -> String {
         config.terminal_foreground.to_hex(),
         bold_foreground,
         palette,
+        config.confirm_close,
     )
 }
 
@@ -329,6 +337,7 @@ mod tests {
             terminal_foreground: RgbColor::new(0xD0, 0xD1, 0xD2),
             terminal_bold_foreground: Some(RgbColor::new(0xFF, 0xFE, 0xFD)),
             terminal_palette: [RgbColor::new(0x01, 0x02, 0x03); 16],
+            confirm_close: false,
             path: None,
         };
         assert_eq!(
@@ -420,6 +429,29 @@ mod tests {
             assert_eq!(parsed.terminal_font_size, DEFAULT_TERMINAL_FONT_SIZE);
             assert_eq!(parsed.scroll_sensitivity, DEFAULT_SCROLL_SENSITIVITY);
         }
+    }
+
+    #[test]
+    fn confirm_close_defaults_to_true_and_parses_only_bool_literals() {
+        assert!(AppConfig::default().confirm_close);
+        assert!(!parse_config_content("confirm_close=false\n").confirm_close);
+        assert!(parse_config_content("confirm_close=true\n").confirm_close);
+        // Non-bool values are the negative case: they must fall back to the default.
+        for invalid in ["maybe", "0", "yes", ""] {
+            let parsed = parse_config_content(&format!("confirm_close={invalid}\n"));
+            assert!(parsed.confirm_close, "value {invalid:?} must fall back to true");
+        }
+    }
+
+    #[test]
+    fn confirm_close_is_written_as_bool_line() {
+        let config = AppConfig {
+            confirm_close: false,
+            ..AppConfig::default()
+        };
+        assert!(format_config_content(&config).contains("confirm_close=false\n"));
+        let default_config = AppConfig::default();
+        assert!(format_config_content(&default_config).contains("confirm_close=true\n"));
     }
 
     #[test]
