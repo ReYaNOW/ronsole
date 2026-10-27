@@ -438,4 +438,9 @@ impl Term {
     pub fn set_palette(&mut self, palette: TermPalette) {
         self.palette = palette;
     }
+
+    /// Palette last given to `set_palette`, or the one the grid was created with.
+    pub fn palette(&self) -> &TermPalette {
+        &self.palette
+    }
 }

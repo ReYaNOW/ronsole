@@ -2665,6 +2665,9 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub settings_background_input: &'a mut crate::single_line_input::SingleLineInput,
     pub settings_background_editing: bool,
     pub settings_confirm_close: bool,
+    pub settings_colors: &'a crate::renderer::SettingsColorView,
+    pub settings_color_editing: Option<crate::renderer::SettingsColorField>,
+    pub settings_color_input: &'a crate::single_line_input::SingleLineInput,
     pub close_confirm: Option<crate::renderer::CloseConfirmView<'a>>,
 }
 
@@ -2972,6 +2975,9 @@ impl WindowRuntime {
             params.settings_background_input,
             params.settings_background_editing,
             params.settings_confirm_close,
+            params.settings_colors,
+            params.settings_color_editing,
+            params.settings_color_input,
             params.close_confirm,
         );
         match (&mut self.target, &self.backend) {
@@ -3761,6 +3767,9 @@ mod tests {
     fn render_empty_frame(runtime: &mut WindowRuntime) {
         let mut search = crate::search::TerminalSearchState::default();
         let mut background_input = crate::single_line_input::SingleLineInput::default();
+        let color_input = crate::single_line_input::SingleLineInput::default();
+        let color_view =
+            crate::renderer::SettingsColorView::new(&crate::config::AppConfig::default());
         let result = runtime.render_terminal_and_present(TerminalRenderParams {
             terminals: &[],
             active_terminal: 0,
@@ -3778,6 +3787,9 @@ mod tests {
             settings_background_input: &mut background_input,
             settings_background_editing: false,
             settings_confirm_close: true,
+            settings_colors: &color_view,
+            settings_color_editing: None,
+            settings_color_input: &color_input,
             close_confirm: None,
         });
         assert!(result.is_ok(), "render failed: {:?}", result.err());

@@ -1,6 +1,7 @@
 use crate::config::{
-    AppConfig, DEFAULT_SCROLL_SENSITIVITY, DEFAULT_TERMINAL_BACKGROUND, DEFAULT_TERMINAL_FONT_SIZE,
-    RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
+    AppConfig, DEFAULT_SCROLL_SENSITIVITY, DEFAULT_TERMINAL_BACKGROUND,
+    DEFAULT_TERMINAL_BOLD_FOREGROUND, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FOREGROUND,
+    DEFAULT_TERMINAL_PALETTE, RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
 };
 use crate::input::TerminalInteraction;
 use crate::input_types::{
@@ -13,7 +14,8 @@ use crate::platform::{
 };
 use crate::platform::single_instance::BridgeResult;
 use crate::renderer::{
-    CloseConfirmHit, CloseConfirmView, SettingsHit, SettingsTab, TerminalTabHit, terminal_palette,
+    CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
+    SettingsTab, TerminalTabHit, settings_color_value, terminal_palette,
 };
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
@@ -249,6 +251,43 @@ fn settings_hex_insert_text(input: &mut SingleLineInput, text: &str) -> bool {
     input.insert_text(&clean)
 }
 
+/// Hex draft text of a Colors-tab field; an unset bold foreground has an empty draft.
+fn settings_color_text(config: &AppConfig, field: SettingsColorField) -> String {
+    settings_color_value(config, field).map_or_else(String::new, |color| color.to_hex())
+}
+
+fn default_settings_color_value(field: SettingsColorField) -> Option<RgbColor> {
+    match field {
+        SettingsColorField::Foreground => Some(DEFAULT_TERMINAL_FOREGROUND),
+        SettingsColorField::BoldForeground => DEFAULT_TERMINAL_BOLD_FOREGROUND,
+        SettingsColorField::Palette(index) => DEFAULT_TERMINAL_PALETTE.get(index).copied(),
+    }
+}
+
+/// Stores one Colors-tab value. `value` is `None` only to unset bold foreground; for the
+/// other fields it is ignored. Returns whether the config changed.
+fn set_settings_color_field(
+    config: &mut AppConfig,
+    field: SettingsColorField,
+    value: Option<RgbColor>,
+) -> bool {
+    if settings_color_value(config, field) == value {
+        return false;
+    }
+    match (field, value) {
+        (SettingsColorField::Foreground, Some(color)) => config.terminal_foreground = color,
+        (SettingsColorField::BoldForeground, _) => config.terminal_bold_foreground = value,
+        (SettingsColorField::Palette(index), Some(color)) => {
+            let Some(slot) = config.terminal_palette.get_mut(index) else {
+                return false;
+            };
+            *slot = color;
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn settings_background_editor_key(
     input: &mut SingleLineInput,
     key: PhysicalKey,
@@ -329,7 +368,11 @@ fn ui_cursor_icon(
     tab_dragging: bool,
 ) -> CursorKind {
     if settings_modal_active {
-        return if settings_text_dragging || settings_hit == SettingsHit::BackgroundField {
+        let text_field_hit = matches!(
+            settings_hit,
+            SettingsHit::BackgroundField | SettingsHit::ColorField(_)
+        );
+        return if settings_text_dragging || text_field_hit {
             CursorKind::Text
         } else {
             CursorKind::Default
@@ -432,6 +475,12 @@ pub struct App {
     settings_font_value: String,
     settings_scroll_value: String,
     settings_background_input: SingleLineInput,
+    /// Draft of the Colors-tab field named by `settings_color_target`.
+    settings_color_input: SingleLineInput,
+    /// Field whose draft `settings_color_input` holds; `None` while the hex editor
+    /// edits the terminal background (or is closed).
+    settings_color_target: Option<SettingsColorField>,
+    settings_colors: SettingsColorView,
     settings_background_editing: bool,
     settings_background_dragging: bool,
     terminals: Vec<Terminal>,
@@ -503,6 +552,7 @@ impl App {
         let settings_scroll_value = format!("{:.2}", config.scroll_sensitivity);
         let settings_background_input =
             SingleLineInput::from_text(&config.terminal_background.to_hex());
+        let settings_colors = SettingsColorView::new(&config);
         Self {
             runtime: None,
             config,
@@ -511,6 +561,9 @@ impl App {
             settings_font_value,
             settings_scroll_value,
             settings_background_input,
+            settings_color_input: SingleLineInput::default(),
+            settings_color_target: None,
+            settings_colors,
             settings_background_editing: false,
             settings_background_dragging: false,
             terminals: Vec::new(),
@@ -1190,12 +1243,57 @@ impl App {
         true
     }
 
+    /// Applies the current draft when it is a complete colour; partial or invalid text
+    /// leaves the config unchanged.
     fn apply_valid_settings_background_draft(&mut self) {
-        if let Some(color) = RgbColor::parse_hex(&self.settings_background_input.text)
-            && self.set_terminal_background(color)
-        {
+        let target = self.settings_color_target;
+        let changed = match target {
+            None => RgbColor::parse_hex(&self.settings_background_input.text)
+                .is_some_and(|color| self.set_terminal_background(color)),
+            Some(field) => self.apply_settings_color_draft(field),
+        };
+        if changed {
             self.mark_config_dirty();
         }
+    }
+
+    fn apply_settings_color_draft(&mut self, field: SettingsColorField) -> bool {
+        let text = self.settings_color_input.text.as_str();
+        let value = if text.is_empty() && field == SettingsColorField::BoldForeground {
+            Some(None)
+        } else {
+            RgbColor::parse_hex(text).map(Some)
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        let changed = set_settings_color_field(&mut self.config, field, value);
+        if changed {
+            self.apply_terminal_colors();
+        }
+        changed
+    }
+
+    /// Pushes the configured colours to every tab's grid and to the renderer. Call only
+    /// after a real change; the renderer returns whether its palette actually moved.
+    fn apply_terminal_colors(&mut self) {
+        for terminal in &self.terminals {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            grid.set_palette(terminal_palette(&self.config));
+        }
+        self.settings_colors = SettingsColorView::new(&self.config);
+        if let Some(runtime) = self.runtime.as_mut() {
+            let _ = runtime.set_terminal_colors(&self.config);
+        }
+        self.request_frame();
+    }
+
+    fn begin_settings_color_edit(&mut self, field: SettingsColorField) {
+        self.settings_color_input
+            .set_text(&settings_color_text(&self.config, field));
+        self.settings_color_target = Some(field);
+        self.settings_background_editing = true;
+        self.request_frame();
     }
 
     fn finish_settings_background_edit(&mut self) {
@@ -1203,8 +1301,14 @@ impl App {
             return;
         }
         self.apply_valid_settings_background_draft();
-        self.settings_background_input
-            .set_text(&self.config.terminal_background.to_hex());
+        match self.settings_color_target.take() {
+            None => self
+                .settings_background_input
+                .set_text(&self.config.terminal_background.to_hex()),
+            Some(field) => self
+                .settings_color_input
+                .set_text(&settings_color_text(&self.config, field)),
+        }
         self.settings_background_editing = false;
         self.settings_background_dragging = false;
         self.request_frame();
@@ -1214,7 +1318,11 @@ impl App {
         if !self.settings_background_editing {
             return false;
         }
-        if settings_hex_insert_text(&mut self.settings_background_input, text) {
+        let input = match self.settings_color_target {
+            None => &mut self.settings_background_input,
+            Some(_) => &mut self.settings_color_input,
+        };
+        if settings_hex_insert_text(input, text) {
             self.apply_valid_settings_background_draft();
             self.request_frame();
         }
@@ -1232,8 +1340,12 @@ impl App {
         } else {
             None
         };
+        let input = match self.settings_color_target {
+            None => &mut self.settings_background_input,
+            Some(_) => &mut self.settings_color_input,
+        };
         let outcome = settings_background_editor_key(
-            &mut self.settings_background_input,
+            input,
             key,
             ctrl,
             shift,
@@ -1267,6 +1379,9 @@ impl App {
     }
 
     fn begin_settings_background_pointer_edit(&mut self, cursor: usize) {
+        if self.settings_color_target.is_some() {
+            self.finish_settings_background_edit();
+        }
         if !self.settings_background_editing {
             self.settings_background_input
                 .set_text(&self.config.terminal_background.to_hex());
@@ -1285,6 +1400,15 @@ impl App {
     fn apply_settings_hit(&mut self, hit: SettingsHit) {
         if hit == SettingsHit::Outside {
             self.close_settings();
+            return;
+        }
+        if let SettingsHit::ColorField(field) = hit {
+            let already_editing =
+                self.settings_background_editing && self.settings_color_target == Some(field);
+            if !already_editing {
+                self.finish_settings_background_edit();
+                self.begin_settings_color_edit(field);
+            }
             return;
         }
         if hit != SettingsHit::BackgroundField && self.settings_background_editing {
@@ -1376,10 +1500,22 @@ impl App {
                     .set_text(&DEFAULT_TERMINAL_BACKGROUND.to_hex());
                 changed
             }
+            SettingsHit::ColorReset(field) => {
+                let changed = set_settings_color_field(
+                    &mut self.config,
+                    field,
+                    default_settings_color_value(field),
+                );
+                if changed {
+                    self.apply_terminal_colors();
+                }
+                changed
+            }
             SettingsHit::None
             | SettingsHit::Outside
             | SettingsHit::Tab(_)
-            | SettingsHit::BackgroundField => false,
+            | SettingsHit::BackgroundField
+            | SettingsHit::ColorField(_) => false,
         };
         if changed {
             self.mark_config_dirty();
@@ -2095,8 +2231,12 @@ impl App {
                 settings_font_value: &self.settings_font_value,
                 settings_scroll_value: &self.settings_scroll_value,
                 settings_background_input: &mut self.settings_background_input,
-                settings_background_editing: self.settings_background_editing,
+                settings_background_editing: self.settings_background_editing
+                    && self.settings_color_target.is_none(),
                 settings_confirm_close: self.config.confirm_close,
+                settings_colors: &self.settings_colors,
+                settings_color_editing: self.settings_color_target,
+                settings_color_input: &self.settings_color_input,
                 close_confirm: self.close_confirm.as_ref().map(|confirm| CloseConfirmView {
                     title: confirm.title,
                     rows: &confirm.rows,
@@ -3896,6 +4036,146 @@ mod tests {
         assert_eq!(input.selection(), Some((2, 6)));
         assert!(update_settings_background_pointer_selection(&mut input, 1));
         assert_eq!(input.selection(), Some((1, 2)));
+    }
+
+    #[test]
+    fn color_field_draft_applies_complete_hex_and_rejects_partial_text() {
+        let mut app = App::from_config(AppConfig::default());
+        app.settings_open = true;
+        app.apply_settings_hit(SettingsHit::ColorField(SettingsColorField::Foreground));
+        assert!(app.settings_background_editing);
+        assert_eq!(
+            app.settings_color_target,
+            Some(SettingsColorField::Foreground)
+        );
+        assert_eq!(app.settings_color_input.text, "#E6E6E6");
+
+        app.settings_color_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
+        assert_eq!(app.config.terminal_foreground, DEFAULT_TERMINAL_FOREGROUND);
+
+        assert!(app.edit_settings_background_text("#12ABCF"));
+        assert_eq!(
+            app.config.terminal_foreground,
+            RgbColor::new(0x12, 0xAB, 0xCF)
+        );
+        assert_eq!(app.settings_background_input.text, "#282A36");
+
+        app.settings_color_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
+        assert!(app.edit_settings_background_text("#12"));
+        assert_eq!(
+            app.config.terminal_foreground,
+            RgbColor::new(0x12, 0xAB, 0xCF),
+            "a partial draft must not reach the config"
+        );
+
+        app.apply_settings_hit(SettingsHit::Outside);
+        assert!(!app.settings_background_editing);
+        assert_eq!(app.settings_color_target, None);
+        assert_eq!(
+            app.config.terminal_foreground,
+            RgbColor::new(0x12, 0xAB, 0xCF)
+        );
+        assert_eq!(app.settings_color_input.text, "#12ABCF");
+    }
+
+    #[test]
+    fn color_field_reset_restores_defaults_and_unsets_bold() {
+        let mut app = App::from_config(AppConfig {
+            terminal_foreground: RgbColor::new(0x12, 0xAB, 0xCF),
+            terminal_bold_foreground: Some(RgbColor::new(0x01, 0x02, 0x03)),
+            ..AppConfig::default()
+        });
+        app.apply_settings_hit(SettingsHit::ColorReset(SettingsColorField::Foreground));
+        assert_eq!(app.config.terminal_foreground, DEFAULT_TERMINAL_FOREGROUND);
+        app.apply_settings_hit(SettingsHit::ColorReset(SettingsColorField::BoldForeground));
+        assert_eq!(app.config.terminal_bold_foreground, None);
+        app.config.terminal_palette[3] = RgbColor::new(0x0A, 0x0B, 0x0C);
+        app.apply_settings_hit(SettingsHit::ColorReset(SettingsColorField::Palette(3)));
+        assert_eq!(app.config.terminal_palette[3], DEFAULT_TERMINAL_PALETTE[3]);
+        assert_eq!(app.config.terminal_palette[2], DEFAULT_TERMINAL_PALETTE[2]);
+
+        let fields = [SettingsColorField::Foreground, SettingsColorField::BoldForeground]
+            .into_iter()
+            .chain((0..16).map(SettingsColorField::Palette));
+        for field in fields {
+            app.apply_settings_hit(SettingsHit::ColorReset(field));
+        }
+        assert_eq!(app.config.terminal_foreground, DEFAULT_TERMINAL_FOREGROUND);
+        assert_eq!(app.config.terminal_bold_foreground, DEFAULT_TERMINAL_BOLD_FOREGROUND);
+        assert_eq!(app.config.terminal_palette, DEFAULT_TERMINAL_PALETTE);
+        assert_eq!(app.settings_colors.hex[0], "#E6E6E6");
+    }
+
+    #[test]
+    fn empty_bold_draft_turns_bold_foreground_off_on_commit() {
+        let mut app = App::from_config(AppConfig {
+            terminal_bold_foreground: Some(RgbColor::new(0x01, 0x02, 0x03)),
+            ..AppConfig::default()
+        });
+        app.apply_settings_hit(SettingsHit::ColorField(SettingsColorField::BoldForeground));
+        assert_eq!(app.settings_color_input.text, "#010203");
+        app.settings_color_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
+        assert_eq!(app.config.terminal_bold_foreground, None);
+        app.apply_settings_hit(SettingsHit::Tab(SettingsTab::Help));
+        assert_eq!(app.config.terminal_bold_foreground, None);
+        assert_eq!(app.settings_colors.hex[1], "");
+        assert!(app.settings_colors.swatch[1].is_none());
+    }
+
+    #[test]
+    fn applied_colors_reach_existing_terminal_grid_palette() {
+        fn assert_applied_palette(app: &App) {
+            let rgb = |r, g, b| ronsole_term::Rgb { r, g, b };
+            let grid = crate::platform::lock_recover(&app.terminals[0].grid);
+            let palette = grid.palette();
+            assert_eq!(palette.foreground, rgb(0x12, 0xAB, 0xCF));
+            assert_eq!(palette.ansi[1], rgb(0x0A, 0x0B, 0x0C));
+            assert_eq!(palette.bold_foreground, Some(rgb(0xFE, 0xDC, 0xBA)));
+            assert_eq!(palette.background, rgb(0x28, 0x2A, 0x36));
+        }
+
+        let mut app = App::from_config(AppConfig::default());
+        app.terminals.push(Terminal::new_for_test(40, 3, 1));
+
+        app.settings_color_input.set_text("#12ABCF");
+        assert!(app.apply_settings_color_draft(SettingsColorField::Foreground));
+        app.settings_color_input.set_text("#0A0B0C");
+        assert!(app.apply_settings_color_draft(SettingsColorField::Palette(1)));
+        app.settings_color_input.set_text("#FEDCBA");
+        assert!(app.apply_settings_color_draft(SettingsColorField::BoldForeground));
+        assert_applied_palette(&app);
+
+        // Re-applying the same colours changes nothing, in the draft or in the grid.
+        app.settings_color_input.set_text("#12ABCF");
+        assert!(!app.apply_settings_color_draft(SettingsColorField::Foreground));
+        app.apply_terminal_colors();
+        assert_applied_palette(&app);
+    }
+
+    #[test]
+    fn set_settings_color_field_reports_only_real_changes() {
+        let mut config = AppConfig::default();
+        let palette = SettingsColorField::Palette(5);
+        assert!(!set_settings_color_field(
+            &mut config,
+            palette,
+            Some(DEFAULT_TERMINAL_PALETTE[5])
+        ));
+        assert!(set_settings_color_field(
+            &mut config,
+            palette,
+            Some(RgbColor::new(0x01, 0x02, 0x03))
+        ));
+        assert!(!set_settings_color_field(
+            &mut config,
+            palette,
+            Some(RgbColor::new(0x01, 0x02, 0x03))
+        ));
+        assert!(!set_settings_color_field(&mut config, palette, None));
+        assert_eq!(config.terminal_palette[5], RgbColor::new(0x01, 0x02, 0x03));
     }
 
     #[test]

@@ -437,6 +437,7 @@ fn settings_modal_rect(width: f32, height: f32, scale: f32, progress: f32) -> Re
 pub(crate) enum SettingsTab {
     #[default]
     General,
+    Colors,
     Help,
 }
 
@@ -446,15 +447,49 @@ struct SettingsTabSpec {
     title: &'static str,
 }
 
-const SETTINGS_TABS: [SettingsTabSpec; 2] = [
+const SETTINGS_TABS: [SettingsTabSpec; 3] = [
     SettingsTabSpec {
         tab: SettingsTab::General,
         title: "Основные",
     },
     SettingsTabSpec {
+        tab: SettingsTab::Colors,
+        title: "Цвета",
+    },
+    SettingsTabSpec {
         tab: SettingsTab::Help,
         title: "Помощь",
     },
+];
+
+/// One hex-editable colour of the Colors tab. The order of `SETTINGS_COLOR_FIELDS`
+/// is the drawn order: foreground, bold foreground, then the palette rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsColorField {
+    Foreground,
+    BoldForeground,
+    Palette(usize),
+}
+
+pub(crate) const SETTINGS_COLOR_FIELDS: [SettingsColorField; 18] = [
+    SettingsColorField::Foreground,
+    SettingsColorField::BoldForeground,
+    SettingsColorField::Palette(0),
+    SettingsColorField::Palette(8),
+    SettingsColorField::Palette(1),
+    SettingsColorField::Palette(9),
+    SettingsColorField::Palette(2),
+    SettingsColorField::Palette(10),
+    SettingsColorField::Palette(3),
+    SettingsColorField::Palette(11),
+    SettingsColorField::Palette(4),
+    SettingsColorField::Palette(12),
+    SettingsColorField::Palette(5),
+    SettingsColorField::Palette(13),
+    SettingsColorField::Palette(6),
+    SettingsColorField::Palette(14),
+    SettingsColorField::Palette(7),
+    SettingsColorField::Palette(15),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,6 +547,70 @@ pub(crate) enum SettingsHit {
     BackgroundField,
     BackgroundReset,
     ConfirmCloseToggle,
+    ColorField(SettingsColorField),
+    ColorReset(SettingsColorField),
+}
+
+/// Label of a Colors-tab row; palette rows name their ANSI slot.
+fn settings_color_label(field: SettingsColorField) -> &'static str {
+    match field {
+        SettingsColorField::Foreground => "Текст",
+        SettingsColorField::BoldForeground => "Жирный текст",
+        SettingsColorField::Palette(index) => SETTINGS_PALETTE_LABELS[index.min(15)],
+    }
+}
+
+const SETTINGS_PALETTE_LABELS: [&str; 16] = [
+    "Цвет 0",
+    "Цвет 1",
+    "Цвет 2",
+    "Цвет 3",
+    "Цвет 4",
+    "Цвет 5",
+    "Цвет 6",
+    "Цвет 7",
+    "Яркий 0",
+    "Яркий 1",
+    "Яркий 2",
+    "Яркий 3",
+    "Яркий 4",
+    "Яркий 5",
+    "Яркий 6",
+    "Яркий 7",
+];
+
+/// Stored value of a Colors-tab field; `None` only for an unset bold foreground.
+pub(crate) fn settings_color_value(
+    config: &crate::config::AppConfig,
+    field: SettingsColorField,
+) -> Option<crate::config::RgbColor> {
+    match field {
+        SettingsColorField::Foreground => Some(config.terminal_foreground),
+        SettingsColorField::BoldForeground => config.terminal_bold_foreground,
+        SettingsColorField::Palette(index) => config.terminal_palette.get(index).copied(),
+    }
+}
+
+/// Hex texts and swatch colours of the Colors tab, in `SETTINGS_COLOR_FIELDS` order.
+/// The app rebuilds it when a colour changes, so drawing formats nothing.
+pub(crate) struct SettingsColorView {
+    pub(crate) hex: [String; SETTINGS_COLOR_FIELDS.len()],
+    pub(crate) swatch: [Option<[f32; 4]>; SETTINGS_COLOR_FIELDS.len()],
+}
+
+impl SettingsColorView {
+    pub(crate) fn new(config: &crate::config::AppConfig) -> Self {
+        let mut view = Self {
+            hex: std::array::from_fn(|_| String::new()),
+            swatch: [None; SETTINGS_COLOR_FIELDS.len()],
+        };
+        for (index, field) in SETTINGS_COLOR_FIELDS.iter().enumerate() {
+            let value = settings_color_value(config, *field);
+            view.hex[index] = value.map_or_else(String::new, |color| color.to_hex());
+            view.swatch[index] = value.map(|color| color.to_rgba());
+        }
+        view
+    }
 }
 
 /// Text of the close confirmation dialog, cached by the app when the dialog opens.
@@ -565,6 +664,15 @@ struct SettingsToggleRowLayout {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsColorRowLayout {
+    label: SettingsLine,
+    label_max_x: f32,
+    swatch: Rect,
+    field: Rect,
+    reset: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SettingsHelpRowLayout {
     keycap: Rect,
     key: SettingsLine,
@@ -594,6 +702,7 @@ struct SettingsLayout {
     scroll: Option<SettingsRowLayout>,
     background: Option<SettingsBackgroundRowLayout>,
     confirm_close: Option<SettingsToggleRowLayout>,
+    colors: [Option<SettingsColorRowLayout>; SETTINGS_COLOR_FIELDS.len()],
     help: [Option<SettingsHelpRowLayout>; SETTINGS_HELP_ENTRIES.len()],
 }
 
@@ -641,6 +750,17 @@ impl SettingsLayout {
             && row.toggle.contains(x, y)
         {
             return SettingsHit::ConfirmCloseToggle;
+        }
+        for (field, row) in SETTINGS_COLOR_FIELDS.iter().zip(self.colors) {
+            let Some(row) = row else {
+                continue;
+            };
+            if row.field.contains(x, y) {
+                return SettingsHit::ColorField(*field);
+            }
+            if row.reset.contains(x, y) {
+                return SettingsHit::ColorReset(*field);
+            }
         }
         SettingsHit::None
     }
@@ -758,6 +878,50 @@ fn settings_toggle_row_layout(clip: Rect, top: f32, scale: f32) -> Option<Settin
         },
         label_max_x: (toggle.x - gap).round(),
         toggle,
+    })
+}
+
+/// One colour cell: label on the left, then swatch, hex field and reset button
+/// packed against the right edge of `clip`.
+fn settings_color_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsColorRowLayout> {
+    let row_h = (30.0 * scale).round().max(1.0);
+    let gap = (8.0 * scale).round().max(1.0);
+    let swatch_w = (20.0 * scale).round().max(1.0);
+    let field_w = (128.0 * scale).round().max(1.0);
+    let reset_w = (86.0 * scale).round().max(1.0);
+    let control_w = swatch_w + field_w + reset_w + gap * 3.0;
+    let label_room = (64.0 * scale).round().max(1.0);
+    if clip.w < control_w + label_room || top < clip.y || top + row_h > clip.y + clip.h {
+        return None;
+    }
+
+    let reset = Rect {
+        x: (clip.x + clip.w - reset_w).round(),
+        y: top.round(),
+        w: reset_w,
+        h: row_h,
+    };
+    let field = Rect {
+        x: (reset.x - gap - field_w).round(),
+        y: top.round(),
+        w: field_w,
+        h: row_h,
+    };
+    let swatch = Rect {
+        x: (field.x - gap - swatch_w).round(),
+        y: top.round(),
+        w: swatch_w,
+        h: row_h,
+    };
+    Some(SettingsColorRowLayout {
+        label: SettingsLine {
+            x: clip.x.round(),
+            baseline_y: (top + row_h * 0.70).round(),
+        },
+        label_max_x: (swatch.x - gap).round(),
+        swatch,
+        field,
+        reset,
     })
 }
 
@@ -985,6 +1149,7 @@ fn settings_layout(
     let mut scroll = None;
     let mut background = None;
     let mut confirm_close = None;
+    let mut colors = [None; SETTINGS_COLOR_FIELDS.len()];
     let mut help = [None; SETTINGS_HELP_ENTRIES.len()];
     match active_tab {
         SettingsTab::General => {
@@ -996,6 +1161,38 @@ fn settings_layout(
                 settings_background_row_layout(content_body, first_top + row_gap * 2.0, scale);
             confirm_close =
                 settings_toggle_row_layout(content_body, first_top + row_gap * 3.0, scale);
+        }
+        SettingsTab::Colors => {
+            // Foreground and bold foreground span the body; the palette rows below
+            // split it into two columns: even fields left (normal), odd fields right (bright).
+            let first_top = (content_body.y + 12.0 * scale).round();
+            let row_step = (44.0 * scale).round().max(1.0);
+            let column_gap = (24.0 * scale).round().max(1.0);
+            let half_w = ((content_body.w - column_gap) * 0.5).round().max(0.0);
+            let left = Rect {
+                x: content_body.x,
+                y: content_body.y,
+                w: half_w,
+                h: content_body.h,
+            };
+            let right = Rect {
+                x: (content_body.x + content_body.w - half_w).round(),
+                y: content_body.y,
+                w: half_w,
+                h: content_body.h,
+            };
+            for (index, slot) in colors.iter_mut().enumerate() {
+                let (clip, row) = match index {
+                    0 => (content_body, 0),
+                    1 => (content_body, 1),
+                    _ => (if index % 2 == 0 { left } else { right }, index / 2 + 1),
+                };
+                *slot = settings_color_row_layout(
+                    clip,
+                    (first_top + row_step * row as f32).round(),
+                    scale,
+                );
+            }
         }
         SettingsTab::Help => {
             for (index, slot) in help.iter_mut().enumerate() {
@@ -1017,6 +1214,7 @@ fn settings_layout(
         scroll,
         background,
         confirm_close,
+        colors,
         help,
     }
 }
@@ -2253,6 +2451,9 @@ impl Renderer {
         background_input: &mut SingleLineInput,
         background_editing: bool,
         confirm_close: bool,
+        colors: &SettingsColorView,
+        color_editing: Option<SettingsColorField>,
+        color_input: &SingleLineInput,
     ) {
         let progress = progress.clamp(0.0, 1.0);
         if progress <= 0.0 {
@@ -2466,6 +2667,23 @@ impl Renderer {
                     );
                 }
             }
+            SettingsTab::Colors => {
+                for (index, (field, row)) in
+                    SETTINGS_COLOR_FIELDS.iter().zip(layout.colors).enumerate()
+                {
+                    if let Some(row) = row {
+                        let input = (color_editing == Some(*field)).then_some(color_input);
+                        self.draw_settings_color_row(
+                            row,
+                            *field,
+                            &colors.hex[index],
+                            colors.swatch[index],
+                            input,
+                            hovered,
+                        );
+                    }
+                }
+            }
             SettingsTab::Help => {
                 for (row, entry) in layout.help.iter().zip(SETTINGS_HELP_ENTRIES.iter()) {
                     if let Some(row) = *row {
@@ -2556,6 +2774,127 @@ impl Renderer {
             self.palette.fg,
             0.78,
         );
+    }
+
+    fn draw_settings_color_row(
+        &mut self,
+        row: SettingsColorRowLayout,
+        field: SettingsColorField,
+        hex: &str,
+        swatch: Option<[f32; 4]>,
+        input: Option<&SingleLineInput>,
+        hovered: SettingsHit,
+    ) {
+        let s = self.scale_factor;
+        let normal = [0.224, 0.231, 0.251, 1.0];
+        let hover = self.palette.accent_with_alpha(0.55);
+        let border = [0.306, 0.319, 0.341, 1.0];
+        let radius = (5.0 * s).round().max(1.0);
+        let field_border = if input.is_some() {
+            self.palette.accent
+        } else if hovered == SettingsHit::ColorField(field) {
+            hover
+        } else {
+            border
+        };
+        self.push_rounded_rect(
+            row.field.x - 1.0,
+            row.field.y - 1.0,
+            row.field.w + 2.0,
+            row.field.h + 2.0,
+            radius,
+            field_border,
+        );
+        self.push_rounded_rect(
+            row.field.x,
+            row.field.y,
+            row.field.w,
+            row.field.h,
+            radius,
+            [0.12, 0.13, 0.16, 1.0],
+        );
+        // An unset bold foreground has no colour; its swatch shows the border tone.
+        self.push_rounded_rect(
+            row.swatch.x,
+            row.swatch.y,
+            row.swatch.w,
+            row.swatch.h,
+            radius,
+            swatch.unwrap_or(border),
+        );
+        self.push_rounded_rect(
+            row.reset.x,
+            row.reset.y,
+            row.reset.w,
+            row.reset.h,
+            radius,
+            if hovered == SettingsHit::ColorReset(field) {
+                hover
+            } else {
+                normal
+            },
+        );
+        self.draw_ui_text_clipped(
+            settings_color_label(field),
+            row.label.x,
+            row.label_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        self.draw_ui_text_clipped(
+            SETTINGS_RESET_LABEL,
+            (row.reset.x + 9.0 * s).round(),
+            (row.reset.x + row.reset.w - 7.0 * s).round(),
+            row.label.baseline_y,
+            self.palette.fg,
+            0.78,
+        );
+
+        let text_x = (row.field.x + 10.0 * s).round();
+        let text_max_x = (row.field.x + row.field.w - 8.0 * s).round();
+        let Some(input) = input else {
+            self.draw_ui_text_clipped(
+                hex,
+                text_x,
+                text_max_x,
+                row.label.baseline_y,
+                self.palette.fg,
+                0.90,
+            );
+            return;
+        };
+        // Short hex drafts fit the field, so the editor draws without a scroll offset.
+        let (cursor_px, _) = self.one_line_text_metrics(&input.text, input.cursor, 0.90);
+        let selection_y = (row.field.y + 5.0 * s).round();
+        let selection_h = (row.field.h - 10.0 * s).round().max(1.0);
+        if let Some((selection_start, selection_end)) = self.one_line_selection_px(input, 0.90) {
+            self.push_rounded_rect(
+                (text_x + selection_start).round(),
+                selection_y,
+                (selection_end - selection_start).round().max(1.0),
+                selection_h,
+                0.0,
+                self.palette.accent_with_alpha(0.75),
+            );
+        }
+        self.draw_ui_text_clipped(
+            &input.text,
+            text_x,
+            text_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        if input.selection().is_none() {
+            self.push_rect(
+                (text_x + cursor_px).round(),
+                selection_y,
+                (1.0 * s).round().max(1.0),
+                selection_h,
+                self.palette.fg,
+            );
+        }
     }
 
     fn draw_settings_background_row(
@@ -2953,6 +3292,9 @@ impl Renderer {
         settings_background_input: &mut SingleLineInput,
         settings_background_editing: bool,
         settings_confirm_close: bool,
+        settings_colors: &SettingsColorView,
+        settings_color_editing: Option<SettingsColorField>,
+        settings_color_input: &SingleLineInput,
         close_confirm: Option<CloseConfirmView<'_>>,
     ) -> TerminalUiLayout {
         self.frame_flushes = 0;
@@ -2992,6 +3334,9 @@ impl Renderer {
             settings_background_input,
             settings_background_editing,
             settings_confirm_close,
+            settings_colors,
+            settings_color_editing,
+            settings_color_input,
         );
         if let Some(view) = close_confirm {
             self.draw_close_confirm(view);
@@ -4750,7 +5095,7 @@ mod tests {
         let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
         let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
         let general = layout.tabs[0].expect("general tab should fit");
-        let help = layout.tabs[1].expect("help tab should fit");
+        let help = layout.tabs[2].expect("help tab should fit");
         let (x, y) = center(general);
         assert_eq!(
             layout.hit_test(x, y),
@@ -4763,6 +5108,42 @@ mod tests {
             layout.hit_test(inner.x + inner.w - 2.0, inner.y + inner.h - 2.0),
             SettingsHit::None,
         );
+    }
+
+    #[test]
+    fn settings_colors_tab_hit_tests_every_field_and_reset_and_its_tab_strip_entry() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Colors);
+        let tab = layout.tabs[1].expect("Colors tab sits second in the strip");
+        assert_eq!(
+            layout.hit_test(tab.x + tab.w * 0.5, tab.y + tab.h * 0.5),
+            SettingsHit::Tab(SettingsTab::Colors)
+        );
+        let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        for (field, row) in SETTINGS_COLOR_FIELDS.iter().zip(layout.colors) {
+            let row = row.expect("every colour row fits a 1100x720 window");
+            let (x, y) = center(row.field);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorField(*field));
+            let (x, y) = center(row.reset);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorReset(*field));
+        }
+    }
+
+    #[test]
+    fn settings_colors_rows_stay_inside_the_body_at_fractional_scale() {
+        let scale = 1.3333333;
+        let layout = settings_layout(
+            1100.0 * scale,
+            720.0 * scale,
+            scale,
+            1.0,
+            SettingsTab::Colors,
+        );
+        let body = layout.content_body.expect("body exists at 1.33x");
+        for row in layout.colors {
+            let row = row.expect("colour rows fit at 1.33x");
+            assert!(row.field.y >= body.y && row.field.y + row.field.h <= body.y + body.h);
+            assert!(row.swatch.x >= body.x && row.reset.x + row.reset.w <= body.x + body.w);
+        }
     }
 
     #[test]
@@ -4999,6 +5380,10 @@ mod tests {
                 SettingsTabSpec {
                     tab: SettingsTab::General,
                     title: "Основные",
+                },
+                SettingsTabSpec {
+                    tab: SettingsTab::Colors,
+                    title: "Цвета",
                 },
                 SettingsTabSpec {
                     tab: SettingsTab::Help,
