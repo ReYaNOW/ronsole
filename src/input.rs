@@ -560,20 +560,20 @@ impl TerminalInteraction {
         let alt = self.modifiers.alt_key();
         let super_key = self.modifiers.super_key();
 
-        // Host shortcuts act on press and repeat. Their release is dropped here, so
-        // neither a repeat nor a release of an intercepted key reaches the encoder.
-        if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV) {
-            if pressed {
-                let file_list = self.clipboard_file_list();
-                let paste = terminal_clipboard_paste_bytes(file_list.as_deref(), None).or_else(|| {
-                    self.clipboard_text()
-                        .and_then(|text| terminal_clipboard_paste_bytes(None, Some(&text)))
-                });
-                if let Some(bytes) = paste {
-                    write_terminal_paste(terminal, bytes);
-                }
+        // Ctrl+V pastes text or a file list on press and repeat. With nothing to paste
+        // (an image, say) the key falls through to the encoder, so the app reads the clipboard itself.
+        // A release is never a paste and always falls through; the encoder ignores it
+        // when its press was not sent.
+        if ctrl && key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV) && pressed {
+            let file_list = self.clipboard_file_list();
+            let paste = terminal_clipboard_paste_bytes(file_list.as_deref(), None).or_else(|| {
+                self.clipboard_text()
+                    .and_then(|text| terminal_clipboard_paste_bytes(None, Some(&text)))
+            });
+            if let Some(bytes) = paste {
+                write_terminal_paste(terminal, bytes);
+                return true;
             }
-            return pressed;
         }
 
         // A key whose press the host consumed keeps out of the encoder until its release.
@@ -1754,16 +1754,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_v_repeat_never_reaches_encoder() {
-        let mut interaction = TerminalInteraction::default();
+    fn ctrl_v_with_nothing_to_paste_reaches_encoder() {
+        // Expected bytes come from the legacy Ctrl+V contract: the encoder sends 0x16 on press,
+        // and the release emits nothing in legacy mode.
+        let mut interaction = TerminalInteraction::new_with_memory_clipboard();
         interaction.set_modifiers(Modifiers::CONTROL);
         let mut terminal = Terminal::new_for_test(80, 30, 1);
-        let repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyV), 47);
-        interaction.handle_key_event(&repeat, &mut terminal);
-        // Clipboard contents depend on the environment, so only encoder output is checked.
-        let bytes = terminal.input_bytes_for_test();
-        assert!(!bytes.contains(&0x16));
-        assert!(!bytes.windows(8).any(|window| window == b"\x1b[118;5u"));
+        let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
+        press.unshifted = Some('v');
+        let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        interaction.handle_key_event(&release, &mut terminal);
+        assert_eq!(terminal.input_bytes_for_test(), [0x16]);
     }
 
     #[test]
