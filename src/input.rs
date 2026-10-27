@@ -4,13 +4,14 @@ use crate::input_types::{
 use crate::platform::Clipboard;
 use crate::renderer::{TerminalUiLayout, terminal_scrollbar_drag_target, visible_row_range};
 use crate::search::{SearchRefreshCause, TerminalSearchHit, TerminalSearchState};
-use crate::terminal::{MouseTrackingMode, Terminal};
+use crate::terminal::{Cell, MouseTrackingMode, Terminal};
 use crate::wayland_input::us_base_char_from_evdev;
 use ronsole_term::{
     KeyEvent, KeyKind, KeyMods, KeyOutcome, KpKey, LinkTarget, MouseButton, MouseEventKind, Term,
     TermKey, bracketed_paste_bytes, mouse_report, ModKey,
 };
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub(crate) struct TerminalInteraction {
     pub search: TerminalSearchState,
@@ -22,6 +23,12 @@ pub(crate) struct TerminalInteraction {
     pressed_mouse_buttons: u8,
     pointer_capture: PointerCapture,
     terminal_selection_anchor: Option<(usize, usize)>,
+    /// Unit that a drag from `terminal_selection_anchor` extends the selection by.
+    terminal_selection_unit: SelectionUnit,
+    /// Word or line span selected by the press, which a drag keeps as its origin.
+    terminal_selection_base: SelectionSpan,
+    /// Recent left presses, used to count double and triple clicks.
+    click_counter: ClickCounter,
     scroll_sensitivity: f32,
     /// URI of the last Ctrl+click on a link, until `take_link_uri` hands it out.
     link_uri: Option<Box<str>>,
@@ -115,6 +122,9 @@ impl Default for TerminalInteraction {
             pressed_mouse_buttons: 0,
             pointer_capture: PointerCapture::None,
             terminal_selection_anchor: None,
+            terminal_selection_unit: SelectionUnit::Cell,
+            terminal_selection_base: (0, 0, 0, 0),
+            click_counter: ClickCounter::default(),
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
             link_uri: None,
             link_press_pending: false,
@@ -354,7 +364,10 @@ impl TerminalInteraction {
         ) else {
             return false;
         };
-        let next = (anchor_x, anchor_y, cell_x, cell_y);
+        let next = match self.terminal_selection_unit {
+            SelectionUnit::Cell => (anchor_x, anchor_y, cell_x, cell_y),
+            unit => extend_unit_span(&grid, unit, self.terminal_selection_base, (cell_x, cell_y)),
+        };
         let selection = grid.selection();
         if selection.is_none() && (cell_x, cell_y) == (anchor_x, anchor_y) {
             return false;
@@ -371,13 +384,39 @@ impl TerminalInteraction {
             return;
         }
         let mut grid = crate::platform::lock_recover(&terminal.grid);
-        if grid
-            .selection()
-            .is_some_and(|(sx, sy, ex, ey)| sx == ex && sy == ey)
+        // A word or line selection is kept even when it covers a single cell.
+        if self.terminal_selection_unit == SelectionUnit::Cell
+            && grid
+                .selection()
+                .is_some_and(|(sx, sy, ex, ey)| sx == ex && sy == ey)
         {
             grid.set_selection(None);
         }
         self.terminal_selection_anchor = None;
+    }
+
+    /// Starts a selection from a left press at `pos`. A double click selects the word
+    /// under it and a triple click the logical line; any other count is a single cell.
+    fn begin_terminal_selection_at(
+        &mut self,
+        terminal: &mut Terminal,
+        pos: (usize, usize),
+        click_count: u8,
+    ) {
+        self.terminal_selection_anchor = Some(pos);
+        self.pointer_capture = PointerCapture::TerminalSelection;
+        self.terminal_selection_unit = match click_count {
+            2 => SelectionUnit::Word,
+            3 => SelectionUnit::Line,
+            _ => SelectionUnit::Cell,
+        };
+        if self.terminal_selection_unit == SelectionUnit::Cell {
+            return;
+        }
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        let span = unit_span(&grid, self.terminal_selection_unit, pos);
+        self.terminal_selection_base = span;
+        grid.set_selection(Some(span));
     }
 
     #[cfg(test)]
@@ -830,10 +869,22 @@ impl TerminalInteraction {
         if !self.layout.body.contains(x, y) {
             return false;
         }
+        let left_press = state == KeyState::Pressed && button == PointerButton::Left;
+        let press_cell = if left_press {
+            terminal_cell_at(self.layout, terminal, x, y)
+        } else {
+            None
+        };
+        let click_count = if left_press {
+            self.click_counter.register(Instant::now(), press_cell)
+        } else {
+            1
+        };
         // Ctrl+click on a link opens it and never reaches the PTY, even under
-        // mouse tracking, and never starts a selection.
-        if state == KeyState::Pressed
-            && button == PointerButton::Left
+        // mouse tracking, and never starts a selection. Only a single click opens
+        // it; a double or triple click falls through to the selection.
+        if left_press
+            && click_count == 1
             && self.modifiers.control_key()
             && let Some((link, _)) = link_under_pointer(self.layout, terminal, x, y)
         {
@@ -876,12 +927,10 @@ impl TerminalInteraction {
         }
 
         if !tracking
-            && button == PointerButton::Left
-            && state == KeyState::Pressed
-            && let Some((cell_x, cell_y)) = terminal_cell_at(self.layout, terminal, x, y)
+            && left_press
+            && let Some(pos) = press_cell
         {
-            self.terminal_selection_anchor = Some((cell_x, cell_y));
-            self.pointer_capture = PointerCapture::TerminalSelection;
+            self.begin_terminal_selection_at(terminal, pos, click_count);
             return true;
         }
         false
@@ -1009,6 +1058,189 @@ fn terminal_cell_from_grid(
         col = col.saturating_sub(1);
     }
     Some((col, row))
+}
+
+/// Selection as `(start_x, start_y, end_x, end_y)`, the layout of `Term::selection`.
+type SelectionSpan = (usize, usize, usize, usize);
+
+/// What a drag extends the selection by: single cells, whole words, or whole lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SelectionUnit {
+    #[default]
+    Cell,
+    Word,
+    Line,
+}
+
+/// Counts left presses for double and triple clicks. Times are passed in, so tests
+/// need no sleeps.
+#[derive(Clone, Copy, Debug, Default)]
+struct ClickCounter {
+    last: Option<(Instant, (usize, usize))>,
+    count: u8,
+}
+
+impl ClickCounter {
+    /// Largest gap between two presses that still counts as one multi-click.
+    const WINDOW: Duration = Duration::from_millis(300);
+
+    /// Returns 1, 2 or 3 for a press at `cell` at time `now`; the fourth press starts over at 1.
+    fn register(&mut self, now: Instant, cell: Option<(usize, usize)>) -> u8 {
+        let continues = match (self.last, cell) {
+            (Some((at, previous)), Some(cell)) => {
+                previous == cell && now.saturating_duration_since(at) <= Self::WINDOW
+            }
+            _ => false,
+        };
+        self.count = if continues && self.count < 3 {
+            self.count + 1
+        } else {
+            1
+        };
+        self.last = cell.map(|cell| (now, cell));
+        self.count
+    }
+}
+
+/// Characters that end a word, following Alacritty's default `semantic_escape_chars`.
+fn is_word_separator(cell: &Cell) -> bool {
+    let ch = cell.ch();
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ',' | '│' | '`' | '|' | ':' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+        )
+}
+
+fn cell_at(grid: &Term, (x, y): (usize, usize)) -> Option<&Cell> {
+    grid.row(y).and_then(|cells| cells.get(x))
+}
+
+/// Cell before `pos` in reading order, crossing a soft wrap.
+fn previous_cell(grid: &Term, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+    if x > 0 {
+        Some((x - 1, y))
+    } else if y > 0 && grid.row_soft_wrapped(y - 1) {
+        Some((grid.cols().saturating_sub(1), y - 1))
+    } else {
+        None
+    }
+}
+
+/// Cell after `pos` in reading order, crossing a soft wrap.
+fn next_cell(grid: &Term, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+    if x + 1 < grid.cols() {
+        Some((x + 1, y))
+    } else if y + 1 < grid.total_rows() && grid.row_soft_wrapped(y) {
+        Some((0, y + 1))
+    } else {
+        None
+    }
+}
+
+/// Whether `pos` belongs to a word. A wide spacer takes the class of its wide cell.
+fn is_word_pos(grid: &Term, pos: (usize, usize)) -> bool {
+    let owner = if cell_at(grid, pos).is_some_and(Cell::is_wide_spacer) {
+        (pos.0.saturating_sub(1), pos.1)
+    } else {
+        pos
+    };
+    cell_at(grid, owner).is_some_and(|cell| !is_word_separator(cell))
+}
+
+/// First and last cell of the word under `pos`, crossing soft wraps. A separator
+/// selects only its own cell (and wide spacer).
+fn word_extent(grid: &Term, pos: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    // A wide spacer is part of the wide cell before it.
+    let pos = if cell_at(grid, pos).is_some_and(Cell::is_wide_spacer) {
+        (pos.0.saturating_sub(1), pos.1)
+    } else {
+        pos
+    };
+    let mut start = pos;
+    let mut end = pos;
+    if is_word_pos(grid, pos) {
+        while let Some(prev) = previous_cell(grid, start) {
+            if !is_word_pos(grid, prev) {
+                break;
+            }
+            start = prev;
+        }
+        while let Some(next) = next_cell(grid, end) {
+            if !is_word_pos(grid, next) {
+                break;
+            }
+            end = next;
+        }
+    }
+    // A separator is one cell, but a wide one still spans its spacer.
+    if let Some(next) = next_cell(grid, end)
+        && cell_at(grid, next).is_some_and(Cell::is_wide_spacer)
+    {
+        end = next;
+    }
+    (start, end)
+}
+
+/// Whole logical line that contains `row`, from its first soft-wrapped row to the
+/// last non-blank cell of its last row.
+fn line_extent(grid: &Term, row: usize) -> SelectionSpan {
+    let mut first = row;
+    while first > 0 && grid.row_soft_wrapped(first - 1) {
+        first -= 1;
+    }
+    let mut last = row;
+    while last + 1 < grid.total_rows() && grid.row_soft_wrapped(last) {
+        last += 1;
+    }
+    let cells = grid.row(last);
+    let end_x = cells
+        .and_then(|cells| cells.iter().rposition(|cell| cell.ch() != ' '))
+        // A wide character at the end of the line also covers its blank spacer.
+        .map(|x| {
+            if cells.and_then(|cells| cells.get(x + 1)).is_some_and(Cell::is_wide_spacer) {
+                x + 1
+            } else {
+                x
+            }
+        })
+        .unwrap_or(0);
+    (0, first, end_x, last)
+}
+
+/// Span of the unit under `pos`: the cell itself, its word, or its logical line.
+fn unit_span(grid: &Term, unit: SelectionUnit, pos: (usize, usize)) -> SelectionSpan {
+    match unit {
+        SelectionUnit::Cell => (pos.0, pos.1, pos.0, pos.1),
+        SelectionUnit::Word => {
+            let (start, end) = word_extent(grid, pos);
+            (start.0, start.1, end.0, end.1)
+        }
+        SelectionUnit::Line => line_extent(grid, pos.1),
+    }
+}
+
+/// Span of a drag that started on the word or line `base` and now reaches `pos`.
+/// The unit under `pos` is added on the side the pointer moved to.
+fn extend_unit_span(
+    grid: &Term,
+    unit: SelectionUnit,
+    base: SelectionSpan,
+    pos: (usize, usize),
+) -> SelectionSpan {
+    // Row-major order, so tuples compare in reading order.
+    let base_start = (base.1, base.0);
+    let base_end = (base.3, base.2);
+    let target = (pos.1, pos.0);
+    if target < base_start {
+        let under = unit_span(grid, unit, pos);
+        (under.0, under.1, base.2, base.3)
+    } else if target > base_end {
+        let under = unit_span(grid, unit, pos);
+        (base.0, base.1, under.2, under.3)
+    } else {
+        base
+    }
 }
 
 #[inline]
@@ -2547,6 +2779,8 @@ mod tests {
         x: f32,
         y: f32,
     ) {
+        // Each helper press is a fresh single click, not a continuation of the last one.
+        interaction.click_counter = ClickCounter::default();
         interaction.layout = mouse_test_layout(0.0);
         interaction.mouse_x = x;
         interaction.mouse_y = y;
@@ -2557,6 +2791,241 @@ mod tests {
             |_, _, _| 0,
         ));
         assert!(interaction.terminal_selection_active());
+    }
+
+    /// Writes raw bytes into the test terminal's grid, like PTY output would.
+    fn feed_test_text(terminal: &Terminal, bytes: &[u8]) {
+        crate::platform::lock_recover(&terminal.grid).advance(
+            bytes,
+            Instant::now(),
+            &mut crate::terminal_process::SessionSink {
+                reply_tx: None,
+                title_cache: None,
+                pending: None,
+                wake: None,
+            },
+        );
+    }
+
+    /// Pointer position at the middle of cell (`col`, `row`) under `mouse_test_layout(0.0)`.
+    fn cell_point(col: usize, row: usize) -> (f32, f32) {
+        (8.0 + 10.0 * col as f32 + 5.0, 107.0 + 20.0 * row as f32)
+    }
+
+    fn grid_selection(terminal: &Terminal) -> Option<SelectionSpan> {
+        crate::platform::lock_recover(&terminal.grid).selection()
+    }
+
+    #[test]
+    fn word_extent_stops_at_separators_and_keeps_wide_cells_whole() {
+        let terminal = selection_test_terminal();
+        feed_test_text(
+            &terminal,
+            "\x1b[1;1Halpha|beta:gamma\x1b[2;1Hx中y z\x1b[3;1Ha,b`c|d:e\"f'g(h)i[j]k{l}m<n>o"
+                .as_bytes(),
+        );
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        assert_eq!(word_extent(&grid, (1, 0)), ((0, 0), (4, 0)));
+        assert_eq!(word_extent(&grid, (5, 0)), ((5, 0), (5, 0)));
+        assert_eq!(word_extent(&grid, (7, 0)), ((6, 0), (9, 0)));
+        assert_eq!(word_extent(&grid, (10, 0)), ((10, 0), (10, 0)));
+        assert_eq!(word_extent(&grid, (12, 0)), ((11, 0), (15, 0)));
+        // Wide cell at column 1 with its spacer at column 2: the whole "x中y" is one word.
+        assert_eq!(word_extent(&grid, (1, 1)), ((0, 1), (3, 1)));
+        assert_eq!(word_extent(&grid, (2, 1)), ((0, 1), (3, 1)));
+        assert_eq!(word_extent(&grid, (4, 1)), ((4, 1), (4, 1)));
+        assert_eq!(word_extent(&grid, (5, 1)), ((5, 1), (5, 1)));
+        // Every character of the third line is a separator or a one-letter word.
+        for col in 0..=28 {
+            assert_eq!(word_extent(&grid, (col, 2)), ((col, 2), (col, 2)), "col {col}");
+        }
+    }
+
+    #[test]
+    fn word_extent_crosses_soft_wrap() {
+        let terminal = selection_test_terminal();
+        let text = format!("\x1b[1;1H{}abcd ef\r\n", "x".repeat(78));
+        feed_test_text(&terminal, text.as_bytes());
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        // "xxx...xxxab" wraps, so "ab" and "cd" are one word.
+        assert_eq!(word_extent(&grid, (79, 0)), ((0, 0), (1, 1)));
+        assert_eq!(word_extent(&grid, (1, 1)), ((0, 0), (1, 1)));
+        assert_eq!(word_extent(&grid, (3, 1)), ((3, 1), (4, 1)));
+    }
+
+    #[test]
+    fn line_extent_includes_soft_wrapped_rows() {
+        let terminal = selection_test_terminal();
+        let text = format!("\x1b[1;1H{}abcd ef\r\nnext", "x".repeat(78));
+        feed_test_text(&terminal, text.as_bytes());
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        assert_eq!(line_extent(&grid, 1), (0, 0, 4, 1));
+        assert_eq!(line_extent(&grid, 2), (0, 2, 3, 2));
+    }
+
+    #[test]
+    fn triple_click_selects_soft_wrapped_logical_line() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        let text = format!("\x1b[1;1H{}abcd ef\r\nnext", "x".repeat(78));
+        feed_test_text(&terminal, text.as_bytes());
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.begin_terminal_selection_at(&mut terminal, (2, 1), 3);
+        assert_eq!(grid_selection(&terminal), Some((0, 0, 4, 1)));
+    }
+
+    #[test]
+    fn triple_click_on_line_ending_with_wide_char_covers_its_spacer() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        let text = format!("\x1b[1;1H{}中", "x".repeat(78));
+        feed_test_text(&terminal, text.as_bytes());
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.begin_terminal_selection_at(&mut terminal, (2, 0), 3);
+        // The wide cell occupies columns 78-79, so its spacer at 79 ends the line.
+        assert_eq!(grid_selection(&terminal), Some((0, 0, 79, 0)));
+    }
+
+    #[test]
+    fn triple_click_drag_extends_selection_by_whole_lines_forward() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        feed_test_text(&terminal, b"\x1b[1;1Halpha\x1b[2;1Hbeta gamma");
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.begin_terminal_selection_at(&mut terminal, (1, 0), 3);
+        assert_eq!(grid_selection(&terminal), Some((0, 0, 4, 0)));
+
+        let (x, y) = cell_point(2, 1);
+        assert!(interaction.cursor_moved(x, y, &mut terminal, |_, _, _| 0));
+        assert_eq!(grid_selection(&terminal), Some((0, 0, 9, 1)));
+
+        // Back onto the anchor line keeps the anchor line selected.
+        let (x, y) = cell_point(2, 0);
+        assert!(interaction.cursor_moved(x, y, &mut terminal, |_, _, _| 0));
+        assert_eq!(grid_selection(&terminal), Some((0, 0, 4, 0)));
+    }
+
+    #[test]
+    fn triple_click_drag_extends_selection_by_whole_lines_backward() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        feed_test_text(&terminal, b"\x1b[1;1Halpha\x1b[2;1Hbeta gamma");
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.begin_terminal_selection_at(&mut terminal, (1, 1), 3);
+        assert_eq!(grid_selection(&terminal), Some((0, 1, 9, 1)));
+
+        let (x, y) = cell_point(2, 0);
+        assert!(interaction.cursor_moved(x, y, &mut terminal, |_, _, _| 0));
+        assert_eq!(grid_selection(&terminal), Some((0, 0, 9, 1)));
+    }
+
+    #[test]
+    fn click_counter_counts_fast_presses_in_one_cell() {
+        let start = Instant::now();
+        let mut counter = ClickCounter::default();
+        let cell = Some((3, 4));
+        assert_eq!(counter.register(start, cell), 1);
+        assert_eq!(counter.register(start + Duration::from_millis(299), cell), 2);
+        assert_eq!(counter.register(start + Duration::from_millis(598), cell), 3);
+        // The fourth press starts over at 1.
+        assert_eq!(counter.register(start + Duration::from_millis(897), cell), 1);
+        // A press in another cell starts over.
+        assert_eq!(
+            counter.register(start + Duration::from_millis(1000), Some((4, 4))),
+            1
+        );
+        assert_eq!(
+            counter.register(start + Duration::from_millis(1100), Some((4, 4))),
+            2
+        );
+        // A press more than 300 ms after the previous one starts over.
+        assert_eq!(
+            counter.register(start + Duration::from_millis(1401), Some((4, 4))),
+            1
+        );
+    }
+
+    #[test]
+    fn word_drag_extends_selection_by_whole_words_both_ways() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        feed_test_text(&terminal, b"\x1b[1;1Halpha|beta:gamma");
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.begin_terminal_selection_at(&mut terminal, (7, 0), 2);
+        assert_eq!(grid_selection(&terminal), Some((6, 0, 9, 0)));
+
+        let (x, y) = cell_point(12, 0);
+        assert!(interaction.cursor_moved(x, y, &mut terminal, |_, _, _| 0));
+        assert_eq!(grid_selection(&terminal), Some((6, 0, 15, 0)));
+
+        let (x, y) = cell_point(1, 0);
+        assert!(interaction.cursor_moved(x, y, &mut terminal, |_, _, _| 0));
+        assert_eq!(grid_selection(&terminal), Some((0, 0, 9, 0)));
+    }
+
+    #[test]
+    fn double_click_on_separator_selects_one_cell_and_keeps_it_on_release() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        feed_test_text(&terminal, b"\x1b[1;1Halpha|beta");
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.begin_terminal_selection_at(&mut terminal, (5, 0), 2);
+        assert!(interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert_eq!(grid_selection(&terminal), Some((5, 0, 5, 0)));
+    }
+
+    #[test]
+    fn ctrl_click_as_second_click_on_link_selects_word_without_opening_link() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        // An earlier press in the same cell makes this press the second click.
+        interaction
+            .click_counter
+            .register(Instant::now(), Some((6, 29)));
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(interaction.take_link_uri().is_none());
+        // "https" on the URL row is cols 4..=8, followed by the separator ':'.
+        assert_eq!(grid_selection(&terminal), Some((4, 29, 8, 29)));
+    }
+
+    #[test]
+    fn ctrl_triple_click_on_link_selects_line_without_opening_link() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.set_modifiers(Modifiers::CONTROL);
+        // Two earlier presses in the same cell make this press the third click.
+        interaction
+            .click_counter
+            .register(Instant::now(), Some((6, 29)));
+        interaction
+            .click_counter
+            .register(Instant::now(), Some((6, 29)));
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        assert!(interaction.take_link_uri().is_none());
+        // "see https://example.com/x" is 25 cells, so the line ends at column 24.
+        assert_eq!(grid_selection(&terminal), Some((0, 29, 24, 29)));
     }
 
     #[test]
