@@ -408,6 +408,9 @@ pub struct App {
     show_fps: bool,
     focused: bool,
     unfocused_redraw_pending: bool,
+    /// Set once a BEL asked the compositor for window attention during the
+    /// current unfocused period; cleared when focus returns.
+    window_attention_requested: bool,
     pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
     tab_input: tab_delivery::TabInputState,
     /// Reusable buffer for `Terminal::observe_dev_channel_warning`.
@@ -481,6 +484,7 @@ impl App {
             show_fps: false,
             focused: true,
             unfocused_redraw_pending: false,
+            window_attention_requested: false,
             pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
             tab_input: tab_delivery::TabInputState::default(),
             dev_warning_scratch: String::new(),
@@ -593,6 +597,9 @@ impl App {
                 .reset_for_terminal_switch(&mut self.terminals[old]);
         }
         self.active_terminal = index;
+        if let Some(terminal) = self.terminals.get_mut(index) {
+            terminal.clear_bell_pending();
+        }
         self.active_terminal_presented = true;
         self.send_terminal_focus_transition(old_presented, Some(index));
         self.pending_tab_reveal = Some(reveal_tail);
@@ -972,6 +979,9 @@ impl App {
     pub(crate) fn on_focus_changed(&mut self, focused: bool) {
         self.focused = focused;
         self.unfocused_redraw_pending = !focused;
+        if focused {
+            self.window_attention_requested = false;
+        }
         self.modifiers = Modifiers::empty();
         self.interaction.set_modifiers(Modifiers::empty());
         self.interaction.cancel_link_press();
@@ -1953,16 +1963,40 @@ impl App {
     /// after the early return.
     fn drain_terminal_host_events(&mut self) {
         let now = Instant::now();
-        for terminal in &mut self.terminals {
+        let active = self.active_terminal;
+        let mut bell_rang = false;
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
             // Only the pending-events lock is held while clipboard text is set;
             // the published deadline is read from the same pending state.
-            terminal.apply_host_events(&mut self.interaction);
+            if terminal.apply_host_events(&mut self.interaction) {
+                bell_rang = true;
+                // The active tab is on screen, so only background tabs get a mark.
+                if index != active {
+                    terminal.mark_bell_pending();
+                }
+            }
             if terminal
                 .sync_deadline()
                 .is_some_and(|deadline| deadline + SYNC_RESERVE_GRACE <= now)
             {
                 terminal.try_flush_expired(now);
             }
+        }
+        if bell_rang {
+            self.request_bell_attention();
+            self.mark_dirty();
+        }
+    }
+
+    /// Asks for window attention after a BEL, at most once per unfocused
+    /// period. A focused window shows the bell in the tab strip only.
+    fn request_bell_attention(&mut self) {
+        if self.focused || self.window_attention_requested {
+            return;
+        }
+        self.window_attention_requested = true;
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.request_window_attention();
         }
     }
 
@@ -3111,6 +3145,57 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(grid.encode_key(&ctrl_release, &mut out), ronsole_term::KeyOutcome::Ignore);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn background_tab_bell_marks_tab_until_it_is_activated() {
+        let mut app = App::new();
+        for display_number in [1, 2] {
+            app.terminals.push(Terminal::new_for_test(8, 2, display_number));
+        }
+        app.terminals[1].ring_bell_for_test();
+
+        app.drain_terminal_host_events();
+        assert!(app.terminals[1].bell_pending());
+        assert!(!app.terminals[0].bell_pending());
+
+        app.activate_ready_terminal(1, false);
+        assert_eq!(app.active_terminal, 1);
+        assert!(!app.terminals[1].bell_pending());
+    }
+
+    #[test]
+    fn active_tab_bell_in_focused_window_sets_nothing() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        assert!(app.focused);
+        app.terminals[0].ring_bell_for_test();
+
+        app.drain_terminal_host_events();
+
+        assert!(!app.terminals[0].bell_pending());
+        assert!(!app.window_attention_requested);
+    }
+
+    #[test]
+    fn unfocused_window_bell_requests_attention_once_per_period() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.focused = false;
+
+        app.terminals[0].ring_bell_for_test();
+        app.drain_terminal_host_events();
+        assert!(app.window_attention_requested);
+        // The active tab is on screen, so it gets no tab mark.
+        assert!(!app.terminals[0].bell_pending());
+
+        app.terminals[0].ring_bell_for_test();
+        app.drain_terminal_host_events();
+        assert!(app.window_attention_requested);
+
+        app.on_focus_changed(true);
+        assert!(!app.window_attention_requested);
     }
 
     #[test]

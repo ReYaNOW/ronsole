@@ -2459,6 +2459,13 @@ impl DirectWaylandBackend {
         let _ = self.connection.flush();
     }
 
+    /// Goes through the same plan as external activation, so it needs the
+    /// fallback serial and seat.
+    fn request_window_attention(&mut self) {
+        self.state.activate_existing_window(&self.qh, None);
+        let _ = self.connection.flush();
+    }
+
     fn dispatch_pending(&mut self) -> Result<usize, String> {
         self.event_queue
             .dispatch_pending(&mut self.state)
@@ -2874,6 +2881,13 @@ impl WindowRuntime {
     pub fn activate_existing_window(&mut self, activation_token: Option<String>) {
         if let RuntimeBackend::Wayland(wayland) = &mut self.backend {
             wayland.activate_existing_window(activation_token);
+        }
+    }
+
+    /// Marks the window as wanting attention, through xdg-activation.
+    pub fn request_window_attention(&mut self) {
+        if let RuntimeBackend::Wayland(wayland) = &mut self.backend {
+            wayland.request_window_attention();
         }
     }
 

@@ -119,6 +119,7 @@ impl Perform for Performer<'_> {
                 }
             }
             b'\t' => self.term.move_to_tab_stop(1, false),
+            0x07 => self.sink.bell(),
             _ => {}
         }
     }

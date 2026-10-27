@@ -1,3 +1,4 @@
+mod bell;
 mod csi;
 mod edges;
 mod keys;

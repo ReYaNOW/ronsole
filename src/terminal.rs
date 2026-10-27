@@ -139,6 +139,27 @@ mod tests {
     }
 
     #[test]
+    fn bell_mark_is_set_and_cleared_by_tab_lifecycle() {
+        let mut terminal = Terminal::new_for_test(40, 3, 8);
+        assert!(!terminal.bell_pending());
+
+        terminal.mark_bell_pending();
+        assert!(terminal.bell_pending());
+
+        terminal.clear_bell_pending();
+        assert!(!terminal.bell_pending());
+    }
+
+    #[test]
+    fn ring_bell_is_taken_once_from_pending_events() {
+        let terminal = Terminal::new_for_test(40, 3, 9);
+        terminal.ring_bell_for_test();
+
+        assert!(PendingHostEvents::take(&terminal.pending).bell);
+        assert!(!PendingHostEvents::take(&terminal.pending).bell);
+    }
+
+    #[test]
     fn earliest_terminal_deadline_picks_minimum() {
         let active = Terminal::new_for_test(40, 3, 1);
         let background = Terminal::new_for_test(40, 3, 2);
@@ -271,6 +292,7 @@ mod tests {
             dev_banner: DevBannerState::default(),
             osc7_cwd: None,
             hovered_link: None,
+            bell_pending: false,
             reply_tx: terminal_reply_channel().0,
             pending: Arc::new(Mutex::new(PendingHostEvents::default())),
             wake: None,
@@ -1569,6 +1591,9 @@ pub struct Terminal {
     /// `content_generation` at search time. Written only by
     /// `set_hovered_link`.
     hovered_link: Option<(LinkTarget, u64)>,
+    /// A BEL arrived while this tab was in the background and the user has
+    /// not activated it since. Set and cleared by the app's tab lifecycle.
+    bell_pending: bool,
     /// Sender clone kept for `flush_expired`; the parser thread holds another.
     reply_tx: SyncSender<Vec<u8>>,
     pending: Arc<Mutex<PendingHostEvents>>,
@@ -1697,6 +1722,7 @@ impl Terminal {
             dev_banner: DevBannerState::default(),
             osc7_cwd: None,
             hovered_link: None,
+            bell_pending: false,
             // No reader exists for test tabs, so replies are dropped unless a
             // test installs its own sender.
             reply_tx: terminal_reply_channel().0,
@@ -1780,6 +1806,7 @@ impl Terminal {
             dev_banner: DevBannerState::default(),
             osc7_cwd: None,
             hovered_link: None,
+            bell_pending: false,
             reply_tx,
             pending,
             wake,
@@ -1827,8 +1854,9 @@ impl Terminal {
     }
 
     /// Applies the clipboard and working-directory events parked by the
-    /// parser thread. Called on the main thread; holds only the pending lock.
-    pub(crate) fn apply_host_events(&mut self, interaction: &mut TerminalInteraction) {
+    /// parser thread and reports whether a BEL was among them. Called on the
+    /// main thread; holds only the pending lock.
+    pub(crate) fn apply_host_events(&mut self, interaction: &mut TerminalInteraction) -> bool {
         let events = PendingHostEvents::take(&self.pending);
         if let Some(text) = events.clipboard {
             let _ = interaction.set_clipboard_text(text);
@@ -1838,6 +1866,28 @@ impl Terminal {
         {
             self.osc7_cwd = Some(cwd);
         }
+        events.bell
+    }
+
+    /// Whether a BEL arrived in this tab while it was in the background.
+    pub(crate) fn bell_pending(&self) -> bool {
+        self.bell_pending
+    }
+
+    /// Marks this background tab as having rung its bell.
+    pub(crate) fn mark_bell_pending(&mut self) {
+        self.bell_pending = true;
+    }
+
+    /// Clears the bell mark once the user activates the tab.
+    pub(crate) fn clear_bell_pending(&mut self) {
+        self.bell_pending = false;
+    }
+
+    /// Queues a BEL as if the parser thread had seen it.
+    #[cfg(test)]
+    pub(crate) fn ring_bell_for_test(&self) {
+        crate::platform::lock_recover(&self.pending).bell = true;
     }
 
     /// Replaces the reply sender used by [`Terminal::try_flush_expired`]; tests

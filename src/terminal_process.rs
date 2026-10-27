@@ -854,6 +854,8 @@ fn install_terminal_title_refresh(
 pub(crate) struct PendingHostEvents {
     pub(crate) clipboard: Option<String>,
     pub(crate) cwd: Option<(String, Vec<u8>)>,
+    /// Set by any number of BEL bytes since the last drain.
+    pub(crate) bell: bool,
     pub(crate) sync_deadline: Option<Instant>,
 }
 
@@ -865,6 +867,7 @@ impl PendingHostEvents {
         Self {
             clipboard: pending.clipboard.take(),
             cwd: pending.cwd.take(),
+            bell: std::mem::take(&mut pending.bell),
             sync_deadline: pending.sync_deadline,
         }
     }
@@ -916,6 +919,13 @@ impl TermSink for SessionSink<'_> {
     fn title_reset(&mut self) {
         if let Some(cache) = self.title_cache {
             platform::lock_recover(cache).clear_programmed();
+        }
+    }
+
+    fn bell(&mut self) {
+        if let Some(pending) = self.pending {
+            platform::lock_recover(pending).bell = true;
+            self.notify_pending();
         }
     }
 
@@ -2171,6 +2181,27 @@ mod tests {
         );
 
         assert_eq!(grid.content_generation(), before);
+    }
+
+    #[test]
+    fn bell_run_coalesces_into_one_pending_flag() {
+        let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
+        let mut grid = test_term(64, 3);
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: Some(&pending),
+            wake: None,
+        };
+        advance_terminal_output_batch(
+            &mut grid,
+            &mut sink,
+            &[output_chunk(b"\x07\x07\x07")],
+            Instant::now(),
+        );
+
+        assert!(PendingHostEvents::take(&pending).bell);
+        assert!(!PendingHostEvents::take(&pending).bell);
     }
 
     #[test]

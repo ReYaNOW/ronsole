@@ -104,6 +104,10 @@ const TERMINAL_TAB_CLOSE_HIT_PAD: f32 = 4.0;
 const SEARCH_ICON_VISUAL_SCALE: f32 = 0.56;
 const TERMINAL_TAB_CLOSE_RIGHT_PADDING: f32 = TERMINAL_TAB_TEXT_PAD - TERMINAL_TAB_CLOSE_HIT_PAD;
 const TERMINAL_TAB_TEXT_PAD: f32 = 16.0;
+/// Diameter of the accent dot that marks a background tab that rang its bell.
+const TERMINAL_TAB_BELL_DOT: f32 = 6.0;
+/// Space between the bell dot and the tab title.
+const TERMINAL_TAB_BELL_GAP: f32 = 6.0;
 const TERMINAL_ADD_SIZE: f32 = 20.0;
 const TAB_STRIP_EDGE_FADE_ALPHA: f32 = 0.4;
 const TAB_STRIP_EDGE_FADE_WIDTH: f32 = 40.0;
@@ -2044,10 +2048,16 @@ impl Renderer {
             let close_icon = show_close
                 .then(|| terminal_tab_close_geometry(tab_x, tab_w, strip, s).0);
 
-            let title_x = (tab_x + TERMINAL_TAB_TEXT_PAD * s).round();
+            let mut title_x = (tab_x + TERMINAL_TAB_TEXT_PAD * s).round();
             let title_max_w = (tab_w - if can_show_close { 56.0 * s } else { 32.0 * s })
                 .max(0.0);
             let title_max_x = title_x + title_max_w;
+            if terminals.get(idx).is_some_and(Terminal::bell_pending) {
+                let dot = (TERMINAL_TAB_BELL_DOT * s).round().max(1.0);
+                let dot_y = (strip.y + (strip.h - dot) * 0.5).round();
+                self.push_rounded_rect(title_x, dot_y, dot, dot, dot * 0.5, self.palette.accent);
+                title_x = (title_x + dot + TERMINAL_TAB_BELL_GAP * s).round();
+            }
             let baseline = (strip.y + strip.h * 0.5 + 5.0 * s).round();
             let title_color = if active { self.palette.fg } else { [self.palette.fg[0], self.palette.fg[1], self.palette.fg[2], 0.72] };
             if title_max_x > title_x {

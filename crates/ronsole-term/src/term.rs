@@ -22,6 +22,9 @@ pub trait TermSink {
     /// No programmed title any more, so the host shows its fallback title.
     /// Sent when `CSI 23 ; Ps t` restores a state that had no programmed title.
     fn title_reset(&mut self) {}
+    /// BEL (0x07) from the output stream. A run of bells may arrive as many
+    /// calls; hosts coalesce them into one pending attention flag.
+    fn bell(&mut self) {}
     /// Clipboard text from OSC 52, decoded as UTF-8.
     fn clipboard_set(&mut self, text: String);
     /// Working directory from OSC 7, with percent-decoded path bytes.
