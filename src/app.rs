@@ -1078,12 +1078,20 @@ impl App {
         false
     }
 
-    /// Shows the dialog. Drag state begun before it opened is dropped, because the
-    /// dialog swallows the release events that would otherwise end that drag.
+    /// Shows the dialog. Pointer state begun before it opened is dropped, because
+    /// the dialog swallows the release events that would otherwise end that drag.
+    /// An unfocused window also asks for attention, so the prompt is noticed.
     fn open_close_dialog(&mut self, confirm: CloseConfirm) {
-        self.terminal_tab_drag = None;
+        self.cancel_pointer_interactions();
         self.settings_background_dragging = false;
         self.close_confirm = Some(confirm);
+        if !self.focused
+            && let Some(runtime) = self.runtime.as_mut()
+        {
+            // The result is not needed: the flag for bell attention stays untouched.
+            let _ = runtime.request_window_attention();
+        }
+        self.refresh_cursor_icon();
         self.request_frame();
     }
 
@@ -1131,6 +1139,7 @@ impl App {
 
     fn cancel_close_dialog(&mut self) {
         if self.close_confirm.take().is_some() {
+            self.update_link_hover();
             self.request_frame();
         }
     }
@@ -1537,18 +1546,18 @@ impl App {
     }
 
     fn desired_cursor_icon(&self) -> CursorKind {
-        let settings_modal_active = self.settings_modal_active();
-        let settings_hit = if settings_modal_active {
+        let modal_active = self.settings_modal_active() || self.close_confirm.is_some();
+        let settings_hit = if modal_active {
             self.settings_hit_test(self.pointer_x, self.pointer_y)
         } else {
             SettingsHit::None
         };
-        let search_hit = if settings_modal_active {
+        let search_hit = if modal_active {
             TerminalSearchHit::None
         } else {
             self.search_hit_test(self.pointer_x, self.pointer_y)
         };
-        let tab_hit = if settings_modal_active || search_hit != TerminalSearchHit::None {
+        let tab_hit = if modal_active || search_hit != TerminalSearchHit::None {
             TerminalTabHit::None
         } else {
             self.runtime
@@ -1558,7 +1567,7 @@ impl App {
                 })
         };
         let icon = ui_cursor_icon(
-            settings_modal_active,
+            modal_active,
             settings_hit,
             self.settings_background_dragging,
             search_hit,
@@ -1580,10 +1589,10 @@ impl App {
     /// Called on pointer motion and on modifier changes. Marks the app dirty
     /// when the hovered link changed, so the underline is drawn on an idle window.
     fn update_link_hover(&mut self) {
-        let settings_modal_active = self.settings_modal_active();
+        let modal_active = self.settings_modal_active() || self.close_confirm.is_some();
         let (x, y) = (self.pointer_x, self.pointer_y);
         let changed = match self.terminals.get_mut(self.active_terminal) {
-            Some(terminal) if settings_modal_active => terminal.set_hovered_link(None),
+            Some(terminal) if modal_active => terminal.set_hovered_link(None),
             Some(terminal) => self.interaction.update_link_hover(terminal, x, y),
             None => false,
         };
@@ -2149,6 +2158,22 @@ impl App {
 
     pub(crate) fn on_scroll(&mut self, delta: ScrollDelta) {
         if self.close_confirm.is_some() || self.settings_modal_active() {
+            // The Colors tab may hold more rows than a small window shows.
+            if self.close_confirm.is_none()
+                && self.settings_open
+                && self.settings_active_tab == SettingsTab::Colors
+                && let Some(runtime) = self.runtime.as_ref()
+                && runtime
+                    .renderer()
+                    .scroll_settings_colors(self.settings_progress, delta)
+            {
+                // A field scrolled out of view must not keep taking keystrokes.
+                if self.settings_color_target.is_some() {
+                    self.finish_settings_background_edit();
+                }
+                self.refresh_cursor_icon();
+                self.request_frame();
+            }
             return;
         }
         if let Some(runtime) = self.runtime.as_ref() {
@@ -2318,10 +2343,12 @@ impl App {
         if self.focused || self.window_attention_requested {
             return;
         }
-        self.window_attention_requested = true;
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.request_window_attention();
-        }
+        // Set only once the compositor request is in flight, so a window that
+        // cannot be flagged retries on the next bell.
+        self.window_attention_requested = self
+            .runtime
+            .as_mut()
+            .is_some_and(WindowRuntime::request_window_attention);
     }
 
     fn on_about_to_wait(&mut self) -> AppLoopControl {
@@ -3144,13 +3171,97 @@ mod tests {
         assert!(app.busy_close_targets(CloseTarget::Window).is_empty());
     }
 
-    #[test]
-    fn disabled_confirm_close_never_opens_the_dialog() {
+    /// Polls `condition` every 10 ms and fails the test after five seconds.
+    fn wait_for_test_condition(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Starts a hermetic shell tab and waits until it runs a command, so input
+    /// written afterwards reaches the shell.
+    fn spawn_shell_tab(label: &str) -> Terminal {
+        let marker = std::env::temp_dir().join(format!(
+            "ronsole-close-{label}-{}.ready",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let terminal = Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec::hermetic_shell_for_test(),
+            terminal_palette(&crate::config::AppConfig::default()),
+        );
+        terminal
+            .write_input(format!("printf ready > {}\r", marker.display()).as_bytes())
+            .unwrap();
+        wait_for_test_condition("shell readiness", || marker.exists());
+        let _ = std::fs::remove_file(&marker);
+        terminal
+    }
+
+    /// Returns an app whose only tab runs `sleep 30` in the foreground, once the
+    /// tab reports that job as busy.
+    pub(super) fn busy_shell_app(label: &str) -> App {
         let mut app = App::new();
-        app.apply_settings_hit(SettingsHit::ConfirmCloseToggle);
-        assert!(!app.config.confirm_close);
-        assert!(!app.request_terminal_close(CloseTarget::Tab(0)));
+        app.terminals.push(spawn_shell_tab(label));
+        app.terminals[0].write_input(b"sleep 30\r").unwrap();
+        wait_for_test_condition("foreground sleep job", || {
+            !app.busy_close_targets(CloseTarget::Window).is_empty()
+        });
+        app
+    }
+
+    #[test]
+    fn window_close_with_running_job_opens_the_dialog() {
+        let mut app = busy_shell_app("window-job");
+        let busy = app.busy_close_targets(CloseTarget::Window);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].1, "sleep");
+        assert!(!busy[0].0.is_empty());
+        assert!(!app.request_terminal_close(CloseTarget::Window));
+        assert!(app.close_confirm.is_some());
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn window_close_with_running_job_closes_at_once_when_confirm_is_off() {
+        let mut app = busy_shell_app("confirm-off");
+        // Set directly, not through the settings hit, so no config save is queued.
+        app.config.confirm_close = false;
+        // The close reaps the shell and its sleep job.
+        assert!(app.request_terminal_close(CloseTarget::Window));
         assert!(app.close_confirm.is_none());
+    }
+
+    #[test]
+    fn background_job_does_not_make_the_tab_busy() {
+        let mut app = App::new();
+        app.terminals.push(spawn_shell_tab("background-job"));
+        let marker = std::env::temp_dir().join(format!(
+            "ronsole-close-background-{}.done",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        // The marker is written after the shell has started the job and returned
+        // to its prompt, so the foreground group is the shell again.
+        app.terminals[0]
+            .write_input(format!("sleep 30 &\rprintf done > {}\r", marker.display()).as_bytes())
+            .unwrap();
+        wait_for_test_condition("background job start", || marker.exists());
+        let _ = std::fs::remove_file(&marker);
+        assert!(app.busy_close_targets(CloseTarget::Window).is_empty());
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn compositor_close_request_with_running_job_opens_the_dialog() {
+        let mut app = busy_shell_app("compositor-job");
+        assert!(!app.on_close_requested());
+        assert!(app.close_confirm.is_some());
+        app.shutdown_all();
     }
 
     #[test]
@@ -3689,23 +3800,18 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_window_bell_requests_attention_once_per_period() {
+    fn unfocused_window_bell_without_runtime_sends_no_attention() {
+        // Without a window runtime no compositor request can be sent, so the
+        // once-per-period flag must stay clear for the next bell to retry.
         let mut app = App::new();
         app.terminals.push(Terminal::new_for_test(8, 2, 1));
         app.focused = false;
 
         app.terminals[0].ring_bell_for_test();
         app.drain_terminal_host_events();
-        assert!(app.window_attention_requested);
+        assert!(!app.window_attention_requested);
         // The active tab is on screen, so it gets no tab mark.
         assert!(!app.terminals[0].bell_pending());
-
-        app.terminals[0].ring_bell_for_test();
-        app.drain_terminal_host_events();
-        assert!(app.window_attention_requested);
-
-        app.on_focus_changed(true);
-        assert!(!app.window_attention_requested);
     }
 
     #[test]

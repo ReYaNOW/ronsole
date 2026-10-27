@@ -58,3 +58,47 @@ fn wrapped_row_in_scrollback_is_joined_with_visible_row() {
     term.set_selection(Some((0, 0, 2, 2)));
     assert_eq!(term.selection_text(), "abcdefghijklm\nxyz");
 }
+
+#[test]
+fn blanks_of_wrapped_row_before_line_break_are_padding() {
+    // "a" plus five spaces: the first row "a   " wraps, the second row "  " ends the logical line.
+    let mut term = Term::new(test_config(4, 3));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, b"a     \r\nb");
+    term.set_selection(Some((0, 0, 0, 2)));
+    assert_eq!(term.selection_text(), "a\nb");
+}
+
+#[test]
+fn non_space_whitespace_before_line_break_is_kept() {
+    // U+00A0 is text, not an empty cell, so it stays before the line break.
+    let mut term = Term::new(test_config(10, 5));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, "a\u{a0}\r\nb".as_bytes());
+    term.set_selection(Some((0, 0, 0, 1)));
+    assert_eq!(term.selection_text(), "a\u{a0}\nb");
+}
+
+#[test]
+fn trailing_blank_rows_add_no_line_breaks() {
+    // Rows 1..=3 are blank padding after the line "abc" and must not produce newlines.
+    let mut term = Term::new(test_config(10, 5));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, b"abc\r\n");
+    term.set_selection(Some((0, 0, 9, 3)));
+    assert_eq!(term.selection_text(), "abc");
+}
+
+#[test]
+fn alt_screen_selection_reads_visible_rows_not_scrollback() {
+    let mut term = Term::new(test_config(10, 2));
+    let mut sink = RecordingSink::new();
+    // Fill the scrollback on the main screen first.
+    feed(&mut term, &mut sink, b"1\r\n2\r\n3\r\n4");
+    assert!(term.scrollback_len() > 0);
+    // Enter the alternate screen (hides scrollback), home the cursor, print on row 0.
+    feed(&mut term, &mut sink, b"\x1b[?1049h\x1b[HALT");
+    assert_eq!(term.scrollback_len(), 0);
+    term.set_selection(Some((0, 0, 2, 0)));
+    assert_eq!(term.selection_text(), "ALT");
+}

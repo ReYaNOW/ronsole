@@ -187,7 +187,8 @@ impl TerminalPalette {
     }
 
     /// Stores the configured text and ANSI colours and returns whether any of them changed.
-    /// It rebuilds no derived state; the caller runs it once at startup, before the first frame.
+    /// It rebuilds no derived state; the caller runs it at startup and again when the colour
+    /// settings change.
     fn set_terminal_colors(&mut self, config: &crate::config::AppConfig) -> bool {
         let term_fg = config.terminal_foreground.to_rgba();
         let term_bold_fg = config.terminal_bold_foreground.map(|c| c.to_rgba());
@@ -514,6 +515,9 @@ pub struct Renderer {
     terminal_tab_render_order: Vec<usize>,
     terminal_tab_x_anim: Vec<f32>,
     terminal_tab_hitboxes: Vec<terminal_ui::TerminalTabHitbox>,
+    /// Shared by Colors-tab drawing and hit-testing; `Cell` lets the wheel handler
+    /// scroll through the runtime's shared renderer reference.
+    settings_colors_scroll: std::cell::Cell<terminal_ui::SettingsColorsScroll>,
     terminal_tab_strip_layout: TerminalTabStripLayout,
     terminal_tab_base_x: f32,
     terminal_tab_animation_active: bool,
@@ -646,6 +650,7 @@ impl Renderer {
             terminal_tab_render_order: Vec::with_capacity(8),
             terminal_tab_x_anim: Vec::with_capacity(8),
             terminal_tab_hitboxes: Vec::with_capacity(8),
+            settings_colors_scroll: Default::default(),
             terminal_tab_strip_layout: TerminalTabStripLayout::default(),
             terminal_tab_base_x: 0.0,
             terminal_tab_animation_active: false,

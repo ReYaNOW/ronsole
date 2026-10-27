@@ -958,8 +958,14 @@ impl TermSink for SessionSink<'_> {
 
     fn bell(&mut self) {
         if let Some(pending) = self.pending {
-            platform::lock_recover(pending).bell = true;
-            self.notify_pending();
+            // Wake only on the false-to-true edge, so a run of BEL bytes in one
+            // output batch costs a single main-loop wakeup.
+            let mut events = platform::lock_recover(pending);
+            if !events.bell {
+                events.bell = true;
+                drop(events);
+                self.notify_pending();
+            }
         }
     }
 
@@ -2268,12 +2274,13 @@ mod tests {
     #[test]
     fn bell_run_coalesces_into_one_pending_flag() {
         let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
+        let wake = WakeHandle::new().expect("eventfd");
         let mut grid = test_term(64, 3);
         let mut sink = SessionSink {
             reply_tx: None,
             title_cache: None,
             pending: Some(&pending),
-            wake: None,
+            wake: Some(&wake),
         };
         advance_terminal_output_batch(
             &mut grid,
@@ -2282,6 +2289,8 @@ mod tests {
             Instant::now(),
         );
 
+        // The eventfd counter sums its writes, so one wakeup reads back as 1.
+        assert_eq!(wake.drain().expect("drain"), 1);
         assert!(PendingHostEvents::take(&pending).bell);
         assert!(!PendingHostEvents::take(&pending).bell);
     }

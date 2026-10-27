@@ -1194,19 +1194,23 @@ impl Term {
     pub fn selection_text(&self) -> String {
         if let Some((sx, sy, ex, ey)) = self.selection {
             let mut res = String::new();
-            let total_lines = self.scrollback.len() + self.lines.len();
+            // Alt-aware: on the alternate screen the scrollback is hidden, so row
+            // indexes start at the visible rows.
+            let scrollback_len = self.scrollback_len();
+            let total_lines = scrollback_len + self.lines.len();
             let (start_x, start_y, end_x, end_y) = normalized_selection_bounds(sx, sy, ex, ey);
+            // Offset in `res` where the current logical line starts.
+            let mut line_start = 0;
 
             for y in start_y..=end_y {
                 if y >= total_lines {
                     continue;
                 }
-                let row = if y < self.scrollback.len() {
+                let row = if y < scrollback_len {
                     &self.scrollback[y]
                 } else {
-                    &self.lines[y - self.scrollback.len()]
+                    &self.lines[y - scrollback_len]
                 };
-                let row_start = res.len();
                 let mut logical_len = row.len().min(self.cols);
                 if self.row_soft_wrapped(y) {
                     // Cells past the used width of a wrapped row are padding left by a
@@ -1230,12 +1234,17 @@ impl Term {
                 // and its trailing blanks are text. A logical line ends with a break and
                 // its trailing blanks are padding.
                 if y != end_y && !self.row_soft_wrapped(y) {
-                    let kept = res[row_start..].trim_end().len();
-                    res.truncate(row_start + kept);
+                    // Padding is trimmed from the whole logical line, including blanks of
+                    // earlier soft-wrapped rows. Blank cells hold ' ', so only spaces are
+                    // dropped; other whitespace such as U+00A0 stays as text.
+                    let kept = res[line_start..].trim_end_matches(' ').len();
+                    res.truncate(line_start + kept);
                     res.push('\n');
+                    line_start = res.len();
                 }
             }
-            res.truncate(res.trim_end().len());
+            // Trailing blank rows leave no empty lines at the end of the copied text.
+            res.truncate(res.trim_end_matches([' ', '\n']).len());
             res
         } else {
             String::new()

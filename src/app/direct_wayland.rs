@@ -125,10 +125,9 @@ impl App {
     }
 
     fn handle_wayland_runtime_events(&mut self, events: WaylandRuntimeEvents) -> bool {
-        if events.close_requested {
-            self.interrupt_automation("Wayland compositor requested window close");
-            return self.on_close_requested();
-        }
+        // Applied after the rest of the batch: a close that only opens the
+        // confirmation dialog must not drop the resize or input queued with it.
+        let close_requested = events.close_requested;
 
         if let Some(metrics) = events.scale_changed {
             self.on_scale_changed(
@@ -177,6 +176,13 @@ impl App {
                 }
                 WaylandInputEvent::Scroll(delta) => self.on_scroll(delta),
             }
+        }
+
+        // Only a close that actually proceeds interrupts automation; a close
+        // that opens the dialog leaves the run alone.
+        if close_requested && self.on_close_requested() {
+            self.interrupt_automation("Wayland compositor requested window close");
+            return true;
         }
         false
     }
@@ -343,6 +349,41 @@ impl App {
 mod tests {
     use super::*;
     use crate::platform::single_instance::ExternalLaunchRequest;
+    use crate::runtime::WaylandWindowMetrics;
+
+    fn configured_metrics(logical: u32) -> WaylandWindowMetrics {
+        WaylandWindowMetrics {
+            logical_width: logical,
+            logical_height: logical,
+            physical_width: logical * 2,
+            physical_height: logical * 2,
+            scale_factor: 2.0,
+        }
+    }
+
+    #[test]
+    fn close_in_batch_still_applies_resize_and_opens_the_dialog() {
+        // A busy tab makes the close open the dialog instead of exiting.
+        let mut app = crate::app::tests::busy_shell_app("batch-close");
+        let events = WaylandRuntimeEvents {
+            close_requested: true,
+            configured: Some(configured_metrics(900)),
+            ..Default::default()
+        };
+        assert!(!app.handle_wayland_runtime_events(events));
+        assert!(app.close_confirm.is_some());
+        assert_eq!(app.config.window_width, 900.0);
+
+        // With the dialog open, a batch without a close still applies its resize.
+        let events = WaylandRuntimeEvents {
+            configured: Some(configured_metrics(1000)),
+            ..Default::default()
+        };
+        assert!(!app.handle_wayland_runtime_events(events));
+        assert!(app.close_confirm.is_some());
+        assert_eq!(app.config.window_width, 1000.0);
+        app.shutdown_all();
+    }
 
     #[test]
     fn rapid_external_launch_burst_preserves_requests_within_bound() {

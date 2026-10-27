@@ -1257,6 +1257,29 @@ impl WaylandState {
         }
     }
 
+    /// Asks the compositor to mark the window as wanting attention. The token
+    /// carries no serial, so the compositor flags the window instead of focusing
+    /// it; the `done` handler then activates it with the same token. Returns true
+    /// when a request is in flight.
+    fn request_window_attention(&mut self, qh: &QueueHandle<Self>) -> bool {
+        if self.keyboard_focused {
+            return false;
+        }
+        if self.pending_activation_token.is_some() {
+            return true;
+        }
+        let (Some(activation), Some(surface)) = (self.activation.as_ref(), self.surface.as_ref())
+        else {
+            return false;
+        };
+        let token = activation.get_activation_token(qh, ());
+        token.set_app_id(WAYLAND_APP_ID.to_owned());
+        token.set_surface(surface);
+        token.commit();
+        self.pending_activation_token = Some(token);
+        true
+    }
+
     fn set_keyboard_focus(&mut self, focused: bool) {
         if focused {
             self.keyboard_focused = true;
@@ -2459,11 +2482,11 @@ impl DirectWaylandBackend {
         let _ = self.connection.flush();
     }
 
-    /// Goes through the same plan as external activation, so it needs the
-    /// fallback serial and seat.
-    fn request_window_attention(&mut self) {
-        self.state.activate_existing_window(&self.qh, None);
+    /// Returns true when an attention request is in flight.
+    fn request_window_attention(&mut self) -> bool {
+        let requested = self.state.request_window_attention(&self.qh);
         let _ = self.connection.flush();
+        requested
     }
 
     fn dispatch_pending(&mut self) -> Result<usize, String> {
@@ -2889,10 +2912,12 @@ impl WindowRuntime {
         }
     }
 
-    /// Marks the window as wanting attention, through xdg-activation.
-    pub fn request_window_attention(&mut self) {
-        if let RuntimeBackend::Wayland(wayland) = &mut self.backend {
-            wayland.request_window_attention();
+    /// Marks the window as wanting attention, through xdg-activation. Returns
+    /// true when a request was sent; the headless backend has no window to flag.
+    pub fn request_window_attention(&mut self) -> bool {
+        match &mut self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.request_window_attention(),
+            RuntimeBackend::Headless(_) => false,
         }
     }
 

@@ -688,6 +688,39 @@ struct SettingsSidebarTabMetrics {
     gap: f32,
 }
 
+/// Colors-tab scroll: whole-row offset plus the sub-row wheel remainder, so rows are
+/// never drawn half outside the body and hitboxes always match the drawn rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SettingsColorsScroll {
+    rows: usize,
+    carry: f32,
+}
+
+impl SettingsColorsScroll {
+    /// Applies `delta_rows` (positive scrolls down) and clamps to `max`.
+    fn step(self, delta_rows: f32, max: usize) -> Self {
+        let carry = self.carry + if delta_rows.is_finite() { delta_rows } else { 0.0 };
+        let whole = carry.trunc();
+        let rows = (self.rows.min(max) as f32 + whole).clamp(0.0, max as f32);
+        // Pushing against either end drops the remainder so reversing responds at once.
+        let carry = carry - whole;
+        let carry = if (rows <= 0.0 && carry < 0.0) || (rows >= max as f32 && carry > 0.0) {
+            0.0
+        } else {
+            carry
+        };
+        Self {
+            rows: rows as usize,
+            carry,
+        }
+    }
+}
+
+#[inline]
+fn settings_color_row_step(scale: f32) -> f32 {
+    (44.0 * scale).round().max(1.0)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SettingsLayout {
     modal: Rect,
@@ -703,6 +736,8 @@ struct SettingsLayout {
     background: Option<SettingsBackgroundRowLayout>,
     confirm_close: Option<SettingsToggleRowLayout>,
     colors: [Option<SettingsColorRowLayout>; SETTINGS_COLOR_FIELDS.len()],
+    /// Largest whole-row Colors scroll offset that still changes what is shown.
+    colors_scroll_max: usize,
     help: [Option<SettingsHelpRowLayout>; SETTINGS_HELP_ENTRIES.len()],
 }
 
@@ -881,17 +916,37 @@ fn settings_toggle_row_layout(clip: Rect, top: f32, scale: f32) -> Option<Settin
     })
 }
 
+/// Hex field width of a colour row; the compact variant still fits `#rrggbb`.
+fn settings_color_field_w(scale: f32, compact: bool) -> f32 {
+    (if compact { 96.0 } else { 128.0 } * scale).round().max(1.0)
+}
+
+/// Narrowest clip `settings_color_row_layout` accepts for the given variant.
+fn settings_color_row_min_w(scale: f32, compact: bool) -> f32 {
+    let gap = (8.0 * scale).round().max(1.0);
+    let swatch_w = (20.0 * scale).round().max(1.0);
+    let reset_w = (86.0 * scale).round().max(1.0);
+    let label_room = (64.0 * scale).round().max(1.0);
+    swatch_w + settings_color_field_w(scale, compact) + reset_w + gap * 3.0 + label_room
+}
+
 /// One colour cell: label on the left, then swatch, hex field and reset button
 /// packed against the right edge of `clip`.
-fn settings_color_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsColorRowLayout> {
+fn settings_color_row_layout(
+    clip: Rect,
+    top: f32,
+    scale: f32,
+    compact: bool,
+) -> Option<SettingsColorRowLayout> {
     let row_h = (30.0 * scale).round().max(1.0);
     let gap = (8.0 * scale).round().max(1.0);
     let swatch_w = (20.0 * scale).round().max(1.0);
-    let field_w = (128.0 * scale).round().max(1.0);
+    let field_w = settings_color_field_w(scale, compact);
     let reset_w = (86.0 * scale).round().max(1.0);
-    let control_w = swatch_w + field_w + reset_w + gap * 3.0;
-    let label_room = (64.0 * scale).round().max(1.0);
-    if clip.w < control_w + label_room || top < clip.y || top + row_h > clip.y + clip.h {
+    if clip.w < settings_color_row_min_w(scale, compact)
+        || top < clip.y
+        || top + row_h > clip.y + clip.h
+    {
         return None;
     }
 
@@ -1034,6 +1089,7 @@ fn settings_layout(
     scale: f32,
     progress: f32,
     active_tab: SettingsTab,
+    colors_scroll: usize,
 ) -> SettingsLayout {
     let scale = scale.max(0.0);
     let modal = settings_modal_rect(width, height, scale, progress);
@@ -1150,6 +1206,7 @@ fn settings_layout(
     let mut background = None;
     let mut confirm_close = None;
     let mut colors = [None; SETTINGS_COLOR_FIELDS.len()];
+    let mut colors_scroll_max = 0;
     let mut help = [None; SETTINGS_HELP_ENTRIES.len()];
     match active_tab {
         SettingsTab::General => {
@@ -1165,10 +1222,29 @@ fn settings_layout(
         SettingsTab::Colors => {
             // Foreground and bold foreground span the body; the palette rows below
             // split it into two columns: even fields left (normal), odd fields right (bright).
+            // A narrow body narrows the hex field first, then stacks all fields in one
+            // column. Rows that do not fit vertically are reached by whole-row scrolling.
             let first_top = (content_body.y + 12.0 * scale).round();
-            let row_step = (44.0 * scale).round().max(1.0);
+            let row_step = settings_color_row_step(scale);
+            let row_h = (30.0 * scale).round().max(1.0);
             let column_gap = (24.0 * scale).round().max(1.0);
             let half_w = ((content_body.w - column_gap) * 0.5).round().max(0.0);
+            let two_columns = half_w >= settings_color_row_min_w(scale, true);
+            let cell_w = if two_columns { half_w } else { content_body.w };
+            let compact = cell_w < settings_color_row_min_w(scale, false);
+            let total_rows = if two_columns {
+                SETTINGS_COLOR_FIELDS.len() / 2 + 1
+            } else {
+                SETTINGS_COLOR_FIELDS.len()
+            };
+            let body_bottom = content_body.y + content_body.h;
+            let visible_rows = (0..total_rows)
+                .take_while(|row| {
+                    (first_top + row_step * *row as f32).round() + row_h <= body_bottom
+                })
+                .count();
+            colors_scroll_max = total_rows.saturating_sub(visible_rows.max(1));
+            let scroll = colors_scroll.min(colors_scroll_max);
             let left = Rect {
                 x: content_body.x,
                 y: content_body.y,
@@ -1183,14 +1259,18 @@ fn settings_layout(
             };
             for (index, slot) in colors.iter_mut().enumerate() {
                 let (clip, row) = match index {
-                    0 => (content_body, 0),
-                    1 => (content_body, 1),
+                    0 | 1 => (content_body, index),
+                    _ if !two_columns => (content_body, index),
                     _ => (if index % 2 == 0 { left } else { right }, index / 2 + 1),
+                };
+                let Some(row) = row.checked_sub(scroll) else {
+                    continue;
                 };
                 *slot = settings_color_row_layout(
                     clip,
                     (first_top + row_step * row as f32).round(),
                     scale,
+                    compact,
                 );
             }
         }
@@ -1215,6 +1295,7 @@ fn settings_layout(
         background,
         confirm_close,
         colors,
+        colors_scroll_max,
         help,
     }
 }
@@ -2469,7 +2550,14 @@ impl Renderer {
             [0.0, 0.0, 0.0, 0.60 * smooth],
         );
 
-        let layout = settings_layout(self.width, self.height, s, progress, active_tab);
+        let layout = settings_layout(
+            self.width,
+            self.height,
+            s,
+            progress,
+            active_tab,
+            self.settings_colors_scroll.get().rows,
+        );
         let modal = layout.modal;
         if modal.w <= 0.0 || modal.h <= 0.0 {
             self.flush();
@@ -3175,8 +3263,37 @@ impl Renderer {
             self.scale_factor,
             progress,
             active_tab,
+            self.settings_colors_scroll.get().rows,
         )
         .hit_test(x, y)
+    }
+
+    /// Scrolls the Colors tab by wheel `delta` in whole rows; returns whether the
+    /// shown rows changed. The offset is clamped against the current window size.
+    pub(crate) fn scroll_settings_colors(
+        &self,
+        progress: f32,
+        delta: crate::input_types::ScrollDelta,
+    ) -> bool {
+        let state = self.settings_colors_scroll.get();
+        let max = settings_layout(
+            self.width,
+            self.height,
+            self.scale_factor,
+            progress,
+            SettingsTab::Colors,
+            state.rows,
+        )
+        .colors_scroll_max;
+        let delta_rows = match delta {
+            crate::input_types::ScrollDelta::Line { y, .. } => -y,
+            crate::input_types::ScrollDelta::Pixel { y, .. } => {
+                -y / settings_color_row_step(self.scale_factor)
+            }
+        };
+        let next = state.step(delta_rows, max);
+        self.settings_colors_scroll.set(next);
+        next.rows != state.rows.min(max)
     }
 
     /// Hit-tests the close confirmation. `line_count` must match the rows it was drawn with.
@@ -3203,6 +3320,7 @@ impl Renderer {
             self.scale_factor,
             progress,
             active_tab,
+            0,
         );
         let row = layout.background?;
         let viewport = settings_background_text_viewport(row, self.scale_factor);
@@ -5003,7 +5121,7 @@ mod tests {
 
     #[test]
     fn confirm_close_toggle_row_hit_tests_its_drawn_control() {
-        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
         let toggle = layout
             .confirm_close
             .expect("toggle row must fit the General tab at 1100x720")
@@ -5063,6 +5181,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let inner = layout
                 .inner
@@ -5082,7 +5201,7 @@ mod tests {
             }
         }
 
-        let tiny = settings_layout(100.0, 80.0, 1.3333333, 1.0, SettingsTab::General);
+        let tiny = settings_layout(100.0, 80.0, 1.3333333, 1.0, SettingsTab::General, 0);
         for rect in tiny.tabs.into_iter().flatten() {
             for value in [rect.x, rect.y, rect.w, rect.h] {
                 assert!(value.is_finite());
@@ -5092,7 +5211,7 @@ mod tests {
 
     #[test]
     fn settings_tab_hit_testing_uses_the_drawn_sidebar_rects() {
-        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
         let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
         let general = layout.tabs[0].expect("general tab should fit");
         let help = layout.tabs[2].expect("help tab should fit");
@@ -5112,7 +5231,7 @@ mod tests {
 
     #[test]
     fn settings_colors_tab_hit_tests_every_field_and_reset_and_its_tab_strip_entry() {
-        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Colors);
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Colors, 0);
         let tab = layout.tabs[1].expect("Colors tab sits second in the strip");
         assert_eq!(
             layout.hit_test(tab.x + tab.w * 0.5, tab.y + tab.h * 0.5),
@@ -5137,6 +5256,7 @@ mod tests {
             scale,
             1.0,
             SettingsTab::Colors,
+            0,
         );
         let body = layout.content_body.expect("body exists at 1.33x");
         for row in layout.colors {
@@ -5147,8 +5267,107 @@ mod tests {
     }
 
     #[test]
+    fn settings_colors_wide_window_keeps_full_two_column_rows_without_scroll() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Colors, 0);
+        assert_eq!(layout.colors_scroll_max, 0);
+        let rows = layout.colors.map(|row| row.expect("every row fits 1100x720"));
+        for row in rows {
+            assert_eq!(row.field.w, 128.0);
+        }
+        // Palette 0 and 1 share a row: normal on the left, bright on the right.
+        assert_eq!(rows[2].field.y, rows[3].field.y);
+        assert!(rows[2].reset.x + rows[2].reset.w < rows[3].label.x);
+        // Bright white (palette 15) closes the last of the ten rows.
+        assert_eq!(rows[17].field.y, rows[0].field.y + 44.0 * 9.0);
+    }
+
+    #[test]
+    fn settings_colors_every_field_is_reachable_operable_and_disjoint_in_small_windows() {
+        let row_box = |row: SettingsColorRowLayout| Rect {
+            x: row.label.x,
+            y: row.field.y,
+            w: row.reset.x + row.reset.w - row.label.x,
+            h: row.field.h,
+        };
+        let overlaps = |a: Rect, b: Rect| {
+            a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+        };
+        for (base_w, base_h) in [(800.0, 600.0), (1000.0, 720.0)] {
+            for scale in [1.0_f32, 1.5] {
+                // Sizes are logical; physical 800x600 at 1.5x is too small even for
+                // the General rows and is covered by the finite-layout test instead.
+                {
+                    let (width, height) = (base_w * scale, base_h * scale);
+                    let at = |offset| {
+                        settings_layout(width, height, scale, 1.0, SettingsTab::Colors, offset)
+                    };
+                    let max = at(0).colors_scroll_max;
+                    let mut seen = [false; SETTINGS_COLOR_FIELDS.len()];
+                    for offset in 0..=max {
+                        let layout = at(offset);
+                        let body = layout.content_body.expect("Colors body exists");
+                        let shown = layout
+                            .colors
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, row)| row.map(|row| (index, row)))
+                            .collect::<Vec<_>>();
+                        assert!(!shown.is_empty(), "{width}x{height}@{scale} offset {offset}");
+                        for &(index, row) in &shown {
+                            let field = SETTINGS_COLOR_FIELDS[index];
+                            let bounds = row_box(row);
+                            assert!(bounds.x >= body.x && bounds.x + bounds.w <= body.x + body.w);
+                            assert!(bounds.y >= body.y && bounds.y + bounds.h <= body.y + body.h);
+                            assert!(row.label_max_x > row.label.x);
+                            let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+                            let (x, y) = center(row.field);
+                            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorField(field));
+                            let (x, y) = center(row.reset);
+                            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorReset(field));
+                            seen[index] = true;
+                        }
+                        for (a, &(_, first)) in shown.iter().enumerate() {
+                            for &(_, second) in &shown[a + 1..] {
+                                assert!(!overlaps(row_box(first), row_box(second)));
+                            }
+                        }
+                    }
+                    assert!(seen.iter().all(|seen| *seen), "{width}x{height}@{scale}");
+                    // Offsets beyond the range clamp to the last view instead of emptying it.
+                    assert_eq!(at(max + 5).colors, at(max).colors);
+                }
+            }
+        }
+        // 1000x720 at 1x needs neither scrolling nor a single column.
+        let layout = settings_layout(1000.0, 720.0, 1.0, 1.0, SettingsTab::Colors, 0);
+        assert_eq!(layout.colors_scroll_max, 0);
+        let rows = layout.colors.map(|row| row.expect("every row fits 1000x720"));
+        assert_eq!(rows[2].field.y, rows[3].field.y);
+    }
+
+    #[test]
+    fn settings_colors_scroll_accumulates_fractional_wheel_and_clamps() {
+        let mut state = SettingsColorsScroll::default();
+        for _ in 0..3 {
+            state = state.step(0.25, 4);
+        }
+        assert_eq!(state.rows, 0);
+        state = state.step(0.25, 4);
+        assert_eq!(state.rows, 1);
+        state = state.step(10.0, 4);
+        assert_eq!(state, SettingsColorsScroll { rows: 4, carry: 0.0 });
+        // Pushing up from the top does not bank a remainder.
+        let top = SettingsColorsScroll::default().step(-3.5, 4).step(0.5, 4);
+        assert_eq!(top, SettingsColorsScroll { rows: 0, carry: 0.5 });
+        // A stale offset from a larger window clamps to the new range.
+        let stale = SettingsColorsScroll { rows: 9, carry: 0.0 }.step(-1.0, 4);
+        assert_eq!(stale.rows, 3);
+        assert_eq!(SettingsColorsScroll::default().step(f32::NAN, 4).rows, 0);
+    }
+
+    #[test]
     fn settings_hit_test_distinguishes_empty_modal_space_from_outside() {
-        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
         let modal = layout.modal;
         assert_eq!(
             layout.hit_test(modal.x + 4.0, modal.y + modal.h - 4.0),
@@ -5181,6 +5400,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let row = layout.font.expect("font row should fit");
             let region_center = (row.value.x + row.value_max_x) * 0.5;
@@ -5208,6 +5428,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let row = layout.background.expect("background row should fit");
             let viewport = settings_background_text_viewport(row, scale);
@@ -5231,6 +5452,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let clip = layout
                 .content_body
@@ -5283,8 +5505,8 @@ mod tests {
 
     #[test]
     fn help_tab_has_no_hidden_general_control_hitboxes() {
-        let general = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
-        let help = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Help);
+        let general = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
+        let help = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Help, 0);
         assert!(help.font.is_none());
         assert!(help.scroll.is_none());
         assert!(help.background.is_none());
@@ -5298,7 +5520,7 @@ mod tests {
     fn help_keycaps_are_bounded_and_leave_a_separate_description_column() {
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
             let layout =
-                settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, SettingsTab::Help);
+                settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, SettingsTab::Help, 0);
             let body = layout.content_body.expect("help content should fit");
             let rows = layout.help.into_iter().flatten().collect::<Vec<_>>();
             assert_eq!(rows.len(), SETTINGS_HELP_ENTRIES.len());
@@ -5332,7 +5554,7 @@ mod tests {
         };
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
             for tab in [SettingsTab::General, SettingsTab::Help] {
-                let layout = settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, tab);
+                let layout = settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, tab, 0);
                 let inner = layout.inner.expect("inner panel should fit");
                 for pill in layout.tabs.into_iter().flatten() {
                     assert!(contains(inner, pill));
@@ -5428,9 +5650,10 @@ mod tests {
 
     #[test]
     fn settings_layout_stays_finite_when_window_is_too_small_for_controls() {
-        for (width, height) in [(0.0, 0.0), (10.0, 10.0), (40.0, 40.0), (100.0, 80.0)] {
-            for tab in [SettingsTab::General, SettingsTab::Help] {
-                let layout = settings_layout(width, height, 1.3333333, 1.0, tab);
+        let sizes = [(0.0, 0.0), (10.0, 10.0), (40.0, 40.0), (100.0, 80.0), (800.0, 600.0)];
+        for (width, height) in sizes {
+            for tab in [SettingsTab::General, SettingsTab::Colors, SettingsTab::Help] {
+                let layout = settings_layout(width, height, 1.3333333, 1.0, tab, usize::MAX);
                 for value in [
                     layout.modal.x,
                     layout.modal.y,
@@ -5459,8 +5682,8 @@ mod tests {
 
     #[test]
     fn settings_hit_test_tracks_animated_modal_position() {
-        let mid = settings_layout(1100.0, 720.0, 1.0, 0.5, SettingsTab::General);
-        let final_layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let mid = settings_layout(1100.0, 720.0, 1.0, 0.5, SettingsTab::General, 0);
+        let final_layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
         let mid_minus = mid.font.expect("mid-animation controls should fit").minus;
         let final_minus = final_layout.font.expect("final controls should fit").minus;
         let mid_center = (
