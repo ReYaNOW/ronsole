@@ -1035,6 +1035,7 @@ impl Term {
         self.key_protocol.set_alt(false);
         self.alt_lines = None;
         self.alt_line_meta = None;
+        self.title_stack.clear();
 
         while self.lines.len() > self.visible_rows {
             let index = self.lines.len() - 1;

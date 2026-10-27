@@ -13,6 +13,8 @@ pub(crate) struct RecordingSink {
     pub(crate) bytes: Vec<u8>,
     /// Every `title` call, in order.
     pub(crate) titles: Vec<String>,
+    /// Number of `title_reset` calls.
+    pub(crate) title_resets: usize,
     /// Every `clipboard_set` text, in order.
     pub(crate) clipboard: Vec<String>,
     /// Every `working_directory` call as (host, percent-decoded path).
@@ -27,6 +29,7 @@ impl RecordingSink {
             calls: Vec::new(),
             bytes: Vec::new(),
             titles: Vec::new(),
+            title_resets: 0,
             clipboard: Vec::new(),
             cwd: Vec::new(),
             now: Instant::now(),
@@ -42,6 +45,10 @@ impl TermSink for RecordingSink {
 
     fn title(&mut self, title: &str) {
         self.titles.push(title.to_owned());
+    }
+
+    fn title_reset(&mut self) {
+        self.title_resets += 1;
     }
 
     fn clipboard_set(&mut self, text: String) {

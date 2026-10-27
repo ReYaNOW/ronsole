@@ -4,9 +4,40 @@ use crate::cell::{Hyperlink, LinkBudget};
 use crate::color::{Rgb, TerminalColor};
 use crate::term::Term;
 use crate::url::{base64_decode, percent_decode};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 pub const TERMINAL_TITLE_MAX_BYTES: usize = 256;
+
+/// Most entries a [`TitleStack`] keeps; pushing past it drops the oldest.
+pub(crate) const TITLE_STACK_MAX_ENTRIES: usize = 4096;
+
+/// Programmed titles saved by `CSI 22 ; Ps t` and restored by `CSI 23 ; Ps t`.
+///
+/// A `None` entry is a state with no programmed title; restoring it makes the
+/// host show its fallback title again.
+#[derive(Default)]
+pub(crate) struct TitleStack {
+    entries: VecDeque<Option<String>>,
+}
+
+impl TitleStack {
+    pub(crate) fn push(&mut self, title: Option<String>) {
+        if self.entries.len() == TITLE_STACK_MAX_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(title);
+    }
+
+    /// Returns the newest saved state, or `None` when the stack is empty.
+    pub(crate) fn pop(&mut self) -> Option<Option<String>> {
+        self.entries.pop_back()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
 
 /// Largest OSC 8 URI in bytes; longer URIs are ignored.
 const OSC8_MAX_URI_BYTES: usize = 2083;

@@ -134,6 +134,10 @@ impl TerminalTitleState {
         });
     }
 
+    pub(crate) fn clear_programmed(&mut self) {
+        self.programmed = None;
+    }
+
     fn observe_unchanged(&mut self) {
         self.observation_serial = self.observation_serial.wrapping_add(1);
     }
@@ -906,6 +910,12 @@ impl TermSink for SessionSink<'_> {
     fn title(&mut self, title: &str) {
         if let Some(cache) = self.title_cache {
             platform::lock_recover(cache).set_programmed(title.to_owned());
+        }
+    }
+
+    fn title_reset(&mut self) {
+        if let Some(cache) = self.title_cache {
+            platform::lock_recover(cache).clear_programmed();
         }
     }
 

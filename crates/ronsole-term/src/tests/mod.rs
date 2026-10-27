@@ -8,6 +8,7 @@ mod queries;
 mod reflow;
 mod sgr;
 mod support;
+mod title_stack;
 mod sync;
 
 use crate::term::Term;
