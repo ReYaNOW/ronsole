@@ -532,7 +532,7 @@ mod tests {
                 None,
                 1,
                 launch,
-                crate::renderer::terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+                crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
             );
             let token = terminal.tab_token().to_owned();
             let deadline = Instant::now() + Duration::from_secs(3);

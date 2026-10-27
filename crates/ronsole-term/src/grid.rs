@@ -1035,6 +1035,7 @@ impl Term {
         self.key_protocol.set_alt(false);
         self.alt_lines = None;
         self.alt_line_meta = None;
+        self.title_stack.clear();
 
         while self.lines.len() > self.visible_rows {
             let index = self.lines.len() - 1;
@@ -1179,22 +1180,43 @@ impl Term {
         );
     }
 
+    /// Used width of row `index` (indexed as in [`Term::row_soft_wrapped`]).
+    fn row_used_cols(&self, index: usize) -> usize {
+        let scrollback_len = self.scrollback_len();
+        let meta = if index < scrollback_len {
+            self.scrollback_meta.get(index)
+        } else {
+            self.line_meta.get(index - scrollback_len)
+        };
+        meta.map_or(self.cols, |meta| meta.used_cols)
+    }
+
     pub fn selection_text(&self) -> String {
         if let Some((sx, sy, ex, ey)) = self.selection {
             let mut res = String::new();
-            let total_lines = self.scrollback.len() + self.lines.len();
+            // Alt-aware: on the alternate screen the scrollback is hidden, so row
+            // indexes start at the visible rows.
+            let scrollback_len = self.scrollback_len();
+            let total_lines = scrollback_len + self.lines.len();
             let (start_x, start_y, end_x, end_y) = normalized_selection_bounds(sx, sy, ex, ey);
+            // Offset in `res` where the current logical line starts.
+            let mut line_start = 0;
 
             for y in start_y..=end_y {
                 if y >= total_lines {
                     continue;
                 }
-                let row = if y < self.scrollback.len() {
+                let row = if y < scrollback_len {
                     &self.scrollback[y]
                 } else {
-                    &self.lines[y - self.scrollback.len()]
+                    &self.lines[y - scrollback_len]
                 };
-                let logical_len = row.len().min(self.cols);
+                let mut logical_len = row.len().min(self.cols);
+                if self.row_soft_wrapped(y) {
+                    // Cells past the used width of a wrapped row are padding left by a
+                    // wide character that moved to the next row, not text.
+                    logical_len = logical_len.min(self.row_used_cols(y));
+                }
                 if logical_len > 0 {
                     let line_start = if y == start_y { start_x } else { 0 };
                     let line_end = if y == end_y {
@@ -1208,11 +1230,21 @@ impl Term {
                         }
                     }
                 }
-                if y != end_y {
+                // A soft-wrapped row continues on the next row, so it has no line break
+                // and its trailing blanks are text. A logical line ends with a break and
+                // its trailing blanks are padding.
+                if y != end_y && !self.row_soft_wrapped(y) {
+                    // Padding is trimmed from the whole logical line, including blanks of
+                    // earlier soft-wrapped rows. Blank cells hold ' ', so only spaces are
+                    // dropped; other whitespace such as U+00A0 stays as text.
+                    let kept = res[line_start..].trim_end_matches(' ').len();
+                    res.truncate(line_start + kept);
                     res.push('\n');
+                    line_start = res.len();
                 }
             }
-            res.truncate(res.trim_end().len());
+            // Trailing blank rows leave no empty lines at the end of the copied text.
+            res.truncate(res.trim_end_matches([' ', '\n']).len());
             res
         } else {
             String::new()

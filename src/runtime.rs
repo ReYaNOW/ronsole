@@ -1257,6 +1257,29 @@ impl WaylandState {
         }
     }
 
+    /// Asks the compositor to mark the window as wanting attention. The token
+    /// carries no serial, so the compositor flags the window instead of focusing
+    /// it; the `done` handler then activates it with the same token. Returns true
+    /// when a request is in flight.
+    fn request_window_attention(&mut self, qh: &QueueHandle<Self>) -> bool {
+        if self.keyboard_focused {
+            return false;
+        }
+        if self.pending_activation_token.is_some() {
+            return true;
+        }
+        let (Some(activation), Some(surface)) = (self.activation.as_ref(), self.surface.as_ref())
+        else {
+            return false;
+        };
+        let token = activation.get_activation_token(qh, ());
+        token.set_app_id(WAYLAND_APP_ID.to_owned());
+        token.set_surface(surface);
+        token.commit();
+        self.pending_activation_token = Some(token);
+        true
+    }
+
     fn set_keyboard_focus(&mut self, focused: bool) {
         if focused {
             self.keyboard_focused = true;
@@ -2459,6 +2482,13 @@ impl DirectWaylandBackend {
         let _ = self.connection.flush();
     }
 
+    /// Returns true when an attention request is in flight.
+    fn request_window_attention(&mut self) -> bool {
+        let requested = self.state.request_window_attention(&self.qh);
+        let _ = self.connection.flush();
+        requested
+    }
+
     fn dispatch_pending(&mut self) -> Result<usize, String> {
         self.event_queue
             .dispatch_pending(&mut self.state)
@@ -2499,6 +2529,13 @@ impl DirectWaylandBackend {
                 },
                 libc::pollfd {
                     fd: wake.as_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                // Shutdown self-pipe; `-1` when signal handling is not installed.
+                // The loop drains it through `signals::take_shutdown_request`.
+                libc::pollfd {
+                    fd: crate::platform::signals::wait_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -2650,6 +2687,11 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub settings_scroll_value: &'a str,
     pub settings_background_input: &'a mut crate::single_line_input::SingleLineInput,
     pub settings_background_editing: bool,
+    pub settings_confirm_close: bool,
+    pub settings_colors: &'a crate::renderer::SettingsColorView,
+    pub settings_color_editing: Option<crate::renderer::SettingsColorField>,
+    pub settings_color_input: &'a crate::single_line_input::SingleLineInput,
+    pub close_confirm: Option<crate::renderer::CloseConfirmView<'a>>,
 }
 
 /// Field order is destruction order: the renderer goes first while its GL target is
@@ -2870,6 +2912,15 @@ impl WindowRuntime {
         }
     }
 
+    /// Marks the window as wanting attention, through xdg-activation. Returns
+    /// true when a request was sent; the headless backend has no window to flag.
+    pub fn request_window_attention(&mut self) -> bool {
+        match &mut self.backend {
+            RuntimeBackend::Wayland(wayland) => wayland.request_window_attention(),
+            RuntimeBackend::Headless(_) => false,
+        }
+    }
+
     pub fn update_scale_factor(&mut self, scale_factor: f32) {
         self.make_target_current();
         self.renderer.update_scale_factor(scale_factor);
@@ -2887,6 +2938,11 @@ impl WindowRuntime {
     pub(crate) fn set_terminal_background(&mut self, background: crate::config::RgbColor) -> bool {
         self.make_target_current();
         self.renderer.set_terminal_background(background)
+    }
+
+    pub(crate) fn set_terminal_colors(&mut self, config: &crate::config::AppConfig) -> bool {
+        self.make_target_current();
+        self.renderer.set_terminal_colors(config)
     }
 
     pub(crate) fn reset_fps_counter(&mut self) {
@@ -2943,6 +2999,11 @@ impl WindowRuntime {
             params.settings_scroll_value,
             params.settings_background_input,
             params.settings_background_editing,
+            params.settings_confirm_close,
+            params.settings_colors,
+            params.settings_color_editing,
+            params.settings_color_input,
+            params.close_confirm,
         );
         match (&mut self.target, &self.backend) {
             (GlTarget::Window { context, surface, .. }, RuntimeBackend::Wayland(_)) => {
@@ -2975,6 +3036,15 @@ impl WindowRuntime {
         y: f32,
     ) -> crate::renderer::SettingsHit {
         self.renderer.settings_hit_test(progress, active_tab, x, y)
+    }
+
+    pub(crate) fn close_confirm_hit_test(
+        &self,
+        line_count: usize,
+        x: f32,
+        y: f32,
+    ) -> crate::renderer::CloseConfirmHit {
+        self.renderer.close_confirm_hit_test(line_count, x, y)
     }
 
     pub(crate) fn settings_background_cursor_from_x(
@@ -3722,6 +3792,9 @@ mod tests {
     fn render_empty_frame(runtime: &mut WindowRuntime) {
         let mut search = crate::search::TerminalSearchState::default();
         let mut background_input = crate::single_line_input::SingleLineInput::default();
+        let color_input = crate::single_line_input::SingleLineInput::default();
+        let color_view =
+            crate::renderer::SettingsColorView::new(&crate::config::AppConfig::default());
         let result = runtime.render_terminal_and_present(TerminalRenderParams {
             terminals: &[],
             active_terminal: 0,
@@ -3738,6 +3811,11 @@ mod tests {
             settings_scroll_value: "",
             settings_background_input: &mut background_input,
             settings_background_editing: false,
+            settings_confirm_close: true,
+            settings_colors: &color_view,
+            settings_color_editing: None,
+            settings_color_input: &color_input,
+            close_confirm: None,
         });
         assert!(result.is_ok(), "render failed: {:?}", result.err());
     }

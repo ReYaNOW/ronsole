@@ -5,6 +5,7 @@ use crate::color::TermPalette;
 use crate::grid::LineMeta;
 use crate::input::{MouseTrackingMode, focus_report_sequence};
 use crate::keys::{self, KeyEvent, KeyOutcome, KeyProtocol};
+use crate::osc::TitleStack;
 use std::ops::Range;
 use std::time::Instant;
 use vte::Parser;
@@ -18,6 +19,12 @@ pub trait TermSink {
     fn reply(&mut self, bytes: &[u8]);
     /// Programmed window title from OSC 0 or OSC 2.
     fn title(&mut self, title: &str);
+    /// No programmed title any more, so the host shows its fallback title.
+    /// Sent when `CSI 23 ; Ps t` restores a state that had no programmed title.
+    fn title_reset(&mut self) {}
+    /// BEL (0x07) from the output stream. A run of bells may arrive as many
+    /// calls; hosts coalesce them into one pending attention flag.
+    fn bell(&mut self) {}
     /// Clipboard text from OSC 52, decoded as UTF-8.
     fn clipboard_set(&mut self, text: String);
     /// Working directory from OSC 7, with percent-decoded path bytes.
@@ -111,6 +118,10 @@ pub struct Term {
     pub(crate) sync_until: Option<Instant>,
     /// Set while held bytes are replayed, so a nested set is a no-op.
     pub(crate) replaying: bool,
+    /// Programmed title from the last OSC 0 or OSC 2; `None` until one is set.
+    pub(crate) window_title: Option<String>,
+    /// Titles saved by `CSI 22 ; Ps t`, restored by `CSI 23 ; Ps t`.
+    pub(crate) title_stack: TitleStack,
 }
 
 /// Upper bound on the bytes of replies queued by one `advance` call.
@@ -190,6 +201,8 @@ impl Term {
             sync_buf: Vec::new(),
             sync_until: None,
             replaying: false,
+            window_title: None,
+            title_stack: TitleStack::default(),
         }
     }
 
@@ -424,5 +437,10 @@ impl Term {
     /// Stores the palette for future use; colour replies do not read it yet.
     pub fn set_palette(&mut self, palette: TermPalette) {
         self.palette = palette;
+    }
+
+    /// Palette last given to `set_palette`, or the one the grid was created with.
+    pub fn palette(&self) -> &TermPalette {
+        &self.palette
     }
 }

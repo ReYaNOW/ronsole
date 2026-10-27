@@ -30,9 +30,9 @@ const DECORATED_BODY: &str = r"\033[4m \033[0m\033[4;38;2;200;10;20m \033[0m\033
 /// Number of cells `DECORATED_BODY` prints.
 const DECORATED_CELLS: u64 = 7;
 
-/// Default foreground under SGR 2: `ANSI_16_COLORS[7]` (0.90) times the renderer's dim factor
-/// 0.66, in f32, times 255 gives 151.47, so every channel is 0x97.
-const DIM_DEFAULT_FG: &str = "#979797";
+/// Default foreground under SGR 2: `DEFAULT_TERMINAL_FOREGROUND` 230 (0xE6) times the renderer's
+/// dim factor 0.66 gives 151.8, which `hex()` rounds to 152 (0x98), so every channel is 0x98.
+const DIM_DEFAULT_FG: &str = "#989898";
 
 /// Runs `script` and asserts that no response is an `err`; returns the responses.
 fn run_ok(session: &mut HeadlessSession, script: &[u8]) -> Vec<String> {

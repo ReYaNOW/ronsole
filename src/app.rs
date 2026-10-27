@@ -1,6 +1,7 @@
 use crate::config::{
-    AppConfig, DEFAULT_SCROLL_SENSITIVITY, DEFAULT_TERMINAL_BACKGROUND, DEFAULT_TERMINAL_FONT_SIZE,
-    RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
+    AppConfig, DEFAULT_SCROLL_SENSITIVITY, DEFAULT_TERMINAL_BACKGROUND,
+    DEFAULT_TERMINAL_BOLD_FOREGROUND, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FOREGROUND,
+    DEFAULT_TERMINAL_PALETTE, RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
 };
 use crate::input::TerminalInteraction;
 use crate::input_types::{
@@ -12,7 +13,10 @@ use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
 use crate::platform::single_instance::BridgeResult;
-use crate::renderer::{SettingsHit, SettingsTab, TerminalTabHit, terminal_palette};
+use crate::renderer::{
+    CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
+    SettingsTab, TerminalTabHit, settings_color_value, terminal_palette,
+};
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::TerminalSearchHit;
@@ -169,6 +173,55 @@ struct SettingsBackgroundKeyOutcome {
     finish: bool,
 }
 
+/// Tab rows listed by the close confirmation before the "and N more" line.
+const CLOSE_CONFIRM_MAX_ROWS: usize = 8;
+
+/// What a confirmed close does: the whole window or one tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseTarget {
+    Window,
+    Tab(usize),
+}
+
+/// Open close confirmation. Its text is built once when the dialog opens.
+struct CloseConfirm {
+    target: CloseTarget,
+    title: &'static str,
+    rows: Vec<String>,
+    more: Option<String>,
+}
+
+impl CloseConfirm {
+    fn line_count(&self) -> usize {
+        self.rows.len() + usize::from(self.more.is_some())
+    }
+
+    /// Builds the dialog text from the busy tabs of a target, given as
+    /// (tab title, job name) in tab order. Returns None when nothing is busy.
+    /// Only the first `CLOSE_CONFIRM_MAX_ROWS` tabs get a row; the rest are counted.
+    fn from_busy(target: CloseTarget, busy: &[(String, String)]) -> Option<Self> {
+        if busy.is_empty() {
+            return None;
+        }
+        let rows: Vec<String> = busy
+            .iter()
+            .take(CLOSE_CONFIRM_MAX_ROWS)
+            .map(|(tab_title, process)| format!("{tab_title} — {process}"))
+            .collect();
+        let hidden = busy.len() - rows.len();
+        let title = match target {
+            CloseTarget::Window => "Закрыть окно?",
+            CloseTarget::Tab(_) => "Закрыть вкладку?",
+        };
+        Some(Self {
+            target,
+            title,
+            rows,
+            more: (hidden > 0).then(|| format!("и ещё {hidden}")),
+        })
+    }
+}
+
 fn settings_hex_insert_text(input: &mut SingleLineInput, text: &str) -> bool {
     if text.is_empty() {
         return false;
@@ -196,6 +249,43 @@ fn settings_hex_insert_text(input: &mut SingleLineInput, text: &str) -> bool {
         return false;
     }
     input.insert_text(&clean)
+}
+
+/// Hex draft text of a Colors-tab field; an unset bold foreground has an empty draft.
+fn settings_color_text(config: &AppConfig, field: SettingsColorField) -> String {
+    settings_color_value(config, field).map_or_else(String::new, |color| color.to_hex())
+}
+
+fn default_settings_color_value(field: SettingsColorField) -> Option<RgbColor> {
+    match field {
+        SettingsColorField::Foreground => Some(DEFAULT_TERMINAL_FOREGROUND),
+        SettingsColorField::BoldForeground => DEFAULT_TERMINAL_BOLD_FOREGROUND,
+        SettingsColorField::Palette(index) => DEFAULT_TERMINAL_PALETTE.get(index).copied(),
+    }
+}
+
+/// Stores one Colors-tab value. `value` is `None` only to unset bold foreground; for the
+/// other fields it is ignored. Returns whether the config changed.
+fn set_settings_color_field(
+    config: &mut AppConfig,
+    field: SettingsColorField,
+    value: Option<RgbColor>,
+) -> bool {
+    if settings_color_value(config, field) == value {
+        return false;
+    }
+    match (field, value) {
+        (SettingsColorField::Foreground, Some(color)) => config.terminal_foreground = color,
+        (SettingsColorField::BoldForeground, _) => config.terminal_bold_foreground = value,
+        (SettingsColorField::Palette(index), Some(color)) => {
+            let Some(slot) = config.terminal_palette.get_mut(index) else {
+                return false;
+            };
+            *slot = color;
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn settings_background_editor_key(
@@ -278,7 +368,11 @@ fn ui_cursor_icon(
     tab_dragging: bool,
 ) -> CursorKind {
     if settings_modal_active {
-        return if settings_text_dragging || settings_hit == SettingsHit::BackgroundField {
+        let text_field_hit = matches!(
+            settings_hit,
+            SettingsHit::BackgroundField | SettingsHit::ColorField(_)
+        );
+        return if settings_text_dragging || text_field_hit {
             CursorKind::Text
         } else {
             CursorKind::Default
@@ -381,6 +475,12 @@ pub struct App {
     settings_font_value: String,
     settings_scroll_value: String,
     settings_background_input: SingleLineInput,
+    /// Draft of the Colors-tab field named by `settings_color_target`.
+    settings_color_input: SingleLineInput,
+    /// Field whose draft `settings_color_input` holds; `None` while the hex editor
+    /// edits the terminal background (or is closed).
+    settings_color_target: Option<SettingsColorField>,
+    settings_colors: SettingsColorView,
     settings_background_editing: bool,
     settings_background_dragging: bool,
     terminals: Vec<Terminal>,
@@ -405,9 +505,13 @@ pub struct App {
     settings_open: bool,
     settings_progress: f32,
     settings_active_tab: SettingsTab,
+    close_confirm: Option<CloseConfirm>,
     show_fps: bool,
     focused: bool,
     unfocused_redraw_pending: bool,
+    /// Set once a BEL asked the compositor for window attention during the
+    /// current unfocused period; cleared when focus returns.
+    window_attention_requested: bool,
     pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
     tab_input: tab_delivery::TabInputState,
     /// Reusable buffer for `Terminal::observe_dev_channel_warning`.
@@ -448,6 +552,7 @@ impl App {
         let settings_scroll_value = format!("{:.2}", config.scroll_sensitivity);
         let settings_background_input =
             SingleLineInput::from_text(&config.terminal_background.to_hex());
+        let settings_colors = SettingsColorView::new(&config);
         Self {
             runtime: None,
             config,
@@ -456,6 +561,9 @@ impl App {
             settings_font_value,
             settings_scroll_value,
             settings_background_input,
+            settings_color_input: SingleLineInput::default(),
+            settings_color_target: None,
+            settings_colors,
             settings_background_editing: false,
             settings_background_dragging: false,
             terminals: Vec::new(),
@@ -478,9 +586,11 @@ impl App {
             settings_open: false,
             settings_progress: 0.0,
             settings_active_tab: SettingsTab::General,
+            close_confirm: None,
             show_fps: false,
             focused: true,
             unfocused_redraw_pending: false,
+            window_attention_requested: false,
             pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
             tab_input: tab_delivery::TabInputState::default(),
             dev_warning_scratch: String::new(),
@@ -593,6 +703,9 @@ impl App {
                 .reset_for_terminal_switch(&mut self.terminals[old]);
         }
         self.active_terminal = index;
+        if let Some(terminal) = self.terminals.get_mut(index) {
+            terminal.clear_bell_pending();
+        }
         self.active_terminal_presented = true;
         self.send_terminal_focus_transition(old_presented, Some(index));
         self.pending_tab_reveal = Some(reveal_tail);
@@ -668,7 +781,7 @@ impl App {
     /// Palette a tab created now starts with: the configured background, with
     /// the renderer's default foreground, ANSI colours and cursor.
     fn new_terminal_palette(&self) -> TermPalette {
-        terminal_palette(self.config.terminal_background)
+        terminal_palette(&self.config)
     }
 
     pub(crate) fn find_terminal_by_bridge_launch_id(&self, id: [u8; 16]) -> Option<usize> {
@@ -875,6 +988,9 @@ impl App {
             self.active_terminal_presented = false;
         }
         let mut removed = self.terminals.remove(index);
+        // Removing a tab shifts the indices a `CloseTarget::Tab` points at, so an open
+        // dialog no longer names the tab it was opened for. Cancel it instead.
+        self.cancel_close_dialog();
         if is_final {
             removed.shutdown();
         }
@@ -940,7 +1056,100 @@ impl App {
     }
 
     fn close_active_terminal(&mut self) -> bool {
-        self.close_terminal_tab_at(self.active_terminal)
+        self.request_terminal_close(CloseTarget::Tab(self.active_terminal))
+    }
+
+    /// Closes at once when nothing runs in the target or the prompt is disabled,
+    /// otherwise opens the confirmation. A request made while a dialog is already
+    /// open is ignored, so the open dialog keeps its target. Returns true when the
+    /// event loop must exit.
+    fn request_terminal_close(&mut self, target: CloseTarget) -> bool {
+        if self.close_confirm.is_some() {
+            return false;
+        }
+        if !self.config.confirm_close {
+            return self.perform_terminal_close(target);
+        }
+        let Some(confirm) = CloseConfirm::from_busy(target, &self.busy_close_targets(target))
+        else {
+            return self.perform_terminal_close(target);
+        };
+        self.open_close_dialog(confirm);
+        false
+    }
+
+    /// Shows the dialog. Pointer state begun before it opened is dropped, because
+    /// the dialog swallows the release events that would otherwise end that drag.
+    /// An unfocused window also asks for attention, so the prompt is noticed.
+    fn open_close_dialog(&mut self, confirm: CloseConfirm) {
+        self.cancel_pointer_interactions();
+        self.settings_background_dragging = false;
+        self.close_confirm = Some(confirm);
+        if !self.focused
+            && let Some(runtime) = self.runtime.as_mut()
+        {
+            // The result is not needed: the flag for bell attention stays untouched.
+            let _ = runtime.request_window_attention();
+        }
+        self.refresh_cursor_icon();
+        self.request_frame();
+    }
+
+    fn perform_terminal_close(&mut self, target: CloseTarget) -> bool {
+        match target {
+            CloseTarget::Window => {
+                self.finish_terminal_session();
+                true
+            }
+            CloseTarget::Tab(index) => self.close_terminal_tab_at(index),
+        }
+    }
+
+    /// Reads foreground job names only at the close moment. Returns (tab title, job
+    /// name) for each tab in the target that runs a job; empty when none does, so the
+    /// close proceeds without a dialog.
+    fn busy_close_targets(&self, target: CloseTarget) -> Vec<(String, String)> {
+        let range = match target {
+            CloseTarget::Window => 0..self.terminals.len(),
+            CloseTarget::Tab(index) => index..index.saturating_add(1).min(self.terminals.len()),
+        };
+        let mut busy = Vec::new();
+        for index in range {
+            let Some(terminal) = self.terminals.get(index) else {
+                continue;
+            };
+            let Some(process) = terminal.busy_foreground_name() else {
+                continue;
+            };
+            let mut tab_title = String::new();
+            terminal.write_display_title(&mut tab_title);
+            busy.push((tab_title, process));
+        }
+        busy
+    }
+
+    /// Closes the dialog's target. Returns true when the event loop must exit.
+    fn confirm_close_dialog(&mut self) -> bool {
+        let Some(confirm) = self.close_confirm.take() else {
+            return false;
+        };
+        self.request_frame();
+        self.perform_terminal_close(confirm.target)
+    }
+
+    fn cancel_close_dialog(&mut self) {
+        if self.close_confirm.take().is_some() {
+            self.update_link_hover();
+            self.request_frame();
+        }
+    }
+
+    fn close_confirm_hit_test(&self, x: f32, y: f32) -> CloseConfirmHit {
+        let (Some(confirm), Some(runtime)) = (self.close_confirm.as_ref(), self.runtime.as_ref())
+        else {
+            return CloseConfirmHit::None;
+        };
+        runtime.close_confirm_hit_test(confirm.line_count(), x, y)
     }
 
     fn reorder_terminal_tab(&mut self, from: usize, to: usize) {
@@ -972,6 +1181,9 @@ impl App {
     pub(crate) fn on_focus_changed(&mut self, focused: bool) {
         self.focused = focused;
         self.unfocused_redraw_pending = !focused;
+        if focused {
+            self.window_attention_requested = false;
+        }
         self.modifiers = Modifiers::empty();
         self.interaction.set_modifiers(Modifiers::empty());
         self.interaction.cancel_link_press();
@@ -1031,7 +1243,7 @@ impl App {
         self.config.terminal_background = color;
         for terminal in &self.terminals {
             let mut grid = crate::platform::lock_recover(&terminal.grid);
-            grid.set_palette(terminal_palette(color));
+            grid.set_palette(terminal_palette(&self.config));
         }
         self.request_frame();
         if let Some(runtime) = self.runtime.as_mut() {
@@ -1040,12 +1252,57 @@ impl App {
         true
     }
 
+    /// Applies the current draft when it is a complete colour; partial or invalid text
+    /// leaves the config unchanged.
     fn apply_valid_settings_background_draft(&mut self) {
-        if let Some(color) = RgbColor::parse_hex(&self.settings_background_input.text)
-            && self.set_terminal_background(color)
-        {
+        let target = self.settings_color_target;
+        let changed = match target {
+            None => RgbColor::parse_hex(&self.settings_background_input.text)
+                .is_some_and(|color| self.set_terminal_background(color)),
+            Some(field) => self.apply_settings_color_draft(field),
+        };
+        if changed {
             self.mark_config_dirty();
         }
+    }
+
+    fn apply_settings_color_draft(&mut self, field: SettingsColorField) -> bool {
+        let text = self.settings_color_input.text.as_str();
+        let value = if text.is_empty() && field == SettingsColorField::BoldForeground {
+            Some(None)
+        } else {
+            RgbColor::parse_hex(text).map(Some)
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        let changed = set_settings_color_field(&mut self.config, field, value);
+        if changed {
+            self.apply_terminal_colors();
+        }
+        changed
+    }
+
+    /// Pushes the configured colours to every tab's grid and to the renderer. Call only
+    /// after a real change; the renderer returns whether its palette actually moved.
+    fn apply_terminal_colors(&mut self) {
+        for terminal in &self.terminals {
+            let mut grid = crate::platform::lock_recover(&terminal.grid);
+            grid.set_palette(terminal_palette(&self.config));
+        }
+        self.settings_colors = SettingsColorView::new(&self.config);
+        if let Some(runtime) = self.runtime.as_mut() {
+            let _ = runtime.set_terminal_colors(&self.config);
+        }
+        self.request_frame();
+    }
+
+    fn begin_settings_color_edit(&mut self, field: SettingsColorField) {
+        self.settings_color_input
+            .set_text(&settings_color_text(&self.config, field));
+        self.settings_color_target = Some(field);
+        self.settings_background_editing = true;
+        self.request_frame();
     }
 
     fn finish_settings_background_edit(&mut self) {
@@ -1053,8 +1310,14 @@ impl App {
             return;
         }
         self.apply_valid_settings_background_draft();
-        self.settings_background_input
-            .set_text(&self.config.terminal_background.to_hex());
+        match self.settings_color_target.take() {
+            None => self
+                .settings_background_input
+                .set_text(&self.config.terminal_background.to_hex()),
+            Some(field) => self
+                .settings_color_input
+                .set_text(&settings_color_text(&self.config, field)),
+        }
         self.settings_background_editing = false;
         self.settings_background_dragging = false;
         self.request_frame();
@@ -1064,7 +1327,11 @@ impl App {
         if !self.settings_background_editing {
             return false;
         }
-        if settings_hex_insert_text(&mut self.settings_background_input, text) {
+        let input = match self.settings_color_target {
+            None => &mut self.settings_background_input,
+            Some(_) => &mut self.settings_color_input,
+        };
+        if settings_hex_insert_text(input, text) {
             self.apply_valid_settings_background_draft();
             self.request_frame();
         }
@@ -1082,8 +1349,12 @@ impl App {
         } else {
             None
         };
+        let input = match self.settings_color_target {
+            None => &mut self.settings_background_input,
+            Some(_) => &mut self.settings_color_input,
+        };
         let outcome = settings_background_editor_key(
-            &mut self.settings_background_input,
+            input,
             key,
             ctrl,
             shift,
@@ -1117,6 +1388,9 @@ impl App {
     }
 
     fn begin_settings_background_pointer_edit(&mut self, cursor: usize) {
+        if self.settings_color_target.is_some() {
+            self.finish_settings_background_edit();
+        }
         if !self.settings_background_editing {
             self.settings_background_input
                 .set_text(&self.config.terminal_background.to_hex());
@@ -1135,6 +1409,15 @@ impl App {
     fn apply_settings_hit(&mut self, hit: SettingsHit) {
         if hit == SettingsHit::Outside {
             self.close_settings();
+            return;
+        }
+        if let SettingsHit::ColorField(field) = hit {
+            let already_editing =
+                self.settings_background_editing && self.settings_color_target == Some(field);
+            if !already_editing {
+                self.finish_settings_background_edit();
+                self.begin_settings_color_edit(field);
+            }
             return;
         }
         if hit != SettingsHit::BackgroundField && self.settings_background_editing {
@@ -1216,16 +1499,32 @@ impl App {
                     true
                 }
             }
+            SettingsHit::ConfirmCloseToggle => {
+                self.config.confirm_close = !self.config.confirm_close;
+                true
+            }
             SettingsHit::BackgroundReset => {
                 let changed = self.set_terminal_background(DEFAULT_TERMINAL_BACKGROUND);
                 self.settings_background_input
                     .set_text(&DEFAULT_TERMINAL_BACKGROUND.to_hex());
                 changed
             }
+            SettingsHit::ColorReset(field) => {
+                let changed = set_settings_color_field(
+                    &mut self.config,
+                    field,
+                    default_settings_color_value(field),
+                );
+                if changed {
+                    self.apply_terminal_colors();
+                }
+                changed
+            }
             SettingsHit::None
             | SettingsHit::Outside
             | SettingsHit::Tab(_)
-            | SettingsHit::BackgroundField => false,
+            | SettingsHit::BackgroundField
+            | SettingsHit::ColorField(_) => false,
         };
         if changed {
             self.mark_config_dirty();
@@ -1247,18 +1546,18 @@ impl App {
     }
 
     fn desired_cursor_icon(&self) -> CursorKind {
-        let settings_modal_active = self.settings_modal_active();
-        let settings_hit = if settings_modal_active {
+        let modal_active = self.settings_modal_active() || self.close_confirm.is_some();
+        let settings_hit = if modal_active {
             self.settings_hit_test(self.pointer_x, self.pointer_y)
         } else {
             SettingsHit::None
         };
-        let search_hit = if settings_modal_active {
+        let search_hit = if modal_active {
             TerminalSearchHit::None
         } else {
             self.search_hit_test(self.pointer_x, self.pointer_y)
         };
-        let tab_hit = if settings_modal_active || search_hit != TerminalSearchHit::None {
+        let tab_hit = if modal_active || search_hit != TerminalSearchHit::None {
             TerminalTabHit::None
         } else {
             self.runtime
@@ -1268,7 +1567,7 @@ impl App {
                 })
         };
         let icon = ui_cursor_icon(
-            settings_modal_active,
+            modal_active,
             settings_hit,
             self.settings_background_dragging,
             search_hit,
@@ -1290,10 +1589,10 @@ impl App {
     /// Called on pointer motion and on modifier changes. Marks the app dirty
     /// when the hovered link changed, so the underline is drawn on an idle window.
     fn update_link_hover(&mut self) {
-        let settings_modal_active = self.settings_modal_active();
+        let modal_active = self.settings_modal_active() || self.close_confirm.is_some();
         let (x, y) = (self.pointer_x, self.pointer_y);
         let changed = match self.terminals.get_mut(self.active_terminal) {
-            Some(terminal) if settings_modal_active => terminal.set_hovered_link(None),
+            Some(terminal) if modal_active => terminal.set_hovered_link(None),
             Some(terminal) => self.interaction.update_link_hover(terminal, x, y),
             None => false,
         };
@@ -1507,7 +1806,15 @@ impl App {
         self.mark_dirty();
     }
 
-    fn on_close_requested(&mut self) {
+    /// Compositor close request. Returns true when the event loop must exit.
+    fn on_close_requested(&mut self) -> bool {
+        self.request_terminal_close(CloseTarget::Window)
+    }
+
+    /// Persists config and reaps every owned PTY session. Called directly by the
+    /// window-close path and the signal shutdown path, so a future close prompt
+    /// stays on the close request only and never blocks a signal.
+    fn finish_terminal_session(&mut self) {
         self.prepare_exit();
         self.shutdown_all();
     }
@@ -1552,6 +1859,9 @@ impl App {
     }
 
     pub(crate) fn on_ime_commit(&mut self, text: &str) {
+        if self.close_confirm.is_some() {
+            return;
+        }
         if self.settings_modal_active() {
             if self.settings_background_editing {
                 let _ = self.edit_settings_background_text(text);
@@ -1571,6 +1881,18 @@ impl App {
         // Before the early returns below, so modifier presses and releases seen while the
         // settings modal or a global shortcut owns the key still update the held state.
         self.interaction.note_modifier_key(&key_input);
+        if self.close_confirm.is_some() {
+            if key_input.state.is_pressed() {
+                match key_input.physical_key {
+                    PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                        return self.confirm_close_dialog();
+                    }
+                    PhysicalKey::Code(KeyCode::Escape) => self.cancel_close_dialog(),
+                    _ => {}
+                }
+            }
+            return false;
+        }
         if key_input.state.is_pressed()
             && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
         {
@@ -1636,6 +1958,10 @@ impl App {
         self.pointer_x = position.x;
         self.pointer_y = position.y;
         self.update_link_hover();
+        // The dialog owns the pointer: tab drag and reorder must not advance under it.
+        if self.close_confirm.is_some() {
+            return;
+        }
         if self.settings_modal_active() {
             let previous_hit = self.settings_hit_test(previous_x, previous_y);
             let current_hit = self.settings_hit_test(self.pointer_x, self.pointer_y);
@@ -1723,6 +2049,18 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        if self.close_confirm.is_some() {
+            if button == PointerButton::Left && state == KeyState::Pressed {
+                match self.close_confirm_hit_test(self.pointer_x, self.pointer_y) {
+                    CloseConfirmHit::Confirm => return self.confirm_close_dialog(),
+                    CloseConfirmHit::Cancel | CloseConfirmHit::Outside => {
+                        self.cancel_close_dialog();
+                    }
+                    CloseConfirmHit::None => {}
+                }
+            }
+            return false;
+        }
         if button == PointerButton::Left
             && state == KeyState::Pressed
             && self.clear_active_terminal_text_selection()
@@ -1759,7 +2097,9 @@ impl App {
                     runtime.terminal_tab_hit_test(self.pointer_x, self.pointer_y)
                 });
             match hit {
-                TerminalTabHit::Close(index) => return self.close_terminal_tab_at(index),
+                TerminalTabHit::Close(index) => {
+                    return self.request_terminal_close(CloseTarget::Tab(index));
+                }
                 TerminalTabHit::Add => {
                     let _ = self.add_terminal();
                     return false;
@@ -1817,7 +2157,23 @@ impl App {
     }
 
     pub(crate) fn on_scroll(&mut self, delta: ScrollDelta) {
-        if self.settings_modal_active() {
+        if self.close_confirm.is_some() || self.settings_modal_active() {
+            // The Colors tab may hold more rows than a small window shows.
+            if self.close_confirm.is_none()
+                && self.settings_open
+                && self.settings_active_tab == SettingsTab::Colors
+                && let Some(runtime) = self.runtime.as_ref()
+                && runtime
+                    .renderer()
+                    .scroll_settings_colors(self.settings_progress, delta)
+            {
+                // A field scrolled out of view must not keep taking keystrokes.
+                if self.settings_color_target.is_some() {
+                    self.finish_settings_background_edit();
+                }
+                self.refresh_cursor_icon();
+                self.request_frame();
+            }
             return;
         }
         if let Some(runtime) = self.runtime.as_ref() {
@@ -1900,7 +2256,17 @@ impl App {
                 settings_font_value: &self.settings_font_value,
                 settings_scroll_value: &self.settings_scroll_value,
                 settings_background_input: &mut self.settings_background_input,
-                settings_background_editing: self.settings_background_editing,
+                settings_background_editing: self.settings_background_editing
+                    && self.settings_color_target.is_none(),
+                settings_confirm_close: self.config.confirm_close,
+                settings_colors: &self.settings_colors,
+                settings_color_editing: self.settings_color_target,
+                settings_color_input: &self.settings_color_input,
+                close_confirm: self.close_confirm.as_ref().map(|confirm| CloseConfirmView {
+                    title: confirm.title,
+                    rows: &confirm.rows,
+                    more: confirm.more.as_deref(),
+                }),
             }))
         } else {
             None
@@ -1946,10 +2312,18 @@ impl App {
     /// after the early return.
     fn drain_terminal_host_events(&mut self) {
         let now = Instant::now();
-        for terminal in &mut self.terminals {
+        let active = self.active_terminal;
+        let mut bell_rang = false;
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
             // Only the pending-events lock is held while clipboard text is set;
             // the published deadline is read from the same pending state.
-            terminal.apply_host_events(&mut self.interaction);
+            if terminal.apply_host_events(&mut self.interaction) {
+                bell_rang = true;
+                // The active tab is on screen, so only background tabs get a mark.
+                if index != active {
+                    terminal.mark_bell_pending();
+                }
+            }
             if terminal
                 .sync_deadline()
                 .is_some_and(|deadline| deadline + SYNC_RESERVE_GRACE <= now)
@@ -1957,6 +2331,24 @@ impl App {
                 terminal.try_flush_expired(now);
             }
         }
+        if bell_rang {
+            self.request_bell_attention();
+            self.mark_dirty();
+        }
+    }
+
+    /// Asks for window attention after a BEL, at most once per unfocused
+    /// period. A focused window shows the bell in the tab strip only.
+    fn request_bell_attention(&mut self) {
+        if self.focused || self.window_attention_requested {
+            return;
+        }
+        // Set only once the compositor request is in flight, so a window that
+        // cannot be flagged retries on the next bell.
+        self.window_attention_requested = self
+            .runtime
+            .as_mut()
+            .is_some_and(WindowRuntime::request_window_attention);
     }
 
     fn on_about_to_wait(&mut self) -> AppLoopControl {
@@ -2511,7 +2903,7 @@ mod tests {
         assert!(close.contains("if self.terminals.is_empty()"));
         assert!(close.contains("return true;"));
         assert!(!close.contains("add_terminal"));
-        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 3);
+        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 2);
 
         let request = production
             .split("    fn request_terminal_activation")
@@ -2562,7 +2954,7 @@ mod tests {
             None,
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         );
         terminal
             .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
@@ -2610,7 +3002,7 @@ mod tests {
                 hold: true,
                 bridge_launch_id: None,
             },
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         );
         app.terminals.push(held);
         app.active_terminal = 0;
@@ -2648,7 +3040,7 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             },
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         ));
         app.active_terminal = 0;
 
@@ -2681,7 +3073,7 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             },
-            terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            terminal_palette(&crate::config::AppConfig::default()),
         );
 
         assert!(!terminal.has_process());
@@ -2768,6 +3160,276 @@ mod tests {
             global_shortcut(PhysicalKey::Code(KeyCode::KeyT), ctrl),
             None
         );
+    }
+
+    #[test]
+    fn close_without_busy_target_skips_the_dialog() {
+        let mut app = App::new();
+        // No terminals means no busy target: the close runs at once.
+        assert!(!app.request_terminal_close(CloseTarget::Tab(0)));
+        assert!(app.close_confirm.is_none());
+        assert!(app.busy_close_targets(CloseTarget::Window).is_empty());
+    }
+
+    /// Polls `condition` every 10 ms and fails the test after five seconds.
+    fn wait_for_test_condition(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Starts a hermetic shell tab and waits until it runs a command, so input
+    /// written afterwards reaches the shell.
+    fn spawn_shell_tab(label: &str) -> Terminal {
+        let marker = std::env::temp_dir().join(format!(
+            "ronsole-close-{label}-{}.ready",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let terminal = Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec::hermetic_shell_for_test(),
+            terminal_palette(&crate::config::AppConfig::default()),
+        );
+        terminal
+            .write_input(format!("printf ready > {}\r", marker.display()).as_bytes())
+            .unwrap();
+        wait_for_test_condition("shell readiness", || marker.exists());
+        let _ = std::fs::remove_file(&marker);
+        terminal
+    }
+
+    /// Returns an app whose only tab runs `sleep 30` in the foreground, once the
+    /// tab reports that job as busy.
+    pub(super) fn busy_shell_app(label: &str) -> App {
+        let mut app = App::new();
+        app.terminals.push(spawn_shell_tab(label));
+        app.terminals[0].write_input(b"sleep 30\r").unwrap();
+        wait_for_test_condition("foreground sleep job", || {
+            !app.busy_close_targets(CloseTarget::Window).is_empty()
+        });
+        app
+    }
+
+    #[test]
+    fn window_close_with_running_job_opens_the_dialog() {
+        let mut app = busy_shell_app("window-job");
+        let busy = app.busy_close_targets(CloseTarget::Window);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].1, "sleep");
+        assert!(!busy[0].0.is_empty());
+        assert!(!app.request_terminal_close(CloseTarget::Window));
+        assert!(app.close_confirm.is_some());
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn window_close_with_running_job_closes_at_once_when_confirm_is_off() {
+        let mut app = busy_shell_app("confirm-off");
+        // Set directly, not through the settings hit, so no config save is queued.
+        app.config.confirm_close = false;
+        // The close reaps the shell and its sleep job.
+        assert!(app.request_terminal_close(CloseTarget::Window));
+        assert!(app.close_confirm.is_none());
+    }
+
+    #[test]
+    fn background_job_does_not_make_the_tab_busy() {
+        let mut app = App::new();
+        app.terminals.push(spawn_shell_tab("background-job"));
+        let marker = std::env::temp_dir().join(format!(
+            "ronsole-close-background-{}.done",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        // The marker is written after the shell has started the job and returned
+        // to its prompt, so the foreground group is the shell again.
+        app.terminals[0]
+            .write_input(format!("sleep 30 &\rprintf done > {}\r", marker.display()).as_bytes())
+            .unwrap();
+        wait_for_test_condition("background job start", || marker.exists());
+        let _ = std::fs::remove_file(&marker);
+        assert!(app.busy_close_targets(CloseTarget::Window).is_empty());
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn compositor_close_request_with_running_job_opens_the_dialog() {
+        let mut app = busy_shell_app("compositor-job");
+        assert!(!app.on_close_requested());
+        assert!(app.close_confirm.is_some());
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn close_confirm_escape_cancels_and_other_keys_are_swallowed() {
+        let key = |physical_key| KeyInput {
+            state: KeyState::Pressed,
+            physical_key,
+            keycode: 0,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        };
+        let open = || CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        };
+        let mut app = App::new();
+        app.close_confirm = Some(open());
+        // F1 would toggle settings, but the open dialog owns every key except Enter and Esc.
+        assert!(!app.on_key(key(PhysicalKey::Code(KeyCode::F1))));
+        assert!(app.close_confirm.is_some());
+        assert!(!app.settings_modal_active());
+        assert!(!app.on_key(key(PhysicalKey::Code(KeyCode::Escape))));
+        assert!(app.close_confirm.is_none());
+    }
+
+    #[test]
+    fn close_confirm_enter_runs_the_close_and_clears_the_dialog() {
+        let key = KeyInput {
+            state: KeyState::Pressed,
+            physical_key: PhysicalKey::Code(KeyCode::Enter),
+            keycode: 0,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        };
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: Some("и ещё 2".to_string()),
+        });
+        // The only tab is the target, so the confirmed close removes it and reports the
+        // exit. Without the close running, the tab would still be there.
+        assert!(app.on_key(key));
+        assert!(app.terminals.is_empty());
+        assert!(app.close_confirm.is_none());
+    }
+
+    #[test]
+    fn close_request_while_dialog_is_open_is_ignored() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        // A window close must neither replace the tab dialog nor exit the event loop.
+        assert!(!app.request_terminal_close(CloseTarget::Window));
+        let confirm = app.close_confirm.as_ref().expect("dialog stays open");
+        assert_eq!(confirm.target, CloseTarget::Tab(0));
+        assert_eq!(confirm.title, "Закрыть вкладку?");
+        assert_eq!(app.terminals.len(), 1);
+    }
+
+    #[test]
+    fn removing_another_tab_cancels_the_open_tab_dialog() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        app.terminals.push(Terminal::new_for_test(80, 24, 2));
+        app.open_close_dialog(CloseConfirm {
+            target: CloseTarget::Tab(1),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        let mut kept_before = String::new();
+        app.terminals[1].write_display_title(&mut kept_before);
+        // Tab 0 closes and tab 1 shifts to index 0; the dialog must not follow it there.
+        assert!(!app.close_terminal_tab_at(0));
+        assert!(app.close_confirm.is_none());
+        assert_eq!(app.terminals.len(), 1);
+        let mut kept_after = String::new();
+        app.terminals[0].write_display_title(&mut kept_after);
+        assert_eq!(kept_before, kept_after);
+    }
+
+    #[test]
+    fn opening_the_dialog_drops_drags_and_motion_leaves_the_tab_drag_alone() {
+        let drag = || TabDragState {
+            start_idx: 0,
+            start_x: 10.0,
+            current_x: 10.0,
+            threshold_passed: true,
+        };
+        let mut app = App::new();
+        app.settings_background_dragging = true;
+        app.terminal_tab_drag = Some(drag());
+        app.open_close_dialog(CloseConfirm {
+            target: CloseTarget::Window,
+            title: "Закрыть окно?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        assert!(app.terminal_tab_drag.is_none());
+        assert!(!app.settings_background_dragging);
+        // A drag that is somehow still set must not advance while the dialog is open.
+        app.terminal_tab_drag = Some(drag());
+        app.on_pointer_motion(PointerPosition { x: 200.0, y: 5.0 });
+        let moved = app.terminal_tab_drag.as_ref().expect("drag untouched");
+        assert_eq!(moved.current_x, 10.0);
+    }
+
+    #[test]
+    fn wheel_is_swallowed_while_the_close_dialog_is_open() {
+        let source = include_str!("app.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        // Source-structure check: the wheel path has no runtime or PTY in unit tests.
+        let scroll = production
+            .split("    pub(crate) fn on_scroll")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn on_frame").next())
+            .expect("wheel routing must remain present");
+        let guard = scroll
+            .find("self.close_confirm.is_some()")
+            .expect("the close dialog must gate the wheel");
+        let strip = scroll
+            .find("terminal_tab_strip_layout")
+            .expect("tab strip wheel routing must remain present");
+        let pty = scroll
+            .find("self.interaction.mouse_wheel")
+            .expect("terminal wheel routing must remain present");
+        assert!(guard < strip);
+        assert!(guard < pty);
+    }
+
+    #[test]
+    fn close_confirm_rows_stop_at_the_limit_and_count_the_rest() {
+        let busy = |count: usize| -> Vec<(String, String)> {
+            (0..count)
+                .map(|index| (format!("tab {index}"), "vim".to_string()))
+                .collect()
+        };
+        let full = CloseConfirm::from_busy(CloseTarget::Window, &busy(8)).expect("busy tabs");
+        assert_eq!(full.rows.len(), 8);
+        assert_eq!(full.more, None);
+        assert_eq!(full.title, "Закрыть окно?");
+        assert_eq!(full.rows[0], "tab 0 — vim");
+
+        let nine = CloseConfirm::from_busy(CloseTarget::Tab(0), &busy(9)).expect("busy tabs");
+        assert_eq!(nine.rows.len(), 8);
+        assert_eq!(nine.more.as_deref(), Some("и ещё 1"));
+        assert_eq!(nine.line_count(), 9);
+        assert_eq!(nine.title, "Закрыть вкладку?");
+
+        let twelve = CloseConfirm::from_busy(CloseTarget::Window, &busy(12)).expect("busy tabs");
+        assert_eq!(twelve.rows.len(), 8);
+        assert_eq!(twelve.more.as_deref(), Some("и ещё 4"));
+
+        assert!(CloseConfirm::from_busy(CloseTarget::Window, &[]).is_none());
     }
 
     #[test]
@@ -3107,6 +3769,52 @@ mod tests {
     }
 
     #[test]
+    fn background_tab_bell_marks_tab_until_it_is_activated() {
+        let mut app = App::new();
+        for display_number in [1, 2] {
+            app.terminals.push(Terminal::new_for_test(8, 2, display_number));
+        }
+        app.terminals[1].ring_bell_for_test();
+
+        app.drain_terminal_host_events();
+        assert!(app.terminals[1].bell_pending());
+        assert!(!app.terminals[0].bell_pending());
+
+        app.activate_ready_terminal(1, false);
+        assert_eq!(app.active_terminal, 1);
+        assert!(!app.terminals[1].bell_pending());
+    }
+
+    #[test]
+    fn active_tab_bell_in_focused_window_sets_nothing() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        assert!(app.focused);
+        app.terminals[0].ring_bell_for_test();
+
+        app.drain_terminal_host_events();
+
+        assert!(!app.terminals[0].bell_pending());
+        assert!(!app.window_attention_requested);
+    }
+
+    #[test]
+    fn unfocused_window_bell_without_runtime_sends_no_attention() {
+        // Without a window runtime no compositor request can be sent, so the
+        // once-per-period flag must stay clear for the next bell to retry.
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.focused = false;
+
+        app.terminals[0].ring_bell_for_test();
+        app.drain_terminal_host_events();
+        assert!(!app.window_attention_requested);
+        // The active tab is on screen, so it gets no tab mark.
+        assert!(!app.terminals[0].bell_pending());
+    }
+
+    #[test]
     fn tab_focus_transition_reports_out_then_in_only_when_focused() {
         let mut app = App::new();
         for display_number in [1, 2] {
@@ -3434,6 +4142,146 @@ mod tests {
         assert_eq!(input.selection(), Some((2, 6)));
         assert!(update_settings_background_pointer_selection(&mut input, 1));
         assert_eq!(input.selection(), Some((1, 2)));
+    }
+
+    #[test]
+    fn color_field_draft_applies_complete_hex_and_rejects_partial_text() {
+        let mut app = App::from_config(AppConfig::default());
+        app.settings_open = true;
+        app.apply_settings_hit(SettingsHit::ColorField(SettingsColorField::Foreground));
+        assert!(app.settings_background_editing);
+        assert_eq!(
+            app.settings_color_target,
+            Some(SettingsColorField::Foreground)
+        );
+        assert_eq!(app.settings_color_input.text, "#E6E6E6");
+
+        app.settings_color_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
+        assert_eq!(app.config.terminal_foreground, DEFAULT_TERMINAL_FOREGROUND);
+
+        assert!(app.edit_settings_background_text("#12ABCF"));
+        assert_eq!(
+            app.config.terminal_foreground,
+            RgbColor::new(0x12, 0xAB, 0xCF)
+        );
+        assert_eq!(app.settings_background_input.text, "#282A36");
+
+        app.settings_color_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
+        assert!(app.edit_settings_background_text("#12"));
+        assert_eq!(
+            app.config.terminal_foreground,
+            RgbColor::new(0x12, 0xAB, 0xCF),
+            "a partial draft must not reach the config"
+        );
+
+        app.apply_settings_hit(SettingsHit::Outside);
+        assert!(!app.settings_background_editing);
+        assert_eq!(app.settings_color_target, None);
+        assert_eq!(
+            app.config.terminal_foreground,
+            RgbColor::new(0x12, 0xAB, 0xCF)
+        );
+        assert_eq!(app.settings_color_input.text, "#12ABCF");
+    }
+
+    #[test]
+    fn color_field_reset_restores_defaults_and_unsets_bold() {
+        let mut app = App::from_config(AppConfig {
+            terminal_foreground: RgbColor::new(0x12, 0xAB, 0xCF),
+            terminal_bold_foreground: Some(RgbColor::new(0x01, 0x02, 0x03)),
+            ..AppConfig::default()
+        });
+        app.apply_settings_hit(SettingsHit::ColorReset(SettingsColorField::Foreground));
+        assert_eq!(app.config.terminal_foreground, DEFAULT_TERMINAL_FOREGROUND);
+        app.apply_settings_hit(SettingsHit::ColorReset(SettingsColorField::BoldForeground));
+        assert_eq!(app.config.terminal_bold_foreground, None);
+        app.config.terminal_palette[3] = RgbColor::new(0x0A, 0x0B, 0x0C);
+        app.apply_settings_hit(SettingsHit::ColorReset(SettingsColorField::Palette(3)));
+        assert_eq!(app.config.terminal_palette[3], DEFAULT_TERMINAL_PALETTE[3]);
+        assert_eq!(app.config.terminal_palette[2], DEFAULT_TERMINAL_PALETTE[2]);
+
+        let fields = [SettingsColorField::Foreground, SettingsColorField::BoldForeground]
+            .into_iter()
+            .chain((0..16).map(SettingsColorField::Palette));
+        for field in fields {
+            app.apply_settings_hit(SettingsHit::ColorReset(field));
+        }
+        assert_eq!(app.config.terminal_foreground, DEFAULT_TERMINAL_FOREGROUND);
+        assert_eq!(app.config.terminal_bold_foreground, DEFAULT_TERMINAL_BOLD_FOREGROUND);
+        assert_eq!(app.config.terminal_palette, DEFAULT_TERMINAL_PALETTE);
+        assert_eq!(app.settings_colors.hex[0], "#E6E6E6");
+    }
+
+    #[test]
+    fn empty_bold_draft_turns_bold_foreground_off_on_commit() {
+        let mut app = App::from_config(AppConfig {
+            terminal_bold_foreground: Some(RgbColor::new(0x01, 0x02, 0x03)),
+            ..AppConfig::default()
+        });
+        app.apply_settings_hit(SettingsHit::ColorField(SettingsColorField::BoldForeground));
+        assert_eq!(app.settings_color_input.text, "#010203");
+        app.settings_color_input.select_all();
+        assert!(app.handle_settings_background_key(PhysicalKey::Code(KeyCode::Backspace)));
+        assert_eq!(app.config.terminal_bold_foreground, None);
+        app.apply_settings_hit(SettingsHit::Tab(SettingsTab::Help));
+        assert_eq!(app.config.terminal_bold_foreground, None);
+        assert_eq!(app.settings_colors.hex[1], "");
+        assert!(app.settings_colors.swatch[1].is_none());
+    }
+
+    #[test]
+    fn applied_colors_reach_existing_terminal_grid_palette() {
+        fn assert_applied_palette(app: &App) {
+            let rgb = |r, g, b| ronsole_term::Rgb { r, g, b };
+            let grid = crate::platform::lock_recover(&app.terminals[0].grid);
+            let palette = grid.palette();
+            assert_eq!(palette.foreground, rgb(0x12, 0xAB, 0xCF));
+            assert_eq!(palette.ansi[1], rgb(0x0A, 0x0B, 0x0C));
+            assert_eq!(palette.bold_foreground, Some(rgb(0xFE, 0xDC, 0xBA)));
+            assert_eq!(palette.background, rgb(0x28, 0x2A, 0x36));
+        }
+
+        let mut app = App::from_config(AppConfig::default());
+        app.terminals.push(Terminal::new_for_test(40, 3, 1));
+
+        app.settings_color_input.set_text("#12ABCF");
+        assert!(app.apply_settings_color_draft(SettingsColorField::Foreground));
+        app.settings_color_input.set_text("#0A0B0C");
+        assert!(app.apply_settings_color_draft(SettingsColorField::Palette(1)));
+        app.settings_color_input.set_text("#FEDCBA");
+        assert!(app.apply_settings_color_draft(SettingsColorField::BoldForeground));
+        assert_applied_palette(&app);
+
+        // Re-applying the same colours changes nothing, in the draft or in the grid.
+        app.settings_color_input.set_text("#12ABCF");
+        assert!(!app.apply_settings_color_draft(SettingsColorField::Foreground));
+        app.apply_terminal_colors();
+        assert_applied_palette(&app);
+    }
+
+    #[test]
+    fn set_settings_color_field_reports_only_real_changes() {
+        let mut config = AppConfig::default();
+        let palette = SettingsColorField::Palette(5);
+        assert!(!set_settings_color_field(
+            &mut config,
+            palette,
+            Some(DEFAULT_TERMINAL_PALETTE[5])
+        ));
+        assert!(set_settings_color_field(
+            &mut config,
+            palette,
+            Some(RgbColor::new(0x01, 0x02, 0x03))
+        ));
+        assert!(!set_settings_color_field(
+            &mut config,
+            palette,
+            Some(RgbColor::new(0x01, 0x02, 0x03))
+        ));
+        assert!(!set_settings_color_field(&mut config, palette, None));
+        assert_eq!(config.terminal_palette[5], RgbColor::new(0x01, 0x02, 0x03));
     }
 
     #[test]

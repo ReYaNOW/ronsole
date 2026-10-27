@@ -44,6 +44,7 @@ fn osc_term() -> Term {
         },
         cursor: Rgb { r: 1, g: 2, b: 3 },
         ansi: [Rgb { r: 0, g: 0, b: 0 }; 16],
+        bold_foreground: None,
     };
     config.palette.ansi[1] = Rgb {
         r: 0xcc,

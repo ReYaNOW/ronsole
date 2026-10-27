@@ -1,5 +1,6 @@
 use super::{App, AppLoopControl};
 use crate::launch::TerminalLaunchSpec;
+use crate::platform::signals;
 use crate::platform::single_instance::{InstanceMessage, PrimaryInstance};
 use crate::runtime::{
     WaylandPollOutcome, WaylandRuntimeEvents, WindowRuntime, poll_timeout_millis,
@@ -81,6 +82,11 @@ impl App {
         primary_instance: &mut PrimaryInstance,
         initial_launch: TerminalLaunchSpec,
     ) -> Result<(), String> {
+        // Installed before the first tab exists. Failure leaves the loop without
+        // signal handling, reported once here.
+        if let Err(error) = signals::install() {
+            eprintln!("Ronsole: signal shutdown unavailable: {error}");
+        }
         let runtime = WindowRuntime::bootstrap_wayland(
             self.config.window_width,
             self.config.window_height,
@@ -119,11 +125,9 @@ impl App {
     }
 
     fn handle_wayland_runtime_events(&mut self, events: WaylandRuntimeEvents) -> bool {
-        if events.close_requested {
-            self.interrupt_automation("Wayland compositor requested window close");
-            self.on_close_requested();
-            return true;
-        }
+        // Applied after the rest of the batch: a close that only opens the
+        // confirmation dialog must not drop the resize or input queued with it.
+        let close_requested = events.close_requested;
 
         if let Some(metrics) = events.scale_changed {
             self.on_scale_changed(
@@ -173,6 +177,13 @@ impl App {
                 WaylandInputEvent::Scroll(delta) => self.on_scroll(delta),
             }
         }
+
+        // Only a close that actually proceeds interrupts automation; a close
+        // that opens the dialog leaves the run alone.
+        if close_requested && self.on_close_requested() {
+            self.interrupt_automation("Wayland compositor requested window close");
+            return true;
+        }
         false
     }
 
@@ -180,9 +191,11 @@ impl App {
     /// target. Shared by the Wayland and headless entry points.
     pub(super) fn prepare_bootstrapped_runtime(
         &mut self,
-        runtime: WindowRuntime,
+        mut runtime: WindowRuntime,
         initial_launch: TerminalLaunchSpec,
     ) {
+        // The renderer starts with default colours; apply the configured ones before its first frame.
+        let _ = runtime.set_terminal_colors(&self.config);
         let metrics = runtime.wayland_metrics();
         self.on_runtime_ready(
             runtime,
@@ -280,6 +293,13 @@ impl App {
             .as_mut()
             .ok_or_else(|| "Wayland runtime disappeared from application state".to_string())?
             .poll_wayland(timeout_ms)?;
+        // Signal shutdown skips the close-request path on purpose: it runs the
+        // shared teardown directly and never asks for confirmation.
+        if signals::take_shutdown_request() {
+            self.interrupt_automation("terminated by signal");
+            self.finish_terminal_session();
+            return Ok(LoopStep::Exit(self.take_automation_exit_result()));
+        }
         let events = self
             .runtime
             .as_mut()
@@ -329,6 +349,41 @@ impl App {
 mod tests {
     use super::*;
     use crate::platform::single_instance::ExternalLaunchRequest;
+    use crate::runtime::WaylandWindowMetrics;
+
+    fn configured_metrics(logical: u32) -> WaylandWindowMetrics {
+        WaylandWindowMetrics {
+            logical_width: logical,
+            logical_height: logical,
+            physical_width: logical * 2,
+            physical_height: logical * 2,
+            scale_factor: 2.0,
+        }
+    }
+
+    #[test]
+    fn close_in_batch_still_applies_resize_and_opens_the_dialog() {
+        // A busy tab makes the close open the dialog instead of exiting.
+        let mut app = crate::app::tests::busy_shell_app("batch-close");
+        let events = WaylandRuntimeEvents {
+            close_requested: true,
+            configured: Some(configured_metrics(900)),
+            ..Default::default()
+        };
+        assert!(!app.handle_wayland_runtime_events(events));
+        assert!(app.close_confirm.is_some());
+        assert_eq!(app.config.window_width, 900.0);
+
+        // With the dialog open, a batch without a close still applies its resize.
+        let events = WaylandRuntimeEvents {
+            configured: Some(configured_metrics(1000)),
+            ..Default::default()
+        };
+        assert!(!app.handle_wayland_runtime_events(events));
+        assert!(app.close_confirm.is_some());
+        assert_eq!(app.config.window_width, 1000.0);
+        app.shutdown_all();
+    }
 
     #[test]
     fn rapid_external_launch_burst_preserves_requests_within_bound() {

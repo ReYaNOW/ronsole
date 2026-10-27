@@ -12,6 +12,7 @@ pub(crate) const DEFAULT_SCROLL_SENSITIVITY: f32 = 1.0;
 pub(crate) const MIN_SCROLL_SENSITIVITY: f32 = 0.25;
 pub(crate) const MAX_SCROLL_SENSITIVITY: f32 = 3.0;
 pub(crate) const SCROLL_SENSITIVITY_STEP: f32 = 0.1;
+pub(crate) const DEFAULT_CONFIRM_CLOSE: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RgbColor {
@@ -61,6 +62,29 @@ impl RgbColor {
 }
 
 pub(crate) const DEFAULT_TERMINAL_BACKGROUND: RgbColor = RgbColor::new(0x28, 0x2A, 0x36);
+/// Default foreground: the former `ANSI_16_COLORS[7]`, rounded to bytes.
+pub(crate) const DEFAULT_TERMINAL_FOREGROUND: RgbColor = RgbColor::new(0xE6, 0xE6, 0xE6);
+/// Bold text keeps the regular foreground unless `bold_foreground` is configured.
+pub(crate) const DEFAULT_TERMINAL_BOLD_FOREGROUND: Option<RgbColor> = None;
+/// Default ANSI 16 colours: the former `ANSI_16_COLORS` in the renderer, rounded to bytes.
+pub(crate) const DEFAULT_TERMINAL_PALETTE: [RgbColor; 16] = [
+    RgbColor::new(0x1A, 0x1A, 0x1A),
+    RgbColor::new(0xF2, 0x4D, 0x4D),
+    RgbColor::new(0x4D, 0xD9, 0x4D),
+    RgbColor::new(0xE6, 0xD9, 0x33),
+    RgbColor::new(0x4D, 0x99, 0xFF),
+    RgbColor::new(0xE6, 0x59, 0xE6),
+    RgbColor::new(0x33, 0xD9, 0xD9),
+    RgbColor::new(0xE6, 0xE6, 0xE6),
+    RgbColor::new(0x73, 0x73, 0x73),
+    RgbColor::new(0xFF, 0x66, 0x66),
+    RgbColor::new(0x66, 0xFF, 0x66),
+    RgbColor::new(0xFF, 0xFF, 0x66),
+    RgbColor::new(0x80, 0xB3, 0xFF),
+    RgbColor::new(0xFF, 0x80, 0xFF),
+    RgbColor::new(0x66, 0xFF, 0xFF),
+    RgbColor::new(0xFF, 0xFF, 0xFF),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AppConfig {
@@ -69,6 +93,12 @@ pub(crate) struct AppConfig {
     pub(crate) terminal_font_size: f32,
     pub(crate) scroll_sensitivity: f32,
     pub(crate) terminal_background: RgbColor,
+    pub(crate) terminal_foreground: RgbColor,
+    /// `None` keeps bold text in the regular foreground.
+    pub(crate) terminal_bold_foreground: Option<RgbColor>,
+    pub(crate) terminal_palette: [RgbColor; 16],
+    /// Ask before closing a window or tab whose shell runs a foreground job.
+    pub(crate) confirm_close: bool,
     /// File this config was loaded from, which `save` writes back to. `None` writes nothing.
     pub(crate) path: Option<PathBuf>,
 }
@@ -81,6 +111,10 @@ impl Default for AppConfig {
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             terminal_background: DEFAULT_TERMINAL_BACKGROUND,
+            terminal_foreground: DEFAULT_TERMINAL_FOREGROUND,
+            terminal_bold_foreground: DEFAULT_TERMINAL_BOLD_FOREGROUND,
+            terminal_palette: DEFAULT_TERMINAL_PALETTE,
+            confirm_close: DEFAULT_CONFIRM_CLOSE,
             path: None,
         }
     }
@@ -220,7 +254,27 @@ fn parse_config_content(content: &str) -> AppConfig {
                 config.terminal_background =
                     RgbColor::parse_hex(value).unwrap_or(DEFAULT_TERMINAL_BACKGROUND);
             }
-            _ => {}
+            "foreground" => {
+                config.terminal_foreground =
+                    RgbColor::parse_hex(value).unwrap_or(DEFAULT_TERMINAL_FOREGROUND);
+            }
+            // An empty or malformed value turns the bold colour off.
+            "bold_foreground" => {
+                config.terminal_bold_foreground = RgbColor::parse_hex(value);
+            }
+            "confirm_close" => {
+                config.confirm_close = value.parse::<bool>().unwrap_or(DEFAULT_CONFIRM_CLOSE);
+            }
+            key => {
+                if let Some(index) = key
+                    .strip_prefix("palette_")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .filter(|index| *index < DEFAULT_TERMINAL_PALETTE.len())
+                {
+                    config.terminal_palette[index] =
+                        RgbColor::parse_hex(value).unwrap_or(DEFAULT_TERMINAL_PALETTE[index]);
+                }
+            }
         }
     }
     config
@@ -235,13 +289,26 @@ fn parse_window_dimension(value: &str, default: f64) -> f64 {
 }
 
 fn format_config_content(config: &AppConfig) -> String {
+    let bold_foreground = config
+        .terminal_bold_foreground
+        .map_or_else(String::new, RgbColor::to_hex);
+    let palette: String = config
+        .terminal_palette
+        .iter()
+        .enumerate()
+        .map(|(index, color)| format!("palette_{index}={}\n", color.to_hex()))
+        .collect();
     format!(
-        "window_width={:.3}\nwindow_height={:.3}\nterminal_font_size={:.2}\nscroll_sensitivity={:.2}\nterminal_background={}\n",
+        "window_width={:.3}\nwindow_height={:.3}\nterminal_font_size={:.2}\nscroll_sensitivity={:.2}\nterminal_background={}\nforeground={}\nbold_foreground={}\n{}confirm_close={}\n",
         config.window_width,
         config.window_height,
         config.terminal_font_size,
         config.scroll_sensitivity,
         config.terminal_background.to_hex(),
+        config.terminal_foreground.to_hex(),
+        bold_foreground,
+        palette,
+        config.confirm_close,
     )
 }
 
@@ -267,12 +334,58 @@ mod tests {
             terminal_font_size: 21.0,
             scroll_sensitivity: 1.75,
             terminal_background: RgbColor::new(0x12, 0xAB, 0xEF),
+            terminal_foreground: RgbColor::new(0xD0, 0xD1, 0xD2),
+            terminal_bold_foreground: Some(RgbColor::new(0xFF, 0xFE, 0xFD)),
+            terminal_palette: [RgbColor::new(0x01, 0x02, 0x03); 16],
+            confirm_close: false,
             path: None,
         };
         assert_eq!(
             parse_config_content(&format_config_content(&config)),
             config
         );
+    }
+
+    #[test]
+    fn config_colour_defaults_are_the_former_renderer_palette() {
+        let config = AppConfig::default();
+        // Expected bytes are the former renderer's ANSI_16_COLORS entries (f32 unit range)
+        // times 255, rounded half away from zero: 0.10 -> 0x1A, 0.95 -> 0xF2, 0.90 -> 0xE6.
+        assert_eq!(config.terminal_foreground, RgbColor::new(0xE6, 0xE6, 0xE6));
+        assert_eq!(config.terminal_bold_foreground, None);
+        assert_eq!(config.terminal_palette[0], RgbColor::new(0x1A, 0x1A, 0x1A));
+        assert_eq!(config.terminal_palette[1], RgbColor::new(0xF2, 0x4D, 0x4D));
+        assert_eq!(config.terminal_palette[7], RgbColor::new(0xE6, 0xE6, 0xE6));
+        assert_eq!(config.terminal_palette[15], RgbColor::new(0xFF, 0xFF, 0xFF));
+    }
+
+    #[test]
+    fn config_colour_keys_parse_and_malformed_values_fall_back() {
+        let config = parse_config_content(
+            "foreground=#102030\nbold_foreground=#A0B0C0\npalette_2=#0A0B0C\npalette_15=#12345Z\npalette_16=#FFFFFF\n",
+        );
+        assert_eq!(config.terminal_foreground, RgbColor::new(0x10, 0x20, 0x30));
+        assert_eq!(
+            config.terminal_bold_foreground,
+            Some(RgbColor::new(0xA0, 0xB0, 0xC0))
+        );
+        assert_eq!(config.terminal_palette[2], RgbColor::new(0x0A, 0x0B, 0x0C));
+        // Malformed hex falls back to the default for that key, and palette_16 is ignored.
+        assert_eq!(config.terminal_palette[15], DEFAULT_TERMINAL_PALETTE[15]);
+        assert_eq!(config.terminal_palette[..2], DEFAULT_TERMINAL_PALETTE[..2]);
+        assert_eq!(config.terminal_palette[3..15], DEFAULT_TERMINAL_PALETTE[3..15]);
+
+        let garbage = parse_config_content("foreground=nope\nbold_foreground=#12345Z\n");
+        assert_eq!(garbage.terminal_foreground, DEFAULT_TERMINAL_FOREGROUND);
+        assert_eq!(garbage.terminal_bold_foreground, None);
+    }
+
+    #[test]
+    fn config_empty_bold_foreground_is_disabled_and_round_trips() {
+        let config = parse_config_content("bold_foreground=\n");
+        assert_eq!(config.terminal_bold_foreground, None);
+        assert!(format_config_content(&config).contains("\nbold_foreground=\n"));
+        assert_eq!(parse_config_content(&format_config_content(&config)), config);
     }
 
     #[test]
@@ -316,6 +429,29 @@ mod tests {
             assert_eq!(parsed.terminal_font_size, DEFAULT_TERMINAL_FONT_SIZE);
             assert_eq!(parsed.scroll_sensitivity, DEFAULT_SCROLL_SENSITIVITY);
         }
+    }
+
+    #[test]
+    fn confirm_close_defaults_to_true_and_parses_only_bool_literals() {
+        assert!(AppConfig::default().confirm_close);
+        assert!(!parse_config_content("confirm_close=false\n").confirm_close);
+        assert!(parse_config_content("confirm_close=true\n").confirm_close);
+        // Non-bool values are the negative case: they must fall back to the default.
+        for invalid in ["maybe", "0", "yes", ""] {
+            let parsed = parse_config_content(&format!("confirm_close={invalid}\n"));
+            assert!(parsed.confirm_close, "value {invalid:?} must fall back to true");
+        }
+    }
+
+    #[test]
+    fn confirm_close_is_written_as_bool_line() {
+        let config = AppConfig {
+            confirm_close: false,
+            ..AppConfig::default()
+        };
+        assert!(format_config_content(&config).contains("confirm_close=false\n"));
+        let default_config = AppConfig::default();
+        assert!(format_config_content(&default_config).contains("confirm_close=true\n"));
     }
 
     #[test]

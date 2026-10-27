@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 mod kde_activation;
 pub(crate) mod offscreen_gl;
 mod process;
+pub(crate) mod signals;
 pub(crate) mod single_instance;
 
 pub(crate) use kde_activation::{KdeActivationWorker, kde_session_active};

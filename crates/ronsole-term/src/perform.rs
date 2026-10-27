@@ -35,6 +35,27 @@ fn csi_form_is_handled(action: char, intermediates: &[u8]) -> bool {
     }
 }
 
+impl Performer<'_> {
+    /// Saves the programmed title for `CSI 22 ; Ps t`.
+    fn push_window_title(&mut self) {
+        let title = self.term.window_title.clone();
+        self.term.title_stack.push(title);
+    }
+
+    /// Restores the newest saved title for `CSI 23 ; Ps t` through the same
+    /// sink calls as OSC 0/2; an empty stack changes nothing.
+    fn pop_window_title(&mut self) {
+        let Some(saved) = self.term.title_stack.pop() else {
+            return;
+        };
+        match &saved {
+            Some(title) => self.sink.title(title),
+            None => self.sink.title_reset(),
+        }
+        self.term.window_title = saved;
+    }
+}
+
 impl Perform for Performer<'_> {
     /// Stops the parser right after a set that starts holding output, so the
     /// rest of the batch can be held instead of applied.
@@ -98,6 +119,7 @@ impl Perform for Performer<'_> {
                 }
             }
             b'\t' => self.term.move_to_tab_stop(1, false),
+            0x07 => self.sink.bell(),
             _ => {}
         }
     }
@@ -115,6 +137,7 @@ impl Perform for Performer<'_> {
             b"0" | b"2" => {
                 if let Some(title) = terminal_programmed_title(&params[1..]) {
                     self.sink.title(&title);
+                    self.term.window_title = Some(title);
                 }
             }
             b"4" => queue_palette_queries(self.term, params, bell_terminated),
@@ -342,6 +365,20 @@ impl Perform for Performer<'_> {
                     [] if param == 0 => self.term.queue_reply(b"\x1B[?62c"),
                     [b'>'] if param == 0 => self.term.queue_da2(),
                     _ => {}
+                }
+            }
+            't' => {
+                // Window-title stack only: Ps 0, 1 and 2 all mean the window title.
+                // Private or intermediate forms never reach this arm.
+                let mut operands = params.iter().map(|p| p[0]);
+                let operation = operands.next().unwrap_or(0);
+                let selector = operands.next().unwrap_or(0);
+                if matches!(selector, 0..=2) {
+                    match operation {
+                        22 => self.push_window_title(),
+                        23 => self.pop_window_title(),
+                        _ => {}
+                    }
                 }
             }
             'n' => {

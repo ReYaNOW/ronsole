@@ -1,6 +1,7 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
-    SettingsHit, SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
+    CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
+    SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout, settings_color_value,
     terminal_cell_render_colors, terminal_cell_span_x_bounds, terminal_palette,
     terminal_render_color, terminal_row_draw_y, terminal_scrollbar_drag_target,
     terminal_text_viewport_height, visible_row_range,
@@ -164,6 +165,12 @@ pub(crate) struct TerminalPalette {
     fg: [f32; 4],
     minimap_bg: [f32; 4],
     accent: [f32; 4],
+    /// Foreground of cells that use the default foreground.
+    term_fg: [f32; 4],
+    /// Foreground of bold cells that use the default foreground, when configured.
+    term_bold_fg: Option<[f32; 4]>,
+    /// The 16 ANSI colours that indexed cells below 16 resolve to.
+    ansi: [[f32; 4]; 16],
 }
 
 impl TerminalPalette {
@@ -173,7 +180,26 @@ impl TerminalPalette {
             fg: [0.972, 0.972, 0.949, 1.0],
             minimap_bg: [0.129, 0.133, 0.172, 1.0],
             accent,
+            term_fg: crate::config::DEFAULT_TERMINAL_FOREGROUND.to_rgba(),
+            term_bold_fg: crate::config::DEFAULT_TERMINAL_BOLD_FOREGROUND.map(|c| c.to_rgba()),
+            ansi: crate::config::DEFAULT_TERMINAL_PALETTE.map(|c| c.to_rgba()),
         }
+    }
+
+    /// Stores the configured text and ANSI colours and returns whether any of them changed.
+    /// It rebuilds no derived state; the caller runs it at startup and again when the colour
+    /// settings change.
+    fn set_terminal_colors(&mut self, config: &crate::config::AppConfig) -> bool {
+        let term_fg = config.terminal_foreground.to_rgba();
+        let term_bold_fg = config.terminal_bold_foreground.map(|c| c.to_rgba());
+        let ansi = config.terminal_palette.map(|c| c.to_rgba());
+        if self.term_fg == term_fg && self.term_bold_fg == term_bold_fg && self.ansi == ansi {
+            return false;
+        }
+        self.term_fg = term_fg;
+        self.term_bold_fg = term_bold_fg;
+        self.ansi = ansi;
+        true
     }
 
     fn accent_with_alpha(self, alpha: f32) -> [f32; 4] {
@@ -489,6 +515,9 @@ pub struct Renderer {
     terminal_tab_render_order: Vec<usize>,
     terminal_tab_x_anim: Vec<f32>,
     terminal_tab_hitboxes: Vec<terminal_ui::TerminalTabHitbox>,
+    /// Shared by Colors-tab drawing and hit-testing; `Cell` lets the wheel handler
+    /// scroll through the runtime's shared renderer reference.
+    settings_colors_scroll: std::cell::Cell<terminal_ui::SettingsColorsScroll>,
     terminal_tab_strip_layout: TerminalTabStripLayout,
     terminal_tab_base_x: f32,
     terminal_tab_animation_active: bool,
@@ -621,6 +650,7 @@ impl Renderer {
             terminal_tab_render_order: Vec::with_capacity(8),
             terminal_tab_x_anim: Vec::with_capacity(8),
             terminal_tab_hitboxes: Vec::with_capacity(8),
+            settings_colors_scroll: Default::default(),
             terminal_tab_strip_layout: TerminalTabStripLayout::default(),
             terminal_tab_base_x: 0.0,
             terminal_tab_animation_active: false,
@@ -737,6 +767,10 @@ impl Renderer {
         }
         self.palette.bg = rgba;
         true
+    }
+
+    pub(crate) fn set_terminal_colors(&mut self, config: &crate::config::AppConfig) -> bool {
+        self.palette.set_terminal_colors(config)
     }
 
     fn prewarm_ascii(&mut self) {
@@ -2092,6 +2126,31 @@ mod tests {
             let content = format!("[Colors:Selection]\nBackgroundNormal={value}");
             assert!(parse_kde_color(&content, "Colors:Selection", "BackgroundNormal").is_none());
         }
+    }
+
+    #[test]
+    fn palette_set_terminal_colors_reports_only_real_changes() {
+        let mut palette = TerminalPalette::new(
+            crate::config::DEFAULT_TERMINAL_BACKGROUND,
+            [0.0; 4],
+        );
+        let mut config = crate::config::AppConfig::default();
+        assert!(!palette.set_terminal_colors(&config), "defaults already match the palette");
+
+        config.terminal_foreground = crate::config::RgbColor::new(0xD0, 0xD1, 0xD2);
+        assert!(palette.set_terminal_colors(&config));
+        assert_eq!(palette.term_fg, crate::config::RgbColor::new(0xD0, 0xD1, 0xD2).to_rgba());
+        assert!(!palette.set_terminal_colors(&config), "same values again change nothing");
+
+        config.terminal_bold_foreground = Some(crate::config::RgbColor::new(0xFF, 0xFE, 0xFD));
+        assert!(palette.set_terminal_colors(&config));
+        let bold = crate::config::RgbColor::new(0xFF, 0xFE, 0xFD).to_rgba();
+        assert_eq!(palette.term_bold_fg, Some(bold));
+
+        config.terminal_palette[1] = crate::config::RgbColor::new(0x01, 0x02, 0x03);
+        assert!(palette.set_terminal_colors(&config));
+        assert_eq!(palette.ansi[1], crate::config::RgbColor::new(0x01, 0x02, 0x03).to_rgba());
+        assert!(!palette.set_terminal_colors(&config));
     }
 
     #[test]

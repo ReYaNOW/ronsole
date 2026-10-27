@@ -14,66 +14,38 @@ use ronsole_term::{
     Cell, CellFlags, Rgb, Term, TermPalette, terminal_force_text_presentation, xterm_256_rgb,
 };
 
-const ANSI_16_COLORS: [[f32; 4]; 16] = [
-    [0.10, 0.10, 0.10, 1.0],
-    [0.95, 0.30, 0.30, 1.0],
-    [0.30, 0.85, 0.30, 1.0],
-    [0.90, 0.85, 0.20, 1.0],
-    [0.30, 0.60, 1.00, 1.0],
-    [0.90, 0.35, 0.90, 1.0],
-    [0.20, 0.85, 0.85, 1.0],
-    [0.90, 0.90, 0.90, 1.0],
-    [0.45, 0.45, 0.45, 1.0],
-    [1.00, 0.40, 0.40, 1.0],
-    [0.40, 1.00, 0.40, 1.0],
-    [1.00, 1.00, 0.40, 1.0],
-    [0.50, 0.70, 1.00, 1.0],
-    [1.00, 0.50, 1.00, 1.0],
-    [0.40, 1.00, 1.00, 1.0],
-    [1.00, 1.00, 1.00, 1.0],
-];
-
-/// Builds the terminal palette the renderer draws with: default foreground
-/// is `ANSI_16_COLORS[7]`, default background is the configured colour, and
-/// the cursor has no palette colour of its own, so it follows the foreground.
-pub(crate) fn terminal_palette(background: crate::config::RgbColor) -> TermPalette {
-    let foreground = palette_rgb(ANSI_16_COLORS[7]);
+/// Builds the terminal palette the renderer draws with from the configured
+/// colours. The cursor has no palette colour of its own, so it follows the
+/// foreground.
+pub(crate) fn terminal_palette(config: &crate::config::AppConfig) -> TermPalette {
+    let foreground = config_rgb(config.terminal_foreground);
     TermPalette {
         foreground,
-        background: Rgb {
-            r: background.r,
-            g: background.g,
-            b: background.b,
-        },
+        background: config_rgb(config.terminal_background),
         cursor: foreground,
-        ansi: std::array::from_fn(|index| palette_rgb(ANSI_16_COLORS[index])),
+        ansi: config.terminal_palette.map(config_rgb),
+        bold_foreground: config.terminal_bold_foreground.map(config_rgb),
     }
 }
 
-fn palette_rgb(rgba: [f32; 4]) -> Rgb {
+fn config_rgb(color: crate::config::RgbColor) -> Rgb {
     Rgb {
-        r: terminal_palette_channel(rgba[0]),
-        g: terminal_palette_channel(rgba[1]),
-        b: terminal_palette_channel(rgba[2]),
+        r: color.r,
+        g: color.g,
+        b: color.b,
     }
 }
 
-/// Converts one unit-range channel to a byte, rounding half away from zero
-/// in f32 arithmetic.
-fn terminal_palette_channel(value: f32) -> u8 {
-    (value * 255.0).round() as u8
-}
-
-fn terminal_color_rgba(color: TerminalColor) -> [f32; 4] {
+fn terminal_color_rgba(palette: &TerminalPalette, color: TerminalColor) -> [f32; 4] {
     if color.is_default_foreground() {
-        return ANSI_16_COLORS[7];
+        return palette.term_fg;
     }
     if color.is_default_background() {
-        return ANSI_16_COLORS[0];
+        return palette.ansi[0];
     }
     if let Some(index) = color.indexed_value() {
         if index < 16 {
-            return ANSI_16_COLORS[index as usize];
+            return palette.ansi[index as usize];
         }
         if let Some(rgb) = xterm_256_rgb(index) {
             return rgb_rgba(rgb.r, rgb.g, rgb.b);
@@ -104,6 +76,10 @@ const TERMINAL_TAB_CLOSE_HIT_PAD: f32 = 4.0;
 const SEARCH_ICON_VISUAL_SCALE: f32 = 0.56;
 const TERMINAL_TAB_CLOSE_RIGHT_PADDING: f32 = TERMINAL_TAB_TEXT_PAD - TERMINAL_TAB_CLOSE_HIT_PAD;
 const TERMINAL_TAB_TEXT_PAD: f32 = 16.0;
+/// Diameter of the accent dot that marks a background tab that rang its bell.
+const TERMINAL_TAB_BELL_DOT: f32 = 6.0;
+/// Space between the bell dot and the tab title.
+const TERMINAL_TAB_BELL_GAP: f32 = 6.0;
 const TERMINAL_ADD_SIZE: f32 = 20.0;
 const TAB_STRIP_EDGE_FADE_ALPHA: f32 = 0.4;
 const TAB_STRIP_EDGE_FADE_WIDTH: f32 = 40.0;
@@ -461,6 +437,7 @@ fn settings_modal_rect(width: f32, height: f32, scale: f32, progress: f32) -> Re
 pub(crate) enum SettingsTab {
     #[default]
     General,
+    Colors,
     Help,
 }
 
@@ -470,15 +447,49 @@ struct SettingsTabSpec {
     title: &'static str,
 }
 
-const SETTINGS_TABS: [SettingsTabSpec; 2] = [
+const SETTINGS_TABS: [SettingsTabSpec; 3] = [
     SettingsTabSpec {
         tab: SettingsTab::General,
         title: "Основные",
     },
     SettingsTabSpec {
+        tab: SettingsTab::Colors,
+        title: "Цвета",
+    },
+    SettingsTabSpec {
         tab: SettingsTab::Help,
         title: "Помощь",
     },
+];
+
+/// One hex-editable colour of the Colors tab. The order of `SETTINGS_COLOR_FIELDS`
+/// is the drawn order: foreground, bold foreground, then the palette rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsColorField {
+    Foreground,
+    BoldForeground,
+    Palette(usize),
+}
+
+pub(crate) const SETTINGS_COLOR_FIELDS: [SettingsColorField; 18] = [
+    SettingsColorField::Foreground,
+    SettingsColorField::BoldForeground,
+    SettingsColorField::Palette(0),
+    SettingsColorField::Palette(8),
+    SettingsColorField::Palette(1),
+    SettingsColorField::Palette(9),
+    SettingsColorField::Palette(2),
+    SettingsColorField::Palette(10),
+    SettingsColorField::Palette(3),
+    SettingsColorField::Palette(11),
+    SettingsColorField::Palette(4),
+    SettingsColorField::Palette(12),
+    SettingsColorField::Palette(5),
+    SettingsColorField::Palette(13),
+    SettingsColorField::Palette(6),
+    SettingsColorField::Palette(14),
+    SettingsColorField::Palette(7),
+    SettingsColorField::Palette(15),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -519,6 +530,7 @@ const SETTINGS_FONT_LABEL: &str = "Размер шрифта";
 const SETTINGS_SCROLL_LABEL: &str = "Чувствительность прокрутки";
 const SETTINGS_BACKGROUND_LABEL: &str = "Цвет фона";
 const SETTINGS_RESET_LABEL: &str = "Сбросить";
+const SETTINGS_CONFIRM_CLOSE_LABEL: &str = "Спрашивать перед закрытием";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SettingsHit {
@@ -534,6 +546,87 @@ pub(crate) enum SettingsHit {
     ScrollReset,
     BackgroundField,
     BackgroundReset,
+    ConfirmCloseToggle,
+    ColorField(SettingsColorField),
+    ColorReset(SettingsColorField),
+}
+
+/// Label of a Colors-tab row; palette rows name their ANSI slot.
+fn settings_color_label(field: SettingsColorField) -> &'static str {
+    match field {
+        SettingsColorField::Foreground => "Текст",
+        SettingsColorField::BoldForeground => "Жирный текст",
+        SettingsColorField::Palette(index) => SETTINGS_PALETTE_LABELS[index.min(15)],
+    }
+}
+
+const SETTINGS_PALETTE_LABELS: [&str; 16] = [
+    "Цвет 0",
+    "Цвет 1",
+    "Цвет 2",
+    "Цвет 3",
+    "Цвет 4",
+    "Цвет 5",
+    "Цвет 6",
+    "Цвет 7",
+    "Яркий 0",
+    "Яркий 1",
+    "Яркий 2",
+    "Яркий 3",
+    "Яркий 4",
+    "Яркий 5",
+    "Яркий 6",
+    "Яркий 7",
+];
+
+/// Stored value of a Colors-tab field; `None` only for an unset bold foreground.
+pub(crate) fn settings_color_value(
+    config: &crate::config::AppConfig,
+    field: SettingsColorField,
+) -> Option<crate::config::RgbColor> {
+    match field {
+        SettingsColorField::Foreground => Some(config.terminal_foreground),
+        SettingsColorField::BoldForeground => config.terminal_bold_foreground,
+        SettingsColorField::Palette(index) => config.terminal_palette.get(index).copied(),
+    }
+}
+
+/// Hex texts and swatch colours of the Colors tab, in `SETTINGS_COLOR_FIELDS` order.
+/// The app rebuilds it when a colour changes, so drawing formats nothing.
+pub(crate) struct SettingsColorView {
+    pub(crate) hex: [String; SETTINGS_COLOR_FIELDS.len()],
+    pub(crate) swatch: [Option<[f32; 4]>; SETTINGS_COLOR_FIELDS.len()],
+}
+
+impl SettingsColorView {
+    pub(crate) fn new(config: &crate::config::AppConfig) -> Self {
+        let mut view = Self {
+            hex: std::array::from_fn(|_| String::new()),
+            swatch: [None; SETTINGS_COLOR_FIELDS.len()],
+        };
+        for (index, field) in SETTINGS_COLOR_FIELDS.iter().enumerate() {
+            let value = settings_color_value(config, *field);
+            view.hex[index] = value.map_or_else(String::new, |color| color.to_hex());
+            view.swatch[index] = value.map(|color| color.to_rgba());
+        }
+        view
+    }
+}
+
+/// Text of the close confirmation dialog, cached by the app when the dialog opens.
+pub(crate) struct CloseConfirmView<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) rows: &'a [String],
+    pub(crate) more: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CloseConfirmHit {
+    #[default]
+    None,
+    Outside,
+    Confirm,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -564,6 +657,22 @@ struct SettingsBackgroundRowLayout {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsToggleRowLayout {
+    label: SettingsLine,
+    label_max_x: f32,
+    toggle: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SettingsColorRowLayout {
+    label: SettingsLine,
+    label_max_x: f32,
+    swatch: Rect,
+    field: Rect,
+    reset: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SettingsHelpRowLayout {
     keycap: Rect,
     key: SettingsLine,
@@ -579,6 +688,39 @@ struct SettingsSidebarTabMetrics {
     gap: f32,
 }
 
+/// Colors-tab scroll: whole-row offset plus the sub-row wheel remainder, so rows are
+/// never drawn half outside the body and hitboxes always match the drawn rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SettingsColorsScroll {
+    rows: usize,
+    carry: f32,
+}
+
+impl SettingsColorsScroll {
+    /// Applies `delta_rows` (positive scrolls down) and clamps to `max`.
+    fn step(self, delta_rows: f32, max: usize) -> Self {
+        let carry = self.carry + if delta_rows.is_finite() { delta_rows } else { 0.0 };
+        let whole = carry.trunc();
+        let rows = (self.rows.min(max) as f32 + whole).clamp(0.0, max as f32);
+        // Pushing against either end drops the remainder so reversing responds at once.
+        let carry = carry - whole;
+        let carry = if (rows <= 0.0 && carry < 0.0) || (rows >= max as f32 && carry > 0.0) {
+            0.0
+        } else {
+            carry
+        };
+        Self {
+            rows: rows as usize,
+            carry,
+        }
+    }
+}
+
+#[inline]
+fn settings_color_row_step(scale: f32) -> f32 {
+    (44.0 * scale).round().max(1.0)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SettingsLayout {
     modal: Rect,
@@ -592,6 +734,10 @@ struct SettingsLayout {
     font: Option<SettingsRowLayout>,
     scroll: Option<SettingsRowLayout>,
     background: Option<SettingsBackgroundRowLayout>,
+    confirm_close: Option<SettingsToggleRowLayout>,
+    colors: [Option<SettingsColorRowLayout>; SETTINGS_COLOR_FIELDS.len()],
+    /// Largest whole-row Colors scroll offset that still changes what is shown.
+    colors_scroll_max: usize,
     help: [Option<SettingsHelpRowLayout>; SETTINGS_HELP_ENTRIES.len()],
 }
 
@@ -633,6 +779,22 @@ impl SettingsLayout {
             }
             if row.reset.contains(x, y) {
                 return SettingsHit::BackgroundReset;
+            }
+        }
+        if let Some(row) = self.confirm_close
+            && row.toggle.contains(x, y)
+        {
+            return SettingsHit::ConfirmCloseToggle;
+        }
+        for (field, row) in SETTINGS_COLOR_FIELDS.iter().zip(self.colors) {
+            let Some(row) = row else {
+                continue;
+            };
+            if row.field.contains(x, y) {
+                return SettingsHit::ColorField(*field);
+            }
+            if row.reset.contains(x, y) {
+                return SettingsHit::ColorReset(*field);
             }
         }
         SettingsHit::None
@@ -728,6 +890,94 @@ fn centered_settings_value_x(left: f32, right: f32, measured_width: f32) -> f32 
     (left + ((right - left - width).max(0.0) * 0.5))
         .round()
         .clamp(left, (right - width).max(left))
+}
+
+fn settings_toggle_row_layout(clip: Rect, top: f32, scale: f32) -> Option<SettingsToggleRowLayout> {
+    let button = (30.0 * scale).round().max(1.0);
+    let gap = (8.0 * scale).round().max(1.0);
+    let toggle_w = (86.0 * scale).round().max(1.0);
+    let label_room = (64.0 * scale).round().max(1.0);
+    if clip.w < toggle_w + gap + label_room || top < clip.y || top + button > clip.y + clip.h {
+        return None;
+    }
+    let toggle = Rect {
+        x: (clip.x + clip.w - toggle_w).round(),
+        y: top.round(),
+        w: toggle_w,
+        h: button,
+    };
+    Some(SettingsToggleRowLayout {
+        label: SettingsLine {
+            x: clip.x.round(),
+            baseline_y: (top + button * 0.70).round(),
+        },
+        label_max_x: (toggle.x - gap).round(),
+        toggle,
+    })
+}
+
+/// Hex field width of a colour row; the compact variant still fits `#rrggbb`.
+fn settings_color_field_w(scale: f32, compact: bool) -> f32 {
+    (if compact { 96.0 } else { 128.0 } * scale).round().max(1.0)
+}
+
+/// Narrowest clip `settings_color_row_layout` accepts for the given variant.
+fn settings_color_row_min_w(scale: f32, compact: bool) -> f32 {
+    let gap = (8.0 * scale).round().max(1.0);
+    let swatch_w = (20.0 * scale).round().max(1.0);
+    let reset_w = (86.0 * scale).round().max(1.0);
+    let label_room = (64.0 * scale).round().max(1.0);
+    swatch_w + settings_color_field_w(scale, compact) + reset_w + gap * 3.0 + label_room
+}
+
+/// One colour cell: label on the left, then swatch, hex field and reset button
+/// packed against the right edge of `clip`.
+fn settings_color_row_layout(
+    clip: Rect,
+    top: f32,
+    scale: f32,
+    compact: bool,
+) -> Option<SettingsColorRowLayout> {
+    let row_h = (30.0 * scale).round().max(1.0);
+    let gap = (8.0 * scale).round().max(1.0);
+    let swatch_w = (20.0 * scale).round().max(1.0);
+    let field_w = settings_color_field_w(scale, compact);
+    let reset_w = (86.0 * scale).round().max(1.0);
+    if clip.w < settings_color_row_min_w(scale, compact)
+        || top < clip.y
+        || top + row_h > clip.y + clip.h
+    {
+        return None;
+    }
+
+    let reset = Rect {
+        x: (clip.x + clip.w - reset_w).round(),
+        y: top.round(),
+        w: reset_w,
+        h: row_h,
+    };
+    let field = Rect {
+        x: (reset.x - gap - field_w).round(),
+        y: top.round(),
+        w: field_w,
+        h: row_h,
+    };
+    let swatch = Rect {
+        x: (field.x - gap - swatch_w).round(),
+        y: top.round(),
+        w: swatch_w,
+        h: row_h,
+    };
+    Some(SettingsColorRowLayout {
+        label: SettingsLine {
+            x: clip.x.round(),
+            baseline_y: (top + row_h * 0.70).round(),
+        },
+        label_max_x: (swatch.x - gap).round(),
+        swatch,
+        field,
+        reset,
+    })
 }
 
 fn settings_background_row_layout(
@@ -839,6 +1089,7 @@ fn settings_layout(
     scale: f32,
     progress: f32,
     active_tab: SettingsTab,
+    colors_scroll: usize,
 ) -> SettingsLayout {
     let scale = scale.max(0.0);
     let modal = settings_modal_rect(width, height, scale, progress);
@@ -953,6 +1204,9 @@ fn settings_layout(
     let mut font = None;
     let mut scroll = None;
     let mut background = None;
+    let mut confirm_close = None;
+    let mut colors = [None; SETTINGS_COLOR_FIELDS.len()];
+    let mut colors_scroll_max = 0;
     let mut help = [None; SETTINGS_HELP_ENTRIES.len()];
     match active_tab {
         SettingsTab::General => {
@@ -962,6 +1216,63 @@ fn settings_layout(
             scroll = settings_row_layout(content_body, first_top + row_gap, scale);
             background =
                 settings_background_row_layout(content_body, first_top + row_gap * 2.0, scale);
+            confirm_close =
+                settings_toggle_row_layout(content_body, first_top + row_gap * 3.0, scale);
+        }
+        SettingsTab::Colors => {
+            // Foreground and bold foreground span the body; the palette rows below
+            // split it into two columns: even fields left (normal), odd fields right (bright).
+            // A narrow body narrows the hex field first, then stacks all fields in one
+            // column. Rows that do not fit vertically are reached by whole-row scrolling.
+            let first_top = (content_body.y + 12.0 * scale).round();
+            let row_step = settings_color_row_step(scale);
+            let row_h = (30.0 * scale).round().max(1.0);
+            let column_gap = (24.0 * scale).round().max(1.0);
+            let half_w = ((content_body.w - column_gap) * 0.5).round().max(0.0);
+            let two_columns = half_w >= settings_color_row_min_w(scale, true);
+            let cell_w = if two_columns { half_w } else { content_body.w };
+            let compact = cell_w < settings_color_row_min_w(scale, false);
+            let total_rows = if two_columns {
+                SETTINGS_COLOR_FIELDS.len() / 2 + 1
+            } else {
+                SETTINGS_COLOR_FIELDS.len()
+            };
+            let body_bottom = content_body.y + content_body.h;
+            let visible_rows = (0..total_rows)
+                .take_while(|row| {
+                    (first_top + row_step * *row as f32).round() + row_h <= body_bottom
+                })
+                .count();
+            colors_scroll_max = total_rows.saturating_sub(visible_rows.max(1));
+            let scroll = colors_scroll.min(colors_scroll_max);
+            let left = Rect {
+                x: content_body.x,
+                y: content_body.y,
+                w: half_w,
+                h: content_body.h,
+            };
+            let right = Rect {
+                x: (content_body.x + content_body.w - half_w).round(),
+                y: content_body.y,
+                w: half_w,
+                h: content_body.h,
+            };
+            for (index, slot) in colors.iter_mut().enumerate() {
+                let (clip, row) = match index {
+                    0 | 1 => (content_body, index),
+                    _ if !two_columns => (content_body, index),
+                    _ => (if index % 2 == 0 { left } else { right }, index / 2 + 1),
+                };
+                let Some(row) = row.checked_sub(scroll) else {
+                    continue;
+                };
+                *slot = settings_color_row_layout(
+                    clip,
+                    (first_top + row_step * row as f32).round(),
+                    scale,
+                    compact,
+                );
+            }
         }
         SettingsTab::Help => {
             for (index, slot) in help.iter_mut().enumerate() {
@@ -982,7 +1293,74 @@ fn settings_layout(
         font,
         scroll,
         background,
+        confirm_close,
+        colors,
+        colors_scroll_max,
         help,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CloseConfirmLayout {
+    panel: Rect,
+    text_x: f32,
+    text_max_x: f32,
+    title_baseline_y: f32,
+    rows_baseline_y: f32,
+    row_step: f32,
+    confirm: Rect,
+    cancel: Rect,
+}
+
+impl CloseConfirmLayout {
+    fn hit_test(self, x: f32, y: f32) -> CloseConfirmHit {
+        if !self.panel.contains(x, y) {
+            return CloseConfirmHit::Outside;
+        }
+        if self.confirm.contains(x, y) {
+            CloseConfirmHit::Confirm
+        } else if self.cancel.contains(x, y) {
+            CloseConfirmHit::Cancel
+        } else {
+            CloseConfirmHit::None
+        }
+    }
+}
+
+/// Centered dialog sized for `line_count` list lines below its title.
+fn close_confirm_layout(width: f32, height: f32, scale: f32, line_count: usize) -> CloseConfirmLayout {
+    let scale = scale.max(0.0);
+    let pad = (24.0 * scale).round();
+    let header_h = (56.0 * scale).round();
+    let row_step = (24.0 * scale).round().max(1.0);
+    let button_h = (36.0 * scale).round().max(1.0);
+    let button_w = (120.0 * scale).round().max(1.0);
+    let gap = (16.0 * scale).round().max(1.0);
+    let panel_w = (460.0 * scale).round();
+    let panel_h = (header_h + row_step * line_count as f32 + pad + button_h + pad).round();
+    let panel = fit_centered_rect(width, height, panel_w, panel_h, pad);
+    let button_y = (panel.y + panel.h - pad - button_h).round();
+    let confirm = Rect {
+        x: (panel.x + panel.w - pad - button_w).round(),
+        y: button_y,
+        w: button_w,
+        h: button_h,
+    };
+    let cancel = Rect {
+        x: (confirm.x - gap - button_w).round(),
+        y: button_y,
+        w: button_w,
+        h: button_h,
+    };
+    CloseConfirmLayout {
+        panel,
+        text_x: (panel.x + pad).round(),
+        text_max_x: (panel.x + panel.w - pad).round(),
+        title_baseline_y: (panel.y + 36.0 * scale).round(),
+        rows_baseline_y: (panel.y + header_h + row_step * 0.70).round(),
+        row_step,
+        confirm,
+        cancel,
     }
 }
 
@@ -1216,11 +1594,11 @@ fn terminal_cell_x_bounds(text_x: f32, cell_index: usize, char_w: f32) -> (f32, 
 }
 
 #[inline]
-pub(crate) fn terminal_render_color(color: TerminalColor, palette: TerminalPalette) -> [f32; 4] {
+pub(crate) fn terminal_render_color(color: TerminalColor, palette: &TerminalPalette) -> [f32; 4] {
     if color.is_default_background() {
         palette.bg
     } else {
-        terminal_color_rgba(color)
+        terminal_color_rgba(palette, color)
     }
 }
 
@@ -1236,15 +1614,19 @@ fn terminal_dim_color(mut color: [f32; 4]) -> [f32; 4] {
 #[inline]
 pub(crate) fn terminal_cell_render_colors(
     cell: &Cell,
-    palette: TerminalPalette,
+    palette: &TerminalPalette,
 ) -> ([f32; 4], Option<[f32; 4]>) {
     let source_fg = terminal_render_color(cell.fg(), palette);
     let source_bg = terminal_render_color(cell.bg(), palette);
     let (mut foreground, background) = if cell.is_inverse() {
         (source_bg, Some(source_fg))
     } else {
+        // Bold text in the default foreground takes the configured bold colour.
+        let bold_default_fg = palette.term_bold_fg.filter(|_| {
+            cell.flags().contains(CellFlags::BOLD) && cell.fg().is_default_foreground()
+        });
         (
-            source_fg,
+            bold_default_fg.unwrap_or(source_fg),
             (!cell.bg().is_default_background()).then_some(source_bg),
         )
     };
@@ -1286,7 +1668,7 @@ const MAX_DECORATION_QUADS: usize = 3;
 /// with a single one across a hovered link; strikethrough and underline colour are kept.
 fn terminal_cell_decoration(
     cell: &Cell,
-    palette: TerminalPalette,
+    palette: &TerminalPalette,
     link_underline: bool,
 ) -> Option<TerminalCellDecoration> {
     if cell.is_hidden() || cell.flags().contains(CellFlags::CONCEAL) {
@@ -2044,10 +2426,16 @@ impl Renderer {
             let close_icon = show_close
                 .then(|| terminal_tab_close_geometry(tab_x, tab_w, strip, s).0);
 
-            let title_x = (tab_x + TERMINAL_TAB_TEXT_PAD * s).round();
+            let mut title_x = (tab_x + TERMINAL_TAB_TEXT_PAD * s).round();
             let title_max_w = (tab_w - if can_show_close { 56.0 * s } else { 32.0 * s })
                 .max(0.0);
             let title_max_x = title_x + title_max_w;
+            if terminals.get(idx).is_some_and(Terminal::bell_pending) {
+                let dot = (TERMINAL_TAB_BELL_DOT * s).round().max(1.0);
+                let dot_y = (strip.y + (strip.h - dot) * 0.5).round();
+                self.push_rounded_rect(title_x, dot_y, dot, dot, dot * 0.5, self.palette.accent);
+                title_x = (title_x + dot + TERMINAL_TAB_BELL_GAP * s).round();
+            }
             let baseline = (strip.y + strip.h * 0.5 + 5.0 * s).round();
             let title_color = if active { self.palette.fg } else { [self.palette.fg[0], self.palette.fg[1], self.palette.fg[2], 0.72] };
             if title_max_x > title_x {
@@ -2143,6 +2531,10 @@ impl Renderer {
         scroll_value: &str,
         background_input: &mut SingleLineInput,
         background_editing: bool,
+        confirm_close: bool,
+        colors: &SettingsColorView,
+        color_editing: Option<SettingsColorField>,
+        color_input: &SingleLineInput,
     ) {
         let progress = progress.clamp(0.0, 1.0);
         if progress <= 0.0 {
@@ -2158,7 +2550,14 @@ impl Renderer {
             [0.0, 0.0, 0.0, 0.60 * smooth],
         );
 
-        let layout = settings_layout(self.width, self.height, s, progress, active_tab);
+        let layout = settings_layout(
+            self.width,
+            self.height,
+            s,
+            progress,
+            active_tab,
+            self.settings_colors_scroll.get().rows,
+        );
         let modal = layout.modal;
         if modal.w <= 0.0 || modal.h <= 0.0 {
             self.flush();
@@ -2347,6 +2746,31 @@ impl Renderer {
                         hovered,
                     );
                 }
+                if let Some(row) = layout.confirm_close {
+                    self.draw_settings_toggle_row(
+                        row,
+                        SETTINGS_CONFIRM_CLOSE_LABEL,
+                        confirm_close,
+                        hovered == SettingsHit::ConfirmCloseToggle,
+                    );
+                }
+            }
+            SettingsTab::Colors => {
+                for (index, (field, row)) in
+                    SETTINGS_COLOR_FIELDS.iter().zip(layout.colors).enumerate()
+                {
+                    if let Some(row) = row {
+                        let input = (color_editing == Some(*field)).then_some(color_input);
+                        self.draw_settings_color_row(
+                            row,
+                            *field,
+                            &colors.hex[index],
+                            colors.swatch[index],
+                            input,
+                            hovered,
+                        );
+                    }
+                }
             }
             SettingsTab::Help => {
                 for (row, entry) in layout.help.iter().zip(SETTINGS_HELP_ENTRIES.iter()) {
@@ -2438,6 +2862,127 @@ impl Renderer {
             self.palette.fg,
             0.78,
         );
+    }
+
+    fn draw_settings_color_row(
+        &mut self,
+        row: SettingsColorRowLayout,
+        field: SettingsColorField,
+        hex: &str,
+        swatch: Option<[f32; 4]>,
+        input: Option<&SingleLineInput>,
+        hovered: SettingsHit,
+    ) {
+        let s = self.scale_factor;
+        let normal = [0.224, 0.231, 0.251, 1.0];
+        let hover = self.palette.accent_with_alpha(0.55);
+        let border = [0.306, 0.319, 0.341, 1.0];
+        let radius = (5.0 * s).round().max(1.0);
+        let field_border = if input.is_some() {
+            self.palette.accent
+        } else if hovered == SettingsHit::ColorField(field) {
+            hover
+        } else {
+            border
+        };
+        self.push_rounded_rect(
+            row.field.x - 1.0,
+            row.field.y - 1.0,
+            row.field.w + 2.0,
+            row.field.h + 2.0,
+            radius,
+            field_border,
+        );
+        self.push_rounded_rect(
+            row.field.x,
+            row.field.y,
+            row.field.w,
+            row.field.h,
+            radius,
+            [0.12, 0.13, 0.16, 1.0],
+        );
+        // An unset bold foreground has no colour; its swatch shows the border tone.
+        self.push_rounded_rect(
+            row.swatch.x,
+            row.swatch.y,
+            row.swatch.w,
+            row.swatch.h,
+            radius,
+            swatch.unwrap_or(border),
+        );
+        self.push_rounded_rect(
+            row.reset.x,
+            row.reset.y,
+            row.reset.w,
+            row.reset.h,
+            radius,
+            if hovered == SettingsHit::ColorReset(field) {
+                hover
+            } else {
+                normal
+            },
+        );
+        self.draw_ui_text_clipped(
+            settings_color_label(field),
+            row.label.x,
+            row.label_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        self.draw_ui_text_clipped(
+            SETTINGS_RESET_LABEL,
+            (row.reset.x + 9.0 * s).round(),
+            (row.reset.x + row.reset.w - 7.0 * s).round(),
+            row.label.baseline_y,
+            self.palette.fg,
+            0.78,
+        );
+
+        let text_x = (row.field.x + 10.0 * s).round();
+        let text_max_x = (row.field.x + row.field.w - 8.0 * s).round();
+        let Some(input) = input else {
+            self.draw_ui_text_clipped(
+                hex,
+                text_x,
+                text_max_x,
+                row.label.baseline_y,
+                self.palette.fg,
+                0.90,
+            );
+            return;
+        };
+        // Short hex drafts fit the field, so the editor draws without a scroll offset.
+        let (cursor_px, _) = self.one_line_text_metrics(&input.text, input.cursor, 0.90);
+        let selection_y = (row.field.y + 5.0 * s).round();
+        let selection_h = (row.field.h - 10.0 * s).round().max(1.0);
+        if let Some((selection_start, selection_end)) = self.one_line_selection_px(input, 0.90) {
+            self.push_rounded_rect(
+                (text_x + selection_start).round(),
+                selection_y,
+                (selection_end - selection_start).round().max(1.0),
+                selection_h,
+                0.0,
+                self.palette.accent_with_alpha(0.75),
+            );
+        }
+        self.draw_ui_text_clipped(
+            &input.text,
+            text_x,
+            text_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        if input.selection().is_none() {
+            self.push_rect(
+                (text_x + cursor_px).round(),
+                selection_y,
+                (1.0 * s).round().max(1.0),
+                selection_h,
+                self.palette.fg,
+            );
+        }
     }
 
     fn draw_settings_background_row(
@@ -2549,6 +3094,125 @@ impl Renderer {
         self.clear_clip();
     }
 
+    fn draw_settings_toggle_row(
+        &mut self,
+        row: SettingsToggleRowLayout,
+        label: &str,
+        enabled: bool,
+        hovered: bool,
+    ) {
+        let s = self.scale_factor;
+        let fill = if hovered {
+            self.palette.accent_with_alpha(0.55)
+        } else {
+            [0.224, 0.231, 0.251, 1.0]
+        };
+        self.push_rounded_rect(
+            row.toggle.x,
+            row.toggle.y,
+            row.toggle.w,
+            row.toggle.h,
+            (5.0 * s).round().max(1.0),
+            fill,
+        );
+        self.draw_ui_text_clipped(
+            label,
+            row.label.x,
+            row.label_max_x,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+        let value = if enabled { "Вкл" } else { "Выкл" };
+        let value_width = self.terminal_ui_text_width(value, 0.90);
+        let value_x = centered_settings_value_x(
+            row.toggle.x,
+            row.toggle.x + row.toggle.w,
+            value_width,
+        );
+        self.draw_ui_text_clipped(
+            value,
+            value_x,
+            row.toggle.x + row.toggle.w,
+            row.label.baseline_y,
+            self.palette.fg,
+            0.90,
+        );
+    }
+
+    /// Draws the close confirmation over the whole window. Its text is cached by the
+    /// caller when the dialog opens, so this only lays out and pushes geometry.
+    fn draw_close_confirm(&mut self, view: CloseConfirmView<'_>) {
+        let s = self.scale_factor;
+        let line_count = view.rows.len() + usize::from(view.more.is_some());
+        let layout = close_confirm_layout(self.width, self.height, s, line_count);
+        let panel = layout.panel;
+        if panel.w <= 0.0 || panel.h <= 0.0 {
+            return;
+        }
+        self.push_rect(0.0, 0.0, self.width, self.height, [0.0, 0.0, 0.0, 0.45]);
+        let radius = (10.0 * s).round().max(1.0);
+        self.push_rounded_rect(
+            panel.x - 1.0,
+            panel.y - 1.0,
+            panel.w + 2.0,
+            panel.h + 2.0,
+            radius,
+            [0.224, 0.231, 0.251, 1.0],
+        );
+        self.push_rounded_rect(panel.x, panel.y, panel.w, panel.h, radius, [0.15, 0.16, 0.20, 1.0]);
+        let button_radius = (5.0 * s).round().max(1.0);
+        let normal = [0.224, 0.231, 0.251, 1.0];
+        let accent = self.palette.accent_with_alpha(0.55);
+        for (rect, fill) in [(layout.cancel, normal), (layout.confirm, accent)] {
+            self.push_rounded_rect(rect.x, rect.y, rect.w, rect.h, button_radius, fill);
+        }
+
+        self.draw_ui_text_clipped(
+            view.title,
+            layout.text_x,
+            layout.text_max_x,
+            layout.title_baseline_y,
+            self.palette.fg,
+            1.1,
+        );
+        for (index, row) in view.rows.iter().enumerate() {
+            let baseline = layout.rows_baseline_y + index as f32 * layout.row_step;
+            self.draw_ui_text_clipped(
+                row,
+                layout.text_x,
+                layout.text_max_x,
+                baseline,
+                self.palette.fg,
+                0.90,
+            );
+        }
+        if let Some(more) = view.more {
+            let baseline = layout.rows_baseline_y + view.rows.len() as f32 * layout.row_step;
+            self.draw_ui_text_clipped(
+                more,
+                layout.text_x,
+                layout.text_max_x,
+                baseline,
+                self.palette.fg,
+                0.90,
+            );
+        }
+        for (rect, label) in [(layout.cancel, "Отмена"), (layout.confirm, "Закрыть")] {
+            let label_width = self.terminal_ui_text_width(label, 0.90);
+            let label_x = centered_settings_value_x(rect.x, rect.x + rect.w, label_width);
+            self.draw_ui_text_clipped(
+                label,
+                label_x,
+                rect.x + rect.w,
+                (rect.y + rect.h * 0.70).round(),
+                self.palette.fg,
+                0.90,
+            );
+        }
+        self.flush();
+    }
+
     fn draw_settings_help_row(&mut self, row: SettingsHelpRowLayout, entry: SettingsHelpEntry) {
         let s = self.scale_factor;
         let radius = (4.0 * s).round().max(1.0);
@@ -2599,8 +3263,47 @@ impl Renderer {
             self.scale_factor,
             progress,
             active_tab,
+            self.settings_colors_scroll.get().rows,
         )
         .hit_test(x, y)
+    }
+
+    /// Scrolls the Colors tab by wheel `delta` in whole rows; returns whether the
+    /// shown rows changed. The offset is clamped against the current window size.
+    pub(crate) fn scroll_settings_colors(
+        &self,
+        progress: f32,
+        delta: crate::input_types::ScrollDelta,
+    ) -> bool {
+        let state = self.settings_colors_scroll.get();
+        let max = settings_layout(
+            self.width,
+            self.height,
+            self.scale_factor,
+            progress,
+            SettingsTab::Colors,
+            state.rows,
+        )
+        .colors_scroll_max;
+        let delta_rows = match delta {
+            crate::input_types::ScrollDelta::Line { y, .. } => -y,
+            crate::input_types::ScrollDelta::Pixel { y, .. } => {
+                -y / settings_color_row_step(self.scale_factor)
+            }
+        };
+        let next = state.step(delta_rows, max);
+        self.settings_colors_scroll.set(next);
+        next.rows != state.rows.min(max)
+    }
+
+    /// Hit-tests the close confirmation. `line_count` must match the rows it was drawn with.
+    pub(crate) fn close_confirm_hit_test(
+        &self,
+        line_count: usize,
+        x: f32,
+        y: f32,
+    ) -> CloseConfirmHit {
+        close_confirm_layout(self.width, self.height, self.scale_factor, line_count).hit_test(x, y)
     }
 
     pub(crate) fn settings_background_cursor_from_x(
@@ -2617,6 +3320,7 @@ impl Renderer {
             self.scale_factor,
             progress,
             active_tab,
+            0,
         );
         let row = layout.background?;
         let viewport = settings_background_text_viewport(row, self.scale_factor);
@@ -2705,6 +3409,11 @@ impl Renderer {
         settings_scroll_value: &str,
         settings_background_input: &mut SingleLineInput,
         settings_background_editing: bool,
+        settings_confirm_close: bool,
+        settings_colors: &SettingsColorView,
+        settings_color_editing: Option<SettingsColorField>,
+        settings_color_input: &SingleLineInput,
+        close_confirm: Option<CloseConfirmView<'_>>,
     ) -> TerminalUiLayout {
         self.frame_flushes = 0;
         self.frame_vertices = 0;
@@ -2742,7 +3451,14 @@ impl Renderer {
             settings_scroll_value,
             settings_background_input,
             settings_background_editing,
+            settings_confirm_close,
+            settings_colors,
+            settings_color_editing,
+            settings_color_input,
         );
+        if let Some(view) = close_confirm {
+            self.draw_close_confirm(view);
+        }
         if show_fps {
             self.draw_fps_overlay(layout.body);
         }
@@ -2838,7 +3554,7 @@ impl Renderer {
                                 } else {
                                     cell_index
                                 };
-                                let (_, mut bg) = terminal_cell_render_colors(cell, palette);
+                                let (_, mut bg) = terminal_cell_render_colors(cell, &palette);
                                 if let Some((sx, sy, ex, ey)) = grid.selection() {
                                     let (start_x, start_y, end_x, end_y) =
                                         normalized_selection_bounds(sx, sy, ex, ey);
@@ -2891,7 +3607,7 @@ impl Renderer {
                                     cell_index,
                                 );
                                 let Some(decoration) =
-                                    terminal_cell_decoration(cell, palette, link_underline)
+                                    terminal_cell_decoration(cell, &palette, link_underline)
                                 else {
                                     continue;
                                 };
@@ -2929,7 +3645,7 @@ impl Renderer {
                                 else {
                                     continue;
                                 };
-                                let (fg, _) = terminal_cell_render_colors(cell, palette);
+                                let (fg, _) = terminal_cell_render_colors(cell, &palette);
                                 let face = terminal_cell_face(cell);
                                 if let Some(glyph) =
                                     self.terminal_glyph(cell.ch(), cell.presentation(), face)
@@ -3084,7 +3800,7 @@ mod tests {
                 name: "ronsole",
                 version: "test",
             },
-            palette: terminal_palette(crate::config::DEFAULT_TERMINAL_BACKGROUND),
+            palette: terminal_palette(&crate::config::AppConfig::default()),
         })
     }
 
@@ -3101,8 +3817,11 @@ mod tests {
 
     #[test]
     fn terminal_palette_from_config() {
-        let background = crate::config::RgbColor::new(0x12, 0xAB, 0xEF);
-        let palette = terminal_palette(background);
+        let config = crate::config::AppConfig {
+            terminal_background: crate::config::RgbColor::new(0x12, 0xAB, 0xEF),
+            ..crate::config::AppConfig::default()
+        };
+        let palette = terminal_palette(&config);
         let grey = Rgb {
             r: 230,
             g: 230,
@@ -3127,7 +3846,15 @@ mod tests {
                 b: 255,
             }
         );
-        assert_eq!(terminal_palette_channel(0.70), 179);
+        // Configured colours replace the defaults in the built TermPalette.
+        let mut config = crate::config::AppConfig::default();
+        config.terminal_palette[1] = crate::config::RgbColor::new(0x12, 0x34, 0x56);
+        config.terminal_bold_foreground = Some(crate::config::RgbColor::new(0xAB, 0xCD, 0xEF));
+        let built = terminal_palette(&config);
+        assert_eq!(built.ansi[1], Rgb { r: 0x12, g: 0x34, b: 0x56 });
+        assert_eq!(built.bold_foreground, Some(Rgb { r: 0xAB, g: 0xCD, b: 0xEF }));
+        assert_eq!(built.foreground, Rgb { r: 0xE6, g: 0xE6, b: 0xE6 });
+        assert_eq!(built.cursor, built.foreground);
     }
 
     fn test_glyph(width: f32, height: f32, mode: f32) -> GlyphInfo {
@@ -3430,9 +4157,12 @@ mod tests {
             ronsole_term::CellFlags::INVERSE,
             UnderlineStyle::None,
         );
-        let (default_fg, default_bg) = terminal_cell_render_colors(&default_cell, palette);
+        let (default_fg, default_bg) = terminal_cell_render_colors(&default_cell, &palette);
         assert_eq!(default_fg, palette.bg);
-        assert_eq!(default_bg, Some(terminal_color_rgba(TerminalColor::default_foreground())));
+        assert_eq!(
+            default_bg,
+            Some(terminal_color_rgba(&palette, TerminalColor::default_foreground()))
+        );
 
         let explicit = Cell::new_for_test(
             'X',
@@ -3441,17 +4171,21 @@ mod tests {
             ronsole_term::CellFlags::INVERSE,
             UnderlineStyle::None,
         );
-        let (fg, bg) = terminal_cell_render_colors(&explicit, palette);
-        assert_eq!(fg, terminal_color_rgba(TerminalColor::indexed(4)));
-        assert_eq!(bg, Some(terminal_color_rgba(TerminalColor::indexed(1))));
-        assert_ne!(default_fg, terminal_color_rgba(TerminalColor::indexed(0)));
+        let (fg, bg) = terminal_cell_render_colors(&explicit, &palette);
+        assert_eq!(fg, terminal_color_rgba(&palette, TerminalColor::indexed(4)));
+        assert_eq!(bg, Some(terminal_color_rgba(&palette, TerminalColor::indexed(1))));
+        assert_ne!(default_fg, terminal_color_rgba(&palette, TerminalColor::indexed(0)));
     }
 
     #[test]
     fn xterm_palette_mapping_covers_cube_and_grayscale() {
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(16)), [0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(231)), [1.0, 1.0, 1.0, 1.0]);
-        let gray = terminal_color_rgba(TerminalColor::indexed(232));
+        let palette = TerminalPalette::new(crate::config::DEFAULT_TERMINAL_BACKGROUND, [0.0; 4]);
+        assert_eq!(terminal_color_rgba(&palette, TerminalColor::indexed(16)), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            terminal_color_rgba(&palette, TerminalColor::indexed(231)),
+            [1.0, 1.0, 1.0, 1.0]
+        );
+        let gray = terminal_color_rgba(&palette, TerminalColor::indexed(232));
         assert!((gray[0] - 8.0 / 255.0).abs() < f32::EPSILON);
         assert_eq!(gray[0], gray[1]);
         assert_eq!(gray[1], gray[2]);
@@ -3462,7 +4196,11 @@ mod tests {
         let cell = Cell::default();
         assert!(cell.bg().is_default_background());
         assert!(!TerminalColor::indexed(0).is_default_background());
-        assert_eq!(terminal_color_rgba(TerminalColor::indexed(0)), ANSI_16_COLORS[0]);
+        let palette = TerminalPalette::new(crate::config::DEFAULT_TERMINAL_BACKGROUND, [0.0; 4]);
+        assert_eq!(
+            terminal_color_rgba(&palette, TerminalColor::indexed(0)),
+            crate::config::DEFAULT_TERMINAL_PALETTE[0].to_rgba()
+        );
     }
 
     #[test]
@@ -3478,13 +4216,53 @@ mod tests {
             ronsole_term::CellFlags::DIM,
             UnderlineStyle::None,
         );
-        let (fg, bg) = terminal_cell_render_colors(&cell, palette);
-        let source = terminal_color_rgba(TerminalColor::rgb(150, 120, 90));
+        let (fg, bg) = terminal_cell_render_colors(&cell, &palette);
+        let source = terminal_color_rgba(&palette, TerminalColor::rgb(150, 120, 90));
         assert!((fg[0] - source[0] * 0.66).abs() < 0.0001);
         assert!((fg[1] - source[1] * 0.66).abs() < 0.0001);
         assert!((fg[2] - source[2] * 0.66).abs() < 0.0001);
         assert_eq!(fg[3], source[3]);
-        assert_eq!(bg, Some(terminal_color_rgba(TerminalColor::indexed(4))));
+        assert_eq!(bg, Some(terminal_color_rgba(&palette, TerminalColor::indexed(4))));
+    }
+
+    #[test]
+    fn bold_colour_replaces_default_foreground_only_outside_inverse() {
+        let mut palette = decoration_test_palette();
+        let bold = crate::config::RgbColor::new(0xFA, 0xFB, 0xFC).to_rgba();
+        palette.term_bold_fg = Some(bold);
+
+        let bold_default = Cell::new_for_test(
+            'x',
+            TerminalColor::default_foreground(),
+            TerminalColor::default_background(),
+            CellFlags::BOLD,
+            UnderlineStyle::None,
+        );
+        let (fg, _) = terminal_cell_render_colors(&bold_default, &palette);
+        assert_eq!(fg, bold);
+
+        // Inverse takes the foreground from the cell background, so the bold colour stays out.
+        let inverse_bold = Cell::new_for_test(
+            'x',
+            TerminalColor::default_foreground(),
+            TerminalColor::indexed(4),
+            CellFlags::BOLD | CellFlags::INVERSE,
+            UnderlineStyle::None,
+        );
+        let (fg, bg) = terminal_cell_render_colors(&inverse_bold, &palette);
+        assert_eq!(fg, terminal_color_rgba(&palette, TerminalColor::indexed(4)));
+        assert_eq!(bg, Some(palette.term_fg));
+
+        // An explicit indexed foreground is not the default, so bold keeps it.
+        let explicit_bold = Cell::new_for_test(
+            'x',
+            TerminalColor::indexed(1),
+            TerminalColor::default_background(),
+            CellFlags::BOLD,
+            UnderlineStyle::None,
+        );
+        let (fg, _) = terminal_cell_render_colors(&explicit_bold, &palette);
+        assert_eq!(fg, palette.ansi[1]);
     }
 
     /// Sink that drops every reply; the decoration tests only read grid contents.
@@ -3503,6 +4281,9 @@ mod tests {
             fg: [1.0; 4],
             minimap_bg: [0.0; 4],
             accent: [0.0; 4],
+            term_fg: [1.0; 4],
+            term_bold_fg: None,
+            ansi: crate::config::DEFAULT_TERMINAL_PALETTE.map(|c| c.to_rgba()),
         }
     }
 
@@ -3714,11 +4495,11 @@ mod tests {
             ronsole_term::CellFlags::INVERSE,
             UnderlineStyle::Single,
         );
-        let decoration = terminal_cell_decoration(&inverse, palette, false).expect("underlined");
-        let expected = terminal_color_rgba(TerminalColor::indexed(4));
+        let decoration = terminal_cell_decoration(&inverse, &palette, false).expect("underlined");
+        let expected = terminal_color_rgba(&palette, TerminalColor::indexed(4));
         assert_eq!(decoration.underline_color, expected);
         assert_eq!(decoration.strike_color, expected);
-        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&inverse, palette).0);
+        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&inverse, &palette).0);
 
         // DIM scales the rendered foreground RGB by 0.66, as in dim_affects_only_effective_foreground_rgb.
         let dim = Cell::new_for_test(
@@ -3728,14 +4509,14 @@ mod tests {
             ronsole_term::CellFlags::DIM,
             UnderlineStyle::Single,
         );
-        let decoration = terminal_cell_decoration(&dim, palette, false).expect("underlined");
-        let source = terminal_color_rgba(TerminalColor::rgb(150, 120, 90));
+        let decoration = terminal_cell_decoration(&dim, &palette, false).expect("underlined");
+        let source = terminal_color_rgba(&palette, TerminalColor::rgb(150, 120, 90));
         let expected = [source[0] * 0.66, source[1] * 0.66, source[2] * 0.66, source[3]];
         for channel in 0..4 {
             assert!((decoration.underline_color[channel] - expected[channel]).abs() < 0.0001);
         }
         assert_eq!(decoration.strike_color, decoration.underline_color);
-        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&dim, palette).0);
+        assert_eq!(decoration.underline_color, terminal_cell_render_colors(&dim, &palette).0);
     }
 
     #[test]
@@ -3748,7 +4529,7 @@ mod tests {
         );
         let cell = &term.row(0).expect("row 0 exists")[0];
         let decoration =
-            terminal_cell_decoration(cell, decoration_test_palette(), false).expect("underlined");
+            terminal_cell_decoration(cell, &decoration_test_palette(),false).expect("underlined");
         assert_eq!(decoration.underline, UnderlineStyle::Single);
         // SGR 58 red wins for the underline; SGR 38 green stays on the strikethrough colour.
         assert_eq!(decoration.underline_color[0], 1.0);
@@ -3762,7 +4543,7 @@ mod tests {
         let palette = decoration_test_palette();
         for flags in [ronsole_term::CellFlags::CONCEAL, ronsole_term::CellFlags::HOST_HIDDEN] {
             let cell = decoration_test_cell(flags, UnderlineStyle::Single);
-            assert_eq!(terminal_cell_decoration(&cell, palette, true), None);
+            assert_eq!(terminal_cell_decoration(&cell, &palette, true), None);
             assert_eq!(terminal_glyph_cell_geometry(0.0, 0, &cell, 8.0), None);
         }
     }
@@ -3823,19 +4604,19 @@ mod tests {
         assert_eq!(hovered_covered_cols(hovered, 8, 0, 8), Vec::<usize>::new());
 
         let plain = decoration_test_cell(ronsole_term::CellFlags::empty(), UnderlineStyle::None);
-        let decoration = terminal_cell_decoration(&plain, decoration_test_palette(), true)
+        let decoration = terminal_cell_decoration(&plain, &decoration_test_palette(),true)
             .expect("hovered link adds an underline");
         assert_eq!(decoration.underline, UnderlineStyle::Single);
 
         // A cell with its own curly underline and strikethrough inside the link range:
         // the link replaces the underline with Single and keeps the strikethrough.
         let curly = decoration_test_cell(ronsole_term::CellFlags::STRIKE, UnderlineStyle::Curly);
-        let decoration = terminal_cell_decoration(&curly, decoration_test_palette(), true)
+        let decoration = terminal_cell_decoration(&curly, &decoration_test_palette(),true)
             .expect("hovered link replaces the cell underline");
         assert_eq!(decoration.underline, UnderlineStyle::Single);
         assert!(decoration.strike);
         // Without a matching generation the cell keeps its own Curly underline.
-        let decoration = terminal_cell_decoration(&curly, decoration_test_palette(), false)
+        let decoration = terminal_cell_decoration(&curly, &decoration_test_palette(),false)
             .expect("cell keeps its own decoration outside the hovered link");
         assert_eq!(decoration.underline, UnderlineStyle::Curly);
         assert!(decoration.strike);
@@ -4321,6 +5102,37 @@ mod tests {
     }
 
     #[test]
+    fn close_confirm_hit_test_maps_buttons_outside_and_empty_panel_space() {
+        let layout = close_confirm_layout(1100.0, 720.0, 1.0, 2);
+        let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        let (x, y) = center(layout.confirm);
+        assert_eq!(layout.hit_test(x, y), CloseConfirmHit::Confirm);
+        let (x, y) = center(layout.cancel);
+        assert_eq!(layout.hit_test(x, y), CloseConfirmHit::Cancel);
+        assert_eq!(
+            layout.hit_test(layout.panel.x + 1.0, layout.panel.y + 1.0),
+            CloseConfirmHit::None
+        );
+        assert_eq!(
+            layout.hit_test(layout.panel.x - 5.0, layout.panel.y - 5.0),
+            CloseConfirmHit::Outside
+        );
+    }
+
+    #[test]
+    fn confirm_close_toggle_row_hit_tests_its_drawn_control() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
+        let toggle = layout
+            .confirm_close
+            .expect("toggle row must fit the General tab at 1100x720")
+            .toggle;
+        assert_eq!(
+            layout.hit_test(toggle.x + toggle.w * 0.5, toggle.y + toggle.h * 0.5),
+            SettingsHit::ConfirmCloseToggle
+        );
+    }
+
+    #[test]
     fn settings_modal_fits_tiny_and_large_windows_at_fractional_scale() {
         for (width, height) in [
             (0.0, 0.0),
@@ -4369,6 +5181,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let inner = layout
                 .inner
@@ -4388,7 +5201,7 @@ mod tests {
             }
         }
 
-        let tiny = settings_layout(100.0, 80.0, 1.3333333, 1.0, SettingsTab::General);
+        let tiny = settings_layout(100.0, 80.0, 1.3333333, 1.0, SettingsTab::General, 0);
         for rect in tiny.tabs.into_iter().flatten() {
             for value in [rect.x, rect.y, rect.w, rect.h] {
                 assert!(value.is_finite());
@@ -4398,10 +5211,10 @@ mod tests {
 
     #[test]
     fn settings_tab_hit_testing_uses_the_drawn_sidebar_rects() {
-        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
         let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
         let general = layout.tabs[0].expect("general tab should fit");
-        let help = layout.tabs[1].expect("help tab should fit");
+        let help = layout.tabs[2].expect("help tab should fit");
         let (x, y) = center(general);
         assert_eq!(
             layout.hit_test(x, y),
@@ -4417,8 +5230,144 @@ mod tests {
     }
 
     #[test]
+    fn settings_colors_tab_hit_tests_every_field_and_reset_and_its_tab_strip_entry() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Colors, 0);
+        let tab = layout.tabs[1].expect("Colors tab sits second in the strip");
+        assert_eq!(
+            layout.hit_test(tab.x + tab.w * 0.5, tab.y + tab.h * 0.5),
+            SettingsHit::Tab(SettingsTab::Colors)
+        );
+        let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        for (field, row) in SETTINGS_COLOR_FIELDS.iter().zip(layout.colors) {
+            let row = row.expect("every colour row fits a 1100x720 window");
+            let (x, y) = center(row.field);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorField(*field));
+            let (x, y) = center(row.reset);
+            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorReset(*field));
+        }
+    }
+
+    #[test]
+    fn settings_colors_rows_stay_inside_the_body_at_fractional_scale() {
+        let scale = 1.3333333;
+        let layout = settings_layout(
+            1100.0 * scale,
+            720.0 * scale,
+            scale,
+            1.0,
+            SettingsTab::Colors,
+            0,
+        );
+        let body = layout.content_body.expect("body exists at 1.33x");
+        for row in layout.colors {
+            let row = row.expect("colour rows fit at 1.33x");
+            assert!(row.field.y >= body.y && row.field.y + row.field.h <= body.y + body.h);
+            assert!(row.swatch.x >= body.x && row.reset.x + row.reset.w <= body.x + body.w);
+        }
+    }
+
+    #[test]
+    fn settings_colors_wide_window_keeps_full_two_column_rows_without_scroll() {
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Colors, 0);
+        assert_eq!(layout.colors_scroll_max, 0);
+        let rows = layout.colors.map(|row| row.expect("every row fits 1100x720"));
+        for row in rows {
+            assert_eq!(row.field.w, 128.0);
+        }
+        // Palette 0 and 1 share a row: normal on the left, bright on the right.
+        assert_eq!(rows[2].field.y, rows[3].field.y);
+        assert!(rows[2].reset.x + rows[2].reset.w < rows[3].label.x);
+        // Bright white (palette 15) closes the last of the ten rows.
+        assert_eq!(rows[17].field.y, rows[0].field.y + 44.0 * 9.0);
+    }
+
+    #[test]
+    fn settings_colors_every_field_is_reachable_operable_and_disjoint_in_small_windows() {
+        let row_box = |row: SettingsColorRowLayout| Rect {
+            x: row.label.x,
+            y: row.field.y,
+            w: row.reset.x + row.reset.w - row.label.x,
+            h: row.field.h,
+        };
+        let overlaps = |a: Rect, b: Rect| {
+            a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+        };
+        for (base_w, base_h) in [(800.0, 600.0), (1000.0, 720.0)] {
+            for scale in [1.0_f32, 1.5] {
+                // Sizes are logical; physical 800x600 at 1.5x is too small even for
+                // the General rows and is covered by the finite-layout test instead.
+                {
+                    let (width, height) = (base_w * scale, base_h * scale);
+                    let at = |offset| {
+                        settings_layout(width, height, scale, 1.0, SettingsTab::Colors, offset)
+                    };
+                    let max = at(0).colors_scroll_max;
+                    let mut seen = [false; SETTINGS_COLOR_FIELDS.len()];
+                    for offset in 0..=max {
+                        let layout = at(offset);
+                        let body = layout.content_body.expect("Colors body exists");
+                        let shown = layout
+                            .colors
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, row)| row.map(|row| (index, row)))
+                            .collect::<Vec<_>>();
+                        assert!(!shown.is_empty(), "{width}x{height}@{scale} offset {offset}");
+                        for &(index, row) in &shown {
+                            let field = SETTINGS_COLOR_FIELDS[index];
+                            let bounds = row_box(row);
+                            assert!(bounds.x >= body.x && bounds.x + bounds.w <= body.x + body.w);
+                            assert!(bounds.y >= body.y && bounds.y + bounds.h <= body.y + body.h);
+                            assert!(row.label_max_x > row.label.x);
+                            let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+                            let (x, y) = center(row.field);
+                            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorField(field));
+                            let (x, y) = center(row.reset);
+                            assert_eq!(layout.hit_test(x, y), SettingsHit::ColorReset(field));
+                            seen[index] = true;
+                        }
+                        for (a, &(_, first)) in shown.iter().enumerate() {
+                            for &(_, second) in &shown[a + 1..] {
+                                assert!(!overlaps(row_box(first), row_box(second)));
+                            }
+                        }
+                    }
+                    assert!(seen.iter().all(|seen| *seen), "{width}x{height}@{scale}");
+                    // Offsets beyond the range clamp to the last view instead of emptying it.
+                    assert_eq!(at(max + 5).colors, at(max).colors);
+                }
+            }
+        }
+        // 1000x720 at 1x needs neither scrolling nor a single column.
+        let layout = settings_layout(1000.0, 720.0, 1.0, 1.0, SettingsTab::Colors, 0);
+        assert_eq!(layout.colors_scroll_max, 0);
+        let rows = layout.colors.map(|row| row.expect("every row fits 1000x720"));
+        assert_eq!(rows[2].field.y, rows[3].field.y);
+    }
+
+    #[test]
+    fn settings_colors_scroll_accumulates_fractional_wheel_and_clamps() {
+        let mut state = SettingsColorsScroll::default();
+        for _ in 0..3 {
+            state = state.step(0.25, 4);
+        }
+        assert_eq!(state.rows, 0);
+        state = state.step(0.25, 4);
+        assert_eq!(state.rows, 1);
+        state = state.step(10.0, 4);
+        assert_eq!(state, SettingsColorsScroll { rows: 4, carry: 0.0 });
+        // Pushing up from the top does not bank a remainder.
+        let top = SettingsColorsScroll::default().step(-3.5, 4).step(0.5, 4);
+        assert_eq!(top, SettingsColorsScroll { rows: 0, carry: 0.5 });
+        // A stale offset from a larger window clamps to the new range.
+        let stale = SettingsColorsScroll { rows: 9, carry: 0.0 }.step(-1.0, 4);
+        assert_eq!(stale.rows, 3);
+        assert_eq!(SettingsColorsScroll::default().step(f32::NAN, 4).rows, 0);
+    }
+
+    #[test]
     fn settings_hit_test_distinguishes_empty_modal_space_from_outside() {
-        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
         let modal = layout.modal;
         assert_eq!(
             layout.hit_test(modal.x + 4.0, modal.y + modal.h - 4.0),
@@ -4451,6 +5400,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let row = layout.font.expect("font row should fit");
             let region_center = (row.value.x + row.value_max_x) * 0.5;
@@ -4478,6 +5428,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let row = layout.background.expect("background row should fit");
             let viewport = settings_background_text_viewport(row, scale);
@@ -4501,6 +5452,7 @@ mod tests {
                 scale,
                 1.0,
                 SettingsTab::General,
+                0,
             );
             let clip = layout
                 .content_body
@@ -4553,8 +5505,8 @@ mod tests {
 
     #[test]
     fn help_tab_has_no_hidden_general_control_hitboxes() {
-        let general = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
-        let help = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Help);
+        let general = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
+        let help = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::Help, 0);
         assert!(help.font.is_none());
         assert!(help.scroll.is_none());
         assert!(help.background.is_none());
@@ -4568,7 +5520,7 @@ mod tests {
     fn help_keycaps_are_bounded_and_leave_a_separate_description_column() {
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
             let layout =
-                settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, SettingsTab::Help);
+                settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, SettingsTab::Help, 0);
             let body = layout.content_body.expect("help content should fit");
             let rows = layout.help.into_iter().flatten().collect::<Vec<_>>();
             assert_eq!(rows.len(), SETTINGS_HELP_ENTRIES.len());
@@ -4602,7 +5554,7 @@ mod tests {
         };
         for scale in [1.0, 1.25, 1.3333333, 1.5] {
             for tab in [SettingsTab::General, SettingsTab::Help] {
-                let layout = settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, tab);
+                let layout = settings_layout(1100.0 * scale, 720.0 * scale, scale, 1.0, tab, 0);
                 let inner = layout.inner.expect("inner panel should fit");
                 for pill in layout.tabs.into_iter().flatten() {
                     assert!(contains(inner, pill));
@@ -4652,6 +5604,10 @@ mod tests {
                     title: "Основные",
                 },
                 SettingsTabSpec {
+                    tab: SettingsTab::Colors,
+                    title: "Цвета",
+                },
+                SettingsTabSpec {
                     tab: SettingsTab::Help,
                     title: "Помощь",
                 },
@@ -4694,9 +5650,10 @@ mod tests {
 
     #[test]
     fn settings_layout_stays_finite_when_window_is_too_small_for_controls() {
-        for (width, height) in [(0.0, 0.0), (10.0, 10.0), (40.0, 40.0), (100.0, 80.0)] {
-            for tab in [SettingsTab::General, SettingsTab::Help] {
-                let layout = settings_layout(width, height, 1.3333333, 1.0, tab);
+        let sizes = [(0.0, 0.0), (10.0, 10.0), (40.0, 40.0), (100.0, 80.0), (800.0, 600.0)];
+        for (width, height) in sizes {
+            for tab in [SettingsTab::General, SettingsTab::Colors, SettingsTab::Help] {
+                let layout = settings_layout(width, height, 1.3333333, 1.0, tab, usize::MAX);
                 for value in [
                     layout.modal.x,
                     layout.modal.y,
@@ -4725,8 +5682,8 @@ mod tests {
 
     #[test]
     fn settings_hit_test_tracks_animated_modal_position() {
-        let mid = settings_layout(1100.0, 720.0, 1.0, 0.5, SettingsTab::General);
-        let final_layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General);
+        let mid = settings_layout(1100.0, 720.0, 1.0, 0.5, SettingsTab::General, 0);
+        let final_layout = settings_layout(1100.0, 720.0, 1.0, 1.0, SettingsTab::General, 0);
         let mid_minus = mid.font.expect("mid-animation controls should fit").minus;
         let final_minus = final_layout.font.expect("final controls should fit").minus;
         let mid_center = (
