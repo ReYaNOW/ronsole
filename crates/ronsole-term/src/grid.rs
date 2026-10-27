@@ -1180,6 +1180,17 @@ impl Term {
         );
     }
 
+    /// Used width of row `index` (indexed as in [`Term::row_soft_wrapped`]).
+    fn row_used_cols(&self, index: usize) -> usize {
+        let scrollback_len = self.scrollback_len();
+        let meta = if index < scrollback_len {
+            self.scrollback_meta.get(index)
+        } else {
+            self.line_meta.get(index - scrollback_len)
+        };
+        meta.map_or(self.cols, |meta| meta.used_cols)
+    }
+
     pub fn selection_text(&self) -> String {
         if let Some((sx, sy, ex, ey)) = self.selection {
             let mut res = String::new();
@@ -1195,7 +1206,13 @@ impl Term {
                 } else {
                     &self.lines[y - self.scrollback.len()]
                 };
-                let logical_len = row.len().min(self.cols);
+                let row_start = res.len();
+                let mut logical_len = row.len().min(self.cols);
+                if self.row_soft_wrapped(y) {
+                    // Cells past the used width of a wrapped row are padding left by a
+                    // wide character that moved to the next row, not text.
+                    logical_len = logical_len.min(self.row_used_cols(y));
+                }
                 if logical_len > 0 {
                     let line_start = if y == start_y { start_x } else { 0 };
                     let line_end = if y == end_y {
@@ -1209,7 +1226,12 @@ impl Term {
                         }
                     }
                 }
-                if y != end_y {
+                // A soft-wrapped row continues on the next row, so it has no line break
+                // and its trailing blanks are text. A logical line ends with a break and
+                // its trailing blanks are padding.
+                if y != end_y && !self.row_soft_wrapped(y) {
+                    let kept = res[row_start..].trim_end().len();
+                    res.truncate(row_start + kept);
                     res.push('\n');
                 }
             }

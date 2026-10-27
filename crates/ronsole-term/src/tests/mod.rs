@@ -10,6 +10,7 @@ mod sgr;
 mod support;
 mod title_stack;
 mod sync;
+mod wrap_copy;
 
 use crate::term::Term;
 use support::{RecordingSink, feed, test_config};
