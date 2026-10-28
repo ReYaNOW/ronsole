@@ -107,6 +107,32 @@ fn ris_and_decstr_reset_kitty() {
     assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?u"), b"\x1b[?0u");
 }
 
+/// RIS from the alternate screen leaves the alternate screen and clears the
+/// kitty flags and stacks of both screens. Each stack holds a stale entry
+/// (main: 3, alternate: 2) that a pop after the reset would expose.
+#[test]
+fn ris_from_alt_screen_resets_kitty_both_stacks() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[>3u\x1b[>4u"), b"");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1049h"), b"");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[>2u\x1b[>5u"), b"");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1bc"), b"");
+    assert!(!term.is_alt_screen(), "RIS must return to the main screen");
+
+    // Main screen: flags 0 and no stale entry to pop.
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?u"), b"\x1b[?0u");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[<u"), b"");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?u"), b"\x1b[?0u");
+
+    // Alternate screen: flags 0 and no stale entry to pop.
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?1049h"), b"");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?u"), b"\x1b[?0u");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[<u"), b"");
+    assert_eq!(reply_to(&mut term, &mut sink, b"\x1b[?u"), b"\x1b[?0u");
+}
+
 #[test]
 fn kitty_query_keeps_pending_wrap() {
     let mut term = Term::new(test_config(10, 3));
