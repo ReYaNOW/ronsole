@@ -2644,25 +2644,34 @@ mod tests {
 
     #[test]
     fn panels_normal_mode_layout_matches_window_body() {
+        // Window literals of the headless fixture: `started_headless` in
+        // src/app/headless_run.rs starts the runtime at (640, 400) with scale 1.0.
+        const WIDTH: f32 = 640.0;
+        const HEIGHT: f32 = 400.0;
+        const SCALE: f32 = 1.0;
         let (mut app, _receiver, _profile, root) =
             crate::app::headless_run::test_support::started_headless_with_test_terminals(
                 "panels-normal",
                 1,
             );
-        let metrics = app.grid_metrics;
-        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
-        app.panels = vec![Panel { terminal: 0, body, header: None, content_hidden: false }];
+        // The test does not set `panels`: on_frame must build the single ordinary-mode panel.
+        assert!(app.panels.is_empty());
+        assert_eq!(app.on_frame(), Ok(true));
 
-        let layouts = render_test_panels(&mut app);
+        let body = terminal_body_rect(WIDTH, HEIGHT, SCALE);
+        assert_eq!(app.panels.len(), 1);
+        assert_eq!(app.panels[0].body, body);
+        assert_eq!(app.panel_layouts.len(), 1);
+        assert_eq!(app.panel_layouts[0].body, app.panels[0].body);
+        assert_eq!(app.interaction.layout.body, app.panels[0].body);
 
         // Expected grid size comes from terminal_grid_size, the window-body formula
         // pinned by terminal_grid_size_matches_current_body_formula in renderer/terminal_ui.rs.
+        let metrics = app.grid_metrics;
         let expected =
-            crate::renderer::terminal_grid_size(body, metrics.char_w, metrics.char_h, metrics.scale);
-        assert_eq!(layouts.len(), 1);
-        assert_eq!(layouts[0].body, body);
-        assert_eq!(layouts[0].cols, expected.cols);
-        assert_eq!(layouts[0].visible_rows, expected.rows);
+            crate::renderer::terminal_grid_size(body, metrics.char_w, metrics.char_h, SCALE);
+        assert_eq!(app.panel_layouts[0].cols, expected.cols);
+        assert_eq!(app.panel_layouts[0].visible_rows, expected.rows);
         let _ = std::fs::remove_dir_all(&root);
     }
 

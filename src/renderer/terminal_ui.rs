@@ -1434,12 +1434,14 @@ fn terminal_dimensions_changed(
 /// Horizontal inset of a grid tile header title, in logical pixels.
 const TILE_TITLE_PAD: f32 = 6.0;
 
-/// Cached header text of one grid tile. `source` and `max_w` are the inputs
-/// `text` was cut from; the cache is recomputed only when either changes.
+/// Cached header text of one grid tile. `source`, `max_w` and `scale` are the inputs
+/// `text` was cut from; the cache is recomputed only when one of them changes. The
+/// advances come from the UI glyphs, whose raster size follows `scale`.
 #[derive(Default)]
 pub(super) struct TileTitleCache {
     source: String,
     max_w: f32,
+    scale: f32,
     text: String,
 }
 
@@ -1481,6 +1483,25 @@ fn ellipsize_to_width(
         out.push(c);
     }
     out.push(ELLIPSIS);
+}
+
+/// Brings `cache.text` up to date with `title`, `max_w` and `scale`. Nothing is
+/// allocated when all three match the cached inputs.
+fn refresh_tile_title(
+    cache: &mut TileTitleCache,
+    title: &str,
+    max_w: f32,
+    scale: f32,
+    advance: impl FnMut(char) -> f32,
+) {
+    if cache.source == title && cache.max_w == max_w && cache.scale == scale {
+        return;
+    }
+    cache.source.clear();
+    cache.source.push_str(title);
+    cache.max_w = max_w;
+    cache.scale = scale;
+    ellipsize_to_width(&cache.source, max_w, advance, &mut cache.text);
 }
 
 /// Resizes `grid` when its size differs from the body geometry and refreshes the
@@ -3526,6 +3547,7 @@ impl Renderer {
         // Taken out of `self` so the title cache and the glyph metrics can be used together.
         let mut titles = std::mem::take(&mut self.tile_titles);
         titles.resize_with(panels.len(), TileTitleCache::default);
+        let mut scratch = std::mem::take(&mut self.tile_title_scratch);
         for (index, panel) in panels.iter().enumerate() {
             let Some(terminal) = terminals.get(panel.terminal) else {
                 panel_layouts.push(TerminalUiLayout::default());
@@ -3542,20 +3564,11 @@ impl Renderer {
                     header.h,
                     [palette.fg[0], palette.fg[1], palette.fg[2], 0.10],
                 );
-                let scratch = &mut self.tile_title_scratch;
                 scratch.clear();
-                terminal.write_display_title(scratch);
-                let cache = &mut titles[index];
-                if cache.source != *scratch || cache.max_w != text_w {
-                    std::mem::swap(&mut cache.source, scratch);
-                    cache.max_w = text_w;
-                    ellipsize_to_width(
-                        &cache.source,
-                        text_w,
-                        |c| self.one_line_text_advance(c, 1.0),
-                        &mut cache.text,
-                    );
-                }
+                terminal.write_display_title(&mut scratch);
+                refresh_tile_title(&mut titles[index], &scratch, text_w, s, |c| {
+                    self.one_line_text_advance(c, 1.0)
+                });
                 let baseline = (header.y + header.h * 0.5 + 5.0 * s).round();
                 let text_x = header.x + pad;
                 self.draw_ui_text_clipped(
@@ -3602,6 +3615,7 @@ impl Renderer {
             }
         }
         self.tile_titles = titles;
+        self.tile_title_scratch = scratch;
         self.draw_terminal_tabs(
             terminals,
             active_terminal,
@@ -3989,6 +4003,24 @@ mod tests {
         assert_eq!(out, "");
         ellipsize_to_width("abcdef", -3.0, one, &mut out);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn tile_title_recomputes_when_scale_changes_with_same_text_and_width() {
+        // Expected values are worked out by hand from the ellipsize_to_width contract
+        // (budget = max_w minus the ellipsis advance), not taken from this code:
+        // scale 1 gives advance 1.0 per char, so budget 3.0 keeps "abc" and then "…";
+        // scale 2 gives advance 2.0 per char, so budget 2.0 keeps only "a" and then "…".
+        let mut cache = TileTitleCache::default();
+        refresh_tile_title(&mut cache, "abcdef", 4.0, 1.0, |_c| 1.0);
+        assert_eq!(cache.text, "abc…");
+        refresh_tile_title(&mut cache, "abcdef", 4.0, 2.0, |_c| 2.0);
+        assert_eq!(cache.text, "a…");
+        // All inputs match: the advance closure must not be called at all.
+        refresh_tile_title(&mut cache, "abcdef", 4.0, 2.0, |_c| -> f32 {
+            panic!("tile title recomputed with unchanged inputs")
+        });
+        assert_eq!(cache.text, "a…");
     }
 
     fn test_term(cols: usize, rows: usize) -> Term {
