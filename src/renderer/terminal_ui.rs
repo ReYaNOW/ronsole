@@ -3643,6 +3643,9 @@ impl Renderer {
             self.push_rect(hint_x, strip.y, right - hint_x, strip.h, palette.bg);
             let color = [palette.fg[0], palette.fg[1], palette.fg[2], 0.72];
             self.draw_ui_text_clipped(hint, hint_x, right, baseline, color, 1.0);
+            // Draw the plate and hint now: vertices left queued until the end of the frame
+            // are drawn under whatever scissor the later passes leave enabled.
+            self.flush();
         }
         self.draw_settings(
             settings_progress,
