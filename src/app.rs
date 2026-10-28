@@ -4273,6 +4273,130 @@ mod tests {
         assert!(app.grid_generation > before);
     }
 
+    /// Ctrl+Shift+S key press, as the window delivers it.
+    fn grid_mode_toggle_key() -> KeyInput {
+        KeyInput {
+            state: KeyState::Pressed,
+            physical_key: PhysicalKey::Code(KeyCode::KeyS),
+            keycode: 0,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        }
+    }
+
+    #[test]
+    fn grid_mode_toggle_ignored_with_settings_or_close_dialog_open() {
+        // Settings: the shortcut is not in the settings-allowed set, so on_key drops it.
+        let mut app = grid_mode_app(&[true, true]);
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        app.settings_open = true;
+        let generation = app.grid_generation;
+        assert!(!app.on_key(grid_mode_toggle_key()));
+        assert!(!app.grid_open());
+        assert_eq!(app.grid_hint, None);
+        assert_eq!(app.grid_generation, generation);
+
+        // Close dialog: every key except Enter and Escape is swallowed before shortcuts.
+        let mut app = grid_mode_app(&[true, true]);
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        let generation = app.grid_generation;
+        assert!(!app.on_key(grid_mode_toggle_key()));
+        assert!(!app.grid_open());
+        assert_eq!(app.grid_hint, None);
+        assert_eq!(app.grid_generation, generation);
+    }
+
+    #[test]
+    fn grid_mode_focus_moves_without_exit_when_focused_tile_loses_claude() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        for terminal in &app.terminals {
+            enable_focus_reporting_for_test(terminal);
+        }
+        app.focused = true;
+        app.active_terminal = 1;
+        let now = Instant::now();
+        app.toggle_claude_grid(now);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1, 2]));
+        assert_eq!(app.active_terminal, 1);
+
+        // The focused tile loses its flag: focus moves to the next member, grid stays open.
+        app.terminals[1].set_claude_foreground_for_test(false);
+        app.sync_claude_grid(now);
+        assert!(app.grid_open());
+        assert_eq!(app.active_terminal, 2);
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[O");
+        assert_eq!(app.terminals[2].input_bytes_for_test(), b"\x1b[I");
+
+        // The last member loses its flag: focus moves to the previous member.
+        app.terminals[2].set_claude_foreground_for_test(false);
+        app.sync_claude_grid(now);
+        assert_eq!(grid_mode_members(&app), Some(vec![0]));
+        assert_eq!(app.active_terminal, 0);
+
+        // No Claude tabs left: grid mode exits and keeps the active tab.
+        app.terminals[0].set_claude_foreground_for_test(false);
+        app.sync_claude_grid(now);
+        assert!(!app.grid_open());
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn grid_mode_pending_activation_is_cancelled_on_entry() {
+        let mut app = grid_mode_app(&[true, true]);
+        // A dangling request to switch to tab 1; it is presentation-ready, so it would fire.
+        app.terminals[1].presentation_intent = TerminalPresentationIntent::ActivateWhenReady;
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        assert_eq!(app.active_terminal, 0);
+        assert!(matches!(
+            app.terminals[1].presentation_intent,
+            TerminalPresentationIntent::None
+        ));
+        assert!(!app.process_terminal_presentation_intents());
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn grid_mode_on_frame_builds_panel_layouts() {
+        // Window literals of the headless fixture: `started_headless` in
+        // src/app/headless_run.rs starts the runtime at (640, 400) with scale 1.0.
+        const WIDTH: f32 = 640.0;
+        const HEIGHT: f32 = 400.0;
+        const SCALE: f32 = 1.0;
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-on-frame",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+
+        // The test does not set `panels`: on_frame must build one panel per tile.
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let body = terminal_body_rect(WIDTH, HEIGHT, SCALE);
+        let mut tiles = Vec::new();
+        crate::panels::grid_tiles(body, 2, SCALE, &mut tiles);
+        assert_eq!(app.panels.len(), 2);
+        assert_eq!(app.panel_layouts.len(), 2);
+        for (index, &(header, tile_body)) in tiles.iter().enumerate() {
+            assert_eq!(app.panels[index].header, Some(header));
+            assert_eq!(app.panels[index].body, tile_body);
+            assert_eq!(app.panel_layouts[index].body, tile_body);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Turns on focus reporting (DECSET 1004) through the same grid path the PTY uses.
     fn enable_focus_reporting_for_test(terminal: &Terminal) {
         let mut sink = crate::terminal_process::SessionSink {
