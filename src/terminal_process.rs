@@ -46,6 +46,8 @@ pub(crate) struct TerminalTitleState {
     display_suffix: Box<str>,
     generation: u64,
     observation_serial: u64,
+    /// Whether the tab's foreground process group leader is a `claude` process.
+    claude_foreground: bool,
 }
 
 pub(crate) type TerminalTitleCache = Arc<Mutex<TerminalTitleState>>;
@@ -113,6 +115,7 @@ impl TerminalTitleState {
             display_suffix: Box::from(""),
             generation: 0,
             observation_serial: 0,
+            claude_foreground: false,
         }
     }
 
@@ -136,6 +139,17 @@ impl TerminalTitleState {
 
     pub(crate) fn clear_programmed(&mut self) {
         self.programmed = None;
+    }
+
+    pub(crate) fn claude_foreground(&self) -> bool {
+        self.claude_foreground
+    }
+
+    /// Stores the flag and returns whether it changed.
+    pub(crate) fn set_claude_foreground(&mut self, value: bool) -> bool {
+        let changed = self.claude_foreground != value;
+        self.claude_foreground = value;
+        changed
     }
 
     fn observe_unchanged(&mut self) {
@@ -784,8 +798,26 @@ fn terminal_foreground_transitioned(
     }
 }
 
-fn refresh_terminal_title_cache(
+/// Foreground process group of the PTY, read once per title refresh tick.
+fn foreground_process_group(
     master_pty: &Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+) -> Option<u32> {
+    platform::lock_recover(master_pty)
+        .process_group_leader()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+/// Records whether `process_group` leads with a `claude` process; returns
+/// whether that changed. Reads `/proc` outside the title cache lock.
+fn observe_claude_foreground(title_cache: &TerminalTitleCache, process_group: Option<u32>) -> bool {
+    let claude = process_group
+        .and_then(crate::tab_input::claude_generation)
+        .is_some();
+    platform::lock_recover(title_cache).set_claude_foreground(claude)
+}
+
+fn refresh_terminal_title_cache(
+    process_group: Option<u32>,
     title_cache: &TerminalTitleCache,
     shell_title: &str,
     initial_cwd: Option<&Path>,
@@ -793,9 +825,6 @@ fn refresh_terminal_title_cache(
     last_process_group: &mut Option<u32>,
     snapshot: &mut Option<platform::ProcessSnapshot>,
 ) -> bool {
-    let process_group = platform::lock_recover(master_pty)
-        .process_group_leader()
-        .and_then(|pid| u32::try_from(pid).ok());
     let Some(process_group) = process_group else {
         platform::lock_recover(title_cache).observe_unchanged();
         return false;
@@ -855,15 +884,20 @@ fn install_terminal_title_refresh(
         let mut last_process_group = None;
         let mut snapshot = None;
         loop {
-            if refresh_terminal_title_cache(
-                &master_pty,
+            let group = foreground_process_group(&master_pty);
+            let title_changed = refresh_terminal_title_cache(
+                group,
                 &title_cache,
                 &shell_title,
                 Some(&initial_cwd),
                 home.as_deref(),
                 &mut last_process_group,
                 &mut snapshot,
-            ) && let Some(wake) = wake.as_ref()
+            );
+            // Evaluated on every tick, independent of the title's early returns.
+            let claude_changed = observe_claude_foreground(&title_cache, group);
+            if (title_changed || claude_changed)
+                && let Some(wake) = wake.as_ref()
             {
                 wake.wake();
             }
@@ -1476,6 +1510,41 @@ fn terminal_fallback_title_with_home(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observe_claude_foreground_tracks_claude_leader_and_reports_only_changes() {
+        use crate::tab_input::test_support::{TestDir, spawn_shell};
+
+        let dir = TestDir::new("claude-foreground");
+        let claude = dir.shell_named("claude");
+        let leader = spawn_shell(&claude, "sleep 30; true");
+        let pid = leader.pid();
+        let cache: TerminalTitleCache = Arc::new(Mutex::new(TerminalTitleState::new(
+            "terminal".to_string(),
+        )));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::tab_input::claude_generation(pid).is_none() {
+            assert!(Instant::now() < deadline, "pid {pid} never reached comm `claude`");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(observe_claude_foreground(&cache, Some(pid)));
+        assert!(platform::lock_recover(&cache).claude_foreground());
+        assert!(!observe_claude_foreground(&cache, Some(pid)));
+        assert!(platform::lock_recover(&cache).claude_foreground());
+        assert!(observe_claude_foreground(&cache, Some(std::process::id())));
+        assert!(!platform::lock_recover(&cache).claude_foreground());
+        assert!(!observe_claude_foreground(&cache, None));
+        assert!(!platform::lock_recover(&cache).claude_foreground());
+    }
+
+    #[test]
+    fn set_claude_foreground_reports_change() {
+        let mut state = TerminalTitleState::new("terminal".to_string());
+        assert!(state.set_claude_foreground(true));
+        assert!(!state.set_claude_foreground(true));
+    }
 
     #[test]
     fn merge_advance_outcome_keeps_any_grid_change_and_deadline() {

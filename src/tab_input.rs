@@ -254,13 +254,116 @@ pub(crate) fn origin_allowed(sender_pid: u32, leader_pid: u32) -> bool {
     origin_allowed_with(sender_pid, leader_pid, read_proc_node)
 }
 
+/// Scratch directories, copied binaries and reaped children for tests that
+/// drive live processes.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
+pub(crate) mod test_support {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Temporary directory removed on drop.
+    pub(crate) struct TestDir(PathBuf);
+
+    impl TestDir {
+        pub(crate) fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "ronsole-tab-input-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        /// Copy of `source` under `name` in this directory (its `comm` becomes
+        /// `name`), warmed up with one `--version` run: a freshly written copy
+        /// can be refused with `ETXTBSY` while a concurrent fork holds it open.
+        pub(crate) fn binary_named(&self, source: &Path, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::copy(source, &path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match Command::new(&path)
+                    .arg("--version")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                {
+                    Ok(_) => return path,
+                    Err(err)
+                        if err.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("run {} --version failed: {err}", path.display()),
+                }
+            }
+        }
+
+        /// Copy of `/bin/sh` under the given name (its `comm` becomes `name`).
+        pub(crate) fn shell_named(&self, name: &str) -> PathBuf {
+            self.binary_named(Path::new("/bin/sh"), name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Child process killed and reaped on drop.
+    pub(crate) struct Reaper(Child);
+
+    impl Reaper {
+        pub(crate) fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn `program -c script`, retrying while the freshly copied binary is
+    /// still held open for writing by a concurrent fork (`ETXTBSY`).
+    pub(crate) fn spawn_shell(program: &Path, script: &str) -> Reaper {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match Command::new(program)
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => return Reaper(child),
+                Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("spawn {} failed: {err}", program.display()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_support::{TestDir, spawn_shell};
+    use std::collections::HashMap;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     fn rule() -> String {
@@ -418,67 +521,6 @@ mod tests {
         assert!(origin_allowed_with(40, 100, long));
     }
 
-    struct TestDir(PathBuf);
-
-    impl TestDir {
-        fn new(tag: &str) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!(
-                "ronsole-tab-input-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-
-        /// Copy of `/bin/sh` under the given name (its `comm` becomes `name`).
-        fn shell_named(&self, name: &str) -> PathBuf {
-            let path = self.0.join(name);
-            fs::copy("/bin/sh", &path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-            path
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    struct Reaper(Child);
-
-    impl Drop for Reaper {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    /// Spawn `program -c script`, retrying while the freshly copied binary is
-    /// still held open for writing by a concurrent fork (`ETXTBSY`).
-    fn spawn_shell(program: &Path, script: &str) -> Reaper {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match Command::new(program)
-                .args(["-c", script])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(child) => return Reaper(child),
-                Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(err) => panic!("spawn {} failed: {err}", program.display()),
-            }
-        }
-    }
-
     /// Find a live process with the given `comm` whose ancestry includes `root`.
     fn wait_for_descendant(root: u32, comm: &str) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -523,9 +565,9 @@ mod tests {
         let dir = TestDir::new("allowed");
         let claude = dir.shell_named("claude");
         let leader = spawn_shell(&claude, "sleep 30; true");
-        let sleeper = wait_for_descendant(leader.0.id(), "sleep");
-        assert!(origin_allowed(sleeper, leader.0.id()));
-        assert!(origin_allowed(leader.0.id(), leader.0.id()));
+        let sleeper = wait_for_descendant(leader.pid(), "sleep");
+        assert!(origin_allowed(sleeper, leader.pid()));
+        assert!(origin_allowed(leader.pid(), leader.pid()));
     }
 
     #[test]
@@ -535,8 +577,8 @@ mod tests {
         let codex = dir.shell_named("codex-x");
         let script = format!("{} -c 'sleep 30; true'; true", codex.display());
         let leader = spawn_shell(&claude, &script);
-        let sleeper = wait_for_descendant(leader.0.id(), "sleep");
-        assert!(!origin_allowed(sleeper, leader.0.id()));
+        let sleeper = wait_for_descendant(leader.pid(), "sleep");
+        assert!(!origin_allowed(sleeper, leader.pid()));
     }
 
     #[test]
@@ -547,8 +589,8 @@ mod tests {
         let inner = inner_dir.shell_named("claude");
         let script = format!("{} -c 'sleep 30; true'; true", inner.display());
         let leader = spawn_shell(&claude, &script);
-        let sleeper = wait_for_descendant(leader.0.id(), "sleep");
-        assert!(!origin_allowed(sleeper, leader.0.id()));
+        let sleeper = wait_for_descendant(leader.pid(), "sleep");
+        assert!(!origin_allowed(sleeper, leader.pid()));
     }
 
     #[test]
@@ -565,12 +607,12 @@ mod tests {
         let claude = dir.shell_named("claude");
         let leader = spawn_shell(&claude, "sleep 30; true");
         let outsider = spawn_shell(Path::new("/bin/sh"), "sleep 30; true");
-        let outsider_sleep = wait_for_descendant(outsider.0.id(), "sleep");
-        assert!(!origin_allowed(outsider_sleep, leader.0.id()));
-        assert!(!origin_allowed(outsider.0.id(), leader.0.id()));
+        let outsider_sleep = wait_for_descendant(outsider.pid(), "sleep");
+        assert!(!origin_allowed(outsider_sleep, leader.pid()));
+        assert!(!origin_allowed(outsider.pid(), leader.pid()));
         // Dead / non-existent pid and pid 0 fail closed.
-        assert!(!origin_allowed(u32::MAX, leader.0.id()));
-        assert!(!origin_allowed(0, leader.0.id()));
+        assert!(!origin_allowed(u32::MAX, leader.pid()));
+        assert!(!origin_allowed(0, leader.pid()));
     }
 
     fn fake_entry(comm: &str, pgrp: u32, starttime: u64, args: &[&str], children: &[u32]) -> ProcEntry {
@@ -623,6 +665,36 @@ mod tests {
     }
 
     #[test]
+    fn claude_foreground_set_by_title_thread_for_claude_shell() {
+        // Test input: a copy of `cat` named `claude` as the tab shell. With no
+        // arguments it reads the PTY and stays the foreground group leader.
+        let dir = TestDir::new("claude-shell");
+        let claude = dir.binary_named(Path::new("/usr/bin/cat"), "claude");
+        let launch = crate::launch::TerminalLaunchSpec {
+            shell: Some(claude),
+            ..crate::launch::TerminalLaunchSpec::default()
+        };
+        let terminal = crate::terminal::Terminal::spawn(
+            None,
+            1,
+            launch,
+            crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+        );
+        let wait_until_claude_foreground = |expected: bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while terminal.claude_foreground() != expected {
+                assert!(Instant::now() < deadline, "claude_foreground never became {expected}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait_until_claude_foreground(true);
+        // The process group is unchanged from here on, so the flag can only
+        // come back from the per-tick observation, not from a transition.
+        terminal.set_claude_foreground_for_test(false);
+        wait_until_claude_foreground(true);
+    }
+
+    #[test]
     fn claude_generation_requires_claude_comm_and_tracks_restarts() {
         assert_eq!(claude_generation(std::process::id()), None);
         assert_eq!(claude_generation(u32::MAX), None);
@@ -630,7 +702,7 @@ mod tests {
         let dir = TestDir::new("generation");
         let claude = dir.shell_named("claude");
         let first = spawn_shell(&claude, "sleep 30; true");
-        let first_id = first.0.id();
+        let first_id = first.pid();
         let first_gen = loop {
             if let Some(generation) = claude_generation(first_id) {
                 break generation;
@@ -646,7 +718,7 @@ mod tests {
         // Start times tick at 10 ms; make sure the restart lands in a later tick.
         std::thread::sleep(Duration::from_millis(50));
         let second = spawn_shell(&claude, "sleep 30; true");
-        let second_id = second.0.id();
+        let second_id = second.pid();
         let second_gen = loop {
             if let Some(generation) = claude_generation(second_id) {
                 break generation;
