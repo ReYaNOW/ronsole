@@ -4277,6 +4277,73 @@ mod tests {
         }
     }
 
+    /// A modifier release swallowed by the settings modal must still clear the held state,
+    /// so the next release reports without the stale flag. Goes through `App::on_key`, not
+    /// `TerminalInteraction::note_modifier_key` directly.
+    #[test]
+    fn modifier_release_swallowed_by_settings_modal_updates_held_state() {
+        let modifier_key = |state, modifier, keycode| KeyInput {
+            state,
+            physical_key: PhysicalKey::Unidentified,
+            keycode,
+            text: None,
+            unshifted: None,
+            named: Some(ronsole_term::TermKey::Modifier(modifier)),
+            ime_preedit: false,
+        };
+        let mut app = App::new();
+        let terminal = Terminal::new_for_test(80, 30, 1);
+        {
+            let mut sink = crate::terminal_process::SessionSink {
+                reply_tx: None,
+                title_cache: None,
+                pending: None,
+                wake: None,
+            };
+            // Kitty flags 10: report all keys and report event types.
+            crate::platform::lock_recover(&terminal.grid).advance(
+                b"\x1b[>10u",
+                Instant::now(),
+                &mut sink,
+            );
+        }
+        app.terminals.push(terminal);
+
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        app.on_key(modifier_key(
+            KeyState::Pressed,
+            ronsole_term::ModKey::LeftCtrl,
+            29,
+        ));
+        // The host drops Ctrl from its state, and the modal owns the keyboard for the release.
+        app.on_modifiers(Modifiers::SHIFT);
+        app.settings_open = true;
+        app.on_key(modifier_key(
+            KeyState::Released,
+            ronsole_term::ModKey::LeftCtrl,
+            29,
+        ));
+        app.settings_open = false;
+
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        app.on_key(modifier_key(
+            KeyState::Pressed,
+            ronsole_term::ModKey::RightCtrl,
+            97,
+        ));
+        app.on_modifiers(Modifiers::SHIFT);
+        app.on_key(modifier_key(
+            KeyState::Released,
+            ronsole_term::ModKey::RightCtrl,
+            97,
+        ));
+        // If the swallowed release were not noted, the last release would keep the Ctrl flag (6 instead of 2).
+        assert_eq!(
+            app.terminals[0].input_bytes_for_test(),
+            b"\x1b[57442;6u\x1b[57448;6u\x1b[57448;2:3u"
+        );
+    }
+
     #[test]
     fn fps_toggle_is_opt_in_and_requests_the_cleanup_frame() {
         let mut app = App::new();
