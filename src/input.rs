@@ -190,9 +190,15 @@ impl TerminalInteraction {
     /// Recomputes the hovered link for the pointer at (`x`, `y`). The link is
     /// kept only while Ctrl is held and the pointer is over the terminal body.
     /// Returns whether the hovered link changed.
-    pub(crate) fn update_link_hover(&self, terminal: &mut Terminal, x: f32, y: f32) -> bool {
-        let link = if self.modifiers.control_key() && self.layout.body.contains(x, y) {
-            link_under_pointer(self.layout, terminal, x, y)
+    pub(crate) fn update_link_hover(
+        &self,
+        terminal: &mut Terminal,
+        x: f32,
+        y: f32,
+        layout: TerminalUiLayout,
+    ) -> bool {
+        let link = if self.modifiers.control_key() && layout.body.contains(x, y) {
+            link_under_pointer(layout, terminal, x, y)
         } else {
             None
         };
@@ -212,6 +218,12 @@ impl TerminalInteraction {
     #[cfg(test)]
     pub(crate) fn modifiers_for_test(&self) -> Modifiers {
         self.modifiers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pointer_for_test(&mut self, x: f32, y: f32) {
+        self.mouse_x = x;
+        self.mouse_y = y;
     }
 
     pub(crate) fn update_layout(&mut self, layout: TerminalUiLayout) {
@@ -936,9 +948,14 @@ impl TerminalInteraction {
         false
     }
 
-    pub(crate) fn mouse_wheel(&mut self, delta: ScrollDelta, terminal: &mut Terminal) -> bool {
-        if !self.layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
-        let dy = terminal_wheel_delta(delta, self.layout.char_h, self.scroll_sensitivity);
+    pub(crate) fn mouse_wheel(
+        &mut self,
+        delta: ScrollDelta,
+        terminal: &mut Terminal,
+        layout: TerminalUiLayout,
+    ) -> bool {
+        if !layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
+        let dy = terminal_wheel_delta(delta, layout.char_h, self.scroll_sensitivity);
         let grid = crate::platform::lock_recover(&terminal.grid);
         let is_alt = grid.is_alt_screen();
         let tracking_mode = grid.mouse_tracking();
@@ -947,7 +964,7 @@ impl TerminalInteraction {
         drop(grid);
         if tracking_mode.enabled() {
             if let Some(input) = terminal_mouse_wheel_sequence(
-                self.layout,
+                layout,
                 tracking_mode,
                 mouse_sgr,
                 self.mouse_x,
@@ -973,7 +990,7 @@ impl TerminalInteraction {
         }
         terminal.scroll_y.anim_speed = 7.0;
         terminal.scroll_y.scroll_by(dy);
-        terminal.scroll_y.clamp_target(0.0, self.layout.max_scroll);
+        terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
         true
     }
 }
@@ -1080,15 +1097,15 @@ struct ClickCounter {
     count: u8,
 }
 
-impl ClickCounter {
-    /// Largest gap between two presses that still counts as one multi-click.
-    const WINDOW: Duration = Duration::from_millis(300);
+/// Largest gap between two presses that still counts as one multi-click.
+pub(crate) const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(300);
 
+impl ClickCounter {
     /// Returns 1, 2 or 3 for a press at `cell` at time `now`; the fourth press starts over at 1.
     fn register(&mut self, now: Instant, cell: Option<(usize, usize)>) -> u8 {
         let continues = match (self.last, cell) {
             (Some((at, previous)), Some(cell)) => {
-                previous == cell && now.saturating_duration_since(at) <= Self::WINDOW
+                previous == cell && now.saturating_duration_since(at) <= MULTI_CLICK_WINDOW
             }
             _ => false,
         };
@@ -2644,7 +2661,7 @@ mod tests {
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
         interaction.set_modifiers(Modifiers::CONTROL);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         let (link, generation) = terminal.hovered_link().expect("link under pointer");
         let term = crate::platform::lock_recover(&terminal.grid);
         // The URL is written on the bottom row, which is the last row of the grid.
@@ -2658,7 +2675,7 @@ mod tests {
         let mut interaction = TerminalInteraction::default();
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_none());
     }
 
@@ -2668,10 +2685,10 @@ mod tests {
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
         interaction.set_modifiers(Modifiers::CONTROL);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_some());
         interaction.set_modifiers(Modifiers::empty());
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_none());
     }
 
@@ -2748,7 +2765,7 @@ mod tests {
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
         interaction.set_modifiers(Modifiers::CONTROL);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_some());
         interaction.reset_for_terminal_switch(&mut terminal);
         assert!(terminal.hovered_link().is_none());

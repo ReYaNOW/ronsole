@@ -1691,7 +1691,7 @@ impl App {
         let (x, y) = (self.pointer_x, self.pointer_y);
         let changed = match self.terminals.get_mut(self.active_terminal) {
             Some(terminal) if modal_active => terminal.set_hovered_link(None),
-            Some(terminal) => self.interaction.update_link_hover(terminal, x, y),
+            Some(terminal) => self.interaction.update_link_hover(terminal, x, y, self.interaction.layout),
             None => false,
         };
         if changed {
@@ -2548,7 +2548,7 @@ impl App {
         }
         let active = self.active_terminal;
         if let Some(terminal) = self.terminals.get_mut(active)
-            && self.interaction.mouse_wheel(delta, terminal)
+            && self.interaction.mouse_wheel(delta, terminal, self.interaction.layout)
         {
             self.sync_animation_state();
             self.request_frame();
