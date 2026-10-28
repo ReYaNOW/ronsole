@@ -102,17 +102,20 @@ impl TerminalSearchGeometry {
 }
 
 /// Search overlay rectangle inside `body`: right-aligned with an 8 logical-pixel
-/// inset from the body's right edge, 10 logical pixels below its top.
+/// inset from the body's right edge, 10 logical pixels below its top. A body
+/// shorter than the overlay (a grid tile) clips the overlay at its bottom edge.
 pub(crate) fn terminal_search_geometry(body: Rect, scale: f32) -> TerminalSearchGeometry {
     let s = scale;
     let window_w = body.w.max(0.0);
     let w = (480.0 * s).min((window_w - 16.0 * s).max(0.0));
     let x = (body.x + window_w - w - 8.0 * s).max(body.x);
+    let bottom = body.y + body.h.max(0.0);
+    let y = (body.y + 10.0 * s).min(bottom);
     let outer = Rect {
         x,
-        y: body.y + 10.0 * s,
+        y,
         w,
-        h: 52.0 * s,
+        h: (52.0 * s).min(bottom - y),
     };
 
     let btn_size = 36.0 * s;
@@ -995,6 +998,27 @@ mod tests {
             y,
             w,
             h: 600.0,
+        }
+    }
+
+    #[test]
+    fn search_overlay_stays_inside_tile_body_shorter_than_overlay() {
+        for scale in [1.0_f32, 1.25] {
+            // Tile body of 46 logical pixels: shorter than the 62-pixel overlay inset.
+            let tile = Rect {
+                x: 0.0,
+                y: 38.0,
+                w: 600.0,
+                h: 46.0 * scale,
+            };
+            let geometry = terminal_search_geometry(tile, scale);
+            assert!(geometry.outer.y >= tile.y, "scale {scale}");
+            assert!(geometry.outer.y + geometry.outer.h <= tile.y + tile.h, "scale {scale}");
+
+            // Whole-window body is taller than the overlay: its placement is unchanged.
+            let full = terminal_search_geometry(window_body(800.0, 38.0), scale);
+            assert_eq!(full.outer.y, 38.0 + 10.0 * scale, "scale {scale}");
+            assert_eq!(full.outer.h, 52.0 * scale, "scale {scale}");
         }
     }
 

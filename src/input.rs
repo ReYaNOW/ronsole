@@ -27,7 +27,7 @@ pub(crate) struct TerminalInteraction {
     mouse_x: f32,
     mouse_y: f32,
     pressed_mouse_buttons: u8,
-    pointer_capture: PointerCapture,
+    pub(crate) pointer_capture: PointerCapture,
     terminal_selection_anchor: Option<(usize, usize)>,
     /// Unit that a drag from `terminal_selection_anchor` extends the selection by.
     terminal_selection_unit: SelectionUnit,
@@ -48,7 +48,7 @@ pub(crate) struct TerminalInteraction {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PointerCapture {
+pub(crate) enum PointerCapture {
     #[default]
     None,
     TerminalSelection,
@@ -251,9 +251,8 @@ impl TerminalInteraction {
             self.search.close();
         }
         self.layout = TerminalUiLayout::default();
-        self.pressed_mouse_buttons = 0;
-        self.pointer_capture = PointerCapture::None;
-        self.terminal_selection_anchor = None;
+        // Ends a scrollbar drag of the left terminal too, so its smooth scroll settles.
+        self.cancel_pointer_interaction_state(&mut terminal.scroll_y);
         // Hover is only refreshed for the active tab, so drop the left tab's
         // link to keep it from showing a stale pointer when it is reactivated.
         terminal.set_hovered_link(None);
@@ -1750,6 +1749,19 @@ mod tests {
         assert_eq!(scroll.drag_offset, 0.0);
         assert_eq!(scroll.current, 42.0);
         assert_eq!(scroll.target, 42.0);
+    }
+
+    #[test]
+    fn reset_for_terminal_switch_ends_scrollbar_drag_of_left_terminal() {
+        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        let mut interaction = TerminalInteraction::default();
+        interaction.pointer_capture = PointerCapture::TerminalScrollbar;
+        terminal.scroll_y.is_dragging = true;
+
+        interaction.reset_for_terminal_switch(&mut terminal);
+
+        assert_eq!(interaction.pointer_capture, PointerCapture::None);
+        assert!(!terminal.scroll_y.is_dragging);
     }
 
     #[test]

@@ -3633,8 +3633,11 @@ impl Renderer {
             let baseline = (strip.y + strip.h * 0.5 + 5.0 * s).round();
             let right = strip.x + strip.w - TERMINAL_TAB_BAR_PAD * s;
             let hint_w = self.terminal_ui_text_width(hint, 1.0);
+            let hint_x = (right - hint_w).max(strip.x);
+            // Plate in the tab bar background so the hint stays readable over tabs drawn beneath it.
+            self.push_rect(hint_x, strip.y, right - hint_x, strip.h, palette.bg);
             let color = [palette.fg[0], palette.fg[1], palette.fg[2], 0.72];
-            self.draw_ui_text_clipped(hint, (right - hint_w).max(strip.x), right, baseline, color, 1.0);
+            self.draw_ui_text_clipped(hint, hint_x, right, baseline, color, 1.0);
         }
         self.draw_settings(
             settings_progress,
@@ -3951,7 +3954,13 @@ impl Renderer {
 
         let search_geometry = match search {
             Some(search) if search.shown => {
-                Some(self.draw_search_overlay(search, body, pointer_x, pointer_y))
+                // Overlay controls may reach past a tile body shorter than the overlay.
+                self.flush();
+                self.set_clip(body.x, body.y, body.w, body.h);
+                let geometry = self.draw_search_overlay(search, body, pointer_x, pointer_y);
+                self.flush();
+                self.clear_clip();
+                Some(geometry)
             }
             _ => None,
         };

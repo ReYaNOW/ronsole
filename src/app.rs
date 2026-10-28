@@ -2656,6 +2656,10 @@ impl App {
         if state == KeyState::Released {
             return true;
         }
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            // A captured pointer belongs to the active tile until its release.
+            return true;
+        }
         let (index, header) = match panel_hit(&self.panels, self.pointer_x, self.pointer_y) {
             Some(PanelHit::Header(index)) => (index, true),
             Some(PanelHit::Body(index)) => (index, false),
@@ -3623,6 +3627,64 @@ mod tests {
                 .iter()
                 .all(|terminal| terminal.presentation_intent == TerminalPresentationIntent::None)
         );
+    }
+
+    #[test]
+    fn grid_pointer_capture_blocks_tile_switch_until_release() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        app.grid_metrics = GridMetrics {
+            width: 800.0,
+            height: 600.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+        app.claude_grid = Some(ClaudeGrid { members: vec![0, 1] });
+        app.rebuild_panels();
+        let tile_b = app.panels[1].body;
+        app.pointer_x = tile_b.x + tile_b.w * 0.5;
+        app.pointer_y = tile_b.y + tile_b.h * 0.5;
+        app.interaction.pointer_capture = crate::input::PointerCapture::TerminalScrollbar;
+
+        app.route_grid_pointer_button(KeyState::Pressed, PointerButton::Right);
+
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.interaction.pointer_capture, crate::input::PointerCapture::TerminalScrollbar);
+    }
+
+    #[test]
+    fn grid_tile_switch_ends_left_tile_scrollbar_drag_animation() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        app.panels = vec![
+            Panel {
+                terminal: 0,
+                body: crate::search::Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 },
+                header: None,
+                content_hidden: false,
+            },
+            Panel {
+                terminal: 1,
+                body: crate::search::Rect { x: 400.0, y: 0.0, w: 400.0, h: 300.0 },
+                header: None,
+                content_hidden: false,
+            },
+        ];
+        app.interaction.pointer_capture = crate::input::PointerCapture::TerminalScrollbar;
+        app.terminals[0].scroll_y.is_dragging = true;
+
+        app.select_grid_tile(1);
+        app.sync_animation_state();
+
+        assert_eq!(app.active_terminal, 1);
+        assert!(!app.animation_active);
     }
 
     #[test]
