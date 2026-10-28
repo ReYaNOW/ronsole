@@ -3,8 +3,9 @@
 
 use super::keys::{key_spec, modifier_key_input};
 use super::session::{FrameBudget, HeadlessSession, HzSource, ProfileChoice, SessionOptions, run_protocol};
-use super::tests::{TEMP_PROFILE_LOCK, run_script, session_for_test};
+use super::tests::{TEMP_PROFILE_LOCK, run_script, session_for_test, session_with_shell};
 use crate::input_types::{KeyState, Modifiers};
+use crate::tab_input::test_support::TestDir;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufReader, Cursor};
@@ -334,4 +335,45 @@ fn key_spec_maps_names_to_evdev_keycodes() {
         let spec = key_spec(name).unwrap_or_else(|| panic!("key '{name}' is known"));
         assert_eq!(spec.keycode, keycode, "{name}");
     }
+}
+
+#[test]
+fn headless_claude_grid_screenshot_four_tiles() {
+    // Test input: a copy of `cat` named `claude` as the shell of every tab. Each tab's
+    // foreground group leader is then a `claude` process, and no rc files are read.
+    let dir = TestDir::new("claude-grid");
+    let claude = dir.binary_named(Path::new("/usr/bin/cat"), "claude");
+    let mut session = session_with_shell(1280, 800, Some(claude));
+    for _ in 0..3 {
+        assert_eq!(run_script(&mut session, b"key ctrl+shift+t\n"), ["ok"]);
+    }
+    // The title worker sets the flag on its own tick, so poll with a bounded deadline.
+    // `dump` carries no Claude flag, hence the direct read of the tabs.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let terminals = session.app_mut().terminals();
+        if terminals.len() == 4 && terminals.iter().all(|terminal| terminal.claude_foreground()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "four claude tabs not foreground within 3 s: {} tabs",
+            terminals.len()
+        );
+        run_script(&mut session, b"wait 50\n");
+    }
+    assert_eq!(run_script(&mut session, b"key ctrl+shift+s\n"), ["ok"]);
+    let shot = PathBuf::from("/tmp/ronsole-claude-grid-4.png");
+    let lines = run_script(
+        &mut session,
+        format!("screenshot {}\n", shot.display()).as_bytes(),
+    );
+    // The reply is `ok <path> <width>x<height>`; the PNG header below is the checked size.
+    assert!(
+        lines.len() == 1 && lines[0].starts_with("ok "),
+        "screenshot must answer ok, got {lines:?}"
+    );
+    assert_eq!(png_size(&shot), (1280, 800), "screenshot size");
+    assert!(session.app_mut().grid_open(), "Ctrl+Shift+S opens the grid");
+    assert_eq!(session.app_mut().grid_tile_count(), 4);
 }
