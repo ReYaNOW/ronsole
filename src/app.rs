@@ -2791,16 +2791,22 @@ impl App {
             self.terminal_tab_scroll.clamp_current(0.0, max);
         }
         let active = self.active_terminal;
+        let active_content_hidden = self
+            .panels
+            .iter()
+            .any(|panel| panel.terminal == active && panel.content_hidden);
         let mut selection_autoscrolled = false;
         if let Some(terminal) = self.terminals.get_mut(active) {
             selection_autoscrolled = self.interaction.update_selection_autoscroll(dt, terminal);
             terminal.scroll_y.update(dt);
-            terminal
-                .scroll_y
-                .clamp_target(0.0, self.interaction.layout.max_scroll);
-            terminal
-                .scroll_y
-                .clamp_current(0.0, self.interaction.layout.max_scroll);
+            if !active_content_hidden {
+                terminal
+                    .scroll_y
+                    .clamp_target(0.0, self.interaction.layout.max_scroll);
+                terminal
+                    .scroll_y
+                    .clamp_current(0.0, self.interaction.layout.max_scroll);
+            }
         }
         // Grid tiles other than the active tab. Their layouts come from the last
         // render, and a stale one is trusted only in the current panel generation:
@@ -2819,7 +2825,7 @@ impl App {
                 .get(index)
                 .map(|layout| layout.max_scroll)
                 .filter(|_| layouts_current);
-            if let Some(max) = layout_max {
+            if !panel.content_hidden && let Some(max) = layout_max {
                 terminal.scroll_y.clamp_target(0.0, max);
                 terminal.scroll_y.clamp_current(0.0, max);
             }
@@ -2875,13 +2881,17 @@ impl App {
                 self.panel_layouts_generation = self.grid_generation;
                 self.interaction.update_layout(layout);
                 let active = self.active_terminal;
-                if let Some(terminal) = self.terminals.get_mut(active) {
+                let active_content_hidden = self
+                    .panels
+                    .iter()
+                    .any(|panel| panel.terminal == active && panel.content_hidden);
+                if !active_content_hidden && let Some(terminal) = self.terminals.get_mut(active) {
                     terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
                     terminal.scroll_y.clamp_current(0.0, layout.max_scroll);
                 }
                 // The render above wrote this frame's layouts for every panel.
                 for (index, panel) in self.panels.iter().enumerate() {
-                    if panel.terminal == active {
+                    if panel.terminal == active || panel.content_hidden {
                         continue;
                     }
                     let Some(max) = self.panel_layouts.get(index).map(|layout| layout.max_scroll)
@@ -5420,6 +5430,7 @@ mod tests {
 
         // Before the deadline nothing is requested.
         app.dirty = false;
+        assert_eq!(app.loop_control(), AppLoopControl::WaitUntil(deadline));
         app.advance_dev_channel_warnings(sent_at + Duration::from_millis(1499));
         assert!(!app.dirty);
         assert_eq!(app.withheld_until, Some(deadline));
@@ -5451,11 +5462,11 @@ mod tests {
             );
         app.terminals[0].set_claude_foreground_for_test(true);
         app.terminals[1].set_claude_foreground_for_test(true);
-        // Tile 0 stays hidden for about 40 ms more, tile 1 for about 1 s more.
+        // Tile 0 stays hidden for about 300 ms more, tile 1 for about 1 s more.
         // The test sleeps past the first deadline so the real-clock frame sees it.
         let now = Instant::now();
         let enter_times = [
-            now - Duration::from_millis(1460),
+            now - Duration::from_millis(1200),
             now - Duration::from_millis(500),
         ];
         for (index, sent_at) in enter_times.into_iter().enumerate() {
@@ -5465,6 +5476,12 @@ mod tests {
         }
         app.toggle_claude_grid(now);
         assert_eq!(grid_frame_step(&mut app), Ok(true));
+        let mut frames = 0;
+        while app.animation_active && frames < 200 {
+            assert_eq!(grid_frame_step(&mut app), Ok(true));
+            frames += 1;
+        }
+        assert!(!app.animation_active, "grid entry did not settle in {frames} frames");
         let first = app.terminals[0]
             .dev_warning_hidden_until()
             .expect("tile 0 banner hides");
@@ -5473,6 +5490,8 @@ mod tests {
             .expect("tile 1 banner hides");
         assert!(first < second);
         assert_eq!(app.withheld_until, Some(first));
+        app.dirty = false;
+        assert_eq!(app.loop_control(), AppLoopControl::WaitUntil(first));
 
         std::thread::sleep(first.saturating_duration_since(Instant::now()) + Duration::from_millis(5));
         app.dirty = false;
@@ -5485,6 +5504,38 @@ mod tests {
         assert!(app.panels.iter().all(|panel| panel.terminal != 0 || !panel.content_hidden));
         assert!(app.panels.iter().any(|panel| panel.terminal == 1 && panel.content_hidden));
         assert_eq!(app.withheld_until, Some(second));
+        app.dirty = false;
+        assert_eq!(app.loop_control(), AppLoopControl::WaitUntil(second));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_frame_hidden_tile_keeps_scroll_position() {
+        let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+        let claude = crate::tab_input::ProcGen {
+            pid: 42,
+            starttime: 7,
+        };
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-hidden-scroll",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[1], warning);
+        let sent_at = Instant::now();
+        let mut scratch = String::new();
+        assert!(app.terminals[1].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
+        app.toggle_claude_grid(sent_at);
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert!(app.panels.iter().any(|panel| panel.terminal == 1 && panel.content_hidden));
+
+        app.terminals[1].scroll_y.target = 20.0;
+        app.terminals[1].scroll_y.current = 20.0;
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[1].scroll_y.target, 20.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5512,6 +5563,11 @@ mod tests {
 
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert_eq!(app.terminals[1].scroll_y.target, 10.0);
+
+        app.terminals[1].scroll_y.target = 10_000.0;
+        app.terminals[1].scroll_y.current = 10_000.0;
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert!(app.terminals[1].scroll_y.target <= app.panel_layouts[1].max_scroll);
         let _ = std::fs::remove_dir_all(&root);
     }
 
