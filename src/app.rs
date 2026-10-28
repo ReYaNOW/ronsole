@@ -6456,6 +6456,94 @@ mod tests {
         assert_eq!(app.settings_scroll_value, "1.00");
     }
 
+    fn cursor_test_app_with_search_overlay() -> App {
+        let mut app = App::new();
+        let body = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        app.interaction.layout.search = Some(crate::search::terminal_search_geometry(body, 1.0));
+        app
+    }
+
+    fn cursor_test_point(app: &mut App, (x, y): (f32, f32)) {
+        app.pointer_x = x;
+        app.pointer_y = y;
+    }
+
+    fn cursor_test_center(rect: &Rect) -> (f32, f32) {
+        (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
+    }
+
+    #[test]
+    fn desired_cursor_icon_maps_search_overlay_hits_to_cursor_kinds() {
+        let mut app = cursor_test_app_with_search_overlay();
+        let input = cursor_test_center(
+            &app.interaction
+                .layout
+                .search
+                .as_ref()
+                .expect("search overlay")
+                .input,
+        );
+        let close = cursor_test_center(
+            &app.interaction
+                .layout
+                .search
+                .as_ref()
+                .expect("search overlay")
+                .close,
+        );
+
+        cursor_test_point(&mut app, input);
+        assert_eq!(app.desired_cursor_icon(), CursorKind::Text);
+        cursor_test_point(&mut app, close);
+        assert_eq!(app.desired_cursor_icon(), CursorKind::Pointer);
+        cursor_test_point(&mut app, (-1000.0, -1000.0));
+        assert_eq!(app.desired_cursor_icon(), CursorKind::Default);
+    }
+
+    #[test]
+    fn desired_cursor_icon_close_confirm_suppresses_search_hit() {
+        let mut app = cursor_test_app_with_search_overlay();
+        let input = cursor_test_center(
+            &app.interaction
+                .layout
+                .search
+                .as_ref()
+                .expect("search overlay")
+                .input,
+        );
+        cursor_test_point(&mut app, input);
+        assert_eq!(app.desired_cursor_icon(), CursorKind::Text);
+
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Tab(0),
+            title: "Закрыть вкладку?",
+            rows: vec!["tab — vim".to_string()],
+            more: None,
+        });
+        assert_eq!(app.desired_cursor_icon(), CursorKind::Default);
+    }
+
+    #[test]
+    fn desired_cursor_icon_open_settings_suppresses_search_hit() {
+        let mut app = cursor_test_app_with_search_overlay();
+        let input = cursor_test_center(
+            &app.interaction
+                .layout
+                .search
+                .as_ref()
+                .expect("search overlay")
+                .input,
+        );
+        cursor_test_point(&mut app, input);
+        app.settings_open = true;
+        assert_eq!(app.desired_cursor_icon(), CursorKind::Default);
+    }
+
     #[test]
     fn settings_and_tab_cursor_policy_prioritizes_modal_and_caches_identical_icon() {
         assert_eq!(
