@@ -224,6 +224,9 @@ pub(crate) struct TerminalProcess {
     tree: ProcessTree,
     title_stop_tx: Option<std::sync::mpsc::Sender<()>>,
     title_worker: Option<JoinHandle<()>>,
+    /// PTY writer thread; it can block inside a write, so teardown reaps it
+    /// through `platform::reap_unit_thread` instead of joining on the caller.
+    writer_worker: Option<JoinHandle<()>>,
     finished: bool,
     shutdown_complete: bool,
 }
@@ -406,7 +409,7 @@ impl TerminalProcess {
             }
         };
 
-        if let Err(error) = install_terminal_io_threads(
+        let writer_worker = match install_terminal_io_threads(
             &grid,
             bridge_screen_lock,
             reader,
@@ -415,14 +418,17 @@ impl TerminalProcess {
             title_cache,
             host,
         ) {
-            let _ = title_stop_tx.send(());
-            platform::reap_unit_thread(title_worker);
-            let _ = tree.terminate_forcefully();
-            let _ = child.kill();
-            let _ = child.wait();
-            tree.finish_after_owner_exit();
-            return Err(error);
-        }
+            Ok(writer_worker) => writer_worker,
+            Err(error) => {
+                let _ = title_stop_tx.send(());
+                platform::reap_unit_thread(title_worker);
+                let _ = tree.terminate_forcefully();
+                let _ = child.kill();
+                let _ = child.wait();
+                tree.finish_after_owner_exit();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             writer,
@@ -432,6 +438,7 @@ impl TerminalProcess {
             tree,
             title_stop_tx: Some(title_stop_tx),
             title_worker: Some(title_worker),
+            writer_worker: Some(writer_worker),
             finished: false,
             shutdown_complete: false,
         })
@@ -571,6 +578,9 @@ impl TerminalProcess {
             self.finished = true;
         }
         self.tree.finish_after_owner_exit();
+        if let Some(worker) = self.writer_worker.take() {
+            platform::reap_unit_thread(worker);
+        }
         self.shutdown_complete = true;
     }
 }
@@ -1199,7 +1209,7 @@ fn install_terminal_io_threads(
     wake: Option<WakeHandle>,
     title_cache: TerminalTitleCache,
     host: HostChannels,
-) -> io::Result<()> {
+) -> io::Result<JoinHandle<()>> {
     let HostChannels {
         reply_tx,
         reply_rx,
@@ -1320,7 +1330,9 @@ fn install_terminal_io_threads(
         )
     })?;
 
-    platform::spawn_named("ronsole-terminal-writer", move || {
+    // Kept by the caller so session teardown can reap it; the reader and
+    // parser threads stay detached as before.
+    let writer_worker = platform::spawn_named("ronsole-terminal-writer", move || {
         while let Ok(message) = reply_rx.recv() {
             let Ok(mut writer) = writer.lock() else {
                 break;
@@ -1365,7 +1377,7 @@ fn install_terminal_io_threads(
         )
     })?;
 
-    Ok(())
+    Ok(writer_worker)
 }
 
 fn terminal_launch_command(
@@ -1747,6 +1759,7 @@ mod tests {
             tree,
             title_stop_tx: None,
             title_worker: None,
+            writer_worker: None,
             finished: false,
             shutdown_complete: false,
         };
@@ -2134,6 +2147,44 @@ mod tests {
             Err(std::sync::mpsc::TrySendError::Full(_))
         ));
         assert_eq!(rx.try_iter().count(), TERMINAL_REPLY_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn terminal_writer_thread_exits_once_reply_queue_closes() {
+        // Source: the writer loop ends when `reply_rx.recv()` fails, which
+        // happens once the parser drops `reply_tx` after the reader hits EOF.
+        let grid = Arc::new(Mutex::new(test_term(8, 2)));
+        let cache: TerminalTitleCache = Arc::new(Mutex::new(TerminalTitleState::new(
+            "fallback".to_string(),
+        )));
+        let (reply_tx, reply_rx) = terminal_reply_channel();
+        let host = HostChannels {
+            reply_tx,
+            reply_rx,
+            pending: Arc::new(Mutex::new(PendingHostEvents::default())),
+        };
+        let sink: Box<dyn Write + Send> = Box::new(io::sink());
+        let writer = Arc::new(Mutex::new(sink));
+        let worker = install_terminal_io_threads(
+            &grid,
+            Arc::new(Mutex::new(())),
+            Box::new(io::empty()),
+            writer,
+            None,
+            cache,
+            host,
+        )
+        .expect("terminal io threads should spawn");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = worker.join();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "writer thread should exit after its reply queue closes"
+        );
     }
 
     #[test]
