@@ -721,6 +721,23 @@ fn legacy_flags0_modified_function_keys_match_93ad29c() {
         (TermKey::F(10), shift, b"\x1b[21;2~"),
         (TermKey::F(11), ctrl, b"\x1b[23;5~"),
         (TermKey::F(12), alt, b"\x1b[24;3~"),
+        // Super alone under flags 0 is not in the modifier field: unmodified legacy bytes.
+        (TermKey::F(2), super_only, b"\x1bOQ"),
+        (TermKey::F(4), super_only, b"\x1bOS"),
+        (TermKey::F(5), super_only, b"\x1b[15~"),
+        (TermKey::F(6), super_only, b"\x1b[17~"),
+        (TermKey::F(7), super_only, b"\x1b[18~"),
+        (TermKey::F(9), super_only, b"\x1b[20~"),
+        (TermKey::F(10), super_only, b"\x1b[21~"),
+        (TermKey::F(11), super_only, b"\x1b[23~"),
+        (TermKey::F(12), super_only, b"\x1b[24~"),
+        (TermKey::Left, super_only, b"\x1b[D"),
+        (TermKey::Right, super_only, b"\x1b[C"),
+        (TermKey::Down, super_only, b"\x1b[B"),
+        (TermKey::End, super_only, b"\x1b[F"),
+        (TermKey::Insert, super_only, b"\x1b[2~"),
+        (TermKey::Delete, super_only, b"\x1b[3~"),
+        (TermKey::PageUp, super_only, b"\x1b[5~"),
     ];
     for (key, modifiers, want) in cases {
         assert_eq!(enc(&mut term, &ev(*key, None, *modifiers, KeyKind::Press, None)).1, *want, "key {key:?} mods {modifiers:?}");
@@ -756,4 +773,65 @@ fn super_f1_to_f4_flags1_report_super_bit() {
     for (n, want) in cases {
         assert_eq!(enc(&mut term, &ev(TermKey::F(*n), None, super_only, KeyKind::Press, None)).1, *want, "F{n}");
     }
+}
+
+/// Flag 1 keeps F5-F12 in the `CSI <n> ~` form, unmodified and with Shift.
+/// Source: protocol reference, functional-key table (F5-F12 row) and legacy column (`CSI 17 ~` ... `CSI 24 ~`).
+#[test]
+fn f6_to_f12_flags1_csi_tilde_forms() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let shift = mods(true, false, false);
+
+    set_flags(&mut term, &mut sink, 1);
+    let cases: &[(u8, &[u8])] = &[
+        (6, b"\x1b[17~"),
+        (7, b"\x1b[18~"),
+        (8, b"\x1b[19~"),
+        (9, b"\x1b[20~"),
+        (10, b"\x1b[21~"),
+        (11, b"\x1b[23~"),
+        (12, b"\x1b[24~"),
+    ];
+    for (n, want) in cases {
+        assert_eq!(enc(&mut term, &ev(TermKey::F(*n), None, none, KeyKind::Press, None)).1, *want, "F{n}");
+    }
+    assert_eq!(enc(&mut term, &ev(TermKey::F(6), None, shift, KeyKind::Press, None)).1, b"\x1b[17;2~");
+    assert_eq!(enc(&mut term, &ev(TermKey::F(12), None, shift, KeyKind::Press, None)).1, b"\x1b[24;2~");
+}
+
+/// Right modifiers have their own PUA codes (RIGHT_SHIFT 57447, RIGHT_ALT 57449,
+/// RIGHT_SUPER 57450), not the left codes. Press includes its own bit, release does not.
+/// Source: protocol reference, functional-key table (RIGHT_* rows) and modifier bits (Alt=2, Super=8).
+#[test]
+fn right_modifiers_report_own_codes_flags10() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+    let shift = mods(true, false, false);
+    let alt = mods(false, false, true);
+    let super_only = KeyMods { shift: false, ctrl: false, alt: false, super_key: true };
+
+    set_flags(&mut term, &mut sink, 10);
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::RightShift), None, shift, KeyKind::Press, None)).1, b"\x1b[57447;2u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::RightShift), None, none, KeyKind::Release, None)).1, b"\x1b[57447;1:3u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::RightAlt), None, alt, KeyKind::Press, None)).1, b"\x1b[57449;3u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::RightAlt), None, none, KeyKind::Release, None)).1, b"\x1b[57449;1:3u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::RightSuper), None, super_only, KeyKind::Press, None)).1, b"\x1b[57450;9u");
+}
+
+/// CapsLock and NumLock are reported under their own PUA codes (57358, 57360)
+/// with flag 8. `KeyMods` carries no lock bits, so the lock state cannot change
+/// these bytes in this model; only the key's own code is checked.
+/// Source: protocol reference, functional-key table (CAPS_LOCK 57358 u, NUM_LOCK 57360 u).
+#[test]
+fn caps_and_num_lock_keys_report_own_codes_flags10() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let none = mods(false, false, false);
+
+    set_flags(&mut term, &mut sink, 10);
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::CapsLock), None, none, KeyKind::Press, None)).1, b"\x1b[57358u");
+    assert_eq!(enc(&mut term, &ev(TermKey::Modifier(ModKey::NumLock), None, none, KeyKind::Press, None)).1, b"\x1b[57360u");
 }
