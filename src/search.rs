@@ -33,6 +33,14 @@ impl Rect {
         if self.w <= 0.0 || self.h <= 0.0 {
             return self;
         }
+        // Exact no-op for a rect already inside: no ulp drift from `right - x`.
+        if self.x >= bounds.x
+            && self.y >= bounds.y
+            && self.x + self.w <= bounds.x + bounds.w
+            && self.y + self.h <= bounds.y + bounds.h
+        {
+            return self;
+        }
         let x = self.x.max(bounds.x);
         let y = self.y.max(bounds.y);
         let right = (self.x + self.w).min(bounds.x + bounds.w);
