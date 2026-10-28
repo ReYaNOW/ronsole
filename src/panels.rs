@@ -2,7 +2,7 @@
 //! testing. Constants are logical pixels, multiplied by the window scale at
 //! call time. Every boundary is snapped to whole pixels with `.round()`.
 
-use crate::renderer::terminal_raw_grid_size;
+use crate::renderer::terminal_grid_size;
 use crate::search::Rect;
 
 /// Gap between neighbouring tiles, in logical pixels.
@@ -41,8 +41,8 @@ pub(crate) fn grid_tiles(body: Rect, n: usize, scale: f32, out: &mut Vec<(Rect, 
 pub(crate) fn grid_fits(body: Rect, n: usize, scale: f32, char_w: f32, char_h: f32) -> bool {
     (0..n).all(|index| {
         let (_, tile_body) = grid_tile(body, n, scale, index);
-        let (raw_cols, raw_rows) = terminal_raw_grid_size(tile_body, scale, char_w, char_h);
-        raw_cols >= 10.0 && raw_rows >= 2.0
+        let size = terminal_grid_size(tile_body, char_w, char_h, scale);
+        size.raw_cols >= 10.0 && size.raw_rows >= 2.0
     })
 }
 

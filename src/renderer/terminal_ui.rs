@@ -187,7 +187,7 @@ fn terminal_tab_strip_rect(width: f32, scale: f32) -> Rect {
 }
 
 #[inline]
-fn terminal_body_rect(width: f32, height: f32, scale: f32) -> Rect {
+pub(crate) fn terminal_body_rect(width: f32, height: f32, scale: f32) -> Rect {
     let y = terminal_tab_body_top(scale);
     Rect {
         x: 0.0,
@@ -1382,28 +1382,42 @@ pub(crate) fn terminal_text_viewport_height(content_h: f32, scale: f32) -> f32 {
 }
 
 /// Unclamped visible row count of a text body, before the PTY minimum of
-/// two rows applied by [`terminal_visible_rows`].
-pub(crate) fn terminal_raw_visible_rows(content_h: f32, char_h: f32, scale: f32) -> f32 {
-    (terminal_text_viewport_height(content_h, scale) / char_h.max(0.0001)).floor()
+/// two rows applied by [`terminal_visible_rows`]. Grid mode checks Q9 against
+/// this value through [`TerminalGridSize::raw_rows`].
+pub(crate) fn terminal_raw_rows(content_h: f32, char_h: f32, scale: f32) -> f32 {
+    terminal_text_viewport_height(content_h, scale) / char_h.max(0.0001)
 }
 
 pub(crate) fn terminal_visible_rows(content_h: f32, char_h: f32, scale: f32) -> usize {
-    terminal_raw_visible_rows(content_h, char_h, scale).max(2.0) as usize
+    terminal_raw_rows(content_h, char_h, scale).floor().max(2.0) as usize
 }
 
-/// Unclamped `(cols, rows)` of a text body, before the PTY minimums applied
-/// by [`terminal_grid_size`]. Grid mode checks Q9 against these values.
-pub(crate) fn terminal_raw_grid_size(body: Rect, scale: f32, char_w: f32, char_h: f32) -> (f32, f32) {
-    let raw_cols = ((body.w - 20.0 * scale) / char_w).floor();
-    let raw_rows = terminal_raw_visible_rows(body.h, char_h, scale);
-    (raw_cols, raw_rows)
+/// Terminal grid size of a text body: clamped `cols`/`rows` for the PTY and
+/// the unclamped `raw_cols`/`raw_rows` that grid mode checks Q9 against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TerminalGridSize {
+    pub cols: usize,
+    pub rows: usize,
+    pub raw_cols: f32,
+    pub raw_rows: f32,
 }
 
-/// Terminal grid size `(cols, rows)` for a text body, clamped to the PTY
-/// minimums of 10 columns and 2 rows.
-pub(crate) fn terminal_grid_size(body: Rect, scale: f32, char_w: f32, char_h: f32) -> (usize, usize) {
-    let (raw_cols, _) = terminal_raw_grid_size(body, scale, char_w, char_h);
-    (raw_cols.max(10.0) as usize, terminal_visible_rows(body.h, char_h, scale))
+/// Terminal grid size for a text body, clamped to the PTY minimums of 10
+/// columns and 2 rows. The raw values are returned before those clamps.
+pub(crate) fn terminal_grid_size(
+    body: Rect,
+    char_w: f32,
+    char_h: f32,
+    scale: f32,
+) -> TerminalGridSize {
+    let raw_cols = (body.w - 20.0 * scale) / char_w;
+    let raw_rows = terminal_raw_rows(body.h, char_h, scale);
+    TerminalGridSize {
+        cols: raw_cols.floor().max(10.0) as usize,
+        rows: terminal_visible_rows(body.h, char_h, scale),
+        raw_cols,
+        raw_rows,
+    }
 }
 
 #[inline]
@@ -3502,7 +3516,8 @@ impl Renderer {
         let body = terminal_body_rect(self.width, self.height, s);
         let char_w = self.terminal_char_width();
         let char_h = self.line_height * TERMINAL_TEXT_SCALE;
-        let (new_cols, new_rows) = terminal_grid_size(body, s, char_w, char_h);
+        let grid_size = terminal_grid_size(body, char_w, char_h, s);
+        let (new_cols, new_rows) = (grid_size.cols, grid_size.rows);
         let visible_rows = new_rows;
 
         let mut grid = crate::platform::lock_recover(&terminal.grid);
@@ -5893,7 +5908,8 @@ mod tests {
         let char_h = 21.7_f32;
         for scale in [1.0_f32, 1.5, 2.0] {
             let body = terminal_body_rect(1280.0, 800.0, scale);
-            let (cols, rows) = terminal_grid_size(body, scale, char_w, char_h);
+            let size = terminal_grid_size(body, char_w, char_h, scale);
+            let (cols, rows) = (size.cols, size.rows);
             // Pre-grid window formulas: cols clamp to 10, rows come from
             // terminal_visible_rows, text padding is 8 * scale on each side.
             let expected_cols = ((body.w - 20.0 * scale) / char_w).floor().max(10.0) as usize;
@@ -5912,7 +5928,8 @@ mod tests {
             crate::panels::grid_tiles(body, 4, scale, &mut tiles);
             assert_eq!(tiles.len(), 4);
             for (_, tile_body) in &tiles {
-                let (cols, rows) = terminal_grid_size(*tile_body, scale, char_w, char_h);
+                let size = terminal_grid_size(*tile_body, char_w, char_h, scale);
+                let (cols, rows) = (size.cols, size.rows);
                 let expected_cols =
                     ((tile_body.w - 20.0 * scale) / char_w).floor().max(10.0) as usize;
                 let expected_rows =
