@@ -146,6 +146,9 @@ pub(crate) struct TerminalUiLayout {
     pub scale: f32,
     pub scrollbar: Option<TerminalScrollbarLayout>,
     pub search: Option<TerminalSearchGeometry>,
+    /// Set when this layout was written for a tile whose content was hidden at
+    /// render time. Its `max_scroll` is not a real content limit, so clamps must skip it.
+    pub content_hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3584,6 +3587,7 @@ impl Renderer {
                 self.push_rect(panel.body.x, panel.body.y, panel.body.w, panel.body.h, palette.bg);
                 TerminalUiLayout {
                     body: panel.body,
+                    content_hidden: true,
                     ..TerminalUiLayout::default()
                 }
             } else {
@@ -3967,6 +3971,7 @@ impl Renderer {
             scale: s,
             scrollbar,
             search: search_geometry,
+            content_hidden: false,
         }
     }
 }

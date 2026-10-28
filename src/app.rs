@@ -2800,10 +2800,9 @@ impl App {
             self.terminal_tab_scroll.clamp_current(0.0, max);
         }
         let active = self.active_terminal;
-        let active_content_hidden = self
-            .panels
-            .iter()
-            .any(|panel| panel.terminal == active && panel.content_hidden);
+        // The last render decides whether the active layout is a hidden one; the
+        // current panel list may already have been rebuilt with content visible.
+        let active_content_hidden = self.interaction.layout.content_hidden;
         let mut selection_autoscrolled = false;
         if let Some(terminal) = self.terminals.get_mut(active) {
             selection_autoscrolled = self.interaction.update_selection_autoscroll(dt, terminal);
@@ -2831,15 +2830,17 @@ impl App {
                 continue;
             };
             terminal.scroll_y.update(dt);
-            let layout_max = self
+            // A layout written for a hidden tile carries no content limit.
+            let Some(max) = self
                 .panel_layouts
                 .get(index)
+                .filter(|layout| layouts_current && !layout.content_hidden)
                 .map(|layout| layout.max_scroll)
-                .filter(|_| layouts_current);
-            if !panel.content_hidden && let Some(max) = layout_max {
-                terminal.scroll_y.clamp_target(0.0, max);
-                terminal.scroll_y.clamp_current(0.0, max);
-            }
+            else {
+                continue;
+            };
+            terminal.scroll_y.clamp_target(0.0, max);
+            terminal.scroll_y.clamp_current(0.0, max);
         }
         if selection_autoscrolled {
             self.mark_dirty();
@@ -5576,6 +5577,70 @@ mod tests {
         app.terminals[1].scroll_y.current = 20.0;
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert_eq!(app.terminals[1].scroll_y.target, 20.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_frame_hidden_tile_keeps_scroll_after_pointer_motion() {
+        let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+        let claude = crate::tab_input::ProcGen {
+            pid: 42,
+            starttime: 7,
+        };
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-hidden-pointer-scroll",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[1], warning);
+        let sent_at = Instant::now();
+        let mut scratch = String::new();
+        assert!(app.terminals[1].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
+        app.toggle_claude_grid(sent_at);
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert!(app.panels.iter().any(|panel| panel.terminal == 1 && panel.content_hidden));
+
+        // Pointer motion over the grid rebuilds the tile list with content_hidden reset.
+        app.terminals[1].scroll_y.target = 20.0;
+        app.terminals[1].scroll_y.current = 20.0;
+        app.on_pointer_motion(PointerPosition { x: 200.0, y: 5.0 });
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[1].scroll_y.target, 20.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_frame_hidden_active_tile_keeps_scroll_after_pointer_motion() {
+        let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+        let claude = crate::tab_input::ProcGen {
+            pid: 42,
+            starttime: 7,
+        };
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-hidden-active-pointer-scroll",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[0], warning);
+        let sent_at = Instant::now();
+        let mut scratch = String::new();
+        assert!(app.terminals[0].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
+        app.toggle_claude_grid(sent_at);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert!(app.panels.iter().any(|panel| panel.terminal == 0 && panel.content_hidden));
+
+        app.terminals[0].scroll_y.target = 20.0;
+        app.terminals[0].scroll_y.current = 20.0;
+        app.on_pointer_motion(PointerPosition { x: 200.0, y: 5.0 });
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[0].scroll_y.target, 20.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
