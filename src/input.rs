@@ -13,6 +13,12 @@ use ronsole_term::{
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Whether the smooth scroll of `terminal` still moves. Shared by the active
+/// tab's animation check and the frame loop that keeps grid tiles animating.
+pub(crate) fn terminal_scroll_animating(terminal: &Terminal) -> bool {
+    !terminal.scroll_y.is_settled()
+}
+
 pub(crate) struct TerminalInteraction {
     pub search: TerminalSearchState,
     pub layout: TerminalUiLayout,
@@ -225,7 +231,7 @@ impl TerminalInteraction {
     }
 
     pub(crate) fn animation_active(&self, terminal: &Terminal) -> bool {
-        !terminal.scroll_y.is_settled() || self.selection_autoscroll_active(terminal)
+        terminal_scroll_animating(terminal) || self.selection_autoscroll_active(terminal)
     }
 
     pub(crate) fn search_refresh_deadline(&self) -> Option<std::time::Instant> {

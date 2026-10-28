@@ -3,7 +3,7 @@ use crate::config::{
     DEFAULT_TERMINAL_BOLD_FOREGROUND, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FOREGROUND,
     DEFAULT_TERMINAL_PALETTE, RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
 };
-use crate::input::{MULTI_CLICK_WINDOW, TerminalInteraction};
+use crate::input::{MULTI_CLICK_WINDOW, TerminalInteraction, terminal_scroll_animating};
 use crate::input_types::{
     CursorKind, KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton,
     PointerPosition, ScrollDelta,
@@ -1767,6 +1767,14 @@ impl App {
             .terminals
             .get(self.active_terminal)
             .is_some_and(|terminal| self.interaction.animation_active(terminal));
+        // Other visible grid tiles keep the frame loop running while their smooth scroll moves.
+        let grid_tile_animation = self.panels.iter().any(|panel| {
+            panel.terminal != self.active_terminal
+                && self
+                    .terminals
+                    .get(panel.terminal)
+                    .is_some_and(terminal_scroll_animating)
+        });
         let tab_animation = !self.terminal_tab_scroll.is_settled()
             || self
                 .runtime
@@ -1777,7 +1785,8 @@ impl App {
                 .is_some_and(|drag| drag.threshold_passed);
         let settings_animation =
             (self.settings_progress - if self.settings_open { 1.0 } else { 0.0 }).abs() > 0.001;
-        self.animation_active = terminal_animation || tab_animation || settings_animation;
+        self.animation_active =
+            terminal_animation || grid_tile_animation || tab_animation || settings_animation;
     }
 
     fn loop_control(&self) -> AppLoopControl {
@@ -2747,6 +2756,28 @@ impl App {
                 .scroll_y
                 .clamp_current(0.0, self.interaction.layout.max_scroll);
         }
+        // Grid tiles other than the active tab. Their layouts come from the last
+        // render, and a stale one is trusted only in the current panel generation:
+        // after a membership change the same index names another tile.
+        let layouts_current = self.panel_layouts_generation == self.grid_generation;
+        for (index, panel) in self.panels.iter().enumerate() {
+            if panel.terminal == active {
+                continue;
+            }
+            let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
+                continue;
+            };
+            terminal.scroll_y.update(dt);
+            let layout_max = self
+                .panel_layouts
+                .get(index)
+                .map(|layout| layout.max_scroll)
+                .filter(|_| layouts_current);
+            if let Some(max) = layout_max {
+                terminal.scroll_y.clamp_target(0.0, max);
+                terminal.scroll_y.clamp_current(0.0, max);
+            }
+        }
         if selection_autoscrolled {
             self.mark_dirty();
         }
@@ -2798,6 +2829,20 @@ impl App {
                 if let Some(terminal) = self.terminals.get_mut(active) {
                     terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
                     terminal.scroll_y.clamp_current(0.0, layout.max_scroll);
+                }
+                // The render above wrote this frame's layouts for every panel.
+                for (index, panel) in self.panels.iter().enumerate() {
+                    if panel.terminal == active {
+                        continue;
+                    }
+                    let Some(max) = self.panel_layouts.get(index).map(|layout| layout.max_scroll)
+                    else {
+                        continue;
+                    };
+                    if let Some(terminal) = self.terminals.get_mut(panel.terminal) {
+                        terminal.scroll_y.clamp_target(0.0, max);
+                        terminal.scroll_y.clamp_current(0.0, max);
+                    }
                 }
                 if let Some(runtime) = self.runtime.as_ref() {
                     let max = runtime.terminal_tab_strip_layout().max_scroll;
@@ -5242,6 +5287,101 @@ mod tests {
 
         assert_eq!(app.active_terminal, 0);
         assert_eq!(app.terminals[1].scroll_y.target, before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Runs one frame as if 16 ms had passed since the previous one, so the
+    /// clamped `animation_dt` advances the smooth scroll by a full step.
+    fn grid_frame_step(app: &mut App) -> Result<bool, String> {
+        app.last_frame = Instant::now() - Duration::from_millis(16);
+        app.on_frame()
+    }
+
+    #[test]
+    fn grid_frame_scroll_animation_of_inactive_tile_keeps_frames() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-animation",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // Tile 1 is inactive: its scroll animation alone must keep frames running.
+        app.terminals[1].scroll_y.target = 5.0;
+        app.sync_animation_state();
+        assert!(app.animation_active);
+
+        let mut frames = 0;
+        while app.animation_active && frames < 200 {
+            assert_eq!(grid_frame_step(&mut app), Ok(true));
+            frames += 1;
+        }
+        assert!(!app.animation_active, "tile scroll did not settle in {frames} frames");
+        assert!(app.terminals[1].scroll_y.is_settled());
+        assert_eq!(app.terminals[1].scroll_y.current, 5.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_frame_clamp_skipped_for_stale_layouts() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-stale-clamp",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+        // The fresh layout of tile 1 (index 1) allows the target below.
+        assert!(app.panel_layouts[1].max_scroll >= 10.0);
+
+        // Previous-frame layout under index 1 is too small for the target,
+        // and the membership change makes it stale.
+        app.panel_layouts[1].max_scroll = 0.0;
+        app.terminals[1].scroll_y.target = 10.0;
+        app.terminals[1].scroll_y.current = 10.0;
+        app.bump_grid_generation();
+
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[1].scroll_y.target, 10.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_frame_idle_settles_without_frames() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-idle",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        app.terminals[1].scroll_y.target = 5.0;
+        app.sync_animation_state();
+        let mut frames = 0;
+        while app.animation_active && frames < 200 {
+            assert_eq!(grid_frame_step(&mut app), Ok(true));
+            frames += 1;
+        }
+        assert!(!app.animation_active, "tile scroll did not settle in {frames} frames");
+
+        // Settled: no continuous frames. Either wait for an event or sleep
+        // until a real deadline in the future.
+        match app.loop_control() {
+            AppLoopControl::Wait => {}
+            AppLoopControl::WaitUntil(deadline) => assert!(deadline > Instant::now()),
+            other => panic!("settled grid must not poll or redraw continuously: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
