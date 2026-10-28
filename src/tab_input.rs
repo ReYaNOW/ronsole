@@ -695,6 +695,34 @@ mod tests {
     }
 
     #[test]
+    fn claude_foreground_clears_when_claude_session_ends() {
+        // Same test input as above: a copy of `cat` named `claude` as the tab shell.
+        let dir = TestDir::new("claude-exit");
+        let claude = dir.binary_named(Path::new("/usr/bin/cat"), "claude");
+        let launch = crate::launch::TerminalLaunchSpec {
+            shell: Some(claude),
+            ..crate::launch::TerminalLaunchSpec::default()
+        };
+        let terminal = crate::terminal::Terminal::spawn(
+            None,
+            1,
+            launch,
+            crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+        );
+        let wait_until_claude_foreground = |expected: bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while terminal.claude_foreground() != expected {
+                assert!(Instant::now() < deadline, "claude_foreground never became {expected}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait_until_claude_foreground(true);
+        // EOF on the PTY makes `cat` exit, so the session ends.
+        terminal.write_input(b"\x04").unwrap();
+        wait_until_claude_foreground(false);
+    }
+
+    #[test]
     fn claude_generation_requires_claude_comm_and_tracks_restarts() {
         assert_eq!(claude_generation(std::process::id()), None);
         assert_eq!(claude_generation(u32::MAX), None);

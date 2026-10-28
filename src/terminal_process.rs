@@ -907,6 +907,15 @@ fn install_terminal_title_refresh(
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
+        // This thread is the only writer of the flag. Clearing it after the
+        // loop orders the reset after its last tick, so a session that has
+        // stopped never keeps a stale `claude` marker.
+        let cleared = platform::lock_recover(&title_cache).set_claude_foreground(false);
+        if cleared
+            && let Some(wake) = wake.as_ref()
+        {
+            wake.wake();
+        }
     })?;
     Ok((stop_tx, worker))
 }
