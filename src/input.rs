@@ -220,12 +220,6 @@ impl TerminalInteraction {
         self.modifiers
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_pointer_for_test(&mut self, x: f32, y: f32) {
-        self.mouse_x = x;
-        self.mouse_y = y;
-    }
-
     pub(crate) fn update_layout(&mut self, layout: TerminalUiLayout) {
         self.layout = layout;
     }

@@ -2463,6 +2463,11 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        // A new press of the same button means the release owed by an earlier
+        // suppressed press was lost; that stale mark must not swallow this press's release.
+        if state == KeyState::Pressed && self.suppressed_release == Some(button) {
+            self.suppressed_release = None;
+        }
         // A press that never reached the terminal (grid header, gap, stale
         // generation) owns its release, even when grid mode has closed since.
         if state == KeyState::Released && self.suppressed_release == Some(button) {
@@ -4862,6 +4867,7 @@ mod tests {
         for terminal in &app.terminals {
             enable_focus_reporting_for_test(terminal);
         }
+        grid_pointer_enable_tracking(&app.terminals[1]);
         app.focused = true;
         app.toggle_claude_grid(Instant::now());
         assert_eq!(app.on_frame(), Ok(true));
@@ -4873,8 +4879,21 @@ mod tests {
         assert!(app.grid_open());
         assert_eq!(app.active_terminal, 1);
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
-        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
         assert_eq!(app.interaction.layout.body, app.panel_layouts[1].body);
+        // Focus-in comes first, then exactly one legacy X10 press (button 0) at the
+        // cell under the click. The expectation is derived from tile 1's layout.
+        let layout = app.panel_layouts[1];
+        let (x, y) = point;
+        let col = ((x - layout.text_x) / layout.char_w).floor() as usize + 1;
+        // Rows are counted up from the bottom edge of the body, as the grid lays them out.
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - y
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows - rows_from_bottom;
+        let mut expected = b"\x1b[I\x1b[M".to_vec();
+        expected.extend_from_slice(&[32, col as u8 + 32, row as u8 + 32]);
+        assert_eq!(app.terminals[1].input_bytes_for_test(), expected);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4967,6 +4986,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Grid with tracking on tile 0 and a suppressed-release mark whose release never arrived.
+    fn grid_pointer_with_stale_mark(name: &str) -> (App, PathBuf) {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(name, 2);
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+        app.suppressed_release = Some(PointerButton::Left);
+        (app, root)
+    }
+
+    #[test]
+    fn grid_pointer_same_button_press_drops_stale_suppressed_release() {
+        let (mut app, root) = grid_pointer_with_stale_mark("grid-pointer-stale-mark");
+        let point = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, point);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.suppressed_release, None);
+        // The press is routed as usual, so the body of the active tile gets bytes.
+        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_other_button_press_keeps_suppressed_release() {
+        let (mut app, root) = grid_pointer_with_stale_mark("grid-pointer-other-press");
+        let point = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, point);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn grid_pointer_generation_ignored_outside_grid() {
         let (mut app, _receiver, _profile, root) =
@@ -4983,6 +5037,30 @@ mod tests {
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
         assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_generation_bump_drops_capture() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-capture",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // Tile 0 is active and has no tracking, so a body press starts a text selection.
+        let start = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, start);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        grid_pointer_move(&mut app, (start.0 + 4.0, start.1));
+        assert!(app.interaction.terminal_selection_active());
+
+        app.bump_grid_generation();
+        assert!(!app.interaction.terminal_selection_active());
         let _ = std::fs::remove_dir_all(&root);
     }
 
