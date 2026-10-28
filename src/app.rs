@@ -1043,6 +1043,13 @@ impl App {
             return false;
         }
         let old_active = self.active_terminal;
+        // Grid mode: the tile that takes focus when the focused tile closes,
+        // numbered for the tab list after the removal.
+        let grid_successor = if index == old_active {
+            self.grid_successor_after_removal(index)
+        } else {
+            None
+        };
         let is_final = self.terminals.len() == 1;
         let active_was_presented = index == old_active && self.active_terminal_presented;
         if index == old_active {
@@ -1088,7 +1095,13 @@ impl App {
 
         self.active_terminal = active_index_after_remove(old_active, index, self.terminals.len());
         if index == old_active {
-            if self.terminals[self.active_terminal].presentation_ready() {
+            if let Some(successor) = grid_successor {
+                // Focus stays on a tile; the neighbour outside the grid gets no
+                // deferred activation.
+                self.cancel_terminal_presentation_intents();
+                self.active_terminal = successor;
+                self.activate_ready_terminal(successor, false);
+            } else if self.terminals[self.active_terminal].presentation_ready() {
                 self.activate_ready_terminal(self.active_terminal, false);
             } else {
                 self.cancel_terminal_presentation_intents();
@@ -2032,6 +2045,30 @@ impl App {
             .is_some_and(|grid| grid.members.contains(&index))
     }
 
+    /// Whether the tab at `index` is on screen: a tile while grid mode is open,
+    /// otherwise the presented active tab.
+    fn tab_visible(&self, index: usize) -> bool {
+        if self.claude_grid.is_some() {
+            self.grid_contains(index)
+        } else {
+            index == self.active_terminal && self.active_terminal_presented
+        }
+    }
+
+    /// Tile that takes focus when the tab at `index` closes: the next member
+    /// in tab order, else the previous one. Returns its index after `index`
+    /// is removed. `None` outside grid mode or when no other tile exists.
+    fn grid_successor_after_removal(&self, index: usize) -> Option<usize> {
+        let grid = self.claude_grid.as_ref()?;
+        let target = grid
+            .members
+            .iter()
+            .copied()
+            .find(|&member| member > index)
+            .or_else(|| grid.members.iter().rev().copied().find(|&member| member < index))?;
+        Some(if target > index { target - 1 } else { target })
+    }
+
     /// Whether the current members fit the window body at the current metrics (Q9).
     fn grid_fits_current(&self, count: usize) -> bool {
         let metrics = self.grid_metrics;
@@ -2641,14 +2678,18 @@ impl App {
     fn drain_terminal_host_events(&mut self) {
         let now = Instant::now();
         let active = self.active_terminal;
+        // Read before the loop: `tab_visible` cannot be called while `terminals` is borrowed.
+        let grid_members = self.claude_grid.as_ref().map(|grid| grid.members.as_slice());
         let mut bell_rang = false;
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
             // Only the pending-events lock is held while clipboard text is set;
             // the published deadline is read from the same pending state.
             if terminal.apply_host_events(&mut self.interaction) {
                 bell_rang = true;
-                // The active tab is on screen, so only background tabs get a mark.
-                if index != active {
+                // Tiles of an open grid and the active tab are on screen; only
+                // other tabs get a mark.
+                let on_grid_tile = grid_members.is_some_and(|members| members.contains(&index));
+                if !on_grid_tile && index != active {
                     terminal.mark_bell_pending();
                 }
             }
@@ -4471,6 +4512,85 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(grid.encode_key(&ctrl_release, &mut out), ronsole_term::KeyOutcome::Ignore);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn grid_mode_close_focused_tab_moves_to_next_tile_not_shell() {
+        let mut app = grid_mode_app(&[true, false, true]);
+        for terminal in &app.terminals {
+            enable_focus_reporting_for_test(terminal);
+        }
+        app.focused = true;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 2]));
+
+        assert!(!app.close_terminal_tab_at(0));
+        // The former tab 2 is now index 1 and takes focus; the shell is index 0.
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        assert_eq!(grid_mode_members(&app), Some(vec![1]));
+        assert!(app.terminals.iter().all(|terminal| {
+            terminal.presentation_intent != TerminalPresentationIntent::ActivateWhenReady
+        }));
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
+    }
+
+    #[test]
+    fn grid_mode_close_last_tile_exits_to_neighbour_tab() {
+        let mut app = grid_mode_app(&[true, false]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0]));
+
+        assert!(!app.close_terminal_tab_at(0));
+        assert!(!app.grid_open());
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.terminals[0].presentation_intent, TerminalPresentationIntent::None);
+    }
+
+    #[test]
+    fn grid_mode_close_other_tile_shifts_members_and_keeps_focus() {
+        let mut app = grid_mode_app(&[true, false, true]);
+        app.active_terminal = 2;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 2]));
+        assert_eq!(app.active_terminal, 2);
+        let generation = app.grid_generation;
+
+        assert!(!app.close_terminal_tab_at(0));
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(grid_mode_members(&app), Some(vec![1]));
+        assert_ne!(app.grid_generation, generation);
+    }
+
+    #[test]
+    fn grid_mode_out_of_range_tab_is_not_visible_and_close_does_not_panic() {
+        let mut app = grid_mode_app(&[true, true]);
+        let now = Instant::now();
+        app.toggle_claude_grid(now);
+        assert!(!app.tab_visible(7));
+        assert!(!app.close_terminal_tab_at(7));
+
+        app.toggle_claude_grid(now);
+        assert!(!app.grid_open());
+        assert!(!app.tab_visible(7));
+    }
+
+    #[test]
+    fn grid_mode_bell_not_marked_on_visible_tiles() {
+        let mut app = grid_mode_app(&[true, false, true]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 2]));
+        for terminal in &app.terminals {
+            terminal.ring_bell_for_test();
+        }
+
+        app.drain_terminal_host_events();
+        assert!(!app.terminals[0].bell_pending());
+        assert!(app.terminals[1].bell_pending());
+        assert!(!app.terminals[2].bell_pending());
     }
 
     #[test]

@@ -102,7 +102,8 @@ impl App {
     }
 
     /// Read-only `TAB_STATUS_REQUEST` answer. `focused` is the focus of the
-    /// application window; `active` means the tab is the active tab and is presented.
+    /// application window; `active` means the tab is on screen: the presented
+    /// active tab, or a tile while grid mode is open.
     pub(super) fn handle_tab_status(&mut self, envelope: TabStatusEnvelope) {
         if envelope.peer.uid != effective_uid() {
             let _ = envelope.reply.send(TabStatusReply::PeerRejected);
@@ -112,7 +113,7 @@ impl App {
             None => TabStatusReply::NoTab,
             Some(index) => TabStatusReply::Status(TabStatus {
                 focused: self.focused,
-                active: index == self.active_terminal && self.active_terminal_presented,
+                active: self.tab_visible(index),
             }),
         };
         let _ = envelope.reply.send(reply);
@@ -1111,5 +1112,38 @@ mod tests {
         assert_eq!(tab_status_call(&mut fx, &token[..31], uid), TabStatusReply::NoTab);
         assert_eq!(tab_status_call(&mut fx, &token, uid.wrapping_add(1)), TabStatusReply::PeerRejected);
         assert!(fx.out().is_empty());
+    }
+
+    #[test]
+    fn grid_mode_tab_status_reports_active_for_every_tile() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        fx.app.terminals.push(Terminal::new_for_test(80, 8, 2));
+        fx.app.terminals.push(Terminal::new_for_test(80, 8, 3));
+        for (index, is_claude) in [true, false, true].into_iter().enumerate() {
+            fx.app.terminals[index].set_claude_foreground_for_test(is_claude);
+        }
+        fx.app.grid_metrics = crate::app::GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+        fx.app.active_terminal = 0;
+        fx.app.active_terminal_presented = true;
+        fx.app.focused = true;
+        fx.app.toggle_claude_grid(Instant::now());
+        assert_eq!(
+            fx.app.claude_grid.as_ref().map(|grid| grid.members.clone()),
+            Some(vec![0, 2])
+        );
+
+        let uid = crate::platform::single_instance::effective_uid();
+        let status = |active: bool| TabStatusReply::Status(TabStatus { focused: true, active });
+        // Both tiles are on screen; the shell between them is not.
+        for (index, expected) in [(0, true), (1, false), (2, true)] {
+            let token = fx.app.terminals[index].tab_token().to_owned();
+            assert_eq!(tab_status_call(&mut fx, &token, uid), status(expected), "tab {index}");
+        }
     }
 }
