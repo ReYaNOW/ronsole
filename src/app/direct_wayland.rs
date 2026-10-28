@@ -4,7 +4,8 @@ use crate::launch::TerminalLaunchSpec;
 use crate::platform::signals;
 use crate::platform::single_instance::{InstanceMessage, PrimaryInstance};
 use crate::runtime::{
-    WaylandPollOutcome, WaylandRuntimeEvents, WindowRuntime, poll_timeout_millis,
+    WaylandPollOutcome, WaylandRuntimeEvents, WaylandWindowMetrics, WindowRuntime,
+    poll_timeout_millis,
 };
 use crate::wayland_input::WaylandInputEvent;
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -139,15 +140,10 @@ impl App {
         }
 
         if let Some(metrics) = events.configured {
-            // Only a floating size is persisted; maximized or tiled sizes are not.
             self.on_resize_with_logical_size(
                 metrics.physical_width,
                 metrics.physical_height,
-                floating_logical_size(
-                    metrics.floating,
-                    metrics.logical_width,
-                    metrics.logical_height,
-                ),
+                persisted_logical_size(metrics),
             );
         }
 
@@ -209,10 +205,7 @@ impl App {
         self.on_resize_with_logical_size(
             metrics.physical_width,
             metrics.physical_height,
-            Some((
-                f64::from(metrics.logical_width),
-                f64::from(metrics.logical_height),
-            )),
+            persisted_logical_size(metrics),
         );
     }
 
@@ -348,11 +341,19 @@ impl App {
     }
 }
 
+/// Logical size that a runtime metrics report persists; only a floating toplevel yields one.
+fn persisted_logical_size(metrics: WaylandWindowMetrics) -> Option<(f64, f64)> {
+    floating_logical_size(
+        metrics.floating,
+        metrics.logical_width,
+        metrics.logical_height,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platform::single_instance::ExternalLaunchRequest;
-    use crate::runtime::WaylandWindowMetrics;
 
     fn configured_metrics(logical: u32) -> WaylandWindowMetrics {
         WaylandWindowMetrics {
@@ -363,6 +364,57 @@ mod tests {
             scale_factor: 2.0,
             floating: true,
         }
+    }
+
+    fn toplevel_metrics(width: u32, height: u32, floating: bool) -> WaylandWindowMetrics {
+        WaylandWindowMetrics {
+            logical_width: width,
+            logical_height: height,
+            physical_width: width * 2,
+            physical_height: height * 2,
+            scale_factor: 2.0,
+            floating,
+        }
+    }
+
+    #[test]
+    fn maximized_configure_does_not_persist_window_size() {
+        assert_eq!(
+            persisted_logical_size(toplevel_metrics(1000, 700, true)),
+            Some((1000.0, 700.0))
+        );
+        assert_eq!(
+            persisted_logical_size(toplevel_metrics(1920, 1080, false)),
+            None
+        );
+
+        let mut app = crate::app::tests::busy_shell_app("maximized-size");
+        let events = WaylandRuntimeEvents {
+            configured: Some(toplevel_metrics(1000, 700, true)),
+            ..Default::default()
+        };
+        app.handle_wayland_runtime_events(events);
+        assert_eq!(app.config.window_width, 1000.0);
+        assert_eq!(app.config.window_height, 700.0);
+
+        // Maximized: the configured size is applied but not persisted.
+        let events = WaylandRuntimeEvents {
+            configured: Some(toplevel_metrics(1920, 1080, false)),
+            ..Default::default()
+        };
+        app.handle_wayland_runtime_events(events);
+        assert_eq!(app.config.window_width, 1000.0);
+        assert_eq!(app.config.window_height, 700.0);
+
+        // Un-maximize: the runtime reports the restored floating size (see runtime tests).
+        let events = WaylandRuntimeEvents {
+            configured: Some(toplevel_metrics(1000, 700, true)),
+            ..Default::default()
+        };
+        app.handle_wayland_runtime_events(events);
+        assert_eq!(app.config.window_width, 1000.0);
+        assert_eq!(app.config.window_height, 700.0);
+        app.shutdown_all();
     }
 
     #[test]

@@ -997,6 +997,8 @@ struct WaylandState {
     scale_factor: f32,
     pending_toplevel_size: Option<(i32, i32)>,
     toplevel_floating: bool,
+    /// Last logical size delivered while the toplevel was floating and non-zero on both axes.
+    last_floating_size: Option<(u32, u32)>,
     configured: bool,
     close_requested: bool,
     pending_configure: Option<WaylandWindowMetrics>,
@@ -1051,6 +1053,7 @@ impl WaylandState {
             scale_factor: 1.0,
             pending_toplevel_size: None,
             toplevel_floating: true,
+            last_floating_size: Some((logical_width, logical_height)),
             configured: false,
             close_requested: false,
             pending_configure: None,
@@ -1771,10 +1774,31 @@ impl WaylandState {
         }
     }
 
+    /// Records an `xdg_toplevel` configure; `apply_configure` consumes the size
+    /// once the matching `xdg_surface` configure arrives.
+    fn apply_toplevel_configure(&mut self, width: i32, height: i32, states: &[u8]) {
+        self.pending_toplevel_size = Some((width, height));
+        self.toplevel_floating = toplevel_is_floating(states);
+    }
+
     fn apply_configure(&mut self) {
         if let Some((width, height)) = self.pending_toplevel_size.take() {
-            self.logical_width = configured_dimension(self.logical_width, width);
-            self.logical_height = configured_dimension(self.logical_height, height);
+            let non_zero = width > 0 && height > 0;
+            match self.last_floating_size {
+                // A zero-sized floating configure (e.g. after un-maximize) restores the
+                // last floating size. While floating, that size equals the current one.
+                Some((last_width, last_height)) if self.toplevel_floating && !non_zero => {
+                    self.logical_width = last_width;
+                    self.logical_height = last_height;
+                }
+                _ => {
+                    self.logical_width = configured_dimension(self.logical_width, width);
+                    self.logical_height = configured_dimension(self.logical_height, height);
+                }
+            }
+            if self.toplevel_floating && non_zero {
+                self.last_floating_size = Some((self.logical_width, self.logical_height));
+            }
         }
         self.configured = true;
         self.apply_surface_geometry();
@@ -2310,8 +2334,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 height,
                 states,
             } => {
-                state.pending_toplevel_size = Some((width, height));
-                state.toplevel_floating = toplevel_is_floating(&states);
+                state.apply_toplevel_configure(width, height, &states);
             }
             xdg_toplevel::Event::Close => state.close_requested = true,
             _ => {}
@@ -3542,6 +3565,84 @@ mod tests {
         assert_eq!(configured_dimension(1100, 0), 1100);
         assert_eq!(configured_dimension(720, 0), 720);
         assert_eq!(configured_dimension(1100, 900), 900);
+    }
+
+    fn toplevel_states_bytes(states: &[u32]) -> Vec<u8> {
+        states
+            .iter()
+            .flat_map(|state| state.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn zero_sized_floating_configure_after_maximize_restores_last_floating_size() {
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.apply_toplevel_configure(1000, 700, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1000, 700, 1.0));
+
+        state.apply_toplevel_configure(1920, 1080, &toplevel_states_bytes(&[1]));
+        state.apply_configure();
+        assert_eq!(
+            state.metrics(),
+            WaylandWindowMetrics {
+                floating: false,
+                ..WaylandWindowMetrics::new(1920, 1080, 1.0)
+            }
+        );
+
+        // Un-maximize: the compositor sends a floating configure with a zero size.
+        state.apply_toplevel_configure(0, 0, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1000, 700, 1.0));
+        assert_eq!(state.last_floating_size, Some((1000, 700)));
+    }
+
+    #[test]
+    fn one_zero_axis_floating_configure_after_maximize_restores_both_axes() {
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.apply_toplevel_configure(1000, 700, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        state.apply_toplevel_configure(1920, 1080, &toplevel_states_bytes(&[1]));
+        state.apply_configure();
+
+        state.apply_toplevel_configure(1100, 0, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1000, 700, 1.0));
+        assert_eq!(state.last_floating_size, Some((1000, 700)));
+    }
+
+    #[test]
+    fn zero_sized_floating_configure_without_prior_floating_size_keeps_current_size() {
+        // The initial size comes from config and seeds last_floating_size; a zero-sized
+        // floating configure must then keep it rather than collapse to zero.
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.apply_toplevel_configure(0, 0, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(800, 600, 1.0));
+        assert_eq!(state.last_floating_size, Some((800, 600)));
+    }
+
+    #[test]
+    fn toplevel_configure_states_drive_metrics_floating_flag() {
+        // Expected values from xdg-shell.xml: maximized=1, fullscreen=2, tiled_left=5 ..
+        // tiled_bottom=8 are not floating; no state and suspended=9 are floating.
+        let cases: &[(&[u32], bool)] = &[
+            (&[1], false),
+            (&[2], false),
+            (&[5], false),
+            (&[6], false),
+            (&[7], false),
+            (&[8], false),
+            (&[], true),
+            (&[9], true),
+        ];
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        for (states, floating) in cases {
+            state.apply_toplevel_configure(800, 600, &toplevel_states_bytes(states));
+            state.apply_configure();
+            assert_eq!(state.metrics().floating, *floating, "states {states:?}");
+        }
     }
 
     #[test]
