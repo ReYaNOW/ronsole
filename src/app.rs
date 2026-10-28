@@ -4283,6 +4283,47 @@ mod tests {
     }
 
     #[test]
+    fn grid_mode_q9_exits_open_grid_when_metrics_shrink() {
+        let now = Instant::now();
+
+        // A smaller window: the open grid no longer fits and closes onto the focused tile.
+        let mut app = grid_mode_app(&[true, true]);
+        app.toggle_claude_grid(now);
+        assert!(app.grid_open());
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            width: 40.0,
+            ..current
+        });
+        app.sync_claude_grid(now);
+        assert!(!app.grid_open());
+        // The focused tile (tab 0) stays active after the grid closes.
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(
+            app.grid_hint,
+            Some((GridHint::TooManyTabs, now + Duration::from_secs(2)))
+        );
+
+        // A larger cell size (font change) makes the tiles too small as well.
+        let mut app = grid_mode_app(&[true, true]);
+        app.toggle_claude_grid(now);
+        assert!(app.grid_open());
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            char_w: 100.0,
+            ..current
+        });
+        app.sync_claude_grid(now);
+        assert!(!app.grid_open());
+        // The focused tile (tab 0) stays active after the grid closes.
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(
+            app.grid_hint,
+            Some((GridHint::TooManyTabs, now + Duration::from_secs(2)))
+        );
+    }
+
+    #[test]
     fn grid_mode_sync_does_nothing_when_closed() {
         let mut app = grid_mode_app(&[true, true]);
         app.grid_generation = 5;
@@ -4312,6 +4353,43 @@ mod tests {
             ..same
         });
         assert!(app.grid_generation > before);
+
+        // Window size and scale start a new generation before any sync.
+        let before = app.grid_generation;
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            width: current.width - 100.0,
+            ..current
+        });
+        assert!(app.grid_generation > before);
+        let before = app.grid_generation;
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            scale: 2.0,
+            ..current
+        });
+        assert!(app.grid_generation > before);
+
+        // A pointer press from before the change is dropped with the generation.
+        app.interaction.set_pressed_mouse_buttons_for_test(1);
+        let before = app.grid_generation;
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            char_h: 20.0,
+            ..current
+        });
+        assert!(app.grid_generation > before);
+        assert_eq!(app.interaction.pressed_mouse_buttons_for_test(), 0);
+
+        // Closed grid mode: metric changes do not start a generation.
+        app.exit_claude_grid(None);
+        let before = app.grid_generation;
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            width: current.width + 1.0,
+            ..current
+        });
+        assert_eq!(app.grid_generation, before);
     }
 
     /// Ctrl+Shift+S key press, as the window delivers it.
@@ -4357,7 +4435,8 @@ mod tests {
 
     #[test]
     fn grid_mode_focus_moves_without_exit_when_focused_tile_loses_claude() {
-        let mut app = grid_mode_app(&[true, true, true]);
+        // Tab 3 is outside the grid and has no Claude flag.
+        let mut app = grid_mode_app(&[true, true, true, false]);
         for terminal in &app.terminals {
             enable_focus_reporting_for_test(terminal);
         }
@@ -4368,10 +4447,15 @@ mod tests {
         assert_eq!(grid_mode_members(&app), Some(vec![0, 1, 2]));
         assert_eq!(app.active_terminal, 1);
 
+        // A dangling activation of the tab outside the grid must not take focus.
+        app.terminals[3].presentation_intent = TerminalPresentationIntent::ActivateWhenReady;
+
         // The focused tile loses its flag: focus moves to the next member, grid stays open.
         app.terminals[1].set_claude_foreground_for_test(false);
         app.sync_claude_grid(now);
         assert!(app.grid_open());
+        assert_eq!(app.active_terminal, 2);
+        assert!(!app.process_terminal_presentation_intents());
         assert_eq!(app.active_terminal, 2);
         assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[O");
         assert_eq!(app.terminals[2].input_bytes_for_test(), b"\x1b[I");
@@ -4524,6 +4608,8 @@ mod tests {
         app.toggle_claude_grid(Instant::now());
         assert_eq!(grid_mode_members(&app), Some(vec![0, 2]));
 
+        // A dangling activation of the shell tab (outside the grid) must not take focus.
+        app.terminals[1].presentation_intent = TerminalPresentationIntent::ActivateWhenReady;
         assert!(!app.close_terminal_tab_at(0));
         // The former tab 2 is now index 1 and takes focus; the shell is index 0.
         assert_eq!(app.terminals.len(), 2);
@@ -4533,6 +4619,8 @@ mod tests {
         assert!(app.terminals.iter().all(|terminal| {
             terminal.presentation_intent != TerminalPresentationIntent::ActivateWhenReady
         }));
+        assert!(!app.process_terminal_presentation_intents());
+        assert_eq!(app.active_terminal, 1);
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
         assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
     }
