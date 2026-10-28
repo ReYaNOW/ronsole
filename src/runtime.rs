@@ -65,6 +65,11 @@ const MAX_CURSOR_BASE_SIZE: u32 = 128;
 const MAX_CURSOR_SCALE_BUCKET: u32 = 8;
 const MAX_CURSOR_THEME_SIZE: u32 = 512;
 const XDG_TOPLEVEL_ICON_MANAGER_VERSION: u32 = 1;
+// `xdg_toplevel.state` values from xdg-shell.xml; these give the window no floating size.
+const XDG_TOPLEVEL_STATE_MAXIMIZED: u32 = 1;
+const XDG_TOPLEVEL_STATE_FULLSCREEN: u32 = 2;
+const XDG_TOPLEVEL_STATE_TILED_LEFT: u32 = 5;
+const XDG_TOPLEVEL_STATE_TILED_BOTTOM: u32 = 8;
 const MAX_TOPLEVEL_ICON_SIZE: u32 = 512;
 const MAX_TOPLEVEL_ICON_SIZES: usize = 8;
 const FALLBACK_TOPLEVEL_ICON_SIZES: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
@@ -261,6 +266,21 @@ pub(crate) fn logical_to_physical(
             .clamp(0.0, f64::from(u32::MAX)) as u32
     };
     (scaled(logical_width), scaled(logical_height))
+}
+
+/// Reports whether an `xdg_toplevel` configure state array (native-endian `u32`
+/// values) leaves the window at a floating size, i.e. not maximized, fullscreen
+/// or tiled. The tiled states are contiguous in xdg-shell.xml.
+fn toplevel_is_floating(states: &[u8]) -> bool {
+    !states.chunks_exact(4).any(|chunk| {
+        let state = <[u8; 4]>::try_from(chunk).map_or(0, u32::from_ne_bytes);
+        matches!(
+            state,
+            XDG_TOPLEVEL_STATE_MAXIMIZED
+                | XDG_TOPLEVEL_STATE_FULLSCREEN
+                | XDG_TOPLEVEL_STATE_TILED_LEFT..=XDG_TOPLEVEL_STATE_TILED_BOTTOM
+        )
+    })
 }
 
 #[inline]
@@ -805,6 +825,8 @@ pub(crate) struct WaylandWindowMetrics {
     pub(crate) physical_width: u32,
     pub(crate) physical_height: u32,
     pub(crate) scale_factor: f32,
+    /// False while the toplevel is maximized, fullscreen or tiled.
+    pub(crate) floating: bool,
 }
 
 impl WaylandWindowMetrics {
@@ -817,6 +839,7 @@ impl WaylandWindowMetrics {
             physical_width,
             physical_height,
             scale_factor,
+            floating: true,
         }
     }
 }
@@ -973,6 +996,7 @@ struct WaylandState {
     logical_height: u32,
     scale_factor: f32,
     pending_toplevel_size: Option<(i32, i32)>,
+    toplevel_floating: bool,
     configured: bool,
     close_requested: bool,
     pending_configure: Option<WaylandWindowMetrics>,
@@ -1026,6 +1050,7 @@ impl WaylandState {
             logical_height,
             scale_factor: 1.0,
             pending_toplevel_size: None,
+            toplevel_floating: true,
             configured: false,
             close_requested: false,
             pending_configure: None,
@@ -1048,7 +1073,10 @@ impl WaylandState {
     }
 
     fn metrics(&self) -> WaylandWindowMetrics {
-        WaylandWindowMetrics::new(self.logical_width, self.logical_height, self.scale_factor)
+        WaylandWindowMetrics {
+            floating: self.toplevel_floating,
+            ..WaylandWindowMetrics::new(self.logical_width, self.logical_height, self.scale_factor)
+        }
     }
 
     fn fractional_scaling_active(&self) -> bool {
@@ -2277,8 +2305,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
                 state.pending_toplevel_size = Some((width, height));
+                state.toplevel_floating = toplevel_is_floating(&states);
             }
             xdg_toplevel::Event::Close => state.close_requested = true,
             _ => {}
@@ -3484,6 +3517,24 @@ mod tests {
                 GlContextPlan::Gles { major: 3, minor: 0 },
             ]
         );
+    }
+
+    #[test]
+    fn toplevel_states_without_maximized_fullscreen_or_tiled_are_floating() {
+        // Expected values come from xdg-shell.xml: maximized=1, fullscreen=2,
+        // tiled_left=5 .. tiled_bottom=8; resizing=3 and activated=4 keep a floating size.
+        let state_array = |states: &[u32]| -> Vec<u8> {
+            states.iter().flat_map(|state| state.to_ne_bytes()).collect()
+        };
+        assert!(toplevel_is_floating(&[]));
+        assert!(toplevel_is_floating(&state_array(&[4])));
+        assert!(toplevel_is_floating(&state_array(&[3, 4])));
+        assert!(!toplevel_is_floating(&state_array(&[1])));
+        assert!(!toplevel_is_floating(&state_array(&[4, 1])));
+        assert!(!toplevel_is_floating(&state_array(&[2])));
+        for tiled in 5..=8 {
+            assert!(!toplevel_is_floating(&state_array(&[tiled])), "tiled state {tiled}");
+        }
     }
 
     #[test]

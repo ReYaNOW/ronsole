@@ -213,6 +213,13 @@ pub(crate) fn normalize_scroll_sensitivity(value: f32) -> f32 {
     }
 }
 
+/// Logical size that a configure should persist as the window size. Only a
+/// floating toplevel (not maximized, fullscreen or tiled) yields a size, so the
+/// last floating size survives a session that ends in a maximized state.
+pub(crate) fn floating_logical_size(floating: bool, width: u32, height: u32) -> Option<(f64, f64)> {
+    floating.then_some((f64::from(width), f64::from(height)))
+}
+
 fn valid_window_dimension(value: f64) -> bool {
     value.is_finite() && value > 0.0
 }
@@ -324,6 +331,15 @@ mod tests {
         assert_eq!(config.terminal_font_size, 16.0);
         assert_eq!(config.scroll_sensitivity, 1.0);
         assert_eq!(config.terminal_background, DEFAULT_TERMINAL_BACKGROUND);
+    }
+
+    #[test]
+    fn floating_logical_size_persists_only_floating_toplevels() {
+        assert_eq!(floating_logical_size(true, 1000, 700), Some((1000.0, 700.0)));
+        assert_eq!(floating_logical_size(true, 1280, 800), Some((1280.0, 800.0)));
+        // Maximized, fullscreen and tiled configures carry no floating size.
+        assert_eq!(floating_logical_size(false, 1920, 1080), None);
+        assert_eq!(floating_logical_size(false, 0, 0), None);
     }
 
     #[test]

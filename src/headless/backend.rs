@@ -42,6 +42,7 @@ impl HeadlessBackend {
                 physical_width,
                 physical_height,
                 scale_factor,
+                floating: true,
             },
             frame_requested: Cell::new(false),
             last_frame: Cell::new(None),
