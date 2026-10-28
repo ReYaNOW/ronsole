@@ -1,4 +1,5 @@
 use super::*;
+use crate::panels::Panel;
 use crate::scroll::{ScrollbarThumb, scrollbar_drag_target, scrollbar_thumb};
 use ronsole_term::{LinkTarget, UnderlineStyle};
 use crate::single_line_input::SingleLineInput;
@@ -1430,9 +1431,64 @@ fn terminal_dimensions_changed(
     cols != new_cols || rows != new_rows
 }
 
+/// Horizontal inset of a grid tile header title, in logical pixels.
+const TILE_TITLE_PAD: f32 = 6.0;
+
+/// Cached header text of one grid tile. `source` and `max_w` are the inputs
+/// `text` was cut from; the cache is recomputed only when either changes.
+#[derive(Default)]
+pub(super) struct TileTitleCache {
+    source: String,
+    max_w: f32,
+    text: String,
+}
+
+const ELLIPSIS: char = '\u{2026}';
+
+/// Writes `text` into `out`, cut with a trailing ellipsis when its advance sum
+/// exceeds `max_w`. `advance` returns the advance of one character. `out` is
+/// cleared first, so the caller can reuse its allocation.
+fn ellipsize_to_width(
+    text: &str,
+    max_w: f32,
+    mut advance: impl FnMut(char) -> f32,
+    out: &mut String,
+) {
+    out.clear();
+    if text.is_empty() || max_w <= 0.0 {
+        return;
+    }
+    let mut total = 0.0;
+    for c in text.chars() {
+        total += advance(c);
+    }
+    if total <= max_w {
+        out.push_str(text);
+        return;
+    }
+    let ellipsis_w = advance(ELLIPSIS);
+    if ellipsis_w > max_w {
+        return;
+    }
+    let budget = max_w - ellipsis_w;
+    let mut used = 0.0;
+    for c in text.chars() {
+        let w = advance(c);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push(ELLIPSIS);
+}
+
+/// Resizes `grid` when its size differs from the body geometry and refreshes the
+/// search matches. `search` is `Some` only for the panel that owns the search
+/// overlay; other panels never recompute matches.
 fn prepare_terminal_grid_for_render(
     grid: &mut Term,
-    search: &mut TerminalSearchState,
+    search: Option<&mut TerminalSearchState>,
     new_cols: usize,
     new_rows: usize,
 ) -> bool {
@@ -1440,7 +1496,7 @@ fn prepare_terminal_grid_for_render(
     if resized {
         grid.resize(new_cols, new_rows);
     }
-    if search.shown {
+    if let Some(search) = search.filter(|search| search.shown) {
         search.refresh_for_grid(grid, SearchRefreshCause::Grid);
     }
     resized
@@ -2039,6 +2095,11 @@ impl Renderer {
         self.get_glyph(c, prefer_color, face)
     }
 
+    /// Terminal cell size in physical pixels: `(advance, line height)`.
+    pub(crate) fn terminal_cell_size(&self) -> (f32, f32) {
+        (self.terminal_char_width(), self.line_height * TERMINAL_TEXT_SCALE)
+    }
+
     fn terminal_char_width(&self) -> f32 {
         self.ascii_advances[b'A' as usize].max(1.0) * TERMINAL_TEXT_SCALE
     }
@@ -2108,7 +2169,7 @@ impl Renderer {
     ) -> TerminalSearchGeometry {
         let s = self.scale_factor;
         let palette = self.palette;
-        let geometry = terminal_search_geometry(self.width, body.y, s);
+        let geometry = terminal_search_geometry(body, s);
         let hovered = geometry.hit_test(pointer_x, pointer_y);
         let radius = 6.0 * s;
         self.push_rounded_rect(
@@ -3429,6 +3490,9 @@ impl Renderer {
         &mut self,
         terminals: &[Terminal],
         active_terminal: usize,
+        panels: &[Panel],
+        panel_layouts: &mut Vec<TerminalUiLayout>,
+        tab_strip_hint: Option<&'static str>,
         search: &mut TerminalSearchState,
         focused: bool,
         show_fps: bool,
@@ -3450,23 +3514,94 @@ impl Renderer {
     ) -> TerminalUiLayout {
         self.frame_flushes = 0;
         self.frame_vertices = 0;
-        let layout = if let Some(terminal) = terminals.get(active_terminal) {
-            self.render_terminal_body(
-                terminal,
-                search,
-                focused && settings_progress <= 0.0,
-                focused,
-                pointer_x,
-                pointer_y,
-            )
-        } else {
-            let palette = self.palette;
-            unsafe {
-                self.gl.clear_color(palette.bg[0], palette.bg[1], palette.bg[2], palette.bg[3]);
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
+        // The frame is cleared once here; panel bodies draw over it without clearing.
+        let palette = self.palette;
+        unsafe {
+            self.gl.clear_color(palette.bg[0], palette.bg[1], palette.bg[2], palette.bg[3]);
+            self.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        let s = self.scale_factor;
+        panel_layouts.clear();
+        let mut active_layout = TerminalUiLayout::default();
+        // Taken out of `self` so the title cache and the glyph metrics can be used together.
+        let mut titles = std::mem::take(&mut self.tile_titles);
+        titles.resize_with(panels.len(), TileTitleCache::default);
+        for (index, panel) in panels.iter().enumerate() {
+            let Some(terminal) = terminals.get(panel.terminal) else {
+                panel_layouts.push(TerminalUiLayout::default());
+                continue;
+            };
+            let is_active = panel.terminal == active_terminal;
+            if let Some(header) = panel.header {
+                let pad = (TILE_TITLE_PAD * s).round();
+                let text_w = (header.w - 2.0 * pad).max(0.0);
+                self.push_rect(
+                    header.x,
+                    header.y,
+                    header.w,
+                    header.h,
+                    [palette.fg[0], palette.fg[1], palette.fg[2], 0.10],
+                );
+                let scratch = &mut self.tile_title_scratch;
+                scratch.clear();
+                terminal.write_display_title(scratch);
+                let cache = &mut titles[index];
+                if cache.source != *scratch || cache.max_w != text_w {
+                    std::mem::swap(&mut cache.source, scratch);
+                    cache.max_w = text_w;
+                    ellipsize_to_width(
+                        &cache.source,
+                        text_w,
+                        |c| self.one_line_text_advance(c, 1.0),
+                        &mut cache.text,
+                    );
+                }
+                let baseline = (header.y + header.h * 0.5 + 5.0 * s).round();
+                let text_x = header.x + pad;
+                self.draw_ui_text_clipped(
+                    &titles[index].text,
+                    text_x,
+                    text_x + text_w,
+                    baseline,
+                    palette.fg,
+                    1.0,
+                );
             }
-            TerminalUiLayout::default()
-        };
+            let layout = if panel.content_hidden {
+                self.push_rect(panel.body.x, panel.body.y, panel.body.w, panel.body.h, palette.bg);
+                TerminalUiLayout {
+                    body: panel.body,
+                    ..TerminalUiLayout::default()
+                }
+            } else {
+                // Only the active panel gets search, cursor and the ordinary-mode separator.
+                let search_for_panel = if is_active { Some(&mut *search) } else { None };
+                self.render_terminal_body(
+                    terminal,
+                    panel.body,
+                    search_for_panel,
+                    is_active && focused && settings_progress <= 0.0,
+                    panel.header.is_some(),
+                    focused,
+                    pointer_x,
+                    pointer_y,
+                )
+            };
+            if let (Some(header), true) = (panel.header, is_active) {
+                let t = s.round().max(1.0);
+                let h = panel.body.y + panel.body.h - header.y;
+                let accent = palette.accent;
+                self.push_rect(header.x, header.y, header.w, t, accent);
+                self.push_rect(header.x, header.y + h - t, header.w, t, accent);
+                self.push_rect(header.x, header.y, t, h, accent);
+                self.push_rect(header.x + header.w - t, header.y, t, h, accent);
+            }
+            panel_layouts.push(layout);
+            if is_active {
+                active_layout = layout;
+            }
+        }
+        self.tile_titles = titles;
         self.draw_terminal_tabs(
             terminals,
             active_terminal,
@@ -3475,6 +3610,14 @@ impl Renderer {
             pointer_x,
             pointer_y,
         );
+        if let Some(hint) = tab_strip_hint {
+            let strip = terminal_tab_strip_rect(self.width, s);
+            let baseline = (strip.y + strip.h * 0.5 + 5.0 * s).round();
+            let right = strip.x + strip.w - TERMINAL_TAB_BAR_PAD * s;
+            let hint_w = self.terminal_ui_text_width(hint, 1.0);
+            let color = [palette.fg[0], palette.fg[1], palette.fg[2], 0.72];
+            self.draw_ui_text_clipped(hint, (right - hint_w).max(strip.x), right, baseline, color, 1.0);
+        }
         self.draw_settings(
             settings_progress,
             settings_tab,
@@ -3493,27 +3636,28 @@ impl Renderer {
             self.draw_close_confirm(view);
         }
         if show_fps {
-            self.draw_fps_overlay(layout.body);
+            self.draw_fps_overlay(terminal_body_rect(self.width, self.height, s));
         }
-        layout
+        active_layout
     }
 
+    /// Draws one terminal body into `body`, which is the scissor and the geometry
+    /// source for text, cursor and search. `search` is `Some` only for the panel that
+    /// owns the search overlay; `show_cursor` gates the cursor; `tile` marks a grid
+    /// tile, which has no accent separator. The frame is cleared by the caller.
     pub(crate) fn render_terminal_body(
         &mut self,
         terminal: &Terminal,
-        search: &mut TerminalSearchState,
-        input_focused: bool,
+        body: Rect,
+        mut search: Option<&mut TerminalSearchState>,
+        show_cursor: bool,
+        tile: bool,
         window_focused: bool,
         pointer_x: f32,
         pointer_y: f32,
     ) -> TerminalUiLayout {
         let palette = self.palette;
-        unsafe {
-            self.gl.clear_color(palette.bg[0], palette.bg[1], palette.bg[2], palette.bg[3]);
-            self.gl.clear(glow::COLOR_BUFFER_BIT);
-        }
         let s = self.scale_factor;
-        let body = terminal_body_rect(self.width, self.height, s);
         let char_w = self.terminal_char_width();
         let char_h = self.line_height * TERMINAL_TEXT_SCALE;
         let grid_size = terminal_grid_size(body, char_w, char_h, s);
@@ -3522,7 +3666,7 @@ impl Renderer {
 
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         let resized =
-            prepare_terminal_grid_for_render(&mut grid, search, new_cols, new_rows);
+            prepare_terminal_grid_for_render(&mut grid, search.as_deref_mut(), new_cols, new_rows);
         grid.mark_presentation_layout_ready();
         if resized {
             drop(grid);
@@ -3531,8 +3675,10 @@ impl Renderer {
                 u16::try_from(new_rows.min(u16::MAX as usize)).unwrap_or(u16::MAX),
             );
             grid = crate::platform::lock_recover(&terminal.grid);
-            prepare_terminal_grid_for_render(&mut grid, search, new_cols, new_rows);
+            prepare_terminal_grid_for_render(&mut grid, search.as_deref_mut(), new_cols, new_rows);
         }
+        // Matches are read only for the panel that owns the search overlay.
+        let search_matches = search.as_deref().filter(|search| search.shown);
         let presentation_visible = grid.presentation_visible();
         grid.set_dirty(false);
         let is_alt = grid.is_alt_screen();
@@ -3541,7 +3687,7 @@ impl Renderer {
         let scroll_offset = terminal_render_scroll_offset(terminal.scroll_y.current, max_scroll, is_alt);
         let text_x = body.x + 10.0 * s;
         let (_, bottom_pad) = terminal_text_padding(s);
-        let separator = terminal_focus_separator_rect(body, s);
+        let separator = if tile { None } else { terminal_focus_separator_rect(body, s) };
         let content_clip = terminal_body_content_clip(body, separator);
 
         self.flush();
@@ -3571,12 +3717,12 @@ impl Renderer {
                     let row = grid.row(i).unwrap_or(&[]);
                     match layer {
                         TerminalBodyLayer::Background => {
-                            let row_matches = if search.shown {
-                                search.row_matches(i)
-                            } else {
-                                &[]
+                            let row_matches = match search_matches {
+                                Some(search) => search.row_matches(i),
+                                None => &[],
                             };
-                            let active_search_match = search.active_match();
+                            let active_search_match =
+                                search_matches.and_then(|search| search.active_match());
                             let mut row_match_index = 0usize;
                             for (cell_index, cell) in row.iter().take(grid.cols()).enumerate() {
                                 let (x, next_x) =
@@ -3751,7 +3897,7 @@ impl Renderer {
                 }
             }
 
-            if input_focused && grid.cursor_visible() {
+            if show_cursor && grid.cursor_visible() {
                 let (cursor_x, cursor_y_row) = grid.cursor();
                 let cursor_offset = grid.rows().saturating_sub(1).saturating_sub(cursor_y_row);
                 let cursor_y = body.y + body.h - bottom_pad - char_h
@@ -3785,9 +3931,12 @@ impl Renderer {
             );
         }
 
-        let search_geometry = search
-            .shown
-            .then(|| self.draw_search_overlay(search, body, pointer_x, pointer_y));
+        let search_geometry = match search {
+            Some(search) if search.shown => {
+                Some(self.draw_search_overlay(search, body, pointer_x, pointer_y))
+            }
+            _ => None,
+        };
         self.flush();
 
         TerminalUiLayout {
@@ -3822,6 +3971,24 @@ mod tests {
             terminal_cell_face_from_flags(CellFlags::BOLD | CellFlags::ITALIC),
             GLYPH_FACE_BOLD_ITALIC
         );
+    }
+
+    #[test]
+    fn ellipsize_to_width_keeps_fitting_text_and_cuts_with_ellipsis() {
+        let mut out = String::new();
+        let one = |_c: char| 1.0;
+        ellipsize_to_width("abcdef", 10.0, one, &mut out);
+        assert_eq!(out, "abcdef");
+        ellipsize_to_width("abcdef", 4.0, one, &mut out);
+        assert_eq!(out, "abc…");
+        ellipsize_to_width("abcdef", 0.5, one, &mut out);
+        assert_eq!(out, "");
+        ellipsize_to_width("", 10.0, one, &mut out);
+        assert_eq!(out, "");
+        ellipsize_to_width("abcdef", 0.0, one, &mut out);
+        assert_eq!(out, "");
+        ellipsize_to_width("abcdef", -3.0, one, &mut out);
+        assert_eq!(out, "");
     }
 
     fn test_term(cols: usize, rows: usize) -> Term {
@@ -4748,7 +4915,7 @@ mod tests {
 
         assert!(prepare_terminal_grid_for_render(
             &mut grid,
-            &mut search,
+            Some(&mut search),
             10,
             2,
         ));
@@ -4766,7 +4933,7 @@ mod tests {
         grid.mark_changed();
         assert!(!prepare_terminal_grid_for_render(
             &mut grid,
-            &mut search,
+            Some(&mut search),
             10,
             2,
         ));

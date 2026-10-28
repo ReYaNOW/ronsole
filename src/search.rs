@@ -101,18 +101,16 @@ impl TerminalSearchGeometry {
     }
 }
 
-pub(crate) fn terminal_search_geometry(
-    window_w: f32,
-    body_y: f32,
-    scale: f32,
-) -> TerminalSearchGeometry {
+/// Search overlay rectangle inside `body`: right-aligned with an 8 logical-pixel
+/// inset from the body's right edge, 10 logical pixels below its top.
+pub(crate) fn terminal_search_geometry(body: Rect, scale: f32) -> TerminalSearchGeometry {
     let s = scale;
-    let window_w = window_w.max(0.0);
+    let window_w = body.w.max(0.0);
     let w = (480.0 * s).min((window_w - 16.0 * s).max(0.0));
-    let x = (window_w - w - 8.0 * s).max(0.0);
+    let x = (body.x + window_w - w - 8.0 * s).max(body.x);
     let outer = Rect {
         x,
-        y: body_y + 10.0 * s,
+        y: body.y + 10.0 * s,
         w,
         h: 52.0 * s,
     };
@@ -935,7 +933,7 @@ mod tests {
         let widths = [0.0, 8.0, 20.0, 35.0, 50.0, 120.0, 180.0, 249.0, 250.0, 329.0, 330.0, 480.0, 900.0];
         for scale in [1.0, 1.333_333_3] {
             for window_w in widths {
-                let geometry = terminal_search_geometry(window_w, 13.0, scale);
+                let geometry = terminal_search_geometry(window_body(window_w, 13.0), scale);
                 let rects = [
                     geometry.outer,
                     geometry.input,
@@ -990,9 +988,52 @@ mod tests {
         }
     }
 
+    /// Body rectangle spanning a whole window of width `w` starting at `y`.
+    fn window_body(w: f32, y: f32) -> Rect {
+        Rect {
+            x: 0.0,
+            y,
+            w,
+            h: 600.0,
+        }
+    }
+
+    #[test]
+    fn terminal_search_geometry_stays_inside_body() {
+        // Left half of an 800-wide window: the overlay is placed from the body's right edge.
+        let left_half = Rect {
+            x: 0.0,
+            y: 38.0,
+            w: 400.0,
+            h: 500.0,
+        };
+        let geometry = terminal_search_geometry(left_half, 1.0);
+        assert!(geometry.outer.x >= left_half.x);
+        assert!(geometry.outer.x + geometry.outer.w <= left_half.x + left_half.w);
+        assert!(geometry.outer.y >= left_half.y);
+        assert_eq!(geometry.outer.w, 384.0);
+        assert_eq!(geometry.outer.x, 8.0);
+
+        // Right half: the overlay stays inside the body, not at the window's right edge.
+        let right_half = Rect {
+            x: 400.0,
+            y: 38.0,
+            w: 400.0,
+            h: 500.0,
+        };
+        let geometry = terminal_search_geometry(right_half, 1.0);
+        assert!(geometry.outer.x >= right_half.x);
+        assert!(geometry.outer.x + geometry.outer.w <= right_half.x + right_half.w);
+
+        // Whole-window body keeps the pre-panel placement: x = 800 - 480 - 8.
+        let full = terminal_search_geometry(window_body(800.0, 38.0), 1.0);
+        assert_eq!(full.outer.x, 312.0);
+        assert_eq!(full.outer.w, 480.0);
+    }
+
     #[test]
     fn search_geometry_hit_test_distinguishes_controls_chrome_and_outside() {
-        let geometry = terminal_search_geometry(800.0, 38.0, 1.0);
+        let geometry = terminal_search_geometry(window_body(800.0, 38.0), 1.0);
         let center = |rect: Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
 
         let (x, y) = center(geometry.input);
@@ -1014,7 +1055,7 @@ mod tests {
 
     #[test]
     fn narrow_search_geometry_has_no_hidden_control_hits() {
-        let geometry = terminal_search_geometry(240.0, 38.0, 1.0);
+        let geometry = terminal_search_geometry(window_body(240.0, 38.0), 1.0);
         assert!(!geometry.show_nav);
         assert!(!geometry.show_case);
         assert_eq!(geometry.previous, Rect::default());

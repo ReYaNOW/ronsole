@@ -9,13 +9,15 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
+use crate::panels::Panel;
 use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
 use crate::platform::single_instance::BridgeResult;
 use crate::renderer::{
     CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
-    SettingsTab, TerminalTabHit, settings_color_value, terminal_palette,
+    SettingsTab, TerminalTabHit, TerminalUiLayout, settings_color_value, terminal_body_rect,
+    terminal_palette,
 };
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
@@ -467,6 +469,17 @@ where
         })
 }
 
+/// Window and terminal-cell metrics the panel layout is computed from.
+/// `width`/`height` are in the units `terminal_body_rect` takes.
+#[derive(Clone, Copy, PartialEq, Default)]
+struct GridMetrics {
+    width: f32,
+    height: f32,
+    scale: f32,
+    char_w: f32,
+    char_h: f32,
+}
+
 pub struct App {
     runtime: Option<WindowRuntime>,
     config: AppConfig,
@@ -524,6 +537,12 @@ pub struct App {
     animation_active: bool,
     last_frame: Instant,
     automation: Option<automation::AutomationController>,
+    /// Written only by `set_grid_metrics`.
+    grid_metrics: GridMetrics,
+    /// Panels drawn in the current frame; rebuilt by `rebuild_panels` before each render.
+    panels: Vec<Panel>,
+    /// Layouts of `panels` from the last render, in `panels` order.
+    panel_layouts: Vec<TerminalUiLayout>,
 }
 
 impl App {
@@ -601,6 +620,9 @@ impl App {
             animation_active: false,
             last_frame: Instant::now(),
             automation: None,
+            grid_metrics: GridMetrics::default(),
+            panels: Vec::new(),
+            panel_layouts: Vec::new(),
         }
     }
 
@@ -1453,6 +1475,7 @@ impl App {
                     if let Some(runtime) = self.runtime.as_mut() {
                         let _ = runtime.set_terminal_font_size(logical_size);
                     }
+                    self.refresh_grid_metrics();
                     self.settings_font_value = format!("{logical_size:.0}");
                     true
                 }
@@ -1467,6 +1490,7 @@ impl App {
                     if let Some(runtime) = self.runtime.as_mut() {
                         let _ = runtime.set_terminal_font_size(DEFAULT_TERMINAL_FONT_SIZE);
                     }
+                    self.refresh_grid_metrics();
                     self.settings_font_value = format!("{DEFAULT_TERMINAL_FONT_SIZE:.0}");
                     true
                 }
@@ -1800,6 +1824,7 @@ impl App {
             eprintln!("Ronsole graphics:\n{}", runtime.diagnostics_report());
         }
         self.runtime = Some(runtime);
+        self.refresh_grid_metrics();
         self.last_frame = Instant::now();
         let _ = self.add_terminal_with_launch(initial_launch);
         self.flush_pending_external_launches();
@@ -1817,6 +1842,41 @@ impl App {
     fn finish_terminal_session(&mut self) {
         self.prepare_exit();
         self.shutdown_all();
+    }
+
+    /// The only writer of `grid_metrics`.
+    fn set_grid_metrics(&mut self, metrics: GridMetrics) {
+        self.grid_metrics = metrics;
+    }
+
+    /// Reads window size, scale and cell size from the runtime. Without a runtime
+    /// the stored metrics are left unchanged.
+    fn refresh_grid_metrics(&mut self) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let (width, height) = runtime.window_size();
+        let (char_w, char_h) = runtime.terminal_cell_size();
+        let metrics = GridMetrics {
+            width,
+            height,
+            scale: runtime.scale_factor(),
+            char_w,
+            char_h,
+        };
+        self.set_grid_metrics(metrics);
+    }
+
+    /// Ordinary mode: one panel, the active terminal filling the window body.
+    fn rebuild_panels(&mut self) {
+        let metrics = self.grid_metrics;
+        self.panels.clear();
+        self.panels.push(Panel {
+            terminal: self.active_terminal,
+            body: terminal_body_rect(metrics.width, metrics.height, metrics.scale),
+            header: None,
+            content_hidden: false,
+        });
     }
 
     pub(crate) fn on_resize_with_logical_size(
@@ -1838,6 +1898,7 @@ impl App {
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.resize(width, height);
         }
+        self.refresh_grid_metrics();
         self.mark_dirty();
     }
 
@@ -1848,6 +1909,7 @@ impl App {
                 runtime.resize(width, height);
             }
         }
+        self.refresh_grid_metrics();
         self.terminal_tab_scroll.reset();
         self.mark_dirty();
     }
@@ -2240,10 +2302,14 @@ impl App {
             settings_animation_step(self.settings_progress, self.settings_open, dt);
         self.settings_progress = settings_progress;
 
+        self.rebuild_panels();
         let render_result = if let Some(runtime) = self.runtime.as_mut() {
             Some(runtime.render_terminal_and_present(TerminalRenderParams {
                 terminals: &self.terminals,
                 active_terminal: self.active_terminal,
+                panels: &self.panels,
+                panel_layouts: &mut self.panel_layouts,
+                tab_strip_hint: None,
                 search: &mut self.interaction.search,
                 focused: self.focused,
                 tab_scroll_x: self.terminal_tab_scroll.current,

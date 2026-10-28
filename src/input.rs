@@ -3438,7 +3438,13 @@ mod tests {
     #[test]
     fn ronsole_overlays_own_mouse_motion_and_wheel_before_terminal_protocol() {
         let mut layout = mouse_test_layout(0.0);
-        let search = crate::search::terminal_search_geometry(800.0, layout.body.y, 1.0);
+        let window_body = crate::search::Rect {
+            x: 0.0,
+            y: layout.body.y,
+            w: 800.0,
+            h: 600.0,
+        };
+        let search = crate::search::terminal_search_geometry(window_body, 1.0);
         layout.search = Some(search);
         layout.scrollbar = Some(Default::default());
         let scrollbar = layout.scrollbar.as_mut().unwrap();
