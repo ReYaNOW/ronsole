@@ -1293,6 +1293,11 @@ impl App {
         self.terminals.insert(to, terminal);
         self.active_terminal = active_index_after_move(self.active_terminal, from, to);
         self.pending_tab_reveal = Some(false);
+        if self.grid_open() {
+            // The tile order changed: the panels and layouts of the last frame
+            // name other tiles now.
+            self.bump_grid_generation();
+        }
         self.mark_dirty();
     }
 
@@ -2209,6 +2214,8 @@ impl App {
         self.cancel_terminal_presentation_intents();
         self.adopt_grid_members();
         self.bump_grid_generation();
+        // A hint from a refused entry must not outlive the successful one.
+        self.grid_hint = None;
         self.activate_ready_terminal(focus, false);
         self.request_frame();
     }
@@ -2220,6 +2227,8 @@ impl App {
         if self.claude_grid.take().is_none() {
             return;
         }
+        // The banner deadline belongs to the open grid; nothing reads it outside.
+        self.withheld_until = None;
         self.bump_grid_generation();
         if let Some(index) = target
             && index != self.active_terminal
@@ -2810,10 +2819,12 @@ impl App {
         }
         // Grid tiles other than the active tab. Their layouts come from the last
         // render, and a stale one is trusted only in the current panel generation:
-        // after a membership change the same index names another tile.
+        // after a membership change the same index names another tile. Outside grid
+        // mode `self.panels` is the previous frame's list, so it is not read at all.
         let layouts_current = self.panel_layouts_generation == self.grid_generation;
+        let in_grid = self.grid_open();
         for (index, panel) in self.panels.iter().enumerate() {
-            if panel.terminal == active {
+            if !in_grid || panel.terminal == active {
                 continue;
             }
             let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
@@ -4529,6 +4540,35 @@ mod tests {
     }
 
     #[test]
+    fn grid_fix_successful_entry_clears_refused_hint() {
+        let mut app = grid_mode_app(&[false, false]);
+        let now = Instant::now();
+        app.toggle_claude_grid(now);
+        assert!(!app.grid_open());
+        assert!(app.tab_strip_hint(now).is_some());
+
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(now);
+        assert!(app.grid_open());
+        assert_eq!(app.tab_strip_hint(now), None);
+        assert_eq!(app.grid_hint, None);
+    }
+
+    #[test]
+    fn grid_fix_exit_clears_withheld_deadline() {
+        let mut app = grid_mode_app(&[true, true]);
+        let now = Instant::now();
+        app.toggle_claude_grid(now);
+        assert!(app.grid_open());
+        app.withheld_until = Some(now + Duration::from_secs(1));
+
+        app.toggle_claude_grid(now);
+        assert!(!app.grid_open());
+        assert_eq!(app.withheld_until, None);
+    }
+
+    #[test]
     fn grid_mode_q9_blocks_entry_when_tiles_do_not_fit() {
         let mut app = grid_mode_app(&[true, true]);
         app.grid_metrics.width = 40.0;
@@ -5572,6 +5612,62 @@ mod tests {
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert!(app.terminals[1].scroll_y.target <= app.panel_layouts[1].max_scroll);
         assert!(app.terminals[1].scroll_y.target < 10_000.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_fix_outside_grid_close_does_not_clamp_other_tab_by_stale_layout() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-fix-outside-clamp",
+                3,
+            );
+        // Tab 1 is short and active; tab 2 has history and a scroll position.
+        feed_batch(&app.terminals[2], &"history line\r\n".repeat(200));
+        app.active_terminal = 1;
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.panel_layouts[0].max_scroll, 0.0);
+
+        app.terminals[2].scroll_y.target = 20.0;
+        app.terminals[2].scroll_y.current = 20.0;
+        // Removal as the close path does it outside grid mode: the tabs shift and
+        // the active index follows, while `panels` keeps last frame's tile list.
+        // `close_terminal_tab_at` is not used because the headless tab's process
+        // cleanup can refuse the close.
+        app.terminals.remove(0);
+        app.active_terminal = 0;
+
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[1].scroll_y.target, 20.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_fix_reorder_bumps_generation_and_skips_stale_layout() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-fix-reorder-generation",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Tile 0 is short; tile 1 has history.
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.panel_layouts[0].max_scroll, 0.0);
+        assert!(app.panel_layouts[1].max_scroll >= 10.0);
+        let generation = app.grid_generation;
+
+        // After the swap the history tab is at index 0, the inactive one, and
+        // the stale layout of index 0 (short tab) must not clamp it.
+        app.reorder_terminal_tab(0, 1);
+        assert_ne!(app.grid_generation, generation);
+        app.terminals[0].scroll_y.target = 20.0;
+        app.terminals[0].scroll_y.current = 20.0;
+
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[0].scroll_y.target, 20.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
