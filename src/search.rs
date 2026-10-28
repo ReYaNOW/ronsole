@@ -25,6 +25,25 @@ impl Rect {
             && y >= self.y
             && y <= self.y + self.h
     }
+
+    /// Intersection with `bounds`. Hidden (zero-size) rects are returned unchanged,
+    /// so `Rect::default()` placeholders for absent controls stay as they are.
+    #[inline]
+    pub(crate) fn clipped_to(self, bounds: Rect) -> Rect {
+        if self.w <= 0.0 || self.h <= 0.0 {
+            return self;
+        }
+        let x = self.x.max(bounds.x);
+        let y = self.y.max(bounds.y);
+        let right = (self.x + self.w).min(bounds.x + bounds.w);
+        let bottom = (self.y + self.h).min(bounds.y + bounds.h);
+        Rect {
+            x,
+            y,
+            w: (right - x).max(0.0),
+            h: (bottom - y).max(0.0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +122,8 @@ impl TerminalSearchGeometry {
 
 /// Search overlay rectangle inside `body`: right-aligned with an 8 logical-pixel
 /// inset from the body's right edge, 10 logical pixels below its top. A body
-/// shorter than the overlay (a grid tile) clips the overlay at its bottom edge.
+/// shorter than the overlay (a grid tile) clips the overlay and its controls at its
+/// bottom edge.
 pub(crate) fn terminal_search_geometry(body: Rect, scale: f32) -> TerminalSearchGeometry {
     let s = scale;
     let window_w = body.w.max(0.0);
@@ -181,13 +201,15 @@ pub(crate) fn terminal_search_geometry(body: Rect, scale: f32) -> TerminalSearch
         h: 30.0 * s,
     };
 
+    // Controls are intersected with `outer` (not re-centered), so draw and hit-test
+    // use the same rects and nothing reaches past a tile body shorter than the overlay.
     TerminalSearchGeometry {
         outer,
-        input,
-        close,
-        previous,
-        next,
-        case_toggle,
+        input: input.clipped_to(outer),
+        close: close.clipped_to(outer),
+        previous: previous.clipped_to(outer),
+        next: next.clipped_to(outer),
+        case_toggle: case_toggle.clipped_to(outer),
         text_viewport_w: (input_w - 10.0 * s).max(0.0),
         show_nav,
         show_case,
@@ -1001,6 +1023,13 @@ mod tests {
         }
     }
 
+    fn rect_inside_body(rect: Rect, body: Rect) -> bool {
+        rect.x >= body.x
+            && rect.y >= body.y
+            && rect.x + rect.w <= body.x + body.w
+            && rect.y + rect.h <= body.y + body.h
+    }
+
     #[test]
     fn search_overlay_stays_inside_tile_body_shorter_than_overlay() {
         for scale in [1.0_f32, 1.25] {
@@ -1014,11 +1043,31 @@ mod tests {
             let geometry = terminal_search_geometry(tile, scale);
             assert!(geometry.outer.y >= tile.y, "scale {scale}");
             assert!(geometry.outer.y + geometry.outer.h <= tile.y + tile.h, "scale {scale}");
+            for (name, rect) in [
+                ("input", geometry.input),
+                ("close", geometry.close),
+                ("previous", geometry.previous),
+                ("next", geometry.next),
+                ("case_toggle", geometry.case_toggle),
+            ] {
+                assert!(
+                    rect_inside_body(rect, tile),
+                    "{name} {rect:?} must stay inside tile body {tile:?} at scale {scale}"
+                );
+            }
 
             // Whole-window body is taller than the overlay: its placement is unchanged.
             let full = terminal_search_geometry(window_body(800.0, 38.0), scale);
             assert_eq!(full.outer.y, 38.0 + 10.0 * scale, "scale {scale}");
             assert_eq!(full.outer.h, 52.0 * scale, "scale {scale}");
+            // Controls keep the fixed offsets from the overlay top (8 and 11 logical px)
+            // and the 36-px button size; none of them is clipped outside the window body.
+            assert_eq!(full.close.y, full.outer.y + 8.0 * scale, "scale {scale}");
+            assert_eq!(full.close.w, 36.0 * scale, "scale {scale}");
+            assert_eq!(full.input.y, full.outer.y + 11.0 * scale, "scale {scale}");
+            assert_eq!(full.input.h, 30.0 * scale, "scale {scale}");
+            assert!(rect_inside_body(full.close, full.outer), "scale {scale}");
+            assert!(rect_inside_body(full.input, full.outer), "scale {scale}");
         }
     }
 

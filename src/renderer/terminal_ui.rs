@@ -2221,7 +2221,7 @@ impl Renderer {
             palette.minimap_bg,
         );
 
-        if geometry.input.w > 0.0 {
+        if geometry.input.w > 0.0 && geometry.input.h > 0.0 {
             let border = (1.0 * s).round().max(1.0);
             let input_radius = (4.0 * s).round().max(0.0);
             let input_border = if search.focused {
@@ -2261,13 +2261,16 @@ impl Renderer {
             let selection_y = (geometry.input.y + 5.0 * s).round();
             let selection_h = (geometry.input.h - 10.0 * s).round().max(1.0);
 
+            // The text clip is intersected with the body so it cannot leave a short tile.
+            let text_clip = Rect {
+                x: geometry.input.x.round() + horizontal_padding,
+                y: geometry.input.y.round(),
+                w: geometry.text_viewport_w.round().max(0.0),
+                h: geometry.input.h.round().max(1.0),
+            }
+            .clipped_to(body);
             self.flush();
-            self.set_clip(
-                geometry.input.x.round() + horizontal_padding,
-                geometry.input.y.round(),
-                geometry.text_viewport_w.round().max(0.0),
-                geometry.input.h.round().max(1.0),
-            );
+            self.set_clip(text_clip.x, text_clip.y, text_clip.w, text_clip.h);
             if let Some((selection_start, selection_end)) = self.one_line_selection_px(search, 1.0)
             {
                 self.push_rounded_rect(
@@ -2290,8 +2293,10 @@ impl Renderer {
                     palette.fg,
                 );
             }
+            // Restore the body clip: clear_clip() disables scissoring entirely, and
+            // the buttons and counter must stay inside the body too.
             self.flush();
-            self.clear_clip();
+            self.set_clip(body.x, body.y, body.w, body.h);
         }
 
         let muted = [0.82, 0.82, 0.84, 1.0];
