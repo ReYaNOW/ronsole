@@ -2551,6 +2551,121 @@ mod tests {
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
     }
 
+    /// Renders `app.panels` through the runtime render path. `on_frame` rebuilds the panel
+    /// list from the window body, so panel-list tests call the runtime with the same
+    /// arguments `on_frame` passes, but with `app.panels` as set by the test.
+    fn render_test_panels(app: &mut App) -> Vec<TerminalUiLayout> {
+        let color_view = SettingsColorView::new(&crate::config::AppConfig::default());
+        let mut background_input = SingleLineInput::default();
+        let color_input = SingleLineInput::default();
+        let mut panel_layouts = Vec::new();
+        let runtime = app.runtime.as_mut().expect("headless runtime");
+        runtime
+            .render_terminal_and_present(TerminalRenderParams {
+                terminals: &app.terminals,
+                active_terminal: app.active_terminal,
+                panels: &app.panels,
+                panel_layouts: &mut panel_layouts,
+                tab_strip_hint: None,
+                search: &mut app.interaction.search,
+                focused: true,
+                show_fps: false,
+                tab_scroll_x: 0.0,
+                drag: None,
+                pointer_x: 0.0,
+                pointer_y: 0.0,
+                settings_progress: 0.0,
+                settings_tab: Default::default(),
+                settings_font_value: "",
+                settings_scroll_value: "",
+                settings_background_input: &mut background_input,
+                settings_background_editing: false,
+                settings_confirm_close: true,
+                settings_colors: &color_view,
+                settings_color_editing: None,
+                settings_color_input: &color_input,
+                close_confirm: None,
+            })
+            .expect("panel render");
+        panel_layouts
+    }
+
+    #[test]
+    fn panels_render_two_bodies_with_search_only_on_active() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "panels-two",
+                2,
+            );
+        let metrics = app.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let half = body.w * 0.5;
+        let left = crate::search::Rect { x: body.x, y: body.y, w: half, h: body.h };
+        let right = crate::search::Rect {
+            x: body.x + half,
+            y: body.y,
+            w: body.w - half,
+            h: body.h,
+        };
+        app.panels = vec![
+            Panel { terminal: 0, body: left, header: None, content_hidden: false },
+            Panel { terminal: 1, body: right, header: None, content_hidden: false },
+        ];
+        app.interaction.search.open();
+        // Changing the inactive grid after the search opened must not trigger its refresh.
+        feed_batch(&app.terminals[1], "inactive output\r\n");
+        let active_gen =
+            crate::platform::lock_recover(&app.terminals[0].grid).content_generation();
+        let inactive_gen =
+            crate::platform::lock_recover(&app.terminals[1].grid).content_generation();
+
+        let layouts = render_test_panels(&mut app);
+
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].body, left);
+        assert_eq!(layouts[1].body, right);
+        let outer = layouts[0].search.expect("active panel draws its search").outer;
+        assert!(outer.x >= left.x && outer.y >= left.y);
+        assert!(outer.x + outer.w <= left.x + left.w && outer.y + outer.h <= left.y + left.h);
+        assert!(layouts[1].search.is_none());
+        // Only the active grid was scanned: the scan generation matches it, not the inactive one.
+        let active_after =
+            crate::platform::lock_recover(&app.terminals[0].grid).content_generation();
+        let inactive_after =
+            crate::platform::lock_recover(&app.terminals[1].grid).content_generation();
+        let scanned = app.interaction.search.scanned_grid_generation_for_test();
+        assert_eq!(
+            scanned, active_after,
+            "active gen before {active_gen} after {active_after}; inactive before {inactive_gen} after {inactive_after}"
+        );
+        assert_ne!(scanned, inactive_after);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn panels_normal_mode_layout_matches_window_body() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "panels-normal",
+                1,
+            );
+        let metrics = app.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        app.panels = vec![Panel { terminal: 0, body, header: None, content_hidden: false }];
+
+        let layouts = render_test_panels(&mut app);
+
+        // Expected grid size comes from terminal_grid_size, the window-body formula
+        // pinned by terminal_grid_size_matches_current_body_formula in renderer/terminal_ui.rs.
+        let expected =
+            crate::renderer::terminal_grid_size(body, metrics.char_w, metrics.char_h, metrics.scale);
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].body, body);
+        assert_eq!(layouts[0].cols, expected.cols);
+        assert_eq!(layouts[0].visible_rows, expected.rows);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn feed_batch(terminal: &Terminal, bytes: &str) {
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
