@@ -1,4 +1,5 @@
 use super::{App, AppLoopControl};
+use crate::config::floating_logical_size;
 use crate::launch::TerminalLaunchSpec;
 use crate::platform::signals;
 use crate::platform::single_instance::{InstanceMessage, PrimaryInstance};
@@ -138,13 +139,15 @@ impl App {
         }
 
         if let Some(metrics) = events.configured {
+            // Only a floating size is persisted; maximized or tiled sizes are not.
             self.on_resize_with_logical_size(
                 metrics.physical_width,
                 metrics.physical_height,
-                Some((
-                    f64::from(metrics.logical_width),
-                    f64::from(metrics.logical_height),
-                )),
+                floating_logical_size(
+                    metrics.floating,
+                    metrics.logical_width,
+                    metrics.logical_height,
+                ),
             );
         }
 
@@ -358,6 +361,7 @@ mod tests {
             physical_width: logical * 2,
             physical_height: logical * 2,
             scale_factor: 2.0,
+            floating: true,
         }
     }
 
