@@ -3,13 +3,13 @@ use crate::config::{
     DEFAULT_TERMINAL_BOLD_FOREGROUND, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FOREGROUND,
     DEFAULT_TERMINAL_PALETTE, RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
 };
-use crate::input::TerminalInteraction;
+use crate::input::{MULTI_CLICK_WINDOW, TerminalInteraction};
 use crate::input_types::{
     CursorKind, KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton,
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::panels::{Panel, grid_fits, grid_tiles};
+use crate::panels::{Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
 use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
@@ -2408,6 +2408,12 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        // A press that never reached the terminal (grid header, gap, stale
+        // generation) owns its release, even when grid mode has closed since.
+        if state == KeyState::Released && self.suppressed_release == Some(button) {
+            self.suppressed_release = None;
+            return false;
+        }
         if self.close_confirm.is_some() {
             if button == PointerButton::Left && state == KeyState::Pressed {
                 match self.close_confirm_hit_test(self.pointer_x, self.pointer_y) {
@@ -2493,6 +2499,9 @@ impl App {
             self.request_frame();
             return false;
         }
+        if self.grid_open() && !self.route_grid_pointer_button(state, button) {
+            return false;
+        }
         let active = self.active_terminal;
         if let (Some(runtime), Some(terminal)) =
             (self.runtime.as_mut(), self.terminals.get_mut(active))
@@ -2513,6 +2522,69 @@ impl App {
             open_uri_with(&uri, self.open_sink.clone());
         }
         false
+    }
+
+    /// Grid-mode routing of one pointer button event. Returns `false` when the
+    /// event is handled here and must not reach the active terminal, `true` when
+    /// it goes on to the terminal's mouse handling.
+    fn route_grid_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        self.rebuild_panels();
+        if state == KeyState::Released {
+            return true;
+        }
+        let (index, header) = match panel_hit(&self.panels, self.pointer_x, self.pointer_y) {
+            Some(PanelHit::Header(index)) => (index, true),
+            Some(PanelHit::Body(index)) => (index, false),
+            None => {
+                // A gap between tiles routes nothing; its release is swallowed.
+                self.suppressed_release = Some(button);
+                return false;
+            }
+        };
+        if self.panel_layouts_generation != self.grid_generation {
+            // The frame's geometry is outdated: a press only chooses the tile under it.
+            self.suppressed_release = Some(button);
+            self.select_grid_tile(index);
+            self.request_frame();
+            return false;
+        }
+        if !header {
+            self.select_grid_tile(index);
+            return true;
+        }
+        self.suppressed_release = Some(button);
+        if button == PointerButton::Left {
+            let terminal = self.panels[index].terminal;
+            let now = Instant::now();
+            let repeated = self.last_header_press.is_some_and(|(at, previous)| {
+                previous == terminal && now.saturating_duration_since(at) <= MULTI_CLICK_WINDOW
+            });
+            if repeated {
+                self.last_header_press = None;
+                self.exit_claude_grid(Some(terminal));
+            } else {
+                self.last_header_press = Some((now, terminal));
+                self.select_grid_tile(index);
+            }
+        }
+        false
+    }
+
+    /// Makes the terminal of tile `index` the active tab and points the terminal
+    /// interaction at that tile's layout. Does nothing for the active tab.
+    fn select_grid_tile(&mut self, index: usize) {
+        let Some(terminal) = self.panels.get(index).map(|panel| panel.terminal) else {
+            return;
+        };
+        if terminal == self.active_terminal {
+            return;
+        }
+        self.cancel_terminal_presentation_intents();
+        self.activate_ready_terminal(terminal, false);
+        if let Some(layout) = self.panel_layouts.get(index) {
+            self.interaction.layout = *layout;
+        }
+        self.request_frame();
     }
 
     pub(crate) fn on_scroll(&mut self, delta: ScrollDelta) {
@@ -4679,6 +4751,236 @@ mod tests {
         assert!(!app.terminals[0].bell_pending());
         assert!(app.terminals[1].bell_pending());
         assert!(!app.terminals[2].bell_pending());
+    }
+
+    /// Centre of tile `index`'s header or body in the panels of the last rebuild.
+    fn grid_pointer_point(app: &App, index: usize, header: bool) -> (f32, f32) {
+        let rect = if header {
+            app.panels[index].header.expect("grid tiles have headers")
+        } else {
+            app.panels[index].body
+        };
+        (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5)
+    }
+
+    fn grid_pointer_move(app: &mut App, (x, y): (f32, f32)) {
+        app.on_pointer_motion(PointerPosition { x, y });
+    }
+
+    /// Enables X10 mouse tracking (DECSET 1000) on a test terminal.
+    fn grid_pointer_enable_tracking(terminal: &Terminal) {
+        feed_batch(terminal, "\x1b[?1000h");
+    }
+
+    #[test]
+    fn grid_pointer_click_in_inactive_tile_focuses_it_and_routes_press() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-focus",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        for terminal in &app.terminals {
+            enable_focus_reporting_for_test(terminal);
+        }
+        app.focused = true;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let point = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, point);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert!(app.grid_open());
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
+        assert_eq!(app.interaction.layout.body, app.panel_layouts[1].body);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_click_cancels_pending_activation() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-cancel",
+                3,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.terminals[2].set_claude_foreground_for_test(false);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+        // Set after the frame: on_frame would run a dangling request before the click.
+        app.terminals[2].presentation_intent = TerminalPresentationIntent::ActivateWhenReady;
+
+        let point = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, point);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert_eq!(app.active_terminal, 1);
+        assert!(matches!(
+            app.terminals[2].presentation_intent,
+            TerminalPresentationIntent::None
+        ));
+        assert!(!app.process_terminal_presentation_intents());
+        assert_eq!(app.active_terminal, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_header_double_click_exits_to_tile() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-header",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let point = grid_pointer_point(&app, 1, true);
+        grid_pointer_move(&mut app, point);
+        // A single press selects the tile and does not leave grid mode.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.grid_open());
+        assert_eq!(app.active_terminal, 1);
+
+        // The second press within the window exits onto the tile.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(!app.grid_open());
+        assert_eq!(app.active_terminal, 1);
+        // The release arrives after the exit and must not reach the PTY.
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.suppressed_release, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_resize_then_press_before_frame_not_routed() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-resize",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // Old geometry: the centre of tile 1 is still inside tile 1 after the widening.
+        let point = grid_pointer_point(&app, 1, false);
+        let generation = app.grid_generation;
+        app.on_resize_with_logical_size(800, 400, None);
+        assert_ne!(app.grid_generation, generation);
+        assert_ne!(app.panel_layouts_generation, app.grid_generation);
+
+        grid_pointer_move(&mut app, point);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 1);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_generation_ignored_outside_grid() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-outside",
+                2,
+            );
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        assert_eq!(app.on_frame(), Ok(true));
+        app.panel_layouts_generation = app.grid_generation.wrapping_add(1);
+        assert!(!app.grid_open());
+
+        let point = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, point);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_stale_generation_press_only_selects_and_swallows_release() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-stale",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        app.bump_grid_generation();
+        let point = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, point);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert_eq!(app.suppressed_release, None);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_header_press_release_in_body_not_sent() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-header-body",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let header = grid_pointer_point(&app, 0, true);
+        grid_pointer_move(&mut app, header);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+
+        let body = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, body);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert_eq!(app.suppressed_release, None);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_release_of_other_button_keeps_suppression() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-other-button",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let header = grid_pointer_point(&app, 0, true);
+        grid_pointer_move(&mut app, header);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert_eq!(app.suppressed_release, None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
