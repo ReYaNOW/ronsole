@@ -15,7 +15,7 @@
 - AGENTS.md §3: в кадре и в обработке вывода — без файлового ввода-вывода, `/proc`, `format!` и растущих аллокаций; списки панелей, раскладок, заголовков плиток — поля долгоживущего состояния, `clear()` и повторное использование.
 - AGENTS.md §3: рендер только при dirty или активной анимации; сетка в простое не рисует; дедлайны — реальные `Instant` в `AppLoopControl::WaitUntil`, без опроса.
 - AGENTS.md §4: все границы плиток, заголовков, рамок и тел — целые пиксели, одним хелпером; текст, курсор, выделение и hitbox одной строки — одна геометрия.
-- Вне сетки поведение Ronsole не меняется (спека §1): все существующие тесты остаются зелёными без правки ожиданий, кроме тестов на структуру исходника (`src/app.rs:2862-2938`, `:4653-4687`, `src/runtime.rs:3763-3778`), которые обновляются в той же задаче, что меняет проверяемый ими текст.
+- Вне сетки поведение Ronsole не меняется (спека §1): все существующие тесты остаются зелёными без правки ожиданий, кроме тестов на структуру исходника (`src/app.rs:2862-2938`, `:4653-4687`, `:2601-2625` — порядок в `on_about_to_wait`: guard < idle_return < `let now` < advance, `:3386-3407` — срез `on_scroll`→`on_frame`; `src/runtime.rs:3763-3778`), которые обновляются в той же задаче, что меняет проверяемый ими текст.
 - Терминальное поведение крейта `crates/ronsole-term` не меняется; новых зависимостей нет.
 - После правки любого `.rs` — `make api-map`, обновлённый `PROJECT_AI_MAP.txt` в том же коммите.
 - Тесты: одна функция — `make test-one TEST='<module>::tests::<name>'`; группа — `make test TEST_FILTER=<filter>`. Не `cargo clean`. Коммиты явными путями (`git add <file>…`).
@@ -65,13 +65,15 @@
 
 **Files:**
 - Create: `src/panels.rs` (модуль в `src/main.rs` рядом с `mod tabs;`)
-- Modify: `src/renderer/terminal_ui.rs` (вынос расчёта cols/rows из `render_terminal_body` :3482-3488; `terminal_body_rect` :189 становится `pub(crate)`)
+- Modify: `src/renderer/terminal_ui.rs` (вынос расчёта cols/rows из `render_terminal_body` :3482-3488; `terminal_body_rect` :190 становится `pub(crate)`)
+- Modify: `src/renderer.rs` (re-export `pub(crate) use terminal_ui::{…}` :2-8: модуль `terminal_ui` приватный, :1)
 - Test: `src/panels.rs`, `src/renderer/terminal_ui.rs`
 
 **Агенты:** implementer ds-low-agentic · reviewer ds-high — high: task review snapped-геометрия плиток при дробном scale и порог Q9 по сырому расчёту
 
 **Interfaces:**
 - Produces (`src/renderer/terminal_ui.rs`): `pub(crate) struct TerminalGridSize { pub cols: usize, pub rows: usize, pub raw_cols: f32, pub raw_rows: f32 }`; `pub(crate) fn terminal_raw_rows(content_h: f32, char_h: f32, scale: f32) -> f32` = `terminal_text_viewport_height(content_h, scale) / char_h.max(0.0001)` — его используют и `terminal_visible_rows` (`.floor().max(2.0)`), и `terminal_grid_size`; `pub(crate) fn terminal_grid_size(body: Rect, char_w: f32, char_h: f32, scale: f32) -> TerminalGridSize` — `raw_cols = (body.w - 20.0 * scale) / char_w`, `raw_rows = terminal_raw_rows(body.h, char_h, scale)`, `cols = raw_cols.floor().max(10.0) as usize`, `rows = raw_rows.floor().max(2.0) as usize` (те же формулы, что сейчас в :3487 и :1384-1387); `render_terminal_body` использует его.
+- Produces (`src/renderer.rs`): `mod terminal_ui` остаётся приватным; в существующий re-export `pub(crate) use terminal_ui::{…}` (:2-8) добавить ровно те из `TerminalGridSize`, `terminal_body_rect`, `terminal_grid_size`, `terminal_raw_rows`, `terminal_visible_rows`, на которые ссылается код вне модуля `renderer` (`src/panels.rs` здесь, `src/app.rs` в Task 3), — лишний вызовет `unused_imports` (clippy `-D warnings`); Task 3 дописывает недостающее тем же способом. Имя нужно только тесту вне `renderer` — тест берёт его через тот же re-export. `Rect` — `crate::search::Rect` (`src/search.rs:11`).
 - Produces (`src/panels.rs`):
   - `pub(crate) struct Panel { pub terminal: usize, pub body: Rect, pub header: Option<Rect>, pub content_hidden: bool }` (`header: None` — обычный режим; `Some` — плитка);
   - `pub(crate) const GRID_TILE_GAP: f32 = 6.0;` `pub(crate) const GRID_TILE_HEADER: f32 = 22.0;` (логические пиксели × scale, `.round()`);
@@ -90,13 +92,13 @@
 - [ ] **Step 3:** реализация; `render_terminal_body` переходит на `terminal_grid_size` без изменения результата.
 - [ ] **Step 4:** те же команды — PASS; `make test TEST_FILTER=terminal_ui` — PASS.
 Тесты этой задачи лежат в модуле `panels` (фильтр `panels::`) или начинаются с `terminal_grid_size`; фильтры `grid_mode_`, `grid_pointer_`, `grid_frame_` зарезервированы за Tasks 4–6.
-- [ ] **Step 5:** `make api-map`; коммит `src/panels.rs src/main.rs src/renderer/terminal_ui.rs PROJECT_AI_MAP.txt`.
+- [ ] **Step 5:** `make api-map`; коммит `src/panels.rs src/main.rs src/renderer.rs src/renderer/terminal_ui.rs PROJECT_AI_MAP.txt`.
 
 ### Task 3: Рендер по списку панелей
 
 **Files:**
 - Modify: `src/renderer/terminal_ui.rs` (`render_terminal_app` :3395, `render_terminal_body` :3468, `draw_terminal_tabs` :2339, `draw_fps_overlay` вызов :3463)
-- Modify: `src/renderer.rs` (поля кэша рядом с `terminal_tab_display_titles` :511)
+- Modify: `src/renderer.rs` (поля кэша рядом с `terminal_tab_display_titles` :511; аксессор `window_size` рядом с `scale_factor` :707; re-export :2-8 — недостающие имена Task 2)
 - Modify: `src/runtime.rs` (`TerminalRenderParams`, `render_terminal_and_present` :2980, аксессор размеров ячейки)
 - Modify: `src/app.rs` (поля App :486-525 и их инициализация, вызов рендера и разбор результата :2243-2285, `on_resize_with_logical_size` :1822, `on_scale_changed` :1844, смена шрифта :1449-1455 и `FontReset` :1466-1468, создание runtime; тест на структуру :2862-2938 — только если проверяемый им текст меняется)
 - Modify: `src/search.rs` (`terminal_search_geometry` :104-118 и его тесты :938, :995, :1017), `src/input.rs` (вызов :3441)
@@ -110,7 +112,7 @@
 - Produces:
   - `TerminalRenderParams` получает `panels: &[Panel]`, `panel_layouts: &mut Vec<TerminalUiLayout>`, `tab_strip_hint: Option<&'static str>`; `active_terminal` остаётся (курсор, поиск, полоса вкладок);
   - `render_terminal_app` возвращает раскладку панели `active_terminal` (или `Default`), а `panel_layouts` заполняет раскладками всех панелей в порядке `panels` (`clear()` в начале);
-  - `struct GridMetrics { width: f32, height: f32, scale: f32, char_w: f32, char_h: f32 }` — поле App `grid_metrics`, обновляет `fn refresh_grid_metrics(&mut self)` из runtime (новый `WindowRuntime::terminal_cell_size(&self) -> (f32, f32)` через новый `pub(crate)` аксессор в `terminal_ui.rs` над приватной `terminal_char_width` :2009 и `line_height * TERMINAL_TEXT_SCALE`; размер окна и scale — из renderer) после создания runtime, в `on_resize_with_logical_size`, `on_scale_changed`, при смене шрифта и `FontReset`; без runtime поле не меняется. `GridMetrics` — `#[derive(Clone, Copy, PartialEq, Default)]`; запись поля — только через `fn set_grid_metrics(&mut self, metrics: GridMetrics)` (её вызывает `refresh_grid_metrics`, тесты зовут её напрямую; Task 4 добавляет в неё рост поколения);
+  - `struct GridMetrics { width: f32, height: f32, scale: f32, char_w: f32, char_h: f32 }` — поле App `grid_metrics`, обновляет `fn refresh_grid_metrics(&mut self)` из runtime (новый `WindowRuntime::terminal_cell_size(&self) -> (f32, f32)` через новый `pub(crate)` аксессор в `terminal_ui.rs` над приватной `terminal_char_width` :2009 и `line_height * TERMINAL_TEXT_SCALE`; размер окна и scale — из renderer: новый `pub fn window_size(&self) -> (f32, f32)` в `Renderer` возвращает поля `width`/`height` (:504-505, те же единицы, что передаются в `terminal_body_rect` внутри renderer), scale — существующий `Renderer::scale_factor()` :707) после создания runtime, в `on_resize_with_logical_size`, `on_scale_changed`, при смене шрифта и `FontReset`; без runtime поле не меняется. `GridMetrics` — `#[derive(Clone, Copy, PartialEq, Default)]`; запись поля — только через `fn set_grid_metrics(&mut self, metrics: GridMetrics)` (её вызывает `refresh_grid_metrics`, тесты зовут её напрямую; Task 4 добавляет в неё рост поколения);
   - поля App `panels: Vec<Panel>`, `panel_layouts: Vec<TerminalUiLayout>`, `fn rebuild_panels(&mut self)` — в этой задаче только обычный режим: одна панель `active_terminal`, `body = terminal_body_rect(grid_metrics.width, grid_metrics.height, grid_metrics.scale)`, `header: None`, `content_hidden: false` (Task 4 добавляет сетку, Task 6 — `content_hidden`); `on_frame` вызывает `rebuild_panels()` перед рендером;
   - `fn ellipsize_to_width(text: &str, max_w: f32, advance: impl FnMut(char) -> f32, out: &mut String)` — чистая функция обрезки с «…»;
   - тестовая обвязка App с runtime для Tasks 3, 5, 6: `#[cfg(test)] pub(crate) mod test_support` в `src/app/headless_run.rs` с `pub(crate) fn started_headless_with_test_terminals(tag: &str, count: usize) -> (App, Receiver<String>, Profile, PathBuf)` — поверх существующего `started_headless` (`src/app/headless_run.rs:253`, сейчас приватный в `mod tests`; перенести в `test_support` вместе с `workspace_root` :165, `mod tests` переходит на них): после старта заменяет `app.terminals` на `count` штук `Terminal::new_for_test` с `grid.lock().unwrap().mark_presentation_ready()` (как `src/app.rs:2739`), `active_terminal = 0`, `active_terminal_presented = true`. Причина: у живых терминалов `started_headless` поток заголовков каждые 250 мс перезаписал бы флаг из `set_claude_foreground_for_test`, а `test_input` у них `None` (`src/terminal.rs:1814`, перехват только при `Some`, :2218) — байты PTY в тесте не видны. Если рендер или `on_frame` с подменёнными терминалами не работает — NEEDS_CONTEXT с причиной, не обходить.
@@ -138,7 +140,7 @@
 ### Task 4: Режим сетки в App: вход, выход, состав, фокус, видимость
 
 **Files:**
-- Modify: `src/app.rs` (поля App :470-527 и их инициализация, `GlobalShortcut` :73-79, `global_shortcut` :136-155, `handle_global_key` :1727-1745, `add_terminal_with_launch` :760, `select_terminal_tab_from_user` :744, `close_terminal_tab_at` :959-1015, `drain_terminal_host_events` :2313-2338, расчёт дедлайна цикла :1659-1672, `on_about_to_wait`, `rebuild_panels` и `set_grid_metrics` из Task 3, разбор результата кадра :2276)
+- Modify: `src/app.rs` (поля App :470-527 и их инициализация, `GlobalShortcut` :73-79, `global_shortcut` :136-155, `handle_global_key` :1727-1745, `add_terminal_with_launch` :760, `select_terminal_tab_from_user` :744, `close_terminal_tab_at` :959-1015, `drain_terminal_host_events` :2313-2338, расчёт дедлайна цикла :1659-1672, `on_about_to_wait`, `rebuild_panels` и `set_grid_metrics` из Task 3, разбор результата кадра :2276; тест на структуру `on_about_to_wait` :2601-2625)
 - Modify: `src/app/tab_delivery.rs` (`handle_tab_status` :104-119)
 - Test: `src/app.rs`, `src/app/tab_delivery.rs`
 
@@ -186,7 +188,7 @@
 
 **Files:**
 - Modify: `src/input.rs` (`mouse_wheel` :939, `update_link_hover` :193, новый метод снятия захвата; `ClickCounter::WINDOW` :1085)
-- Modify: `src/app.rs` (`on_pointer_button` :2051-2150, `on_pointer_motion` :1955-2017, `on_scroll` :2159-2193, `update_link_hover` :1591; тест на структуру :4653-4687)
+- Modify: `src/app.rs` (`on_pointer_button` :2051-2150, `on_pointer_motion` :1955-2017, `on_scroll` :2159-2193, `update_link_hover` :1591; тесты на структуру :4653-4687 и :3386-3407)
 - Test: `src/app.rs`, `src/input.rs`
 
 **Агенты:** implementer ds-low-agentic · reviewer ds-high — high: task review маршрутизация мыши по панелям, поколение раскладок, непарные release
