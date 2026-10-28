@@ -558,7 +558,8 @@ pub struct App {
     tab_input: tab_delivery::TabInputState,
     /// Reusable buffer for `Terminal::observe_dev_channel_warning`.
     dev_warning_scratch: String,
-    /// A frame was skipped by `withhold_active_frame`; redraw once hiding ends.
+    /// Outside grid mode, a frame was skipped by `withhold_active_frame`; redraw
+    /// once the active tab's hiding ends. Grid mode never sets it.
     frame_withheld: bool,
     occluded: bool,
     zero_sized: bool,
@@ -588,7 +589,8 @@ pub struct App {
     suppressed_release: Option<PointerButton>,
     last_header_press: Option<(Instant, usize)>,
     hovered_panel_terminal: Option<usize>,
-    /// Pending deadline reserved for grid frame withholding.
+    /// Earliest end of the banner hiding among grid tiles that the last grid
+    /// frame drew with `content_hidden`; grid mode only.
     withheld_until: Option<Instant>,
 }
 
@@ -878,7 +880,9 @@ impl App {
     /// Development-channels warning check for every tab (see
     /// `Terminal::observe_dev_channel_warning`); runs before
     /// `advance_bridge_launches` so one warning gets one Enter. Requests the
-    /// frame that `withhold_active_frame` skipped once hiding has ended.
+    /// redraw once hiding has ended: outside grid mode that is the frame that
+    /// `withhold_active_frame` skipped, in grid mode the `withheld_until`
+    /// deadline (the next grid frame recomputes it).
     fn advance_dev_channel_warnings(&mut self, now: Instant) {
         for terminal in &mut self.terminals {
             terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
@@ -888,7 +892,12 @@ impl App {
                 pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
             });
         }
-        if self.frame_withheld && !self.active_dev_warning_hidden(now) {
+        if self.grid_open() {
+            if self.withheld_until.is_some_and(|until| now >= until) {
+                self.withheld_until = None;
+                self.request_frame();
+            }
+        } else if self.frame_withheld && !self.active_dev_warning_hidden(now) {
             self.frame_withheld = false;
             self.request_frame();
         }
@@ -920,6 +929,34 @@ impl App {
         self.frame_withheld = true;
         self.dirty = false;
         true
+    }
+
+    /// Grid counterpart of `withhold_active_frame`: applies the warning and
+    /// banner hiding to every tile terminal and sets `content_hidden` on its
+    /// panel, so the frame is drawn with only the hidden tile body blank. Must
+    /// run after `rebuild_panels`, which resets `content_hidden`. Records the
+    /// earliest hiding end in `withheld_until` for the loop to wake at.
+    fn observe_grid_dev_warnings(&mut self, now: Instant) {
+        let mut withheld_until: Option<Instant> = None;
+        for panel in &mut self.panels {
+            let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
+                panel.content_hidden = false;
+                continue;
+            };
+            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
+                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
+            });
+            terminal.observe_dev_channel_banner(|pgrp| {
+                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
+            });
+            panel.content_hidden = terminal.dev_warning_frame_hidden(now);
+            if panel.content_hidden {
+                if let Some(until) = terminal.dev_warning_hidden_until() {
+                    withheld_until = Some(withheld_until.map_or(until, |earliest| earliest.min(until)));
+                }
+            }
+        }
+        self.withheld_until = withheld_until;
     }
 
     fn advance_bridge_launches(&mut self, now: Instant) {
@@ -1789,6 +1826,20 @@ impl App {
             terminal_animation || grid_tile_animation || tab_animation || settings_animation;
     }
 
+    /// Future instant at which a hidden dev-channels banner must be redrawn:
+    /// the earliest grid tile's hiding end in grid mode, otherwise the active
+    /// tab's.
+    fn dev_warning_wake_deadline(&self, now: Instant) -> Option<Instant> {
+        let deadline = if self.grid_open() {
+            self.withheld_until
+        } else {
+            self.terminals
+                .get(self.active_terminal)
+                .and_then(Terminal::dev_warning_hidden_until)
+        };
+        deadline.filter(|deadline| *deadline > now)
+    }
+
     fn loop_control(&self) -> AppLoopControl {
         let renderable = self.renderable();
         let plan = frame_plan(
@@ -1820,12 +1871,7 @@ impl App {
                     earliest_terminal_deadline(&self.terminals)
                         .map(|deadline| sync_reserve_wake(deadline, now)),
                 )
-                .chain(
-                    self.terminals
-                        .get(self.active_terminal)
-                        .and_then(Terminal::dev_warning_hidden_until)
-                        .filter(|deadline| *deadline > now),
-                )
+                .chain(self.dev_warning_wake_deadline(now))
                 .chain(
                     self.grid_hint
                         .map(|(_, deadline)| deadline)
@@ -2729,7 +2775,7 @@ impl App {
 
         let _ = self.process_terminal_presentation_intents();
         let now = Instant::now();
-        if self.withhold_active_frame(now) {
+        if !self.grid_open() && self.withhold_active_frame(now) {
             return Ok(false);
         }
         let dt = animation_dt((now - self.last_frame).as_secs_f32());
@@ -2786,6 +2832,9 @@ impl App {
         self.settings_progress = settings_progress;
 
         self.rebuild_panels();
+        if self.grid_open() {
+            self.observe_grid_dev_warnings(now);
+        }
         let tab_strip_hint = self.tab_strip_hint(now);
         let render_result = if let Some(runtime) = self.runtime.as_mut() {
             Some(runtime.render_terminal_and_present(TerminalRenderParams {
@@ -5323,6 +5372,119 @@ mod tests {
         assert!(!app.animation_active, "tile scroll did not settle in {frames} frames");
         assert!(app.terminals[1].scroll_y.is_settled());
         assert_eq!(app.terminals[1].scroll_y.current, 5.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_frame_dev_warning_hides_only_its_tile_and_redraws_after_deadline() {
+        let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+        let claude = crate::tab_input::ProcGen {
+            pid: 42,
+            starttime: 7,
+        };
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-dev-warning",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], warning);
+        let sent_at = Instant::now();
+        let mut scratch = String::new();
+        assert!(app.terminals[1].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
+        app.toggle_claude_grid(sent_at);
+        // Enter was sent at `sent_at`, so the banner hides until this deadline.
+        let deadline = sent_at + crate::terminal::DEV_WARNING_HIDE_LIMIT;
+        let content_hidden = |app: &App, terminal: usize| {
+            app.panels
+                .iter()
+                .find(|panel| panel.terminal == terminal)
+                .is_some_and(|panel| panel.content_hidden)
+        };
+
+        // The frame is drawn, not withheld: only tile 1 shows its body background.
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert!(!content_hidden(&app, 0));
+        assert!(content_hidden(&app, 1));
+        assert!(!app.frame_withheld);
+        assert_eq!(app.withheld_until, Some(deadline));
+
+        // Let the grid entry animation settle so only the banner deadline can wake the loop.
+        let mut frames = 0;
+        while app.animation_active && frames < 200 {
+            assert_eq!(grid_frame_step(&mut app), Ok(true));
+            frames += 1;
+        }
+        assert!(!app.animation_active, "grid entry did not settle in {frames} frames");
+
+        // Before the deadline nothing is requested.
+        app.dirty = false;
+        app.advance_dev_channel_warnings(sent_at + Duration::from_millis(1499));
+        assert!(!app.dirty);
+        assert_eq!(app.withheld_until, Some(deadline));
+
+        // At the deadline the frame is requested and the wake deadline is cleared.
+        app.advance_dev_channel_warnings(deadline);
+        assert!(app.dirty);
+        assert_eq!(app.withheld_until, None);
+
+        // Without new output the next advance requests nothing and the loop settles.
+        app.dirty = false;
+        app.advance_dev_channel_warnings(deadline);
+        assert!(!app.dirty);
+        assert_eq!(app.loop_control(), AppLoopControl::Wait);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_frame_two_hidden_tiles_redraw_first_at_its_deadline() {
+        let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+        let claude = crate::tab_input::ProcGen {
+            pid: 42,
+            starttime: 7,
+        };
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-frame-two-dev-warnings",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Tile 0 stays hidden for about 40 ms more, tile 1 for about 1 s more.
+        // The test sleeps past the first deadline so the real-clock frame sees it.
+        let now = Instant::now();
+        let enter_times = [
+            now - Duration::from_millis(1460),
+            now - Duration::from_millis(500),
+        ];
+        for (index, sent_at) in enter_times.into_iter().enumerate() {
+            feed_batch(&app.terminals[index], warning);
+            let mut scratch = String::new();
+            assert!(app.terminals[index].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
+        }
+        app.toggle_claude_grid(now);
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        let first = app.terminals[0]
+            .dev_warning_hidden_until()
+            .expect("tile 0 banner hides");
+        let second = app.terminals[1]
+            .dev_warning_hidden_until()
+            .expect("tile 1 banner hides");
+        assert!(first < second);
+        assert_eq!(app.withheld_until, Some(first));
+
+        std::thread::sleep(first.saturating_duration_since(Instant::now()) + Duration::from_millis(5));
+        app.dirty = false;
+        app.advance_dev_channel_warnings(first);
+        assert!(app.dirty, "first deadline must request a redraw");
+        assert_eq!(app.withheld_until, None);
+
+        // The redraw recomputes the wake deadline: tile 0 is shown, tile 1 still hidden.
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert!(app.panels.iter().all(|panel| panel.terminal != 0 || !panel.content_hidden));
+        assert!(app.panels.iter().any(|panel| panel.terminal == 1 && panel.content_hidden));
+        assert_eq!(app.withheld_until, Some(second));
         let _ = std::fs::remove_dir_all(&root);
     }
 
