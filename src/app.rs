@@ -1689,15 +1689,66 @@ impl App {
     fn update_link_hover(&mut self) {
         let modal_active = self.settings_modal_active() || self.close_confirm.is_some();
         let (x, y) = (self.pointer_x, self.pointer_y);
-        let changed = match self.terminals.get_mut(self.active_terminal) {
-            Some(terminal) if modal_active => terminal.set_hovered_link(None),
-            Some(terminal) => self.interaction.update_link_hover(terminal, x, y, self.interaction.layout),
-            None => false,
+        let changed = if self.grid_open() {
+            self.update_grid_link_hover(modal_active, x, y)
+        } else {
+            // Grid mode is closed: a link still hovered in a tile is dropped first.
+            let tile_cleared = self
+                .hovered_panel_terminal
+                .take()
+                .and_then(|index| self.terminals.get_mut(index))
+                .is_some_and(|terminal| terminal.set_hovered_link(None));
+            let active_changed = match self.terminals.get_mut(self.active_terminal) {
+                Some(terminal) if modal_active => terminal.set_hovered_link(None),
+                Some(terminal) => self.interaction.update_link_hover(terminal, x, y, self.interaction.layout),
+                None => false,
+            };
+            tile_cleared | active_changed
         };
         if changed {
             self.mark_dirty();
         }
         self.refresh_cursor_icon();
+    }
+
+    /// Grid-mode hover: only the tile under the pointer, with its own layout,
+    /// may hold a link. Outdated layouts skip the hover entirely.
+    fn update_grid_link_hover(&mut self, modal_active: bool, x: f32, y: f32) -> bool {
+        if self.panel_layouts_generation != self.grid_generation {
+            return false;
+        }
+        let target = match panel_hit(&self.panels, x, y) {
+            Some(PanelHit::Body(index)) if !modal_active => {
+                self.panels.get(index).map(|panel| (index, panel.terminal))
+            }
+            _ => None,
+        };
+        let next = target.map(|(_, terminal)| terminal);
+        let previous = std::mem::replace(&mut self.hovered_panel_terminal, next);
+        let mut changed = false;
+        if previous != next
+            && let Some(index) = previous
+            && let Some(terminal) = self.terminals.get_mut(index)
+        {
+            changed |= terminal.set_hovered_link(None);
+        }
+        match target {
+            Some((index, terminal_index)) => {
+                let Some(layout) = self.panel_layouts.get(index).copied() else {
+                    return changed;
+                };
+                if let Some(terminal) = self.terminals.get_mut(terminal_index) {
+                    changed |= self.interaction.update_link_hover(terminal, x, y, layout);
+                }
+            }
+            None => {
+                // No tile body under the pointer: the active tab must not keep a link.
+                if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
+                    changed |= terminal.set_hovered_link(None);
+                }
+            }
+        }
+        changed
     }
 
     fn refresh_cursor_icon(&mut self) {
@@ -2316,6 +2367,10 @@ impl App {
         let previous_y = self.pointer_y;
         self.pointer_x = position.x;
         self.pointer_y = position.y;
+        if self.grid_open() {
+            // Hit-tests of this event use the tile list as it is now.
+            self.rebuild_panels();
+        }
         self.update_link_hover();
         // The dialog owns the pointer: tab drag and reorder must not advance under it.
         if self.close_confirm.is_some() {
@@ -2617,6 +2672,29 @@ impl App {
                 self.request_frame();
                 return;
             }
+        }
+        if self.grid_open() {
+            // The wheel scrolls the tile under the pointer and never moves focus.
+            self.rebuild_panels();
+            if self.panel_layouts_generation != self.grid_generation {
+                return;
+            }
+            let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
+            else {
+                return;
+            };
+            let (Some(panel), Some(layout)) = (self.panels.get(index), self.panel_layouts.get(index).copied())
+            else {
+                return;
+            };
+            let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
+                return;
+            };
+            if self.interaction.mouse_wheel(delta, terminal, layout) {
+                self.sync_animation_state();
+                self.request_frame();
+            }
+            return;
         }
         let active = self.active_terminal;
         if let Some(terminal) = self.terminals.get_mut(active)
@@ -4980,6 +5058,112 @@ mod tests {
         assert_eq!(app.suppressed_release, Some(PointerButton::Left));
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
         assert_eq!(app.suppressed_release, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_wheel_over_inactive_tile_scrolls_it_without_focus() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-wheel",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Enough rows to push history into the scrollback of tile 1.
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let point = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, point);
+        let before = app.terminals[1].scroll_y.target;
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+
+        assert_eq!(app.active_terminal, 0);
+        assert_ne!(app.terminals[1].scroll_y.target, before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_stale_generation_wheel_has_no_effect() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-wheel-stale",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let point = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, point);
+        let before = app.terminals[1].scroll_y.target;
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+        // Sanity: with a current frame the same wheel does move the tile.
+        let scrolled = app.terminals[1].scroll_y.target;
+        assert_ne!(scrolled, before);
+
+        app.bump_grid_generation();
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+        assert_eq!(app.terminals[1].scroll_y.target, scrolled);
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_hover_moves_between_tiles_and_clears_previous() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-hover",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        app.on_modifiers(Modifiers::CONTROL);
+        let first = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, first);
+        assert_eq!(app.hovered_panel_terminal, Some(0));
+        // No link text is drawn in the test terminals, so seed one on tile 0
+        // to observe that moving away clears it.
+        let link = ronsole_term::LinkTarget {
+            uri: "https://example.com/".into(),
+            cells: Vec::new(),
+        };
+        assert!(app.terminals[0].set_hovered_link(Some((link, 0))));
+
+        let second = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, second);
+        assert_eq!(app.hovered_panel_terminal, Some(1));
+        assert!(app.terminals[0].hovered_link().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pointer_wheel_outside_tiles_has_no_effect() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-wheel-outside",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // Left of and above every tile, so no panel body is under the pointer.
+        grid_pointer_move(&mut app, (-50.0, -50.0));
+        let before = app.terminals[1].scroll_y.target;
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.terminals[1].scroll_y.target, before);
         let _ = std::fs::remove_dir_all(&root);
     }
 
