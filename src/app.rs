@@ -5564,10 +5564,14 @@ mod tests {
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert_eq!(app.terminals[1].scroll_y.target, 10.0);
 
+        // A permissive previous layout makes the pre-render clamp a no-op, so only
+        // the post-render clamp by the fresh layout can cut the target.
+        app.panel_layouts[1].max_scroll = 1_000_000.0;
         app.terminals[1].scroll_y.target = 10_000.0;
         app.terminals[1].scroll_y.current = 10_000.0;
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert!(app.terminals[1].scroll_y.target <= app.panel_layouts[1].max_scroll);
+        assert!(app.terminals[1].scroll_y.target < 10_000.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
