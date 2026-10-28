@@ -9,7 +9,7 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::panels::Panel;
+use crate::panels::{Panel, grid_fits, grid_tiles};
 use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
@@ -21,7 +21,7 @@ use crate::renderer::{
 };
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
-use crate::search::TerminalSearchHit;
+use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
@@ -35,7 +35,7 @@ use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_t
 use ronsole_term::TermPalette;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod automation;
 mod direct_wayland;
@@ -78,6 +78,7 @@ enum GlobalShortcut {
     NewTab,
     CloseTab,
     Search,
+    ToggleClaudeGrid,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -151,6 +152,9 @@ fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShort
         }
         PhysicalKey::Code(KeyCode::KeyF) if exact_global_modifiers(modifiers, false) => {
             Some(GlobalShortcut::Search)
+        }
+        PhysicalKey::Code(KeyCode::KeyS) if exact_global_modifiers(modifiers, true) => {
+            Some(GlobalShortcut::ToggleClaudeGrid)
         }
         _ => None,
     }
@@ -480,6 +484,31 @@ struct GridMetrics {
     char_h: f32,
 }
 
+/// Grid mode state: the tabs shown as tiles. `members` holds tab indices in tab order.
+#[derive(Default)]
+struct ClaudeGrid {
+    members: Vec<usize>,
+}
+
+/// Why grid mode did not open or had to close. Shown on the tab strip until
+/// `GRID_HINT_DURATION` has passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridHint {
+    NoClaudeTabs,
+    TooManyTabs,
+}
+
+impl GridHint {
+    fn text(self) -> &'static str {
+        match self {
+            Self::NoClaudeTabs => "Нет вкладок с Claude",
+            Self::TooManyTabs => "Слишком много вкладок с Claude для окна",
+        }
+    }
+}
+
+const GRID_HINT_DURATION: Duration = Duration::from_secs(2);
+
 pub struct App {
     runtime: Option<WindowRuntime>,
     config: AppConfig,
@@ -543,6 +572,24 @@ pub struct App {
     panels: Vec<Panel>,
     /// Layouts of `panels` from the last render, in `panels` order.
     panel_layouts: Vec<TerminalUiLayout>,
+    /// `None` while the ordinary single-panel view is shown.
+    claude_grid: Option<ClaudeGrid>,
+    /// Grows whenever the panel composition, order, metrics or mode change.
+    grid_generation: u64,
+    /// `grid_generation` at the time `panel_layouts` were rendered.
+    panel_layouts_generation: u64,
+    /// Hint shown on the tab strip until its deadline.
+    grid_hint: Option<(GridHint, Instant)>,
+    /// Scratch for the tab indices of the current composition; swapped with `ClaudeGrid::members`.
+    grid_members_scratch: Vec<usize>,
+    /// Scratch for the tile rectangles `rebuild_panels` gets from `grid_tiles`.
+    grid_tile_rects: Vec<(Rect, Rect)>,
+    /// Pointer state reserved for grid tile handling.
+    suppressed_release: Option<PointerButton>,
+    last_header_press: Option<(Instant, usize)>,
+    hovered_panel_terminal: Option<usize>,
+    /// Pending deadline reserved for grid frame withholding.
+    withheld_until: Option<Instant>,
 }
 
 impl App {
@@ -623,6 +670,16 @@ impl App {
             grid_metrics: GridMetrics::default(),
             panels: Vec::new(),
             panel_layouts: Vec::new(),
+            claude_grid: None,
+            grid_generation: 0,
+            panel_layouts_generation: 0,
+            grid_hint: None,
+            grid_members_scratch: Vec::new(),
+            grid_tile_rects: Vec::new(),
+            suppressed_release: None,
+            last_header_press: None,
+            hovered_panel_terminal: None,
+            withheld_until: None,
         }
     }
 
@@ -764,6 +821,7 @@ impl App {
     }
 
     fn select_terminal_tab_from_user(&mut self, index: usize) {
+        self.exit_claude_grid(None);
         self.request_terminal_activation(index, false);
     }
 
@@ -780,6 +838,8 @@ impl App {
     }
 
     fn add_terminal_with_launch(&mut self, mut launch: TerminalLaunchSpec) -> Option<usize> {
+        // Leaves grid mode at the request, before the runtime check can return early.
+        self.exit_claude_grid(None);
         let wake = self.runtime.as_ref()?.wake_handle();
         launch.shell.clone_from(&self.shell_override);
         self.cancel_terminal_presentation_intents();
@@ -1038,6 +1098,7 @@ impl App {
         }
         self.pending_tab_reveal = Some(false);
         self.request_frame();
+        self.sync_claude_grid(Instant::now());
         false
     }
 
@@ -1692,6 +1753,11 @@ impl App {
                         .and_then(Terminal::dev_warning_hidden_until)
                         .filter(|deadline| *deadline > now),
                 )
+                .chain(
+                    self.grid_hint
+                        .map(|(_, deadline)| deadline)
+                        .filter(|deadline| *deadline > now),
+                )
                 .min()
                 .map_or(AppLoopControl::Wait, AppLoopControl::WaitUntil),
             LoopMode::Poll => AppLoopControl::Poll,
@@ -1766,6 +1832,7 @@ impl App {
                     self.request_frame();
                 }
             }
+            GlobalShortcut::ToggleClaudeGrid => self.toggle_claude_grid(Instant::now()),
         }
         false
     }
@@ -1844,8 +1911,13 @@ impl App {
         self.shutdown_all();
     }
 
-    /// The only writer of `grid_metrics`.
+    /// The only writer of `grid_metrics`. A change while grid mode is open
+    /// starts a new generation at once, so input that arrives before the next
+    /// frame is not matched against the old tile geometry.
     fn set_grid_metrics(&mut self, metrics: GridMetrics) {
+        if self.claude_grid.is_some() && metrics != self.grid_metrics {
+            self.bump_grid_generation();
+        }
         self.grid_metrics = metrics;
     }
 
@@ -1868,15 +1940,203 @@ impl App {
     }
 
     /// Ordinary mode: one panel, the active terminal filling the window body.
+    /// Grid mode: one tile per member, in tab order.
     fn rebuild_panels(&mut self) {
         let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
         self.panels.clear();
-        self.panels.push(Panel {
-            terminal: self.active_terminal,
-            body: terminal_body_rect(metrics.width, metrics.height, metrics.scale),
-            header: None,
-            content_hidden: false,
-        });
+        let Some(grid) = self.claude_grid.as_ref() else {
+            self.panels.push(Panel {
+                terminal: self.active_terminal,
+                body,
+                header: None,
+                content_hidden: false,
+            });
+            return;
+        };
+        grid_tiles(body, grid.members.len(), metrics.scale, &mut self.grid_tile_rects);
+        for (&terminal, &(header, tile_body)) in grid.members.iter().zip(&self.grid_tile_rects) {
+            self.panels.push(Panel {
+                terminal,
+                body: tile_body,
+                header: Some(header),
+                content_hidden: false,
+            });
+        }
+    }
+
+    /// Whether grid mode is open.
+    pub(crate) fn grid_open(&self) -> bool {
+        self.claude_grid.is_some()
+    }
+
+    /// Number of tiles while grid mode is open; zero otherwise.
+    pub(crate) fn grid_tile_count(&self) -> usize {
+        self.claude_grid
+            .as_ref()
+            .map_or(0, |grid| grid.members.len())
+    }
+
+    /// Tab-strip hint that is still due at `now`.
+    fn tab_strip_hint(&self, now: Instant) -> Option<&'static str> {
+        self.grid_hint
+            .filter(|(_, deadline)| *deadline > now)
+            .map(|(hint, _)| hint.text())
+    }
+
+    /// Clears the hint once its deadline has passed and asks for one frame to remove it.
+    fn advance_grid_hint(&mut self, now: Instant) {
+        if let Some((_, deadline)) = self.grid_hint
+            && deadline <= now
+        {
+            self.grid_hint = None;
+            self.request_frame();
+        }
+    }
+
+    fn set_grid_hint(&mut self, hint: GridHint, now: Instant) {
+        self.grid_hint = Some((hint, now + GRID_HINT_DURATION));
+        self.request_frame();
+    }
+
+    /// Starts a new panel generation and drops the pointer capture of the
+    /// active terminal, so a press from before the change is not finished in a
+    /// tile whose geometry has moved.
+    fn bump_grid_generation(&mut self) {
+        self.grid_generation = self.grid_generation.wrapping_add(1);
+        if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
+            self.interaction.cancel_pointer_interaction(terminal);
+        }
+    }
+
+    /// Fills `grid_members_scratch` with the tabs whose foreground is Claude Code.
+    fn collect_claude_members(&mut self) {
+        self.grid_members_scratch.clear();
+        for (index, terminal) in self.terminals.iter().enumerate() {
+            if terminal.claude_foreground() {
+                self.grid_members_scratch.push(index);
+            }
+        }
+    }
+
+    /// Makes the collected scratch list the grid's members. The previous list
+    /// becomes the scratch buffer, so both allocations are reused.
+    fn adopt_grid_members(&mut self) {
+        let grid = self.claude_grid.get_or_insert_with(ClaudeGrid::default);
+        std::mem::swap(&mut grid.members, &mut self.grid_members_scratch);
+    }
+
+    fn grid_contains(&self, index: usize) -> bool {
+        self.claude_grid
+            .as_ref()
+            .is_some_and(|grid| grid.members.contains(&index))
+    }
+
+    /// Whether the current members fit the window body at the current metrics (Q9).
+    fn grid_fits_current(&self, count: usize) -> bool {
+        let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        grid_fits(body, count, metrics.scale, metrics.char_w, metrics.char_h)
+    }
+
+    /// Ctrl+Shift+S. Opens grid mode over the Claude tabs, or leaves it onto the
+    /// focused tile.
+    fn toggle_claude_grid(&mut self, now: Instant) {
+        if self.claude_grid.is_some() {
+            self.exit_claude_grid(Some(self.active_terminal));
+            return;
+        }
+        self.collect_claude_members();
+        let count = self.grid_members_scratch.len();
+        if count == 0 {
+            self.set_grid_hint(GridHint::NoClaudeTabs, now);
+            return;
+        }
+        if !self.grid_fits_current(count) {
+            self.set_grid_hint(GridHint::TooManyTabs, now);
+            return;
+        }
+        // Focus: the active tab when it is a member, otherwise the first tile.
+        let active = self.active_terminal;
+        let focus = if self.grid_members_scratch.contains(&active) {
+            active
+        } else {
+            self.grid_members_scratch.first().copied().unwrap_or(active)
+        };
+        self.cancel_terminal_presentation_intents();
+        self.adopt_grid_members();
+        self.bump_grid_generation();
+        self.activate_ready_terminal(focus, false);
+        self.request_frame();
+    }
+
+    /// Leaves grid mode. `target` becomes the active tab (plain activation,
+    /// as a tab click); `None` keeps the active tab. Does nothing when grid mode
+    /// is closed.
+    fn exit_claude_grid(&mut self, target: Option<usize>) {
+        if self.claude_grid.take().is_none() {
+            return;
+        }
+        self.bump_grid_generation();
+        if let Some(index) = target
+            && index != self.active_terminal
+        {
+            self.cancel_terminal_presentation_intents();
+            self.activate_ready_terminal(index, false);
+        }
+        self.request_frame();
+    }
+
+    /// Brings the grid in line with the Claude flags of the tabs. Does nothing
+    /// while grid mode is closed. Membership changes start a new generation;
+    /// when the focused tile loses its flag, focus moves to the next member
+    /// (or the previous one); when the members stop fitting (Q9), grid mode
+    /// closes onto the focused tile with a hint.
+    fn sync_claude_grid(&mut self, now: Instant) {
+        if self.claude_grid.is_none() {
+            return;
+        }
+        self.collect_claude_members();
+        let members_changed = self
+            .claude_grid
+            .as_ref()
+            .is_some_and(|grid| grid.members != self.grid_members_scratch);
+        if members_changed {
+            self.bump_grid_generation();
+            self.adopt_grid_members();
+            self.request_frame();
+        }
+        let Some(grid) = self.claude_grid.as_ref() else {
+            return;
+        };
+        if grid.members.is_empty() {
+            self.exit_claude_grid(None);
+            return;
+        }
+        let active = self.active_terminal;
+        if !self.grid_contains(active) {
+            // Members are tab indices in ascending order: the next one after the
+            // focused tab, else the last one (all of them lie before it).
+            let target = grid
+                .members
+                .iter()
+                .copied()
+                .find(|&index| index > active)
+                .or_else(|| grid.members.last().copied());
+            if let Some(target) = target {
+                self.cancel_terminal_presentation_intents();
+                self.activate_ready_terminal(target, false);
+                self.request_frame();
+            }
+        }
+        let count = self
+            .claude_grid
+            .as_ref()
+            .map_or(0, |grid| grid.members.len());
+        if !self.grid_fits_current(count) {
+            self.exit_claude_grid(Some(self.active_terminal));
+            self.set_grid_hint(GridHint::TooManyTabs, now);
+        }
     }
 
     pub(crate) fn on_resize_with_logical_size(
@@ -2303,13 +2563,14 @@ impl App {
         self.settings_progress = settings_progress;
 
         self.rebuild_panels();
+        let tab_strip_hint = self.tab_strip_hint(now);
         let render_result = if let Some(runtime) = self.runtime.as_mut() {
             Some(runtime.render_terminal_and_present(TerminalRenderParams {
                 terminals: &self.terminals,
                 active_terminal: self.active_terminal,
                 panels: &self.panels,
                 panel_layouts: &mut self.panel_layouts,
-                tab_strip_hint: None,
+                tab_strip_hint,
                 search: &mut self.interaction.search,
                 focused: self.focused,
                 tab_scroll_x: self.terminal_tab_scroll.current,
@@ -2339,6 +2600,7 @@ impl App {
         };
         match render_result {
             Some(Ok(layout)) => {
+                self.panel_layouts_generation = self.grid_generation;
                 self.interaction.update_layout(layout);
                 let active = self.active_terminal;
                 if let Some(terminal) = self.terminals.get_mut(active) {
@@ -2431,6 +2693,8 @@ impl App {
         if self.process_terminal_presentation_intents() {
             self.request_frame();
         }
+        self.advance_grid_hint(Instant::now());
+        self.sync_claude_grid(Instant::now());
         if !self.renderable() {
             self.suspend_frame_clock();
         }
@@ -3880,6 +4144,133 @@ mod tests {
 
         assert_eq!(app.pending_external_launches.len(), 1);
         assert_eq!(app.pending_external_launches.front(), Some(&request));
+    }
+
+    /// Pure app with one terminal per flag; the flag is the Claude foreground state.
+    fn grid_mode_app(claude: &[bool]) -> App {
+        let mut app = App::new();
+        for (index, &is_claude) in claude.iter().enumerate() {
+            let terminal = Terminal::new_for_test(80, 24, index as u64 + 1);
+            crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
+            terminal.set_claude_foreground_for_test(is_claude);
+            app.terminals.push(terminal);
+        }
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        app.grid_metrics = GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+        app
+    }
+
+    fn grid_mode_members(app: &App) -> Option<Vec<usize>> {
+        app.claude_grid.as_ref().map(|grid| grid.members.clone())
+    }
+
+    #[test]
+    fn grid_mode_toggle_enters_with_claude_tabs_and_exits_to_focused_tile() {
+        let mut app = grid_mode_app(&[true, false, true]);
+        app.active_terminal = 1;
+        let now = Instant::now();
+
+        app.toggle_claude_grid(now);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 2]));
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.grid_tile_count(), 2);
+
+        app.toggle_claude_grid(now);
+        assert_eq!(grid_mode_members(&app), None);
+        assert_eq!(app.active_terminal, 0);
+    }
+
+    #[test]
+    fn grid_mode_toggle_without_claude_tabs_shows_hint_with_deadline() {
+        let mut app = grid_mode_app(&[false, false]);
+        let now = Instant::now();
+
+        app.toggle_claude_grid(now);
+        assert!(!app.grid_open());
+        assert_eq!(
+            app.grid_hint,
+            Some((GridHint::NoClaudeTabs, now + Duration::from_secs(2)))
+        );
+
+        app.dirty = false;
+        app.advance_grid_hint(now + Duration::from_secs(1));
+        assert!(app.grid_hint.is_some());
+        assert!(!app.dirty);
+
+        app.advance_grid_hint(now + Duration::from_secs(2));
+        assert_eq!(app.grid_hint, None);
+        assert!(app.dirty, "clearing the hint requests one frame");
+
+        app.dirty = false;
+        app.advance_grid_hint(now + Duration::from_secs(3));
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn grid_mode_exit_paths() {
+        let mut app = grid_mode_app(&[true, false, true]);
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        app.select_terminal_tab_from_user(1);
+        assert!(!app.grid_open());
+        assert_eq!(app.active_terminal, 1);
+
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        assert_eq!(app.add_terminal_with_launch(TerminalLaunchSpec::default()), None);
+        assert!(!app.grid_open(), "leaving happens before the runtime check");
+    }
+
+    #[test]
+    fn grid_mode_q9_blocks_entry_when_tiles_do_not_fit() {
+        let mut app = grid_mode_app(&[true, true]);
+        app.grid_metrics.width = 40.0;
+        let now = Instant::now();
+        app.toggle_claude_grid(now);
+        assert!(!app.grid_open());
+        assert_eq!(
+            app.grid_hint,
+            Some((GridHint::TooManyTabs, now + Duration::from_secs(2)))
+        );
+    }
+
+    #[test]
+    fn grid_mode_sync_does_nothing_when_closed() {
+        let mut app = grid_mode_app(&[true, true]);
+        app.grid_generation = 5;
+        app.dirty = false;
+        app.sync_claude_grid(Instant::now());
+        assert_eq!(app.grid_generation, 5);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn grid_mode_generation_grows_on_composition_and_metrics_change() {
+        let mut app = grid_mode_app(&[true, true, false]);
+        app.toggle_claude_grid(Instant::now());
+        let before = app.grid_generation;
+
+        app.terminals[1].set_claude_foreground_for_test(false);
+        app.sync_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0]));
+        assert!(app.grid_generation > before);
+
+        let before = app.grid_generation;
+        let same = app.grid_metrics;
+        app.set_grid_metrics(same);
+        assert_eq!(app.grid_generation, before, "same metrics keep the generation");
+        app.set_grid_metrics(GridMetrics {
+            char_w: 9.0,
+            ..same
+        });
+        assert!(app.grid_generation > before);
     }
 
     /// Turns on focus reporting (DECSET 1004) through the same grid path the PTY uses.
