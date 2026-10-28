@@ -1783,20 +1783,16 @@ impl WaylandState {
 
     fn apply_configure(&mut self) {
         if let Some((width, height)) = self.pending_toplevel_size.take() {
-            let non_zero = width > 0 && height > 0;
-            match self.last_floating_size {
-                // A zero-sized floating configure (e.g. after un-maximize) restores the
-                // last floating size. While floating, that size equals the current one.
-                Some((last_width, last_height)) if self.toplevel_floating && !non_zero => {
-                    self.logical_width = last_width;
-                    self.logical_height = last_height;
-                }
-                _ => {
-                    self.logical_width = configured_dimension(self.logical_width, width);
-                    self.logical_height = configured_dimension(self.logical_height, height);
-                }
-            }
-            if self.toplevel_floating && non_zero {
+            // A floating configure may zero one or both axes (e.g. after un-maximize).
+            // Each zero axis restores the last floating size; outside floating state
+            // the current size is the fallback.
+            let (base_width, base_height) = match self.last_floating_size {
+                Some(size) if self.toplevel_floating => size,
+                _ => (self.logical_width, self.logical_height),
+            };
+            self.logical_width = configured_dimension(base_width, width);
+            self.logical_height = configured_dimension(base_height, height);
+            if self.toplevel_floating {
                 self.last_floating_size = Some((self.logical_width, self.logical_height));
             }
         }
@@ -3599,24 +3595,26 @@ mod tests {
     }
 
     #[test]
-    fn one_zero_axis_floating_configure_after_maximize_restores_both_axes() {
+    fn one_zero_axis_floating_configure_after_maximize_takes_width_and_restores_height() {
         let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
         state.apply_toplevel_configure(1000, 700, &toplevel_states_bytes(&[]));
         state.apply_configure();
         state.apply_toplevel_configure(1920, 1080, &toplevel_states_bytes(&[1]));
         state.apply_configure();
 
+        // Width comes from the configure; the zero height restores last_floating_size.
         state.apply_toplevel_configure(1100, 0, &toplevel_states_bytes(&[]));
         state.apply_configure();
-        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1000, 700, 1.0));
-        assert_eq!(state.last_floating_size, Some((1000, 700)));
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1100, 700, 1.0));
+        assert_eq!(state.last_floating_size, Some((1100, 700)));
     }
 
     #[test]
     fn zero_sized_floating_configure_without_prior_floating_size_keeps_current_size() {
-        // The initial size comes from config and seeds last_floating_size; a zero-sized
-        // floating configure must then keep it rather than collapse to zero.
+        // No floating size is recorded, so a zero-sized floating configure falls back to
+        // the current size instead of collapsing to zero.
         let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.last_floating_size = None;
         state.apply_toplevel_configure(0, 0, &toplevel_states_bytes(&[]));
         state.apply_configure();
         assert_eq!(state.metrics(), WaylandWindowMetrics::new(800, 600, 1.0));

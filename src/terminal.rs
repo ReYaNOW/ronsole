@@ -902,6 +902,129 @@ mod tests {
         }
     }
 
+    /// The card lines as Claude Code draws them: the first two rows carry a
+    /// box border in the first cell, the last row has none; each row sits
+    /// beside a side panel divider and panel text in the same screen row.
+    #[test]
+    fn dev_banner_card_beside_side_panel_is_hidden() {
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
+        assert!(head.ends_with("without "));
+        let second = DEV_CHANNEL_BANNER_LINES[1];
+        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let screen = format!(
+            "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
+             \x1b[2;1H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
+             \x1b[3;1H\x1b[38;2;255;193;7m{second}\x1b[39m\x1b[110G│ panel\
+             \x1b[4;1H> prompt\x1b[110G│ more"
+        );
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+
+        for row in 0..3 {
+            let (hidden, total) = {
+                let grid = crate::platform::lock_recover(&terminal.grid);
+                let line = grid.visible_row(row).expect("screen row");
+                assert_eq!(line[109].ch(), '│', "row {row}");
+                assert!(!line[109].is_hidden(), "divider row {row}");
+                assert_ne!(line[111].ch(), ' ');
+                assert!(!line[111].is_hidden(), "panel row {row}");
+                let cells = line[..109].iter().filter(|cell| cell.ch() != ' ');
+                cells.fold((0, 0), |(hidden, total), cell| {
+                    (hidden + usize::from(cell.is_hidden()), total + 1)
+                })
+            };
+            assert!(total > 0);
+            assert_eq!(hidden, total, "card row {row}");
+        }
+        assert_eq!(hidden_cells(&terminal, 3).0, 0, "prompt row");
+    }
+
+    /// The first line keeps the quote bar in every row, so the second line
+    /// needs its bar too: without the pane divider the card is not a banner,
+    /// and nothing is hidden.
+    #[test]
+    fn dev_banner_card_with_quote_bar_and_bare_second_line_is_not_hidden() {
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
+        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let screen = format!(
+            "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
+             \x1b[2;1H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
+             \x1b[3;1H\x1b[38;2;255;193;7m{}\x1b[39m\x1b[110G│ panel\
+             \x1b[4;1H> prompt\x1b[110G│ more",
+            DEV_CHANNEL_BANNER_LINES[1]
+        );
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+
+        for row in 0..4 {
+            assert_eq!(hidden_cells(&terminal, row).0, 0, "row {row}");
+        }
+    }
+
+    /// The second line without a bar, beside a side panel, with no first line
+    /// above it: it is not a banner.
+    #[test]
+    fn dev_banner_bare_second_line_beside_side_panel_alone_is_not_hidden() {
+        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let screen = format!(
+            "\x1b[2J\x1b[H{}\x1b[110G│ panel\x1b[2;1H> prompt\x1b[110G│ more",
+            DEV_CHANNEL_BANNER_LINES[1]
+        );
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+
+        for row in 0..2 {
+            assert_eq!(hidden_cells(&terminal, row).0, 0, "row {row}");
+        }
+    }
+
+    /// The bare second line after first-line rows barred by the quote bar:
+    /// the second line may drop its bar only beside the pane divider, so the
+    /// block is not a banner and nothing is hidden.
+    #[test]
+    fn dev_banner_quote_bar_first_line_with_bare_second_line_is_not_hidden() {
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
+        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let screen = format!(
+            "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
+             \x1b[2;1H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
+             \x1b[3;1H{}\x1b[110G│ panel\
+             \x1b[4;1H> prompt\x1b[110G│ more",
+            DEV_CHANNEL_BANNER_LINES[1]
+        );
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+
+        for row in 0..4 {
+            assert_eq!(hidden_cells(&terminal, row).0, 0, "row {row}");
+        }
+    }
+
+    /// Text that only begins like the second line is not the banner: "names"
+    /// runs past the end of the line, so the block is not matched.
+    #[test]
+    fn dev_banner_first_line_followed_by_longer_text_is_not_hidden() {
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
+        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let screen = format!(
+            "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
+             \x1b[2;1H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
+             \x1b[3;1H{}s\x1b[110G│ panel\
+             \x1b[4;1H> prompt\x1b[110G│ more",
+            DEV_CHANNEL_BANNER_LINES[1]
+        );
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
+
+        for row in 0..4 {
+            assert_eq!(hidden_cells(&terminal, row).0, 0, "row {row}");
+        }
+    }
+
     #[test]
     fn dev_banner_like_text_beside_side_panel_is_not_hidden() {
         let first = DEV_CHANNEL_BANNER_LINES[0];
@@ -1359,7 +1482,9 @@ struct DevWarningState {
 /// Text of the two Claude Code notice lines shown for the cc-tg development
 /// channel, without the quote-border prefix (`DEV_CHANNEL_BANNER_BAR` and one
 /// space) that Claude Code draws on every row of the notice, wrapped rows
-/// included.
+/// included. Beside a side panel, the rows of the first line keep their bar
+/// (as `DEV_CHANNEL_PANE_DIVIDER`), but the second line may lose it; see
+/// `match_banner_row`.
 const DEV_CHANNEL_BANNER_LINES: [&str; 2] = [
     "Channels (experimental) messages from server:cc-tg inject directly in this session \u{b7} restart without --dangerously-load-development-channels to stop",
     "server:cc-tg \u{b7} no MCP server configured with that name",
@@ -1378,25 +1503,37 @@ const DEV_CHANNEL_BANNER_MAX_ROWS: usize =
 /// Matches one logical row (a row and its soft-wrapped continuations, as
 /// `cells`) against `expected[pos..]`: optional leading blanks, the bar, one
 /// space, then a non-empty segment equal to the next part of `expected`
-/// (trailing blanks ignored). The space of `expected` at a wrap point may be
-/// dropped by the wrapper. Returns the byte position after the segment.
+/// (trailing blanks ignored). The bar is `DEV_CHANNEL_BANNER_BAR`, or
+/// `DEV_CHANNEL_PANE_DIVIDER` as the first cell of the row. When `bare` is
+/// set, the row may have no bar and no space: the segment then starts at the
+/// first non-blank cell. The space of `expected` at a wrap point may be
+/// dropped by the wrapper. Returns the byte position after the segment and
+/// whether the row was barred by `DEV_CHANNEL_PANE_DIVIDER` in its first cell.
 fn match_banner_row<'a>(
     cells: impl Iterator<Item = &'a Cell>,
     expected: &str,
     pos: usize,
-) -> Option<usize> {
+    bare: bool,
+) -> Option<(usize, bool)> {
     let mut cells = cells.filter(|cell| !cell.is_wide_spacer());
     let plain = |cell: &Cell, c: char| cell.ch() == c && cell.zero_width().is_empty();
-    let (x, bar) = cells.by_ref().enumerate().find(|(_, cell)| cell.ch() != ' ')?;
-    let is_bar =
-        plain(bar, DEV_CHANNEL_BANNER_BAR) || (x == 0 && plain(bar, DEV_CHANNEL_PANE_DIVIDER));
-    if !is_bar || !cells.next().is_some_and(|cell| plain(cell, ' ')) {
+    let (x, first) = cells.by_ref().enumerate().find(|(_, cell)| cell.ch() != ' ')?;
+    let divider = x == 0 && plain(first, DEV_CHANNEL_PANE_DIVIDER);
+    // Without a bar, the first non-blank cell is already part of the segment.
+    let mut pending = None;
+    if plain(first, DEV_CHANNEL_BANNER_BAR) || divider {
+        if !cells.next().is_some_and(|cell| plain(cell, ' ')) {
+            return None;
+        }
+    } else if bare {
+        pending = Some(first);
+    } else {
         return None;
     }
     let mut rest = expected.get(pos..)?;
     // Byte position in `expected` after the last matched non-blank cell.
     let mut end = None;
-    while let Some(cell) = cells.next() {
+    while let Some(cell) = pending.take().or_else(|| cells.next()) {
         if end.is_none() && pos > 0 && cell.ch() != ' ' {
             rest = rest.strip_prefix(' ').unwrap_or(rest);
         }
@@ -1431,7 +1568,7 @@ fn match_banner_row<'a>(
             end = Some(expected.len() - rest.len());
         }
     }
-    end
+    end.map(|end| (end, divider))
 }
 
 /// Rows scanned for banner blocks: the last `history` scrollback rows (none
@@ -1494,13 +1631,24 @@ impl<'a> BannerRows<'a> {
 
     /// Number of rows taken by the banner text from byte `pos` of
     /// `DEV_CHANNEL_BANNER_LINES[line]` to the end of the last line, from the
-    /// logical row starting at `start`.
+    /// logical row starting at `start`. Rows of the second line may lack the
+    /// bar only when every row of the first line matched beside the pane
+    /// divider.
     fn rest_at(self, start: usize, line: usize, mut pos: usize) -> Option<usize> {
         let mut row = start;
-        for expected in DEV_CHANNEL_BANNER_LINES.get(line..)? {
+        // Whether every first-line row so far was barred by the pane divider;
+        // `None` until the first first-line row matches.
+        let mut divider_only = None;
+        for (offset, expected) in DEV_CHANNEL_BANNER_LINES.get(line..)?.iter().enumerate() {
+            let index = line + offset;
             while pos < expected.len() {
                 let rows = self.logical_rows(row)?;
-                pos = match_banner_row(self.cells(row, rows), expected, pos)?;
+                let bare = index > 0 && divider_only == Some(true);
+                let (end, divider) = match_banner_row(self.cells(row, rows), expected, pos, bare)?;
+                if index == 0 {
+                    divider_only = Some(divider_only.unwrap_or(true) && divider);
+                }
+                pos = end;
                 row += rows;
             }
             pos = 0;
