@@ -673,6 +673,12 @@ impl TerminalInteraction {
             return false;
         }
         let Some(key) = terminal_key_event(key_event, self.event_modifiers(key_event)) else {
+            // A key with no named, physical, or layout identity has no encoder event, but its
+            // press or repeat may still carry text. That text goes to the terminal as plain text.
+            if pressed && let Some(text) = key_event.text.as_deref() {
+                drop(grid);
+                return self.handle_text(text, terminal);
+            }
             return false;
         };
         let mut out = Vec::new();
@@ -2140,6 +2146,23 @@ mod tests {
     }
 
     #[test]
+    fn unidentified_key_with_text_sends_text_on_press_only() {
+        // Expected bytes are the UTF-8 of the event text, from the task brief: a key with
+        // text but no named, physical, or layout identity still types that text.
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut press = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
+        press.text = Some("é".to_string());
+        let release = KeyInput {
+            state: KeyState::Released,
+            ..press.clone()
+        };
+        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(!interaction.handle_key_event(&release, &mut terminal));
+        assert_eq!(terminal.input_bytes_for_test(), "é".as_bytes());
+    }
+
+    #[test]
     fn unidentified_alt_key_sends_nothing_with_or_without_kitty_flags() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::ALT);
@@ -2198,7 +2221,7 @@ mod tests {
         let mut interaction = TerminalInteraction::default();
         let mut terminal = modifier_test_terminal();
         let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
-        assert!(interaction.handle_key_event(&press, &mut terminal));
+        assert!(send_key(&mut interaction, &press, &mut terminal));
         assert_eq!(terminal.input_bytes_for_test(), b"\x1b[57442;5u");
     }
 
@@ -2208,8 +2231,8 @@ mod tests {
         let mut terminal = modifier_test_terminal();
         let press = modifier_key(KeyState::Pressed, ModKey::LeftCtrl, 29);
         let release = modifier_key(KeyState::Released, ModKey::LeftCtrl, 29);
-        assert!(interaction.handle_key_event(&press, &mut terminal));
-        assert!(interaction.handle_key_event(&release, &mut terminal));
+        assert!(send_key(&mut interaction, &press, &mut terminal));
+        assert!(send_key(&mut interaction, &release, &mut terminal));
         assert_eq!(
             terminal.input_bytes_for_test(),
             b"\x1b[57442;5u\x1b[57442;1:3u"
@@ -2646,6 +2669,49 @@ mod tests {
             Some("https://example.com/x")
         );
         assert!(interaction.take_link_uri().is_none());
+    }
+
+    #[test]
+    fn ctrl_double_click_on_link_opens_link_once() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = link_test_terminal(false);
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.mouse_x = 73.0;
+        interaction.mouse_y = 682.0;
+        interaction.set_modifiers(Modifiers::CONTROL);
+        // The first click is the only one that opens the link.
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        );
+        assert_eq!(
+            interaction.take_link_uri().as_deref(),
+            Some("https://example.com/x")
+        );
+        // A press in the same cell within the multi-click window is the second click.
+        // It selects text and must not queue the link a second time.
+        assert!(interaction.mouse_input(
+            KeyState::Pressed,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        ));
+        interaction.mouse_input(
+            KeyState::Released,
+            PointerButton::Left,
+            &mut terminal,
+            |_, _, _| 0,
+        );
+        assert!(interaction.take_link_uri().is_none());
+        assert!(terminal.input_bytes_for_test().is_empty());
     }
 
     #[test]

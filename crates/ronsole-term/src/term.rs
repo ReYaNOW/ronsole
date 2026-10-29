@@ -434,7 +434,8 @@ impl Term {
         self.dirty = dirty;
     }
 
-    /// Stores the palette for future use; colour replies do not read it yet.
+    /// Replaces the palette that OSC colour queries (`queue_palette_queries`, OSC 4/10/11/12)
+    /// report from. OSC 104 and 110-112 (palette and colour reset) are still no-ops.
     pub fn set_palette(&mut self, palette: TermPalette) {
         self.palette = palette;
     }

@@ -215,6 +215,37 @@ enum TerminalOutputBatchAction {
     FlushAndRedraw,
 }
 
+/// PTY writer thread together with the owner-side handles that stop it.
+///
+/// The writer exits when it sees `stop` after a `recv` or before a write, or
+/// when every reply sender is dropped. `request_stop` raises the flag and
+/// queues one empty message so a writer parked in `recv` wakes up.
+struct PtyWriterWorker {
+    handle: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    /// Sender clone used only to wake the writer; dropped by `request_stop`
+    /// so it never keeps the reply queue open past teardown.
+    wake_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+}
+
+impl PtyWriterWorker {
+    fn request_stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(wake_tx) = self.wake_tx.take() {
+            // Full means the writer is busy and checks `stop` on its next
+            // iteration; Disconnected means it is already exiting.
+            let _ = wake_tx.try_send(Vec::new());
+        }
+    }
+
+    /// Stops the writer and hands its thread to the shared reaper, so the
+    /// caller never blocks on a write that may never return.
+    fn retire(mut self) {
+        self.request_stop();
+        platform::reap_unit_thread(self.handle);
+    }
+}
+
 pub(crate) struct TerminalProcess {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master_pty: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -224,6 +255,9 @@ pub(crate) struct TerminalProcess {
     tree: ProcessTree,
     title_stop_tx: Option<std::sync::mpsc::Sender<()>>,
     title_worker: Option<JoinHandle<()>>,
+    /// PTY writer thread; it can block inside a write, so teardown retires it
+    /// through `PtyWriterWorker::retire` instead of joining on the caller.
+    writer_worker: Option<PtyWriterWorker>,
     finished: bool,
     shutdown_complete: bool,
 }
@@ -406,7 +440,7 @@ impl TerminalProcess {
             }
         };
 
-        if let Err(error) = install_terminal_io_threads(
+        let writer_worker = match install_terminal_io_threads(
             &grid,
             bridge_screen_lock,
             reader,
@@ -415,14 +449,17 @@ impl TerminalProcess {
             title_cache,
             host,
         ) {
-            let _ = title_stop_tx.send(());
-            platform::reap_unit_thread(title_worker);
-            let _ = tree.terminate_forcefully();
-            let _ = child.kill();
-            let _ = child.wait();
-            tree.finish_after_owner_exit();
-            return Err(error);
-        }
+            Ok(writer_worker) => writer_worker,
+            Err(error) => {
+                let _ = title_stop_tx.send(());
+                platform::reap_unit_thread(title_worker);
+                let _ = tree.terminate_forcefully();
+                let _ = child.kill();
+                let _ = child.wait();
+                tree.finish_after_owner_exit();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             writer,
@@ -432,6 +469,7 @@ impl TerminalProcess {
             tree,
             title_stop_tx: Some(title_stop_tx),
             title_worker: Some(title_worker),
+            writer_worker: Some(writer_worker),
             finished: false,
             shutdown_complete: false,
         })
@@ -571,6 +609,9 @@ impl TerminalProcess {
             self.finished = true;
         }
         self.tree.finish_after_owner_exit();
+        if let Some(worker) = self.writer_worker.take() {
+            worker.retire();
+        }
         self.shutdown_complete = true;
     }
 }
@@ -973,9 +1014,11 @@ pub(crate) struct SessionSink<'a> {
 }
 
 impl SessionSink<'_> {
+    /// Rouses the main loop without requesting a frame: `on_about_to_wait`
+    /// applies parked host events and marks the frame dirty when it needs one.
     fn notify_pending(&self) {
         if let Some(wake) = self.wake {
-            wake.wake();
+            wake.wake_timer();
         }
     }
 }
@@ -1199,12 +1242,15 @@ fn install_terminal_io_threads(
     wake: Option<WakeHandle>,
     title_cache: TerminalTitleCache,
     host: HostChannels,
-) -> io::Result<()> {
+) -> io::Result<PtyWriterWorker> {
     let HostChannels {
         reply_tx,
         reply_rx,
         pending,
     } = host;
+    // Owner-side sender clone; `PtyWriterWorker::request_stop` uses it to wake the writer.
+    let wake_tx = reply_tx.clone();
+    let writer_stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::sync_channel::<OutputChunk>(TERMINAL_OUTPUT_QUEUE_CAPACITY);
     let (recycle_tx, recycle_rx) =
         std::sync::mpsc::sync_channel::<Vec<u8>>(TERMINAL_OUTPUT_QUEUE_CAPACITY);
@@ -1320,11 +1366,21 @@ fn install_terminal_io_threads(
         )
     })?;
 
-    platform::spawn_named("ronsole-terminal-writer", move || {
+    // Kept by the caller so session teardown can reap it; the reader and
+    // parser threads stay detached as before.
+    let thread_stop = writer_stop.clone();
+    let writer_handle = platform::spawn_named("ronsole-terminal-writer", move || {
         while let Ok(message) = reply_rx.recv() {
+            // Stop wins over queued replies: the child they answer is gone.
+            if thread_stop.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(mut writer) = writer.lock() else {
                 break;
             };
+            if thread_stop.load(Ordering::Acquire) {
+                break;
+            }
             if writer.write_all(&message).is_err() || writer.flush().is_err() {
                 break;
             }
@@ -1365,7 +1421,11 @@ fn install_terminal_io_threads(
         )
     })?;
 
-    Ok(())
+    Ok(PtyWriterWorker {
+        handle: writer_handle,
+        stop: writer_stop,
+        wake_tx: Some(wake_tx),
+    })
 }
 
 fn terminal_launch_command(
@@ -1747,6 +1807,7 @@ mod tests {
             tree,
             title_stop_tx: None,
             title_worker: None,
+            writer_worker: None,
             finished: false,
             shutdown_complete: false,
         };
@@ -2137,6 +2198,87 @@ mod tests {
     }
 
     #[test]
+    fn terminal_writer_thread_exits_once_reply_queue_closes() {
+        // Source: the writer loop ends when `reply_rx.recv()` fails, which
+        // happens once the parser drops `reply_tx` after the reader hits EOF.
+        let grid = Arc::new(Mutex::new(test_term(8, 2)));
+        let cache: TerminalTitleCache = Arc::new(Mutex::new(TerminalTitleState::new(
+            "fallback".to_string(),
+        )));
+        let (reply_tx, reply_rx) = terminal_reply_channel();
+        let host = HostChannels {
+            reply_tx,
+            reply_rx,
+            pending: Arc::new(Mutex::new(PendingHostEvents::default())),
+        };
+        let sink: Box<dyn Write + Send> = Box::new(io::sink());
+        let writer = Arc::new(Mutex::new(sink));
+        let mut worker = install_terminal_io_threads(
+            &grid,
+            Arc::new(Mutex::new(())),
+            Box::new(io::empty()),
+            writer,
+            None,
+            cache,
+            host,
+        )
+        .expect("terminal io threads should spawn");
+        // The owner's wake sender is part of "all senders" too; teardown drops
+        // it the same way, so the queue can close once the parser's clone is gone.
+        drop(worker.wake_tx.take());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = worker.handle.join();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "writer thread should exit after its reply queue closes"
+        );
+    }
+
+    #[test]
+    fn writer_thread_stops_on_request_while_reply_sender_stays_alive() {
+        // `external_tx` stands in for a tab's `Terminal.reply_tx`, which keeps
+        // the reply queue open after the child is gone. Only the stop flag and
+        // its wake message may end the writer here.
+        let grid = Arc::new(Mutex::new(test_term(8, 2)));
+        let cache: TerminalTitleCache = Arc::new(Mutex::new(TerminalTitleState::new(
+            "fallback".to_string(),
+        )));
+        let (reply_tx, reply_rx) = terminal_reply_channel();
+        let external_tx = reply_tx.clone();
+        let host = HostChannels {
+            reply_tx,
+            reply_rx,
+            pending: Arc::new(Mutex::new(PendingHostEvents::default())),
+        };
+        let sink: Box<dyn Write + Send> = Box::new(io::sink());
+        let mut worker = install_terminal_io_threads(
+            &grid,
+            Arc::new(Mutex::new(())),
+            Box::new(io::empty()),
+            Arc::new(Mutex::new(sink)),
+            None,
+            cache,
+            host,
+        )
+        .expect("terminal io threads should spawn");
+
+        worker.request_stop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            worker.handle.is_finished(),
+            "writer thread should exit after a stop request while a reply sender is alive"
+        );
+        drop(external_tx);
+    }
+
+    #[test]
     fn cleanup_worker_enqueue_is_nonblocking_and_kills_separate_job_group() {
         assert_eq!(TERMINAL_CLEANUP_QUEUE_CAPACITY, 16);
         let (process, shell_pid, job_pid, _pid_path) = spawn_test_bash_with_background_job();
@@ -2369,8 +2511,35 @@ mod tests {
 
         // The eventfd counter sums its writes, so one wakeup reads back as 1.
         assert_eq!(wake.drain().expect("drain"), 1);
+        assert!(!wake.take_frame_wake());
         assert!(PendingHostEvents::take(&pending).bell);
         assert!(!PendingHostEvents::take(&pending).bell);
+    }
+
+    #[test]
+    fn session_sink_clipboard_and_cwd_wake_loop_without_frame() {
+        let pending = Arc::new(Mutex::new(PendingHostEvents::default()));
+        let wake = WakeHandle::new().expect("eventfd");
+        let mut sink = SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: Some(&pending),
+            wake: Some(&wake),
+        };
+
+        sink.clipboard_set("copied".to_string());
+        assert!(wake.pending(), "clipboard event should queue a loop wake");
+        assert!(!wake.take_frame_wake(), "clipboard event should not request a frame");
+        assert_eq!(wake.drain().expect("drain"), 1);
+
+        sink.working_directory("host", b"/tmp");
+        assert!(wake.pending(), "working directory event should queue a loop wake");
+        assert!(!wake.take_frame_wake(), "working directory event should not request a frame");
+        assert_eq!(wake.drain().expect("drain"), 1);
+
+        let events = PendingHostEvents::take(&pending);
+        assert_eq!(events.clipboard.as_deref(), Some("copied"));
+        assert!(events.cwd.is_some());
     }
 
     #[test]

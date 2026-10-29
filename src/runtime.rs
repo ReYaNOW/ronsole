@@ -65,6 +65,11 @@ const MAX_CURSOR_BASE_SIZE: u32 = 128;
 const MAX_CURSOR_SCALE_BUCKET: u32 = 8;
 const MAX_CURSOR_THEME_SIZE: u32 = 512;
 const XDG_TOPLEVEL_ICON_MANAGER_VERSION: u32 = 1;
+// `xdg_toplevel.state` values from xdg-shell.xml; these give the window no floating size.
+const XDG_TOPLEVEL_STATE_MAXIMIZED: u32 = 1;
+const XDG_TOPLEVEL_STATE_FULLSCREEN: u32 = 2;
+const XDG_TOPLEVEL_STATE_TILED_LEFT: u32 = 5;
+const XDG_TOPLEVEL_STATE_TILED_BOTTOM: u32 = 8;
 const MAX_TOPLEVEL_ICON_SIZE: u32 = 512;
 const MAX_TOPLEVEL_ICON_SIZES: usize = 8;
 const FALLBACK_TOPLEVEL_ICON_SIZES: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
@@ -261,6 +266,21 @@ pub(crate) fn logical_to_physical(
             .clamp(0.0, f64::from(u32::MAX)) as u32
     };
     (scaled(logical_width), scaled(logical_height))
+}
+
+/// Reports whether an `xdg_toplevel` configure state array (native-endian `u32`
+/// values) leaves the window at a floating size, i.e. not maximized, fullscreen
+/// or tiled. The tiled states are contiguous in xdg-shell.xml.
+fn toplevel_is_floating(states: &[u8]) -> bool {
+    !states.chunks_exact(4).any(|chunk| {
+        let state = <[u8; 4]>::try_from(chunk).map_or(0, u32::from_ne_bytes);
+        matches!(
+            state,
+            XDG_TOPLEVEL_STATE_MAXIMIZED
+                | XDG_TOPLEVEL_STATE_FULLSCREEN
+                | XDG_TOPLEVEL_STATE_TILED_LEFT..=XDG_TOPLEVEL_STATE_TILED_BOTTOM
+        )
+    })
 }
 
 #[inline]
@@ -805,6 +825,8 @@ pub(crate) struct WaylandWindowMetrics {
     pub(crate) physical_width: u32,
     pub(crate) physical_height: u32,
     pub(crate) scale_factor: f32,
+    /// False while the toplevel is maximized, fullscreen or tiled.
+    pub(crate) floating: bool,
 }
 
 impl WaylandWindowMetrics {
@@ -817,6 +839,7 @@ impl WaylandWindowMetrics {
             physical_width,
             physical_height,
             scale_factor,
+            floating: true,
         }
     }
 }
@@ -973,6 +996,9 @@ struct WaylandState {
     logical_height: u32,
     scale_factor: f32,
     pending_toplevel_size: Option<(i32, i32)>,
+    toplevel_floating: bool,
+    /// Last logical size delivered while the toplevel was floating and non-zero on both axes.
+    last_floating_size: Option<(u32, u32)>,
     configured: bool,
     close_requested: bool,
     pending_configure: Option<WaylandWindowMetrics>,
@@ -1026,6 +1052,8 @@ impl WaylandState {
             logical_height,
             scale_factor: 1.0,
             pending_toplevel_size: None,
+            toplevel_floating: true,
+            last_floating_size: Some((logical_width, logical_height)),
             configured: false,
             close_requested: false,
             pending_configure: None,
@@ -1048,7 +1076,10 @@ impl WaylandState {
     }
 
     fn metrics(&self) -> WaylandWindowMetrics {
-        WaylandWindowMetrics::new(self.logical_width, self.logical_height, self.scale_factor)
+        WaylandWindowMetrics {
+            floating: self.toplevel_floating,
+            ..WaylandWindowMetrics::new(self.logical_width, self.logical_height, self.scale_factor)
+        }
     }
 
     fn fractional_scaling_active(&self) -> bool {
@@ -1743,10 +1774,27 @@ impl WaylandState {
         }
     }
 
+    /// Records an `xdg_toplevel` configure; `apply_configure` consumes the size
+    /// once the matching `xdg_surface` configure arrives.
+    fn apply_toplevel_configure(&mut self, width: i32, height: i32, states: &[u8]) {
+        self.pending_toplevel_size = Some((width, height));
+        self.toplevel_floating = toplevel_is_floating(states);
+    }
+
     fn apply_configure(&mut self) {
         if let Some((width, height)) = self.pending_toplevel_size.take() {
-            self.logical_width = configured_dimension(self.logical_width, width);
-            self.logical_height = configured_dimension(self.logical_height, height);
+            // A floating configure may zero one or both axes (e.g. after un-maximize).
+            // Each zero axis restores the last floating size; outside floating state
+            // the current size is the fallback.
+            let (base_width, base_height) = match self.last_floating_size {
+                Some(size) if self.toplevel_floating => size,
+                _ => (self.logical_width, self.logical_height),
+            };
+            self.logical_width = configured_dimension(base_width, width);
+            self.logical_height = configured_dimension(base_height, height);
+            if self.toplevel_floating {
+                self.last_floating_size = Some((self.logical_width, self.logical_height));
+            }
         }
         self.configured = true;
         self.apply_surface_geometry();
@@ -2277,8 +2325,12 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
-                state.pending_toplevel_size = Some((width, height));
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
+                state.apply_toplevel_configure(width, height, &states);
             }
             xdg_toplevel::Event::Close => state.close_requested = true,
             _ => {}
@@ -3487,10 +3539,108 @@ mod tests {
     }
 
     #[test]
+    fn toplevel_states_without_maximized_fullscreen_or_tiled_are_floating() {
+        // Expected values come from xdg-shell.xml: maximized=1, fullscreen=2,
+        // tiled_left=5 .. tiled_bottom=8; resizing=3 and activated=4 keep a floating size.
+        let state_array = |states: &[u32]| -> Vec<u8> {
+            states.iter().flat_map(|state| state.to_ne_bytes()).collect()
+        };
+        assert!(toplevel_is_floating(&[]));
+        assert!(toplevel_is_floating(&state_array(&[4])));
+        assert!(toplevel_is_floating(&state_array(&[3, 4])));
+        assert!(!toplevel_is_floating(&state_array(&[1])));
+        assert!(!toplevel_is_floating(&state_array(&[4, 1])));
+        assert!(!toplevel_is_floating(&state_array(&[2])));
+        for tiled in 5..=8 {
+            assert!(!toplevel_is_floating(&state_array(&[tiled])), "tiled state {tiled}");
+        }
+    }
+
+    #[test]
     fn configure_zero_dimensions_keep_last_logical_size() {
         assert_eq!(configured_dimension(1100, 0), 1100);
         assert_eq!(configured_dimension(720, 0), 720);
         assert_eq!(configured_dimension(1100, 900), 900);
+    }
+
+    fn toplevel_states_bytes(states: &[u32]) -> Vec<u8> {
+        states
+            .iter()
+            .flat_map(|state| state.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn zero_sized_floating_configure_after_maximize_restores_last_floating_size() {
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.apply_toplevel_configure(1000, 700, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1000, 700, 1.0));
+
+        state.apply_toplevel_configure(1920, 1080, &toplevel_states_bytes(&[1]));
+        state.apply_configure();
+        assert_eq!(
+            state.metrics(),
+            WaylandWindowMetrics {
+                floating: false,
+                ..WaylandWindowMetrics::new(1920, 1080, 1.0)
+            }
+        );
+
+        // Un-maximize: the compositor sends a floating configure with a zero size.
+        state.apply_toplevel_configure(0, 0, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1000, 700, 1.0));
+        assert_eq!(state.last_floating_size, Some((1000, 700)));
+    }
+
+    #[test]
+    fn one_zero_axis_floating_configure_after_maximize_takes_width_and_restores_height() {
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.apply_toplevel_configure(1000, 700, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        state.apply_toplevel_configure(1920, 1080, &toplevel_states_bytes(&[1]));
+        state.apply_configure();
+
+        // Width comes from the configure; the zero height restores last_floating_size.
+        state.apply_toplevel_configure(1100, 0, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(1100, 700, 1.0));
+        assert_eq!(state.last_floating_size, Some((1100, 700)));
+    }
+
+    #[test]
+    fn zero_sized_floating_configure_without_prior_floating_size_keeps_current_size() {
+        // No floating size is recorded, so a zero-sized floating configure falls back to
+        // the current size instead of collapsing to zero.
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        state.last_floating_size = None;
+        state.apply_toplevel_configure(0, 0, &toplevel_states_bytes(&[]));
+        state.apply_configure();
+        assert_eq!(state.metrics(), WaylandWindowMetrics::new(800, 600, 1.0));
+        assert_eq!(state.last_floating_size, Some((800, 600)));
+    }
+
+    #[test]
+    fn toplevel_configure_states_drive_metrics_floating_flag() {
+        // Expected values from xdg-shell.xml: maximized=1, fullscreen=2, tiled_left=5 ..
+        // tiled_bottom=8 are not floating; no state and suspended=9 are floating.
+        let cases: &[(&[u32], bool)] = &[
+            (&[1], false),
+            (&[2], false),
+            (&[5], false),
+            (&[6], false),
+            (&[7], false),
+            (&[8], false),
+            (&[], true),
+            (&[9], true),
+        ];
+        let mut state = WaylandState::new(800, 600).expect("XKB must initialize");
+        for (states, floating) in cases {
+            state.apply_toplevel_configure(800, 600, &toplevel_states_bytes(states));
+            state.apply_configure();
+            assert_eq!(state.metrics().floating, *floating, "states {states:?}");
+        }
     }
 
     #[test]
