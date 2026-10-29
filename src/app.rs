@@ -560,7 +560,6 @@ pub struct App {
     pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
     tab_input: tab_delivery::TabInputState,
     tab_waiters: VecDeque<tab_delivery::TabWaiter>,
-    tab_wait_visibility: Option<(bool, Vec<(String, bool)>)>,
     /// Reusable buffer for `Terminal::observe_dev_channel_warning`.
     dev_warning_scratch: String,
     /// Outside grid mode, a frame was skipped by `withhold_active_frame`; redraw
@@ -667,7 +666,6 @@ impl App {
             pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
             tab_input: tab_delivery::TabInputState::default(),
             tab_waiters: VecDeque::new(),
-            tab_wait_visibility: None,
             dev_warning_scratch: String::new(),
             frame_withheld: false,
             occluded: false,
@@ -1156,7 +1154,6 @@ impl App {
         self.pending_tab_reveal = Some(false);
         self.request_frame();
         self.sync_claude_grid(Instant::now());
-        self.recheck_tab_waiters_if_visibility_changed();
         false
     }
 
@@ -3051,6 +3048,7 @@ impl App {
         }
         self.advance_grid_hint(Instant::now());
         self.sync_claude_grid(Instant::now());
+        self.recheck_tab_waiters();
         if !self.renderable() {
             self.suspend_frame_clock();
         }

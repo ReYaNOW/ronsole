@@ -1390,7 +1390,7 @@ fn valid_tab_wait_token(token: &str) -> bool {
     token.len() == TAB_WAIT_TOKEN_LEN
         && token
             .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub(crate) fn write_tab_wait_result(writer: &mut impl Write, status: u8) -> io::Result<()> {
@@ -2241,9 +2241,13 @@ mod tests {
         bad_length[5] = 31;
         assert!(read_tab_wait_request(&mut Cursor::new(bad_length)).is_err());
         assert!(write_tab_wait_request(&mut Vec::new(), "z".repeat(32).as_str()).is_err());
+        assert!(write_tab_wait_request(&mut Vec::new(), "A".repeat(32).as_str()).is_err());
         let mut garbage_token = valid.clone();
         garbage_token[6] = b'z';
         assert!(read_tab_wait_request(&mut Cursor::new(garbage_token)).is_err());
+        let mut uppercase_token = valid.clone();
+        uppercase_token[6] = b'A';
+        assert!(read_tab_wait_request(&mut Cursor::new(uppercase_token)).is_err());
         assert!(read_tab_wait_request(&mut Cursor::new(&valid[..5])).is_err());
         let mut unknown = vec![PROTOCOL_VERSION, 255];
         assert!(read_instance_message(&mut Cursor::new(&unknown), PeerCred { uid: 1, pid: 1 }).is_err());
