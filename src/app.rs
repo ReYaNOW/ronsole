@@ -559,6 +559,7 @@ pub struct App {
     window_attention_requested: bool,
     pending_external_launches: VecDeque<crate::platform::single_instance::ExternalLaunchRequest>,
     tab_input: tab_delivery::TabInputState,
+    tab_waiters: VecDeque<tab_delivery::TabWaiter>,
     /// Reusable buffer for `Terminal::observe_dev_channel_warning`.
     dev_warning_scratch: String,
     /// Outside grid mode, a frame was skipped by `withhold_active_frame`; redraw
@@ -664,6 +665,7 @@ impl App {
             window_attention_requested: false,
             pending_external_launches: VecDeque::with_capacity(PENDING_EXTERNAL_LAUNCH_CAPACITY),
             tab_input: tab_delivery::TabInputState::default(),
+            tab_waiters: VecDeque::new(),
             dev_warning_scratch: String::new(),
             frame_withheld: false,
             occluded: false,
@@ -1995,6 +1997,7 @@ impl App {
     /// is SIGKILLed and reaped before this returns, so no tab process outlives
     /// Ronsole.
     fn shutdown_all(&mut self) {
+        self.tab_waiters.clear();
         let mut processes: Vec<TerminalProcess> = self
             .terminals
             .iter_mut()
@@ -3045,6 +3048,7 @@ impl App {
         }
         self.advance_grid_hint(Instant::now());
         self.sync_claude_grid(Instant::now());
+        self.recheck_tab_waiters();
         if !self.renderable() {
             self.suspend_frame_clock();
         }

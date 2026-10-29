@@ -129,6 +129,9 @@ fn main() -> ExitCode {
     if args.get(1).is_some_and(|arg| arg == "tab-status") {
         return platform::single_instance::run_tab_status_command();
     }
+    if args.get(1).is_some_and(|arg| arg == "tab-wait") {
+        return platform::single_instance::run_tab_wait_command();
+    }
     // Headless runs never touch the single-instance socket or Wayland.
     if args.get(1).is_some_and(|arg| arg == "--headless") {
         return headless::main(&args);

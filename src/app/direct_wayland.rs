@@ -120,6 +120,7 @@ impl App {
                 InstanceMessage::TabInput(envelope) => self.handle_tab_input(envelope),
                 InstanceMessage::BridgeRequest(envelope) => self.handle_bridge_request(envelope),
                 InstanceMessage::TabStatus(envelope) => self.handle_tab_status(envelope),
+                InstanceMessage::TabWait(envelope) => self.handle_tab_wait(envelope),
             }
             handled = true;
         }
@@ -463,7 +464,7 @@ mod tests {
         for index in 0..EXTERNAL_LAUNCH_QUEUE_CAPACITY {
             let request = match receiver.try_recv().unwrap() {
                 InstanceMessage::ExternalLaunch(request) => request,
-                InstanceMessage::TabInput(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) => {
+                InstanceMessage::TabInput(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) | InstanceMessage::TabWait(_) => {
                     panic!("unexpected message")
                 }
             };

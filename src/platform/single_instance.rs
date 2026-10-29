@@ -25,6 +25,8 @@ pub(crate) const BRIDGE_RESULT_MESSAGE: u8 = 6;
 /// Read-only query: is the tab addressed by the token focused and active.
 pub(crate) const TAB_STATUS_REQUEST_MESSAGE: u8 = 7;
 pub(crate) const TAB_STATUS_RESULT_MESSAGE: u8 = 8;
+const TAB_WAIT_REQUEST_MESSAGE: u8 = 9;
+const TAB_WAIT_RESULT_MESSAGE: u8 = 10;
 /// Bridge op: write one ESC byte into the tab whose foreground process group
 /// holds the addressed `claude` process.
 pub(crate) const BRIDGE_OP_ESCAPE: u8 = 3;
@@ -56,6 +58,11 @@ const TAB_STATUS_STATUS_NO_TAB: u8 = 1;
 const TAB_STATUS_STATUS_PEER_REJECTED: u8 = 2;
 /// Client-side budget for the whole `tab-status` query, connect included.
 const TAB_STATUS_CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
+const TAB_WAIT_TOKEN_LEN: usize = 32;
+const TAB_WAIT_RESULT_LEN: usize = 1;
+pub(crate) const TAB_WAIT_STATUS_SEEN: u8 = 0;
+pub(crate) const TAB_WAIT_STATUS_NO_TAB: u8 = 1;
+pub(crate) const TAB_WAIT_STATUS_PEER_REJECTED: u8 = 2;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TabInputRequest {
@@ -169,11 +176,19 @@ pub(crate) struct TabStatusEnvelope {
 }
 
 #[derive(Debug)]
+pub(crate) struct TabWaitEnvelope {
+    pub(crate) token: String,
+    pub(crate) peer: PeerCred,
+    pub(crate) stream: UnixStream,
+}
+
+#[derive(Debug)]
 pub(crate) enum InstanceMessage {
     ExternalLaunch(ExternalLaunchRequest),
     TabInput(TabInputEnvelope),
     BridgeRequest(BridgeRequestEnvelope),
     TabStatus(TabStatusEnvelope),
+    TabWait(TabWaitEnvelope),
 }
 
 pub(crate) fn peer_allowed(peer: PeerCred, own_uid: u32) -> bool {
@@ -334,7 +349,7 @@ impl PrimaryInstance {
                 if stream.read_exact(&mut prefix).is_err() {
                     continue;
                 }
-                if matches!(prefix[1], TAB_INPUT_MESSAGE | BRIDGE_REQUEST_MESSAGE | TAB_STATUS_REQUEST_MESSAGE)
+                if matches!(prefix[1], TAB_INPUT_MESSAGE | BRIDGE_REQUEST_MESSAGE | TAB_STATUS_REQUEST_MESSAGE | TAB_WAIT_REQUEST_MESSAGE)
                     && !peer_allowed(peer, effective_uid())
                 {
                     match prefix[1] {
@@ -344,9 +359,25 @@ impl PrimaryInstance {
                         TAB_STATUS_REQUEST_MESSAGE => {
                             let _ = write_tab_status_result(&mut stream, &TabStatusReply::PeerRejected);
                         }
+                        TAB_WAIT_REQUEST_MESSAGE => {
+                            let _ = write_tab_wait_result(&mut stream, TAB_WAIT_STATUS_PEER_REJECTED);
+                        }
                         _ => {
                             let _ = write_bridge_result(&mut stream, &BridgeResult::code(4));
                         }
+                    }
+                    continue;
+                }
+                if prefix[1] == TAB_WAIT_REQUEST_MESSAGE {
+                    let mut framed = io::Cursor::new(prefix).chain(&mut stream);
+                    let token = read_tab_wait_request(&mut framed);
+                    drop(framed);
+                    let Ok(token) = token else { continue };
+                    if stream.set_nonblocking(true).is_err() {
+                        continue;
+                    }
+                    if !deliver(InstanceMessage::TabWait(TabWaitEnvelope { token, peer, stream })) {
+                        continue;
                     }
                     continue;
                 }
@@ -418,6 +449,9 @@ impl PrimaryInstance {
                                     let _ = write_tab_status_result(&mut stream, &reply);
                                 }
                             });
+                    }
+                    Ok(InstanceMessage::TabWait(envelope)) => {
+                        let _ = deliver(InstanceMessage::TabWait(envelope));
                     }
                     Err(_) => {}
                 }
@@ -1324,6 +1358,63 @@ fn read_tab_status_result(reader: &mut impl Read) -> io::Result<TabStatusReply> 
     }
 }
 
+fn write_tab_wait_request(writer: &mut impl Write, token: &str) -> io::Result<()> {
+    if !valid_tab_wait_token(token) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid tab wait token"));
+    }
+    writer.write_all(&[PROTOCOL_VERSION, TAB_WAIT_REQUEST_MESSAGE])?;
+    writer.write_all(&(TAB_WAIT_TOKEN_LEN as u32).to_be_bytes())?;
+    writer.write_all(token.as_bytes())
+}
+
+fn read_tab_wait_request(reader: &mut impl Read) -> io::Result<String> {
+    let mut header = [0_u8; REQUEST_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    if header[0] != PROTOCOL_VERSION || header[1] != TAB_WAIT_REQUEST_MESSAGE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab wait request header"));
+    }
+    if u32::from_be_bytes([header[2], header[3], header[4], header[5]]) != TAB_WAIT_TOKEN_LEN as u32 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab wait request length"));
+    }
+    let mut token = [0_u8; TAB_WAIT_TOKEN_LEN];
+    reader.read_exact(&mut token)?;
+    let token = std::str::from_utf8(&token)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "tab wait token is not UTF-8"))?;
+    if !valid_tab_wait_token(token) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab wait token"));
+    }
+    Ok(token.to_owned())
+}
+
+fn valid_tab_wait_token(token: &str) -> bool {
+    token.len() == TAB_WAIT_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub(crate) fn write_tab_wait_result(writer: &mut impl Write, status: u8) -> io::Result<()> {
+    writer.write_all(&[TAB_WAIT_RESULT_MESSAGE])?;
+    writer.write_all(&(TAB_WAIT_RESULT_LEN as u32).to_be_bytes())?;
+    writer.write_all(&[status])
+}
+
+fn read_tab_wait_result(reader: &mut impl Read) -> io::Result<u8> {
+    let mut header = [0_u8; 5];
+    reader.read_exact(&mut header)?;
+    if header[0] != TAB_WAIT_RESULT_MESSAGE
+        || u32::from_be_bytes([header[1], header[2], header[3], header[4]]) != TAB_WAIT_RESULT_LEN as u32
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tab wait result header"));
+    }
+    let mut status = [0_u8; TAB_WAIT_RESULT_LEN];
+    reader.read_exact(&mut status)?;
+    if status[0] > TAB_WAIT_STATUS_PEER_REJECTED {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tab wait result"));
+    }
+    Ok(status[0])
+}
+
 /// Runtime directories a tab-status client may query, in the order the server
 /// chooses them: the XDG directory when set, then the per-user fallback.
 fn tab_status_runtime_dirs(xdg_runtime_dir: Option<OsString>, uid: u32) -> Vec<PathBuf> {
@@ -1386,6 +1477,43 @@ fn query_tab_status_blocking(socket_path: &Path, token: &str) -> io::Result<TabS
     }
 }
 
+fn query_tab_wait(runtime_dirs: Vec<PathBuf>, uid: u32, token: String) -> io::Result<u8> {
+    if !valid_tab_wait_token(&token) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid tab wait token"));
+    }
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = query_tab_wait_candidates(&runtime_dirs, uid, &token);
+        let _ = sender.send(result);
+    });
+    let mut stream = receiver
+        .recv_timeout(TAB_STATUS_CLIENT_TIMEOUT)
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tab wait connect/send timed out"))??;
+    read_tab_wait_result(&mut stream)
+}
+
+fn query_tab_wait_candidates(runtime_dirs: &[PathBuf], uid: u32, token: &str) -> io::Result<UnixStream> {
+    let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no trusted tab wait runtime directory");
+    for dir in runtime_dirs {
+        if !runtime_dir_trusted_for_client(dir, uid) {
+            continue;
+        }
+        match query_tab_wait_blocking(&dir.join(SOCKET_FILE_NAME), token) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn query_tab_wait_blocking(socket_path: &Path, token: &str) -> io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_write_timeout(Some(TAB_STATUS_CLIENT_TIMEOUT))?;
+    write_tab_wait_request(&mut stream, token)?;
+    stream.set_write_timeout(None)?;
+    Ok(stream)
+}
+
 /// Entry point of `ronsole tab-status`. Prints `focused=0|1 active=0|1` and
 /// succeeds only for a valid answer; every failure exits non-zero with no stdout.
 /// Runs before the GUI and before single-instance acquisition.
@@ -1403,6 +1531,23 @@ pub(crate) fn run_tab_status_command() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Err(_) => std::process::ExitCode::FAILURE,
+    }
+}
+
+pub(crate) fn run_tab_wait_command() -> std::process::ExitCode {
+    let Some(token) = std::env::var_os(crate::terminal_process::TERMINAL_TAB_TOKEN_ENV)
+        .and_then(|value| value.into_string().ok())
+    else {
+        return std::process::ExitCode::FAILURE;
+    };
+    if !valid_tab_wait_token(&token) {
+        return std::process::ExitCode::FAILURE;
+    }
+    let uid = effective_uid();
+    let runtime_dirs = tab_status_runtime_dirs(std::env::var_os("XDG_RUNTIME_DIR"), uid);
+    match query_tab_wait(runtime_dirs, uid, token) {
+        Ok(TAB_WAIT_STATUS_SEEN) => std::process::ExitCode::SUCCESS,
+        Ok(_) | Err(_) => std::process::ExitCode::FAILURE,
     }
 }
 
@@ -1492,7 +1637,7 @@ mod tests {
     fn external_message(message: InstanceMessage) -> ExternalLaunchRequest {
         match message {
             InstanceMessage::ExternalLaunch(request) => request,
-            InstanceMessage::TabInput(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) => {
+            InstanceMessage::TabInput(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) | InstanceMessage::TabWait(_) => {
                 panic!("unexpected message")
             }
         }
@@ -2069,6 +2214,88 @@ mod tests {
         assert!(read_result(&result[..8]).is_err());
     }
 
+    #[test]
+    fn tab_wait_frames_match_wire_vectors_and_round_trip() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut request = Vec::new();
+        write_tab_wait_request(&mut request, token).unwrap();
+        let mut expected = vec![2, TAB_WAIT_REQUEST_MESSAGE, 0, 0, 0, 32];
+        expected.extend_from_slice(token.as_bytes());
+        assert_eq!(request, expected);
+        assert_eq!(read_tab_wait_request(&mut Cursor::new(&request)).unwrap(), token);
+
+        for status in [TAB_WAIT_STATUS_SEEN, TAB_WAIT_STATUS_NO_TAB, TAB_WAIT_STATUS_PEER_REJECTED] {
+            let mut result = Vec::new();
+            write_tab_wait_result(&mut result, status).unwrap();
+            assert_eq!(result, [TAB_WAIT_RESULT_MESSAGE, 0, 0, 0, 1, status]);
+            assert_eq!(read_tab_wait_result(&mut Cursor::new(result)).unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn tab_wait_frames_reject_malformed_token_length_and_unknown_type() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut valid = Vec::new();
+        write_tab_wait_request(&mut valid, token).unwrap();
+        let mut bad_length = valid.clone();
+        bad_length[5] = 31;
+        assert!(read_tab_wait_request(&mut Cursor::new(bad_length)).is_err());
+        assert!(write_tab_wait_request(&mut Vec::new(), "z".repeat(32).as_str()).is_err());
+        assert!(write_tab_wait_request(&mut Vec::new(), "A".repeat(32).as_str()).is_err());
+        let mut garbage_token = valid.clone();
+        garbage_token[6] = b'z';
+        assert!(read_tab_wait_request(&mut Cursor::new(garbage_token)).is_err());
+        let mut uppercase_token = valid.clone();
+        uppercase_token[6] = b'A';
+        assert!(read_tab_wait_request(&mut Cursor::new(uppercase_token)).is_err());
+        assert!(read_tab_wait_request(&mut Cursor::new(&valid[..5])).is_err());
+        let mut unknown = vec![PROTOCOL_VERSION, 255];
+        assert!(read_instance_message(&mut Cursor::new(&unknown), PeerCred { uid: 1, pid: 1 }).is_err());
+        unknown.clear();
+
+        let mut invalid_result = vec![TAB_WAIT_RESULT_MESSAGE, 0, 0, 0, 2, TAB_WAIT_STATUS_SEEN, 0];
+        assert!(read_tab_wait_result(&mut Cursor::new(invalid_result.as_slice())).is_err());
+        invalid_result[4] = 1;
+        invalid_result[5] = 9;
+        assert!(read_tab_wait_result(&mut Cursor::new(invalid_result)).is_err());
+    }
+
+    #[test]
+    fn tab_wait_old_server_closes_after_unknown_message_without_hanging() {
+        let dir = TestDir::new();
+        let path = dir.socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut prefix = [0; 2];
+            stream.read_exact(&mut prefix).unwrap();
+            assert_eq!(prefix[1], TAB_WAIT_REQUEST_MESSAGE);
+        });
+        let stream = query_tab_wait_blocking(&path, "0123456789abcdef0123456789abcdef").unwrap();
+        assert!(read_tab_wait_result(&mut &stream).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tab_wait_query_round_trips_through_the_listener() {
+        let dir = TestDir::new();
+        let path = dir.socket_path();
+        let mut primary = take_primary(claim_without_activation_token(path, effective_uid()).unwrap());
+        let (tx, rx) = mpsc::channel();
+        primary.start_listener(move |message| tx.send(message).is_ok()).unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let responder = std::thread::spawn(move || {
+            let InstanceMessage::TabWait(mut envelope) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                panic!("unexpected message")
+            };
+            assert_eq!(envelope.token, token);
+            assert_eq!(envelope.peer.uid, effective_uid());
+            write_tab_wait_result(&mut envelope.stream, TAB_WAIT_STATUS_SEEN).unwrap();
+        });
+        assert_eq!(query_tab_wait(vec![dir.0.clone()], effective_uid(), token.to_owned()).unwrap(), 0);
+        responder.join().unwrap();
+    }
+
     fn spawn_raw_tab_status_peer(path: PathBuf, hold: Duration) -> JoinHandle<()> {
         let listener = UnixListener::bind(&path).unwrap();
         std::thread::spawn(move || {
@@ -2206,7 +2433,7 @@ mod tests {
             .unwrap();
             let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
                 InstanceMessage::TabInput(envelope) => envelope,
-                InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) => {
+                InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) | InstanceMessage::TabWait(_) => {
                 panic!("unexpected message")
             }
             };
@@ -2241,7 +2468,7 @@ mod tests {
         .unwrap();
         let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             InstanceMessage::TabInput(envelope) => envelope,
-            InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) => {
+            InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) | InstanceMessage::TabWait(_) => {
                 panic!("unexpected message")
             }
         };
@@ -2263,7 +2490,7 @@ mod tests {
         write_tab_input_request(&mut stream, &request).unwrap();
         let envelope = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             InstanceMessage::TabInput(envelope) => envelope,
-            InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) => {
+            InstanceMessage::ExternalLaunch(_) | InstanceMessage::BridgeRequest(_) | InstanceMessage::TabStatus(_) | InstanceMessage::TabWait(_) => {
                 panic!("unexpected message")
             }
         };

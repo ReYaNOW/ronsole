@@ -5,13 +5,15 @@
 use super::App;
 use crate::platform::single_instance::{
     BRIDGE_CODE_PTY_WRITE_FAILED, PeerCred, TabInputCode, TabInputEnvelope, TabInputKind, TabInputRequest,
-    TabStatus, TabStatusEnvelope, TabStatusReply, effective_uid, validate_tab_input_text,
+    TAB_WAIT_STATUS_NO_TAB, TAB_WAIT_STATUS_PEER_REJECTED, TAB_WAIT_STATUS_SEEN, TabStatus, TabStatusEnvelope,
+    TabStatusReply, TabWaitEnvelope, effective_uid, validate_tab_input_text, write_tab_wait_result,
 };
 use crate::tab_input::{
     InputBox, ProcGen, claude_generation, claude_process_group, classify_input_box, origin_allowed,
 };
 use crate::terminal::Terminal;
 use std::sync::mpsc::Sender;
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 const TAB_TOKEN_HEX_LEN: usize = 32;
@@ -21,6 +23,12 @@ const ACCEPT_INTERVAL: Duration = Duration::from_millis(300);
 const ENTER_DELAY: Duration = Duration::from_millis(150);
 const HOLD_RELEASE_DELAY: Duration = Duration::from_millis(100);
 const CLEAR_CAUSALITY: Duration = Duration::from_secs(10);
+const TAB_WAIT_LIMIT: usize = 64;
+
+pub(super) struct TabWaiter {
+    token: String,
+    stream: UnixStream,
+}
 
 /// Process lookups behind the receipt and delivery checks; replaceable in tests.
 #[derive(Clone, Copy)]
@@ -117,6 +125,52 @@ impl App {
             }),
         };
         let _ = envelope.reply.send(reply);
+    }
+
+    pub(super) fn handle_tab_wait(&mut self, envelope: TabWaitEnvelope) {
+        let status = if envelope.peer.uid != effective_uid() {
+            Some(TAB_WAIT_STATUS_PEER_REJECTED)
+        } else {
+            match self.find_tab_by_token(&envelope.token) {
+                None => Some(TAB_WAIT_STATUS_NO_TAB),
+                Some(index) if self.focused && self.tab_visible(index) => Some(TAB_WAIT_STATUS_SEEN),
+                Some(_) => None,
+            }
+        };
+        if let Some(status) = status {
+            let mut stream = envelope.stream;
+            let _ = write_tab_wait_result(&mut stream, status);
+            return;
+        }
+        if self.tab_waiters.len() == TAB_WAIT_LIMIT {
+            self.tab_waiters.pop_front();
+        }
+        self.tab_waiters.push_back(TabWaiter {
+            token: envelope.token,
+            stream: envelope.stream,
+        });
+    }
+
+    pub(super) fn recheck_tab_waiters(&mut self) {
+        if self.tab_waiters.is_empty() {
+            return;
+        }
+        let waiting = self.tab_waiters.len();
+        for _ in 0..waiting {
+            let Some(mut waiter) = self.tab_waiters.pop_front() else {
+                break;
+            };
+            let status = match self.find_tab_by_token(&waiter.token) {
+                None => Some(TAB_WAIT_STATUS_NO_TAB),
+                Some(index) if self.focused && self.tab_visible(index) => Some(TAB_WAIT_STATUS_SEEN),
+                Some(_) => None,
+            };
+            if let Some(status) = status {
+                let _ = write_tab_wait_result(&mut waiter.stream, status);
+            } else {
+                self.tab_waiters.push_back(waiter);
+            }
+        }
     }
 
     fn handle_tab_input_at(&mut self, envelope: TabInputEnvelope, now: Instant) {
@@ -450,6 +504,7 @@ fn check_no_input_since(terminal: &Terminal, since: Option<Instant>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use crate::launch::TerminalLaunchSpec;
     use crate::app::AppLoopControl;
     use std::cell::Cell;
@@ -1076,6 +1131,24 @@ mod tests {
         response.recv().unwrap()
     }
 
+    fn tab_wait_call(app: &mut App, token: &str, uid: u32) -> UnixStream {
+        let (stream, client) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        app.handle_tab_wait(TabWaitEnvelope {
+            token: token.to_owned(),
+            peer: PeerCred { uid, pid: 4242 },
+            stream,
+        });
+        client
+    }
+
+    fn read_tab_wait_status(stream: &mut UnixStream) -> u8 {
+        let mut response = [0; 6];
+        stream.read_exact(&mut response).unwrap();
+        assert_eq!(&response[..5], &[10, 0, 0, 0, 1]);
+        response[5]
+    }
+
     #[test]
     fn tab_status_reports_window_focus_and_presented_active_tab() {
         let mut fx = Fixture::new(EMPTY_BOX);
@@ -1145,5 +1218,75 @@ mod tests {
             let token = fx.app.terminals[index].tab_token().to_owned();
             assert_eq!(tab_status_call(&mut fx, &token, uid), status(expected), "tab {index}");
         }
+    }
+
+    #[test]
+    fn tab_wait_answers_missing_visible_and_rejected_tabs_immediately() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 8, 1));
+        app.active_terminal_presented = true;
+        let token = app.terminals[0].tab_token().to_owned();
+        let uid = effective_uid();
+
+        let mut missing = tab_wait_call(&mut app, &"a".repeat(32), uid);
+        assert_eq!(read_tab_wait_status(&mut missing), 1);
+        let mut visible = tab_wait_call(&mut app, &token, uid);
+        assert_eq!(read_tab_wait_status(&mut visible), 0);
+        let mut rejected = tab_wait_call(&mut app, &token, uid.wrapping_add(1));
+        assert_eq!(read_tab_wait_status(&mut rejected), 2);
+    }
+
+    #[test]
+    fn tab_wait_resolves_after_focus_tab_change_and_close_handlers() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 8, 1));
+        app.terminals.push(Terminal::new_for_test(80, 8, 2));
+        app.active_terminal_presented = true;
+        let first = app.terminals[0].tab_token().to_owned();
+        let uid = effective_uid();
+
+        app.on_focus_changed(false);
+        let mut on_focus = tab_wait_call(&mut app, &first, uid);
+        app.on_focus_changed(true);
+        app.on_about_to_wait();
+        assert_eq!(read_tab_wait_status(&mut on_focus), 0);
+
+        let mut first_seen = tab_wait_call(&mut app, &first, uid);
+        assert_eq!(read_tab_wait_status(&mut first_seen), 0);
+        app.activate_ready_terminal(1, false);
+        app.on_about_to_wait();
+        assert!(app.tab_waiters.is_empty());
+        let mut on_active = tab_wait_call(&mut app, &first, uid);
+        assert_eq!(app.tab_waiters.len(), 1);
+        app.activate_ready_terminal(0, false);
+        app.on_about_to_wait();
+        assert_eq!(read_tab_wait_status(&mut on_active), 0);
+
+        app.activate_ready_terminal(1, false);
+        let mut on_close = tab_wait_call(&mut app, &first, uid);
+        app.on_focus_changed(false);
+        app.on_focus_changed(true);
+        app.on_about_to_wait();
+        assert_eq!(app.tab_waiters.len(), 1);
+        app.close_terminal_tab_at(0);
+        app.on_about_to_wait();
+        assert_eq!(read_tab_wait_status(&mut on_close), 1);
+    }
+
+    #[test]
+    fn tab_wait_limit_drops_oldest_connection_without_a_reply() {
+        let mut app = App::new();
+        app.terminals.push(Terminal::new_for_test(80, 8, 1));
+        app.terminals.push(Terminal::new_for_test(80, 8, 2));
+        app.active_terminal = 0;
+        app.active_terminal_presented = false;
+        let token = app.terminals[1].tab_token().to_owned();
+        let uid = effective_uid();
+        let mut clients: Vec<_> = (0..=TAB_WAIT_LIMIT)
+            .map(|_| tab_wait_call(&mut app, &token, uid))
+            .collect();
+        assert_eq!(app.tab_waiters.len(), TAB_WAIT_LIMIT);
+        let mut byte = [0];
+        assert_eq!(clients[0].read(&mut byte).unwrap(), 0);
     }
 }
