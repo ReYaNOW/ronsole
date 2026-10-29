@@ -104,7 +104,7 @@ fn session_allows_close(session_json: &str, process: ProcGen, job_state: Option<
         return false;
     }
     match session.get("jobId") {
-        None | Some(Value::Null) => true,
+        None => true,
         Some(Value::String(job_id)) if is_job_id(job_id) => {
             job_state.is_some_and(job_state_is_settled)
         }
@@ -183,7 +183,7 @@ fn job_id_of(session_json: &str) -> Option<String> {
 fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)?;
     if !path.starts_with("/proc") && !file.metadata()?.is_file() {
         return Err(io::Error::new(
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn interactive_idle_without_children_closes() {
         assert!(close_with(INTERACTIVE, &session(""), None, Vec::new()));
-        assert!(close_with(INTERACTIVE, &session(r#","kind":"interactive","jobId":null"#), None, Vec::new()));
+        assert!(!close_with(INTERACTIVE, &session(r#","kind":"interactive","jobId":null"#), None, Vec::new()));
     }
 
     #[test]
