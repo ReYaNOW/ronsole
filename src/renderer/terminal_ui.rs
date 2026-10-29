@@ -622,6 +622,8 @@ pub(crate) struct CloseConfirmView<'a> {
     pub(crate) title: &'a str,
     pub(crate) rows: &'a [String],
     pub(crate) more: Option<&'a str>,
+    /// Button under the pointer (`Confirm`, `Cancel` or `None`), drawn highlighted.
+    pub(crate) hovered: CloseConfirmHit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1334,33 +1336,38 @@ impl CloseConfirmLayout {
 /// Centered dialog sized for `line_count` list lines below its title.
 fn close_confirm_layout(width: f32, height: f32, scale: f32, line_count: usize) -> CloseConfirmLayout {
     let scale = scale.max(0.0);
+    // Metrics follow the RRiter file dialogs: 460 px panel, 28 px side padding,
+    // a centered 130x32 button pair 10 px apart and 32 px below the buttons.
     let pad = (24.0 * scale).round();
+    let side_pad = (28.0 * scale).round();
     let header_h = (56.0 * scale).round();
     let row_step = (24.0 * scale).round().max(1.0);
-    let button_h = (36.0 * scale).round().max(1.0);
-    let button_w = (120.0 * scale).round().max(1.0);
-    let gap = (16.0 * scale).round().max(1.0);
+    let button_h = (32.0 * scale).round().max(1.0);
+    let button_w = (130.0 * scale).round().max(1.0);
+    let gap = (10.0 * scale).round().max(1.0);
+    let bottom_pad = (32.0 * scale).round();
     let panel_w = (460.0 * scale).round();
-    let panel_h = (header_h + row_step * line_count as f32 + pad + button_h + pad).round();
+    let panel_h = (header_h + row_step * line_count as f32 + pad + button_h + bottom_pad).round();
     let panel = fit_centered_rect(width, height, panel_w, panel_h, pad);
-    let button_y = (panel.y + panel.h - pad - button_h).round();
+    let button_y = (panel.y + panel.h - bottom_pad - button_h).round();
+    // Confirm on the left, Cancel on the right, the pair centered in the panel.
     let confirm = Rect {
-        x: (panel.x + panel.w - pad - button_w).round(),
+        x: (panel.x + (panel.w - button_w * 2.0 - gap) * 0.5).round(),
         y: button_y,
         w: button_w,
         h: button_h,
     };
     let cancel = Rect {
-        x: (confirm.x - gap - button_w).round(),
+        x: confirm.x + button_w + gap,
         y: button_y,
         w: button_w,
         h: button_h,
     };
     CloseConfirmLayout {
         panel,
-        text_x: (panel.x + pad).round(),
-        text_max_x: (panel.x + panel.w - pad).round(),
-        title_baseline_y: (panel.y + 36.0 * scale).round(),
+        text_x: (panel.x + side_pad).round(),
+        text_max_x: (panel.x + panel.w - side_pad).round(),
+        title_baseline_y: (panel.y + 38.0 * scale).round(),
         rows_baseline_y: (panel.y + header_h + row_step * 0.70).round(),
         row_step,
         confirm,
@@ -3273,21 +3280,38 @@ impl Renderer {
         if panel.w <= 0.0 || panel.h <= 0.0 {
             return;
         }
-        self.push_rect(0.0, 0.0, self.width, self.height, [0.0, 0.0, 0.0, 0.45]);
+        // Shell of the RRiter file dialogs: scrim, then a 2 px accent (KDE selection)
+        // border around the dialog fill, both 10 px rounded.
+        self.push_rect(0.0, 0.0, self.width, self.height, [0.0, 0.0, 0.0, 0.42]);
         let radius = (10.0 * s).round().max(1.0);
+        let border = (2.0 * s).round().max(1.0);
         self.push_rounded_rect(
-            panel.x - 1.0,
-            panel.y - 1.0,
-            panel.w + 2.0,
-            panel.h + 2.0,
+            panel.x,
+            panel.y,
+            panel.w,
+            panel.h,
             radius,
-            [0.224, 0.231, 0.251, 1.0],
+            self.palette.accent_with_alpha(1.0),
         );
-        self.push_rounded_rect(panel.x, panel.y, panel.w, panel.h, radius, [0.15, 0.16, 0.20, 1.0]);
+        self.push_rounded_rect(
+            panel.x + border,
+            panel.y + border,
+            (panel.w - border * 2.0).max(0.0),
+            (panel.h - border * 2.0).max(0.0),
+            (radius - border).max(1.0),
+            [0.15, 0.16, 0.20, 1.0],
+        );
         let button_radius = (5.0 * s).round().max(1.0);
-        let normal = [0.224, 0.231, 0.251, 1.0];
-        let accent = self.palette.accent_with_alpha(0.55);
-        for (rect, fill) in [(layout.cancel, normal), (layout.confirm, accent)] {
+        let buttons = [
+            (layout.confirm, CloseConfirmHit::Confirm, "Закрыть"),
+            (layout.cancel, CloseConfirmHit::Cancel, "Отмена"),
+        ];
+        for (rect, hit, _) in buttons {
+            let fill = if view.hovered == hit {
+                [0.30, 0.32, 0.38, 1.0]
+            } else {
+                [0.22, 0.23, 0.28, 1.0]
+            };
             self.push_rounded_rect(rect.x, rect.y, rect.w, rect.h, button_radius, fill);
         }
 
@@ -3297,8 +3321,9 @@ impl Renderer {
             layout.text_max_x,
             layout.title_baseline_y,
             self.palette.fg,
-            1.1,
+            1.0,
         );
+        let secondary = [0.75, 0.76, 0.82, 1.0];
         for (index, row) in view.rows.iter().enumerate() {
             let baseline = layout.rows_baseline_y + index as f32 * layout.row_step;
             self.draw_ui_text_clipped(
@@ -3306,8 +3331,8 @@ impl Renderer {
                 layout.text_x,
                 layout.text_max_x,
                 baseline,
-                self.palette.fg,
-                0.90,
+                secondary,
+                0.88,
             );
         }
         if let Some(more) = view.more {
@@ -3317,20 +3342,20 @@ impl Renderer {
                 layout.text_x,
                 layout.text_max_x,
                 baseline,
-                self.palette.fg,
-                0.90,
+                secondary,
+                0.88,
             );
         }
-        for (rect, label) in [(layout.cancel, "Отмена"), (layout.confirm, "Закрыть")] {
-            let label_width = self.terminal_ui_text_width(label, 0.90);
+        for (rect, _, label) in buttons {
+            let label_width = self.terminal_ui_text_width(label, 0.86);
             let label_x = centered_settings_value_x(rect.x, rect.x + rect.w, label_width);
             self.draw_ui_text_clipped(
                 label,
                 label_x,
                 rect.x + rect.w,
-                (rect.y + rect.h * 0.70).round(),
+                (rect.y + rect.h * 0.5 + 5.0 * s).round(),
                 self.palette.fg,
-                0.90,
+                0.86,
             );
         }
         self.flush();
@@ -5353,6 +5378,33 @@ mod tests {
             clipped_rect(Rect { x: 90.0, y: 6.0, w: 20.0, h: 32.0 }, strip),
             Some(Rect { x: 90.0, y: 6.0, w: 10.0, h: 32.0 })
         );
+    }
+
+    #[test]
+    fn close_confirm_buttons_put_confirm_left_and_cancel_right_on_snapped_pixels() {
+        // Window dialog with a full list, tab dialog with one row; fractional scales too.
+        for (scale, line_count) in [(1.0, 9), (1.0, 1), (1.25, 9), (1.75, 1)] {
+            let layout = close_confirm_layout(1100.0, 900.0, scale, line_count);
+            let (confirm, cancel) = (layout.confirm, layout.cancel);
+            assert!(
+                confirm.x + confirm.w < cancel.x,
+                "confirm must be the left button"
+            );
+            assert_eq!(confirm.y, cancel.y);
+            for value in [
+                confirm.x, confirm.y, confirm.w, confirm.h, cancel.x, cancel.w,
+            ] {
+                assert_eq!(value, value.round(), "button geometry must be snapped");
+            }
+            // The pair is centered in the panel within one pixel of rounding.
+            let left_gap = confirm.x - layout.panel.x;
+            let right_gap = layout.panel.x + layout.panel.w - (cancel.x + cancel.w);
+            assert!((left_gap - right_gap).abs() <= 1.0);
+            let left = (confirm.x + 1.0, confirm.y + confirm.h * 0.5);
+            let right = (cancel.x + cancel.w - 1.0, cancel.y + cancel.h * 0.5);
+            assert_eq!(layout.hit_test(left.0, left.1), CloseConfirmHit::Confirm);
+            assert_eq!(layout.hit_test(right.0, right.1), CloseConfirmHit::Cancel);
+        }
     }
 
     #[test]

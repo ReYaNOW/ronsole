@@ -195,6 +195,8 @@ struct CloseConfirm {
     title: &'static str,
     rows: Vec<String>,
     more: Option<String>,
+    /// Button under the pointer: `Confirm`, `Cancel` or `None`.
+    hovered: CloseConfirmHit,
 }
 
 impl CloseConfirm {
@@ -224,6 +226,7 @@ impl CloseConfirm {
             title,
             rows,
             more: (hidden > 0).then(|| format!("и ещё {hidden}")),
+            hovered: CloseConfirmHit::None,
         })
     }
 }
@@ -1218,6 +1221,7 @@ impl App {
         self.cancel_pointer_interactions();
         self.settings_background_dragging = false;
         self.close_confirm = Some(confirm);
+        self.refresh_close_confirm_hover();
         if !self.focused
             && let Some(runtime) = self.runtime.as_mut()
         {
@@ -1283,6 +1287,31 @@ impl App {
             return CloseConfirmHit::None;
         };
         runtime.close_confirm_hit_test(confirm.line_count(), x, y)
+    }
+
+    /// Re-hit-tests the dialog at the stored pointer, e.g. after motion or a resize.
+    fn refresh_close_confirm_hover(&mut self) {
+        if self.close_confirm.is_some() {
+            self.set_close_confirm_hover(
+                self.close_confirm_hit_test(self.pointer_x, self.pointer_y),
+            );
+        }
+    }
+
+    /// Stores the dialog button under the pointer. Only a change of the hovered
+    /// button asks for a frame; motion within one button or over the panel does not.
+    fn set_close_confirm_hover(&mut self, hit: CloseConfirmHit) {
+        let hovered = match hit {
+            CloseConfirmHit::Confirm | CloseConfirmHit::Cancel => hit,
+            CloseConfirmHit::None | CloseConfirmHit::Outside => CloseConfirmHit::None,
+        };
+        let Some(confirm) = self.close_confirm.as_mut() else {
+            return;
+        };
+        if confirm.hovered != hovered {
+            confirm.hovered = hovered;
+            self.request_frame();
+        }
     }
 
     fn reorder_terminal_tab(&mut self, from: usize, to: usize) {
@@ -2311,6 +2340,7 @@ impl App {
             runtime.resize(width, height);
         }
         self.refresh_grid_metrics();
+        self.refresh_close_confirm_hover();
         self.mark_dirty();
     }
 
@@ -2322,6 +2352,7 @@ impl App {
             }
         }
         self.refresh_grid_metrics();
+        self.refresh_close_confirm_hover();
         self.terminal_tab_scroll.reset();
         self.mark_dirty();
     }
@@ -2438,6 +2469,7 @@ impl App {
         self.update_link_hover();
         // The dialog owns the pointer: tab drag and reorder must not advance under it.
         if self.close_confirm.is_some() {
+            self.refresh_close_confirm_hover();
             return;
         }
         if self.settings_modal_active() {
@@ -2512,6 +2544,7 @@ impl App {
                 runtime.set_cursor_kind(next);
             }
         }
+        self.set_close_confirm_hover(CloseConfirmHit::None);
         if self.settings_modal_active() || self.terminal_tab_drag.is_some() {
             return;
         }
@@ -2887,6 +2920,7 @@ impl App {
                     title: confirm.title,
                     rows: &confirm.rows,
                     more: confirm.more.as_deref(),
+                    hovered: confirm.hovered,
                 }),
             }))
         } else {
@@ -4108,6 +4142,7 @@ mod tests {
             title: "Закрыть вкладку?",
             rows: vec!["tab — vim".to_string()],
             more: None,
+            hovered: CloseConfirmHit::None,
         };
         let mut app = App::new();
         app.close_confirm = Some(open());
@@ -4137,6 +4172,7 @@ mod tests {
             title: "Закрыть вкладку?",
             rows: vec!["tab — vim".to_string()],
             more: Some("и ещё 2".to_string()),
+            hovered: CloseConfirmHit::None,
         });
         // The only tab is the target, so the confirmed close removes it and reports the
         // exit. Without the close running, the tab would still be there.
@@ -4154,6 +4190,7 @@ mod tests {
             title: "Закрыть вкладку?",
             rows: vec!["tab — vim".to_string()],
             more: None,
+            hovered: CloseConfirmHit::None,
         });
         // A window close must neither replace the tab dialog nor exit the event loop.
         assert!(!app.request_terminal_close(CloseTarget::Window));
@@ -4173,6 +4210,7 @@ mod tests {
             title: "Закрыть вкладку?",
             rows: vec!["tab — vim".to_string()],
             more: None,
+            hovered: CloseConfirmHit::None,
         });
         let mut kept_before = String::new();
         app.terminals[1].write_display_title(&mut kept_before);
@@ -4201,6 +4239,7 @@ mod tests {
             title: "Закрыть окно?",
             rows: vec!["tab — vim".to_string()],
             more: None,
+            hovered: CloseConfirmHit::None,
         });
         assert!(app.terminal_tab_drag.is_none());
         assert!(!app.settings_background_dragging);
@@ -4209,6 +4248,65 @@ mod tests {
         app.on_pointer_motion(PointerPosition { x: 200.0, y: 5.0 });
         let moved = app.terminal_tab_drag.as_ref().expect("drag untouched");
         assert_eq!(moved.current_x, 10.0);
+    }
+
+    #[test]
+    fn close_confirm_hover_redraws_only_when_the_hovered_button_changes() {
+        for (target, title) in [
+            (CloseTarget::Window, "Закрыть окно?"),
+            (CloseTarget::Tab(0), "Закрыть вкладку?"),
+        ] {
+            let mut app = App::new();
+            app.close_confirm = Some(CloseConfirm {
+                target,
+                title,
+                rows: vec!["tab — vim".to_string()],
+                more: None,
+                hovered: CloseConfirmHit::None,
+            });
+            let hovered = |app: &App| app.close_confirm.as_ref().map(|confirm| confirm.hovered);
+            app.dirty = false;
+            app.set_close_confirm_hover(CloseConfirmHit::Confirm);
+            assert_eq!(hovered(&app), Some(CloseConfirmHit::Confirm));
+            assert!(app.dirty);
+            // Motion within the same button does not ask for a frame.
+            app.dirty = false;
+            app.set_close_confirm_hover(CloseConfirmHit::Confirm);
+            assert!(!app.dirty);
+            app.set_close_confirm_hover(CloseConfirmHit::Cancel);
+            assert_eq!(hovered(&app), Some(CloseConfirmHit::Cancel));
+            assert!(app.dirty);
+            // Leaving the buttons for the panel or the scrim clears the hover once.
+            app.dirty = false;
+            app.set_close_confirm_hover(CloseConfirmHit::Outside);
+            assert_eq!(hovered(&app), Some(CloseConfirmHit::None));
+            assert!(app.dirty);
+            app.dirty = false;
+            app.set_close_confirm_hover(CloseConfirmHit::None);
+            assert!(!app.dirty);
+            // The pointer leaving the window drops the hover.
+            app.set_close_confirm_hover(CloseConfirmHit::Confirm);
+            app.dirty = false;
+            app.on_pointer_leave(800, 600);
+            assert_eq!(hovered(&app), Some(CloseConfirmHit::None));
+            assert!(app.dirty);
+        }
+
+        // Source-structure check: hit-testing needs the runtime, absent in unit tests.
+        let source = include_str!("app.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let motion = production
+            .split("    pub(crate) fn on_pointer_motion")
+            .nth(1)
+            .and_then(|tail| tail.split("    pub(crate) fn on_pointer_leave").next())
+            .expect("pointer motion routing must remain present");
+        let guard = motion
+            .find("if self.close_confirm.is_some() {")
+            .expect("the close dialog must gate pointer motion");
+        let refresh = motion
+            .find("self.refresh_close_confirm_hover();")
+            .expect("pointer motion must refresh the dialog hover");
+        assert!(guard < refresh);
     }
 
     #[test]
@@ -4854,6 +4952,7 @@ mod tests {
             title: "Закрыть вкладку?",
             rows: vec!["tab — vim".to_string()],
             more: None,
+            hovered: CloseConfirmHit::None,
         });
         let generation = app.grid_generation;
         assert!(!app.on_key(grid_mode_toggle_key()));
@@ -6524,6 +6623,7 @@ mod tests {
             title: "Закрыть вкладку?",
             rows: vec!["tab — vim".to_string()],
             more: None,
+            hovered: CloseConfirmHit::None,
         });
         assert_eq!(app.desired_cursor_icon(), CursorKind::Default);
     }
