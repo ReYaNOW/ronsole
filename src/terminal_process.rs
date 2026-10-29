@@ -508,9 +508,17 @@ impl TerminalProcess {
 
     /// Name of the foreground job while it is running instead of the shell. Background
     /// jobs (`&`) leave the shell as the foreground group, so they never report a name.
-    /// Walks `/proc`, so call it only at the moment a close is requested.
+    /// A `claude` job that `claude_close::claude_group_close_is_safe` accepts is not busy.
+    /// Walks `/proc` and `~/.claude`, so call it only at the moment a close is requested.
     pub(crate) fn busy_foreground_name(&self) -> Option<String> {
-        busy_job_label(self.process_group_leader(), self.shell_pid, |process_group| {
+        let process_group = self.process_group_leader();
+        if process_group.is_some_and(|group| {
+            foreground_job_is_busy(group, self.shell_pid)
+                && crate::claude_close::claude_group_close_is_safe(group)
+        }) {
+            return None;
+        }
+        busy_job_label(process_group, self.shell_pid, |process_group| {
             platform::foreground_process_snapshot(process_group)
                 .map(|snapshot| terminal_process_program_name(&snapshot, ""))
                 .filter(|name| !name.is_empty())

@@ -2,6 +2,7 @@
 compile_error!("Ronsole supports Linux/Wayland only");
 
 mod app;
+mod claude_close;
 mod config;
 mod headless;
 mod input;
