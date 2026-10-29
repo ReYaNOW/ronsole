@@ -2194,6 +2194,16 @@ impl Terminal {
         crate::platform::lock_recover(&self.title_cache).write_resolved(output);
     }
 
+    /// Whether this tab's foreground process group leader is a `claude` process.
+    pub(crate) fn claude_foreground(&self) -> bool {
+        crate::platform::lock_recover(&self.title_cache).claude_foreground()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_claude_foreground_for_test(&self, value: bool) {
+        crate::platform::lock_recover(&self.title_cache).set_claude_foreground(value);
+    }
+
     /// Link found under the pointer by the last hover search, if any.
     pub(crate) fn hovered_link(&self) -> Option<&(LinkTarget, u64)> {
         self.hovered_link.as_ref()

@@ -147,22 +147,17 @@ impl App {
     }
 }
 
+/// Shared fixtures for App tests that need a started headless runtime.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::app::AutomationOptions;
-    use crate::app::automation::AutomationController;
-    use crate::app::direct_wayland::LoopFlow;
     use crate::headless::Profile;
-    use crate::headless::backend::HeadlessCounters;
-    use crate::runtime::WaylandPollOutcome;
     use std::path::PathBuf;
     use std::sync::mpsc::Receiver;
-    use std::time::{Duration, Instant};
 
     /// Creates `<tmp>/ronsole-t4-<tag>-<pid>/workspace` with an empty fixture file
     /// (the name matches `FIXTURE_NAME` in the automation module).
-    fn workspace_root(tag: &str) -> PathBuf {
+    pub(crate) fn workspace_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("ronsole-t4-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let workspace = root.join("workspace");
@@ -170,6 +165,53 @@ mod tests {
         std::fs::write(workspace.join("terminal_fixture.sh"), "").expect("test fixture");
         root
     }
+
+    /// Headless app with no automation and its 640x400 runtime started on a hermetic bash.
+    /// The caller removes the returned `root` at the end of the test.
+    pub(crate) fn started_headless(tag: &str) -> (App, Receiver<String>, Profile, PathBuf) {
+        crate::prefer_egl_vendor();
+        let root = workspace_root(tag);
+        let profile = Profile::create(Some(root.clone()), std::process::id()).expect("profile");
+        let (mut app, receiver) =
+            App::load_headless(None, &profile.dir, None).expect("headless app");
+        app.start_headless((640, 400), 1.0, TerminalLaunchSpec::hermetic_shell_for_test())
+            .expect("headless runtime starts");
+        (app, receiver, profile, root)
+    }
+
+    /// Like `started_headless`, but the live shell tabs are replaced by `count` test
+    /// terminals. Live terminals would let their title poll overwrite the Claude flag
+    /// set by a test, and their PTY input is not visible to tests. Terminal 0 is active
+    /// and presented; every terminal is marked presentation-ready.
+    pub(crate) fn started_headless_with_test_terminals(
+        tag: &str,
+        count: usize,
+    ) -> (App, Receiver<String>, Profile, PathBuf) {
+        let (mut app, receiver, profile, root) = started_headless(tag);
+        app.terminals = (0..count)
+            .map(|index| {
+                let terminal = Terminal::new_for_test(80, 24, index as u64 + 1);
+                terminal.grid.lock().unwrap().mark_presentation_ready();
+                terminal
+            })
+            .collect();
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        (app, receiver, profile, root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_support::{started_headless, workspace_root};
+    use crate::app::AutomationOptions;
+    use crate::app::automation::AutomationController;
+    use crate::app::direct_wayland::LoopFlow;
+    use crate::headless::Profile;
+    use crate::headless::backend::HeadlessCounters;
+    use crate::runtime::WaylandPollOutcome;
+    use std::time::{Duration, Instant};
 
     fn options_for(root: &std::path::Path) -> AutomationOptions {
         AutomationOptions {
@@ -246,19 +288,6 @@ mod tests {
             HeadlessRunError::Egl("EGL setup failed at CreatePbuffer: zero size".to_string())
         );
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Headless app with no automation and its 640x400 runtime started on a hermetic bash.
-    /// The caller removes the returned `root` at the end of the test.
-    fn started_headless(tag: &str) -> (App, Receiver<String>, Profile, PathBuf) {
-        crate::prefer_egl_vendor();
-        let root = workspace_root(tag);
-        let profile = Profile::create(Some(root.clone()), std::process::id()).expect("profile");
-        let (mut app, receiver) =
-            App::load_headless(None, &profile.dir, None).expect("headless app");
-        app.start_headless((640, 400), 1.0, TerminalLaunchSpec::hermetic_shell_for_test())
-            .expect("headless runtime starts");
-        (app, receiver, profile, root)
     }
 
     fn counters(app: &App) -> HeadlessCounters {

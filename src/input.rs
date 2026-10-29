@@ -13,6 +13,12 @@ use ronsole_term::{
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Whether the smooth scroll of `terminal` still moves. Shared by the active
+/// tab's animation check and the frame loop that keeps grid tiles animating.
+pub(crate) fn terminal_scroll_animating(terminal: &Terminal) -> bool {
+    !terminal.scroll_y.is_settled()
+}
+
 pub(crate) struct TerminalInteraction {
     pub search: TerminalSearchState,
     pub layout: TerminalUiLayout,
@@ -21,7 +27,7 @@ pub(crate) struct TerminalInteraction {
     mouse_x: f32,
     mouse_y: f32,
     pressed_mouse_buttons: u8,
-    pointer_capture: PointerCapture,
+    pub(crate) pointer_capture: PointerCapture,
     terminal_selection_anchor: Option<(usize, usize)>,
     /// Unit that a drag from `terminal_selection_anchor` extends the selection by.
     terminal_selection_unit: SelectionUnit,
@@ -42,7 +48,7 @@ pub(crate) struct TerminalInteraction {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PointerCapture {
+pub(crate) enum PointerCapture {
     #[default]
     None,
     TerminalSelection,
@@ -190,9 +196,15 @@ impl TerminalInteraction {
     /// Recomputes the hovered link for the pointer at (`x`, `y`). The link is
     /// kept only while Ctrl is held and the pointer is over the terminal body.
     /// Returns whether the hovered link changed.
-    pub(crate) fn update_link_hover(&self, terminal: &mut Terminal, x: f32, y: f32) -> bool {
-        let link = if self.modifiers.control_key() && self.layout.body.contains(x, y) {
-            link_under_pointer(self.layout, terminal, x, y)
+    pub(crate) fn update_link_hover(
+        &self,
+        terminal: &mut Terminal,
+        x: f32,
+        y: f32,
+        layout: TerminalUiLayout,
+    ) -> bool {
+        let link = if self.modifiers.control_key() && layout.body.contains(x, y) {
+            link_under_pointer(layout, terminal, x, y)
         } else {
             None
         };
@@ -219,7 +231,7 @@ impl TerminalInteraction {
     }
 
     pub(crate) fn animation_active(&self, terminal: &Terminal) -> bool {
-        !terminal.scroll_y.is_settled() || self.selection_autoscroll_active(terminal)
+        terminal_scroll_animating(terminal) || self.selection_autoscroll_active(terminal)
     }
 
     pub(crate) fn search_refresh_deadline(&self) -> Option<std::time::Instant> {
@@ -239,9 +251,8 @@ impl TerminalInteraction {
             self.search.close();
         }
         self.layout = TerminalUiLayout::default();
-        self.pressed_mouse_buttons = 0;
-        self.pointer_capture = PointerCapture::None;
-        self.terminal_selection_anchor = None;
+        // Ends a scrollbar drag of the left terminal too, so its smooth scroll settles.
+        self.cancel_pointer_interaction_state(&mut terminal.scroll_y);
         // Hover is only refreshed for the active tab, so drop the left tab's
         // link to keep it from showing a stale pointer when it is reactivated.
         terminal.set_hovered_link(None);
@@ -936,9 +947,14 @@ impl TerminalInteraction {
         false
     }
 
-    pub(crate) fn mouse_wheel(&mut self, delta: ScrollDelta, terminal: &mut Terminal) -> bool {
-        if !self.layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
-        let dy = terminal_wheel_delta(delta, self.layout.char_h, self.scroll_sensitivity);
+    pub(crate) fn mouse_wheel(
+        &mut self,
+        delta: ScrollDelta,
+        terminal: &mut Terminal,
+        layout: TerminalUiLayout,
+    ) -> bool {
+        if !layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
+        let dy = terminal_wheel_delta(delta, layout.char_h, self.scroll_sensitivity);
         let grid = crate::platform::lock_recover(&terminal.grid);
         let is_alt = grid.is_alt_screen();
         let tracking_mode = grid.mouse_tracking();
@@ -947,7 +963,7 @@ impl TerminalInteraction {
         drop(grid);
         if tracking_mode.enabled() {
             if let Some(input) = terminal_mouse_wheel_sequence(
-                self.layout,
+                layout,
                 tracking_mode,
                 mouse_sgr,
                 self.mouse_x,
@@ -973,7 +989,7 @@ impl TerminalInteraction {
         }
         terminal.scroll_y.anim_speed = 7.0;
         terminal.scroll_y.scroll_by(dy);
-        terminal.scroll_y.clamp_target(0.0, self.layout.max_scroll);
+        terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
         true
     }
 }
@@ -1080,15 +1096,15 @@ struct ClickCounter {
     count: u8,
 }
 
-impl ClickCounter {
-    /// Largest gap between two presses that still counts as one multi-click.
-    const WINDOW: Duration = Duration::from_millis(300);
+/// Largest gap between two presses that still counts as one multi-click.
+pub(crate) const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(300);
 
+impl ClickCounter {
     /// Returns 1, 2 or 3 for a press at `cell` at time `now`; the fourth press starts over at 1.
     fn register(&mut self, now: Instant, cell: Option<(usize, usize)>) -> u8 {
         let continues = match (self.last, cell) {
             (Some((at, previous)), Some(cell)) => {
-                previous == cell && now.saturating_duration_since(at) <= Self::WINDOW
+                previous == cell && now.saturating_duration_since(at) <= MULTI_CLICK_WINDOW
             }
             _ => false,
         };
@@ -1733,6 +1749,19 @@ mod tests {
         assert_eq!(scroll.drag_offset, 0.0);
         assert_eq!(scroll.current, 42.0);
         assert_eq!(scroll.target, 42.0);
+    }
+
+    #[test]
+    fn reset_for_terminal_switch_ends_scrollbar_drag_of_left_terminal() {
+        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        let mut interaction = TerminalInteraction::default();
+        interaction.pointer_capture = PointerCapture::TerminalScrollbar;
+        terminal.scroll_y.is_dragging = true;
+
+        interaction.reset_for_terminal_switch(&mut terminal);
+
+        assert_eq!(interaction.pointer_capture, PointerCapture::None);
+        assert!(!terminal.scroll_y.is_dragging);
     }
 
     #[test]
@@ -2644,7 +2673,7 @@ mod tests {
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
         interaction.set_modifiers(Modifiers::CONTROL);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         let (link, generation) = terminal.hovered_link().expect("link under pointer");
         let term = crate::platform::lock_recover(&terminal.grid);
         // The URL is written on the bottom row, which is the last row of the grid.
@@ -2658,7 +2687,7 @@ mod tests {
         let mut interaction = TerminalInteraction::default();
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_none());
     }
 
@@ -2668,10 +2697,10 @@ mod tests {
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
         interaction.set_modifiers(Modifiers::CONTROL);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_some());
         interaction.set_modifiers(Modifiers::empty());
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_none());
     }
 
@@ -2748,7 +2777,7 @@ mod tests {
         let mut terminal = link_test_terminal(false);
         interaction.layout = mouse_test_layout(0.0);
         interaction.set_modifiers(Modifiers::CONTROL);
-        interaction.update_link_hover(&mut terminal, 73.0, 682.0);
+        interaction.update_link_hover(&mut terminal, 73.0, 682.0, interaction.layout);
         assert!(terminal.hovered_link().is_some());
         interaction.reset_for_terminal_switch(&mut terminal);
         assert!(terminal.hovered_link().is_none());
@@ -3438,7 +3467,13 @@ mod tests {
     #[test]
     fn ronsole_overlays_own_mouse_motion_and_wheel_before_terminal_protocol() {
         let mut layout = mouse_test_layout(0.0);
-        let search = crate::search::terminal_search_geometry(800.0, layout.body.y, 1.0);
+        let window_body = crate::search::Rect {
+            x: 0.0,
+            y: layout.body.y,
+            w: 800.0,
+            h: 600.0,
+        };
+        let search = crate::search::terminal_search_geometry(window_body, 1.0);
         layout.search = Some(search);
         layout.scrollbar = Some(Default::default());
         let scrollbar = layout.scrollbar.as_mut().unwrap();

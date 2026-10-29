@@ -7,6 +7,7 @@ mod headless;
 mod input;
 mod input_types;
 mod launch;
+mod panels;
 mod platform;
 mod renderer;
 mod runtime;

@@ -2674,6 +2674,9 @@ impl Drop for DirectWaylandBackend {
 pub(crate) struct TerminalRenderParams<'a> {
     pub terminals: &'a [crate::terminal::Terminal],
     pub active_terminal: usize,
+    pub panels: &'a [crate::panels::Panel],
+    pub panel_layouts: &'a mut Vec<crate::renderer::TerminalUiLayout>,
+    pub tab_strip_hint: Option<&'static str>,
     pub search: &'a mut crate::search::TerminalSearchState,
     pub focused: bool,
     pub show_fps: bool,
@@ -2986,6 +2989,9 @@ impl WindowRuntime {
         let layout = self.renderer.render_terminal_app(
             params.terminals,
             params.active_terminal,
+            params.panels,
+            params.panel_layouts,
+            params.tab_strip_hint,
             params.search,
             params.focused,
             show_fps,
@@ -3090,6 +3096,16 @@ impl WindowRuntime {
 
     pub fn scale_factor(&self) -> f32 {
         self.renderer.scale_factor()
+    }
+
+    /// Window size in the units `terminal_body_rect` takes.
+    pub fn window_size(&self) -> (f32, f32) {
+        self.renderer.window_size()
+    }
+
+    /// Terminal cell size in physical pixels: `(advance, line height)`.
+    pub fn terminal_cell_size(&self) -> (f32, f32) {
+        self.renderer.terminal_cell_size()
     }
 
     pub fn terminal_search_cursor_from_x(&mut self, text: &str, x: f32, scroll_x: f32) -> usize {
@@ -3795,9 +3811,13 @@ mod tests {
         let color_input = crate::single_line_input::SingleLineInput::default();
         let color_view =
             crate::renderer::SettingsColorView::new(&crate::config::AppConfig::default());
+        let mut panel_layouts = Vec::new();
         let result = runtime.render_terminal_and_present(TerminalRenderParams {
             terminals: &[],
             active_terminal: 0,
+            panels: &[],
+            panel_layouts: &mut panel_layouts,
+            tab_strip_hint: None,
             search: &mut search,
             focused: true,
             show_fps: false,

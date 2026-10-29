@@ -2,7 +2,7 @@ mod terminal_ui;
 pub(crate) use terminal_ui::{
     CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
     SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout, settings_color_value,
-    terminal_cell_render_colors, terminal_cell_span_x_bounds, terminal_palette,
+    terminal_body_rect, terminal_cell_render_colors, terminal_cell_span_x_bounds, terminal_grid_size, terminal_palette,
     terminal_render_color, terminal_row_draw_y, terminal_scrollbar_drag_target,
     terminal_text_viewport_height, visible_row_range,
 };
@@ -510,6 +510,10 @@ pub struct Renderer {
     search_icons: [Option<GlyphInfo>; 4],
     terminal_tab_display_titles: Vec<String>,
     terminal_tab_widths: Vec<f32>,
+    /// Header text cache of grid tiles, indexed by panel; see `render_terminal_app`.
+    tile_titles: Vec<terminal_ui::TileTitleCache>,
+    /// Reused buffer for the raw display title of a tile before the cache check.
+    tile_title_scratch: String,
     terminal_tab_actual_xs: Vec<f32>,
     terminal_tab_order: Vec<usize>,
     terminal_tab_render_order: Vec<usize>,
@@ -645,6 +649,8 @@ impl Renderer {
             search_icons: [None; 4],
             terminal_tab_display_titles: Vec::with_capacity(8),
             terminal_tab_widths: Vec::with_capacity(8),
+            tile_titles: Vec::with_capacity(8),
+            tile_title_scratch: String::with_capacity(96),
             terminal_tab_actual_xs: Vec::with_capacity(8),
             terminal_tab_order: Vec::with_capacity(8),
             terminal_tab_render_order: Vec::with_capacity(8),
@@ -702,6 +708,11 @@ impl Renderer {
 
     pub(crate) fn record_presented_frame(&mut self, now: Instant) {
         self.presented_fps.record_presented_frame(now);
+    }
+
+    /// Window size in the same physical units `terminal_body_rect` takes.
+    pub fn window_size(&self) -> (f32, f32) {
+        (self.width, self.height)
     }
 
     pub fn scale_factor(&self) -> f32 {
