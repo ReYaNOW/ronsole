@@ -211,6 +211,7 @@ Every behavior change must add or update focused regression tests. Keep tests pu
 During development:
 
 - Run the narrowest relevant test first when practical.
+- The crate needs nightly (`cargo-features` in `Cargo.toml`): bare `cargo check`/`cargo test` on stable fails. Use the make targets or `cargo +nightly …`.
 - Use `make test-one TEST='module::test_name'` for one exact test.
 - Use `make test` for the project test profile. It runs the whole workspace (`TEST_PKG ?= --workspace`).
 - For a narrow run of the terminal crate: `make test TEST_PKG='-p ronsole-term' TEST_FILTER=<filter>`. Without `TEST_PKG`, a `tests::` filter also matches `mod tests` of the whole workspace.
