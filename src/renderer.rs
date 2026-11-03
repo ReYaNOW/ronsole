@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 use std::cell::OnceCell;
 use std::sync::Arc;
 use std::time::Instant;
-use swash::FontRef;
+use swash::{FontDataRef, FontRef, StringId};
 use swash::scale::{
     Render, ScaleContext, Source, StrikeWith,
     image::{Content, Image},
@@ -339,6 +339,20 @@ impl FontData {
         None
     }
 
+    /// Maps the first existing `(path, family)` file and selects the face named
+    /// `family`, so a collection (`.ttc`) contributes the intended face. Face 0
+    /// is used when no face carries that name.
+    fn map_first_face(candidates: &[(&str, &str)]) -> Option<Self> {
+        for (path, family) in candidates {
+            let Some(mut font) = Self::map_first(&[path]) else {
+                continue;
+            };
+            font.index = font_face_index_by_family(font.data(), family).unwrap_or(0);
+            return Some(font);
+        }
+        None
+    }
+
     fn map_all_into(paths: &[&str], output: &mut Vec<Self>) {
         for path in paths {
             let Ok(file) = std::fs::File::open(path) else {
@@ -362,10 +376,32 @@ impl FontData {
     }
 }
 
+/// System CJK fallback for the Regular chain: `(file, family of the face to use)`.
+/// The monospace face keeps ideographs on the two-cell grid of wide chars.
+const TERMINAL_CJK_FONT_CANDIDATES: &[(&str, &str)] = &[
+    ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "Noto Sans Mono CJK SC"),
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "Noto Sans Mono CJK SC"),
+    ("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", "Noto Sans Mono CJK SC"),
+    ("/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc", "WenQuanYi Zen Hei Mono"),
+    ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", "WenQuanYi Zen Hei Mono"),
+];
+
+/// Index of the face whose English family name is `family` in a font file or collection.
+fn font_face_index_by_family(data: &[u8], family: &str) -> Option<u32> {
+    let collection = FontDataRef::new(data)?;
+    (0..collection.len()).find_map(|index| {
+        let name = collection
+            .get(index)?
+            .localized_strings()
+            .find_by_id(StringId::Family, Some("en"))?;
+        name.chars().eq(family.chars()).then_some(index as u32)
+    })
+}
+
 /// Builds the Regular font chain once at renderer creation: the system monospace
-/// font first, then the bundled Regular font, symbol fallbacks and emoji.
+/// font first, then the bundled Regular font, symbol fallbacks, CJK and emoji.
 fn load_terminal_fonts() -> Vec<FontData> {
-    let mut fonts = Vec::with_capacity(12);
+    let mut fonts = Vec::with_capacity(13);
     if let Some(font) = FontData::map_first(&[
         "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
@@ -388,6 +424,12 @@ fn load_terminal_fonts() -> Vec<FontData> {
         ],
         &mut fonts,
     );
+    // CJK ideographs and full-width punctuation are in none of the fonts above;
+    // without this face they all fall back to the tofu glyph. It sits after the
+    // symbol fonts so glyphs they already draw keep their look.
+    if let Some(font) = FontData::map_first_face(TERMINAL_CJK_FONT_CANDIDATES) {
+        fonts.push(font);
+    }
     if let Some(font) = FontData::map_first(&[
         "/usr/share/fonts/noto/NotoColorEmoji.ttf",
         "/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf",
@@ -1789,6 +1831,34 @@ mod tests {
             .expect("bundled font in chain");
         assert!(bundled <= 1);
         assert!(chain[..bundled].iter().all(|font| !matches!(font.source, FontSource::Static(_))));
+    }
+
+    // Chinese output drew every ideograph and full-width comma as tofu while a CJK
+    // font was installed: no font of the Regular chain mapped them.
+    #[test]
+    fn regular_chain_draws_cjk_with_installed_cjk_font() {
+        let Some(&(path, family)) = TERMINAL_CJK_FONT_CANDIDATES
+            .iter()
+            .find(|(path, _)| std::path::Path::new(path).exists())
+        else {
+            return;
+        };
+        let chain = load_terminal_fonts();
+        let mut ctx = ScaleContext::new();
+        for c in ['你', '\u{FF0C}'] {
+            let glyph = rasterize_glyph(&chain, None, &mut ctx, c, 16.0, false)
+                .unwrap_or_else(|| panic!("{c:?} has no glyph in the Regular chain"));
+            assert!(glyph.image.is_some());
+        }
+        let cjk = chain
+            .iter()
+            .find(|font| font_ref_of(font).is_some_and(|font| font_maps_char(font, '你')))
+            .expect("CJK font in chain");
+        assert_eq!(
+            Some(cjk.index),
+            font_face_index_by_family(cjk.data(), family),
+            "face {family} of {path}"
+        );
     }
 
     fn same_image(a: &Option<Image>, b: &Option<Image>) -> bool {
