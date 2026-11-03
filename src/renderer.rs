@@ -313,6 +313,8 @@ enum FontSource {
 struct FontData {
     source: FontSource,
     index: u32,
+    /// The CJK fallback face; the colour pass of `rasterize_glyph` tries it last.
+    cjk_fallback: bool,
 }
 
 impl FontData {
@@ -320,6 +322,7 @@ impl FontData {
         Self {
             source: FontSource::Static(data),
             index: 0,
+            cjk_fallback: false,
         }
     }
 
@@ -334,20 +337,24 @@ impl FontData {
             return Some(Self {
                 source: FontSource::Mapped(Arc::new(mapping)),
                 index: 0,
+                cjk_fallback: false,
             });
         }
         None
     }
 
-    /// Maps the first existing `(path, family)` file and selects the face named
-    /// `family`, so a collection (`.ttc`) contributes the intended face. Face 0
-    /// is used when no face carries that name.
+    /// Maps the first `(path, family)` candidate whose file parses and has a face
+    /// named `family`, so a collection (`.ttc`) contributes the intended face.
+    /// A file without that face, or one that does not parse, moves on to the next candidate.
     fn map_first_face(candidates: &[(&str, &str)]) -> Option<Self> {
         for (path, family) in candidates {
             let Some(mut font) = Self::map_first(&[path]) else {
                 continue;
             };
-            font.index = font_face_index_by_family(font.data(), family).unwrap_or(0);
+            let Some(index) = font_face_index_by_family(font.data(), family) else {
+                continue;
+            };
+            font.index = index;
             return Some(font);
         }
         None
@@ -364,6 +371,7 @@ impl FontData {
             output.push(Self {
                 source: FontSource::Mapped(Arc::new(mapping)),
                 index: 0,
+                cjk_fallback: false,
             });
         }
     }
@@ -426,8 +434,10 @@ fn load_terminal_fonts() -> Vec<FontData> {
     );
     // CJK ideographs and full-width punctuation are in none of the fonts above;
     // without this face they all fall back to the tofu glyph. It sits after the
-    // symbol fonts so glyphs they already draw keep their look.
-    if let Some(font) = FontData::map_first_face(TERMINAL_CJK_FONT_CANDIDATES) {
+    // symbol fonts so glyphs they already draw keep their look; the colour pass
+    // also tries it last (see `color_pass_fonts`).
+    if let Some(mut font) = FontData::map_first_face(TERMINAL_CJK_FONT_CANDIDATES) {
+        font.cjk_fallback = true;
         fonts.push(font);
     }
     if let Some(font) = FontData::map_first(&[
@@ -1327,7 +1337,11 @@ impl Renderer {
         Some(texture)
     }
 
+    /// Clears both atlases and the glyph caches. Queued quads are drawn first:
+    /// an overflow in `upload_alpha` resets mid-frame, and those quads still
+    /// point at the old atlas contents.
     fn reset_atlases(&mut self) {
+        self.flush();
         self.glyphs.clear();
         self.ui_glyphs.clear();
         self.search_icons.fill(None);
@@ -1374,7 +1388,9 @@ impl Renderer {
         }
     }
 
+    /// Clears the colour atlas; queued quads are drawn first, as in `reset_atlases`.
     fn reset_color_atlas(&mut self) {
+        self.flush();
         self.glyphs.clear();
         self.ui_glyphs.clear();
         self.color_atlas_x = 2;
@@ -1581,7 +1597,7 @@ fn rasterize_glyph(
     prefer_color: bool,
 ) -> Option<RasterizedGlyph> {
     if prefer_color {
-        for font in fonts.iter().rev() {
+        for font in color_pass_fonts(fonts) {
             let Some(font_ref) = font_ref_of(font) else {
                 continue;
             };
@@ -1607,6 +1623,18 @@ fn rasterize_glyph(
         }
     }
     None
+}
+
+/// Font order of the colour pass: the Regular chain reversed so the emoji font
+/// comes first, with the CJK fallback moved to the end. Emoji-presentation chars
+/// missing from the emoji font (Enclosed Alphanumeric Supplement and similar)
+/// keep the symbol-font glyphs they had before the CJK face joined the chain.
+fn color_pass_fonts(fonts: &[FontData]) -> impl Iterator<Item = &FontData> {
+    fonts
+        .iter()
+        .rev()
+        .filter(|font| !font.cjk_fallback)
+        .chain(fonts.iter().filter(|font| font.cjk_fallback))
 }
 
 fn rasterize_from_font(
@@ -1859,6 +1887,81 @@ mod tests {
             font_face_index_by_family(cjk.data(), family),
             "face {family} of {path}"
         );
+    }
+
+    const BUNDLED_REGULAR_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/fonts/JetBrainsMonoNerdFont-Regular.ttf");
+
+    #[test]
+    fn font_face_index_by_family_finds_bundled_face_and_rejects_unknown_family() {
+        // Family is name ID 1 ("JetBrainsMono NF"), not the typographic family (ID 16).
+        assert_eq!(font_face_index_by_family(TERMINAL_FONT, "JetBrainsMono NF"), Some(0));
+        assert_eq!(font_face_index_by_family(UI_FONT, "Inter"), Some(0));
+        assert_eq!(font_face_index_by_family(TERMINAL_FONT, "Noto Sans Mono CJK SC"), None);
+        assert_eq!(font_face_index_by_family(b"not a font", "Inter"), None);
+    }
+
+    // A candidate whose file lacks the requested family used to be taken with face 0
+    // (the proportional JP face of a Noto CJK collection) instead of trying the next one.
+    #[test]
+    fn map_first_face_skips_candidates_without_the_family() {
+        let missing = "/nonexistent/ronsole-font.ttc";
+        let font = FontData::map_first_face(&[
+            (missing, "JetBrainsMono NF"),
+            (BUNDLED_REGULAR_PATH, "Noto Sans Mono CJK SC"),
+            (BUNDLED_REGULAR_PATH, "JetBrainsMono NF"),
+        ])
+        .expect("third candidate has the family");
+        assert_eq!(font.index, 0);
+        assert_eq!(font.data(), TERMINAL_FONT);
+        assert!(FontData::map_first_face(&[(BUNDLED_REGULAR_PATH, "Noto Sans Mono CJK SC")]).is_none());
+    }
+
+    // Emoji-presentation chars missing from the emoji font (U+1F100 and others) were
+    // drawn by the CJK face once it joined the chain, since the colour pass walks it reversed.
+    #[test]
+    fn color_pass_tries_cjk_fallback_after_every_other_font() {
+        let mut cjk = FontData::new_static(TERMINAL_ITALIC_FONT);
+        cjk.cjk_fallback = true;
+        let chain = [
+            FontData::new_static(TERMINAL_FONT),
+            FontData::new_static(TERMINAL_BOLD_FONT),
+            cjk,
+            FontData::new_static(TERMINAL_BOLD_ITALIC_FONT),
+        ];
+        let order: Vec<&[u8]> = color_pass_fonts(&chain).map(FontData::data).collect();
+        assert_eq!(
+            order,
+            [TERMINAL_BOLD_ITALIC_FONT, TERMINAL_BOLD_FONT, TERMINAL_FONT, TERMINAL_ITALIC_FONT]
+        );
+    }
+
+    // An alpha-atlas overflow reset the atlas mid-frame while quads sampling the old
+    // contents were still queued, so they drew from a cleared texture.
+    #[test]
+    fn alpha_atlas_overflow_draws_queued_quads_before_reset() {
+        crate::prefer_egl_vendor();
+        let ctx = crate::platform::offscreen_gl::OffscreenContext::new(64, 64)
+            .expect("offscreen EGL context");
+        let mut renderer = Renderer::new(
+            ctx.glow(),
+            1.0,
+            LEGACY_TERMINAL_FONT_LOGICAL_SIZE,
+            crate::config::RgbColor { r: 0, g: 0, b: 0 },
+        )
+        .expect("renderer");
+        renderer.resize(64, 64);
+        let glyph = renderer.get_glyph('A', None, GLYPH_FACE_REGULAR).expect("glyph A");
+        renderer.push_glyph(4.0, 20.0, glyph, [1.0; 4], 1.0);
+        assert!(!renderer.vertices.is_empty());
+        let flushes = renderer.frame_flushes;
+        renderer.alpha_atlas_y = ATLAS_SIZE_H - 4;
+        let entry = renderer.upload_alpha(4, 4, &[255; 16]).expect("slot after reset");
+        assert_eq!((entry.u, entry.v), (2.0 / ATLAS_SIZE_W as f32, 2.0 / ATLAS_SIZE_H as f32));
+        assert!(renderer.vertices.is_empty(), "queued quads survived the atlas reset");
+        assert_eq!(renderer.frame_flushes, flushes + 1);
+        assert!(renderer.glyphs.is_empty());
+        drop(renderer);
     }
 
     fn same_image(a: &Option<Image>, b: &Option<Image>) -> bool {
