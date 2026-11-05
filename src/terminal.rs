@@ -68,6 +68,111 @@ mod tests {
         assert_ne!(after, before);
     }
 
+    const ANCHOR_CHAR_H: f32 = 10.0;
+    const ANCHOR_BODY_H: f32 = 60.0;
+
+    /// One frame of the app's scroll step: anchor, then clamp to the limit.
+    fn anchor_frame(terminal: &mut Terminal) {
+        if let Some(max) = terminal.anchor_scroll(ANCHOR_CHAR_H, ANCHOR_BODY_H, 1.0) {
+            terminal.scroll_y.clamp_target(0.0, max);
+            terminal.scroll_y.clamp_current(0.0, max);
+        }
+    }
+
+    fn anchor_max(terminal: &Terminal) -> f32 {
+        let total = crate::platform::lock_recover(&terminal.grid).total_rows();
+        crate::renderer::terminal_max_scroll(total, ANCHOR_CHAR_H, ANCHOR_BODY_H, 1.0)
+    }
+
+    fn feed_numbered(terminal: &Terminal, from: usize, count: usize) {
+        let bytes: String = (from..from + count).map(|i| format!("l{i}\r\n")).collect();
+        feed(&mut crate::platform::lock_recover(&terminal.grid), bytes.as_bytes());
+    }
+
+    /// Text of the bottom line in view at the current offset.
+    fn bottom_line_in_view(terminal: &Terminal) -> String {
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        let scrolled = (terminal.scroll_y.current / ANCHOR_CHAR_H).round() as usize;
+        let row = grid.total_rows() - 1 - scrolled;
+        grid.row(row)
+            .map(|line| line.iter().map(|cell| cell.ch()).collect::<String>())
+            .unwrap_or_default()
+            .trim_end()
+            .to_string()
+    }
+
+    fn scroll_to(terminal: &mut Terminal, offset: f32) {
+        terminal.scroll_y.current = offset;
+        terminal.scroll_y.target = offset;
+    }
+
+    #[test]
+    fn scrolled_up_view_keeps_its_lines_while_output_arrives() {
+        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
+        anchor_frame(&mut terminal);
+        let before = bottom_line_in_view(&terminal);
+
+        feed_numbered(&terminal, 40, 7);
+        anchor_frame(&mut terminal);
+
+        assert_eq!(bottom_line_in_view(&terminal), before);
+        assert_eq!(terminal.scroll_y.current, 12.0 * ANCHOR_CHAR_H);
+        assert_eq!(terminal.scroll_y.target, 12.0 * ANCHOR_CHAR_H);
+    }
+
+    #[test]
+    fn view_at_bottom_follows_output() {
+        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        anchor_frame(&mut terminal);
+
+        feed_numbered(&terminal, 40, 7);
+        anchor_frame(&mut terminal);
+
+        assert_eq!(terminal.scroll_y.current, 0.0);
+        assert_eq!(terminal.scroll_y.target, 0.0);
+        // The cursor sits on the empty row below the newest line.
+        scroll_to(&mut terminal, ANCHOR_CHAR_H);
+        assert_eq!(bottom_line_in_view(&terminal), "l46");
+    }
+
+    #[test]
+    fn scrolled_up_view_keeps_its_lines_while_full_scrollback_evicts() {
+        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        terminal.grid = Arc::new(Mutex::new(Term::new(TermConfig {
+            cols: 20,
+            rows: 4,
+            scrollback_lines: 8,
+            identity: TermIdentity {
+                name: "ronsole",
+                version: "0",
+            },
+            palette: crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+        })));
+        feed_numbered(&terminal, 0, 30);
+        assert_eq!(crate::platform::lock_recover(&terminal.grid).scrollback_len(), 8);
+        scroll_to(&mut terminal, 3.0 * ANCHOR_CHAR_H);
+        anchor_frame(&mut terminal);
+        let before = bottom_line_in_view(&terminal);
+
+        feed_numbered(&terminal, 30, 2);
+        anchor_frame(&mut terminal);
+        assert_eq!(bottom_line_in_view(&terminal), before);
+
+        // At the oldest retained line, evicted content leaves the view pinned
+        // to the new oldest line: the offset stays at the limit.
+        let max = anchor_max(&terminal);
+        scroll_to(&mut terminal, max);
+        anchor_frame(&mut terminal);
+        feed_numbered(&terminal, 32, 3);
+        anchor_frame(&mut terminal);
+        assert_eq!(terminal.scroll_y.current, max);
+        assert_eq!(terminal.scroll_y.target, max);
+        assert_eq!(anchor_max(&terminal), max);
+    }
+
     #[test]
     fn background_tab_buffer_flushed_at_deadline() {
         let background = Terminal::new_for_test(40, 3, 2);
@@ -280,6 +385,7 @@ mod tests {
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
+            scroll_anchor: ronsole_term::ScrollbackAnchor::new(),
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
             title_cache,
@@ -1809,6 +1915,9 @@ pub struct Terminal {
     process: Option<crate::terminal_process::TerminalProcess>,
     hold: bool,
     pub scroll_y: crate::scroll::ScrollState,
+    /// Keeps `scroll_y` on the same lines while it is scrolled up and output
+    /// pushes lines into the scrollback; driven by `anchor_scroll`.
+    scroll_anchor: ronsole_term::ScrollbackAnchor,
     pub(crate) presentation_intent: TerminalPresentationIntent,
     pub(crate) reveal_right_tail_when_presented: bool,
     title_cache: crate::terminal_process::TerminalTitleCache,
@@ -1945,6 +2054,7 @@ impl Terminal {
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
+            scroll_anchor: ronsole_term::ScrollbackAnchor::new(),
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
             title_cache,
@@ -2029,6 +2139,7 @@ impl Terminal {
             process,
             hold,
             scroll_y: crate::scroll::ScrollState::new(7.0),
+            scroll_anchor: ronsole_term::ScrollbackAnchor::new(),
             presentation_intent: TerminalPresentationIntent::None,
             reveal_right_tail_when_presented: false,
             title_cache,
@@ -2302,6 +2413,38 @@ impl Terminal {
             self.dev_banner.hid_any |= flagged;
         }
         self.dev_banner.mark_scanned(&grid);
+    }
+
+    /// Keeps a viewport scrolled up into the scrollback on the same lines:
+    /// `scroll_y` is measured from the bottom, so it grows by the lines output
+    /// pushed into the scrollback since the last call (`ScrollbackAnchor`).
+    /// At the bottom (`target <= 0`) the anchor is released and the view
+    /// follows output without taking the grid lock. Returns the scroll limit
+    /// of the current content (0 on the alternate screen) for the caller's
+    /// clamp, or `None` when released; a full scrollback that evicts lines
+    /// under the view clamps it to the oldest retained line.
+    pub(crate) fn anchor_scroll(&mut self, char_h: f32, body_h: f32, scale: f32) -> Option<f32> {
+        if !(self.scroll_y.target > 0.0) {
+            self.scroll_anchor.release();
+            return None;
+        }
+        let (pushed, total_lines, is_alt) = {
+            let grid = crate::platform::lock_recover(&self.grid);
+            (self.scroll_anchor.hold(&grid), grid.total_rows(), grid.is_alt_screen())
+        };
+        if !char_h.is_finite() || char_h <= 0.0 {
+            return None;
+        }
+        if pushed > 0 {
+            let delta = pushed as f32 * char_h;
+            self.scroll_y.current += delta;
+            self.scroll_y.target += delta;
+        }
+        Some(if is_alt {
+            0.0
+        } else {
+            crate::renderer::terminal_max_scroll(total_lines, char_h, body_h, scale)
+        })
     }
 
     pub(crate) fn manually_confirm_bridge(
