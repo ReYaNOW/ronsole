@@ -2846,14 +2846,20 @@ impl App {
         let mut selection_autoscrolled = false;
         if let Some(terminal) = self.terminals.get_mut(active) {
             selection_autoscrolled = self.interaction.update_selection_autoscroll(dt, terminal);
+            let layout = &self.interaction.layout;
+            // The last render's limit is stale once output grew the scrollback;
+            // a held anchor returns the current one.
+            let max = if active_content_hidden {
+                layout.max_scroll
+            } else {
+                terminal
+                    .anchor_scroll(layout.char_h, layout.body.h, layout.scale)
+                    .unwrap_or(layout.max_scroll)
+            };
             terminal.scroll_y.update(dt);
             if !active_content_hidden {
-                terminal
-                    .scroll_y
-                    .clamp_target(0.0, self.interaction.layout.max_scroll);
-                terminal
-                    .scroll_y
-                    .clamp_current(0.0, self.interaction.layout.max_scroll);
+                terminal.scroll_y.clamp_target(0.0, max);
+                terminal.scroll_y.clamp_current(0.0, max);
             }
         }
         // Grid tiles other than the active tab. Their layouts come from the last
@@ -2869,16 +2875,21 @@ impl App {
             let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
                 continue;
             };
-            terminal.scroll_y.update(dt);
             // A layout written for a hidden tile carries no content limit.
             let Some(max) = self
                 .panel_layouts
                 .get(index)
                 .filter(|layout| layouts_current && !layout.content_hidden)
-                .map(|layout| layout.max_scroll)
+                .map(|layout| {
+                    terminal
+                        .anchor_scroll(layout.char_h, layout.body.h, layout.scale)
+                        .unwrap_or(layout.max_scroll)
+                })
             else {
+                terminal.scroll_y.update(dt);
                 continue;
             };
+            terminal.scroll_y.update(dt);
             terminal.scroll_y.clamp_target(0.0, max);
             terminal.scroll_y.clamp_current(0.0, max);
         }

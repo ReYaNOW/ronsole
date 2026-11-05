@@ -2,7 +2,7 @@ mod terminal_ui;
 pub(crate) use terminal_ui::{
     CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
     SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout, settings_color_value,
-    terminal_body_rect, terminal_cell_render_colors, terminal_cell_span_x_bounds, terminal_grid_size, terminal_palette,
+    terminal_body_rect, terminal_cell_render_colors, terminal_cell_span_x_bounds, terminal_grid_size, terminal_max_scroll, terminal_palette,
     terminal_render_color, terminal_row_draw_y, terminal_scrollbar_drag_target,
     terminal_text_viewport_height, visible_row_range,
 };

@@ -7,6 +7,7 @@ mod links;
 mod osc;
 mod queries;
 mod reflow;
+mod scroll_anchor;
 mod sgr;
 mod support;
 mod title_stack;
