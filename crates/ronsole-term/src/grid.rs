@@ -1106,6 +1106,8 @@ impl Term {
                     .unwrap_or_else(|| (vec![blank.clone(); self.cols], LineMeta::default()));
             if top == 0 && bottom == self.visible_rows.saturating_sub(1) {
                 if !self.is_alt {
+                    // Output-driven only: resize shrinks reach push_scrollback_row directly.
+                    self.output_scrolled_lines = self.output_scrolled_lines.wrapping_add(1);
                     self.push_scrollback_row(removed, removed_meta);
                 } else if self.pool.len() < 128 {
                     removed.clear();

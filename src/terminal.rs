@@ -91,8 +91,13 @@ mod tests {
 
     /// Text of the bottom line in view at the current offset.
     fn bottom_line_in_view(terminal: &Terminal) -> String {
+        bottom_line_at(terminal, terminal.scroll_y.current)
+    }
+
+    /// Text of the bottom line in view at `offset` from the bottom.
+    fn bottom_line_at(terminal: &Terminal, offset: f32) -> String {
         let grid = crate::platform::lock_recover(&terminal.grid);
-        let scrolled = (terminal.scroll_y.current / ANCHOR_CHAR_H).round() as usize;
+        let scrolled = (offset / ANCHOR_CHAR_H).round() as usize;
         let row = grid.total_rows() - 1 - scrolled;
         grid.row(row)
             .map(|line| line.iter().map(|cell| cell.ch()).collect::<String>())
@@ -171,6 +176,86 @@ mod tests {
         assert_eq!(terminal.scroll_y.current, max);
         assert_eq!(terminal.scroll_y.target, max);
         assert_eq!(anchor_max(&terminal), max);
+    }
+
+    #[test]
+    fn shrink_then_grow_while_scrolled_up_keeps_offset() {
+        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
+        anchor_frame(&mut terminal);
+        let before = bottom_line_in_view(&terminal);
+
+        crate::platform::lock_recover(&terminal.grid).resize(20, 1);
+        anchor_frame(&mut terminal);
+        crate::platform::lock_recover(&terminal.grid).resize(20, 4);
+        anchor_frame(&mut terminal);
+
+        assert_eq!(terminal.scroll_y.current, 5.0 * ANCHOR_CHAR_H);
+        assert_eq!(terminal.scroll_y.target, 5.0 * ANCHOR_CHAR_H);
+        assert_eq!(bottom_line_in_view(&terminal), before);
+    }
+
+    #[test]
+    fn pending_lines_are_drawn_before_the_next_anchor_step() {
+        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
+        anchor_frame(&mut terminal);
+        let before = bottom_line_in_view(&terminal);
+
+        // Output lands between the anchor step and the render of the frame.
+        feed_numbered(&terminal, 40, 7);
+        let pending = {
+            let grid = crate::platform::lock_recover(&terminal.grid);
+            terminal.scroll_anchor_pending(&grid)
+        };
+        assert_eq!(pending, 7);
+        let drawn = terminal.scroll_y.current + pending as f32 * ANCHOR_CHAR_H;
+        assert_eq!(bottom_line_at(&terminal, drawn), before);
+
+        // The next step applies the same lines, so the drawn offset does not change.
+        anchor_frame(&mut terminal);
+        assert_eq!(terminal.scroll_y.current, drawn);
+        let pending_after = {
+            let grid = crate::platform::lock_recover(&terminal.grid);
+            terminal.scroll_anchor_pending(&grid)
+        };
+        assert_eq!(pending_after, 0);
+    }
+
+    #[test]
+    fn unusable_char_h_leaves_scrolled_lines_for_the_next_frame() {
+        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
+        anchor_frame(&mut terminal);
+
+        feed_numbered(&terminal, 40, 7);
+        assert_eq!(terminal.anchor_scroll(0.0, ANCHOR_BODY_H, 1.0), None);
+        assert_eq!(terminal.scroll_y.current, 5.0 * ANCHOR_CHAR_H);
+
+        anchor_frame(&mut terminal);
+        assert_eq!(terminal.scroll_y.current, 12.0 * ANCHOR_CHAR_H);
+    }
+
+    #[test]
+    fn alternate_screen_round_trip_keeps_scrolled_up_offset() {
+        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
+        anchor_frame(&mut terminal);
+
+        feed(&mut crate::platform::lock_recover(&terminal.grid), b"\x1b[?1049h");
+        assert!(crate::platform::lock_recover(&terminal.grid).is_alt_screen());
+        anchor_frame(&mut terminal);
+        assert_eq!(terminal.scroll_y.current, 5.0 * ANCHOR_CHAR_H);
+        assert_eq!(terminal.scroll_y.target, 5.0 * ANCHOR_CHAR_H);
+
+        feed(&mut crate::platform::lock_recover(&terminal.grid), b"\x1b[?1049l");
+        anchor_frame(&mut terminal);
+        assert_eq!(terminal.scroll_y.current, 5.0 * ANCHOR_CHAR_H);
+        assert_eq!(terminal.scroll_y.target, 5.0 * ANCHOR_CHAR_H);
     }
 
     #[test]
@@ -2417,34 +2502,45 @@ impl Terminal {
 
     /// Keeps a viewport scrolled up into the scrollback on the same lines:
     /// `scroll_y` is measured from the bottom, so it grows by the lines output
-    /// pushed into the scrollback since the last call (`ScrollbackAnchor`).
+    /// scrolled into the history since the last call (`ScrollbackAnchor`).
     /// At the bottom (`target <= 0`) the anchor is released and the view
     /// follows output without taking the grid lock. Returns the scroll limit
-    /// of the current content (0 on the alternate screen) for the caller's
-    /// clamp, or `None` when released; a full scrollback that evicts lines
-    /// under the view clamps it to the oldest retained line.
+    /// of the current content for the caller's clamp. Returns `None` when
+    /// released, when `char_h` is unusable, and on the alternate screen; the
+    /// caller must not clamp then, so the offset survives an alternate-screen
+    /// round trip. The anchor is still held on the alternate screen.
     pub(crate) fn anchor_scroll(&mut self, char_h: f32, body_h: f32, scale: f32) -> Option<f32> {
         if !(self.scroll_y.target > 0.0) {
             self.scroll_anchor.release();
             return None;
         }
-        let (pushed, total_lines, is_alt) = {
-            let grid = crate::platform::lock_recover(&self.grid);
-            (self.scroll_anchor.hold(&grid), grid.total_rows(), grid.is_alt_screen())
-        };
         if !char_h.is_finite() || char_h <= 0.0 {
             return None;
         }
-        if pushed > 0 {
-            let delta = pushed as f32 * char_h;
+        let (scrolled, total_lines, is_alt) = {
+            let grid = crate::platform::lock_recover(&self.grid);
+            (self.scroll_anchor.hold(&grid), grid.total_rows(), grid.is_alt_screen())
+        };
+        if scrolled > 0 {
+            let delta = scrolled as f32 * char_h;
             self.scroll_y.current += delta;
             self.scroll_y.target += delta;
         }
-        Some(if is_alt {
-            0.0
-        } else {
-            crate::renderer::terminal_max_scroll(total_lines, char_h, body_h, scale)
-        })
+        if is_alt {
+            return None;
+        }
+        Some(crate::renderer::terminal_max_scroll(total_lines, char_h, body_h, scale))
+    }
+
+    /// Lines output scrolled into the history since the last `anchor_scroll`,
+    /// read under the grid lock the caller already holds. A render adds them
+    /// to `scroll_y` so it draws the offset the next `anchor_scroll` applies.
+    /// 0 once the view is back at the bottom (the next step releases the anchor).
+    pub(crate) fn scroll_anchor_pending(&self, grid: &Term) -> usize {
+        if !(self.scroll_y.target > 0.0) {
+            return 0;
+        }
+        self.scroll_anchor.pending(grid)
     }
 
     pub(crate) fn manually_confirm_bridge(
