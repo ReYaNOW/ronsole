@@ -58,3 +58,48 @@ fn release_forgets_lines_pushed_while_following() {
     feed(&mut term, &mut sink, &lines(2));
     assert_eq!(anchor.hold(&term), 2);
 }
+
+#[test]
+fn resize_round_trip_is_not_output() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, &lines(5));
+    let mut anchor = ScrollbackAnchor::new();
+    anchor.hold(&term);
+    let pushed_before = term.scrollback_pushed();
+
+    // Shrinking moves top rows into the scrollback; growing pulls them back.
+    term.resize(10, 1);
+    assert_ne!(term.scrollback_pushed(), pushed_before);
+    term.resize(10, 3);
+
+    assert_eq!(anchor.hold(&term), 0);
+    assert_eq!(anchor.pending(&term), 0);
+}
+
+#[test]
+fn pending_reports_lines_without_consuming_them() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, &lines(5));
+    let mut anchor = ScrollbackAnchor::new();
+    anchor.hold(&term);
+
+    feed(&mut term, &mut sink, &lines(4));
+    assert_eq!(anchor.pending(&term), 4);
+    assert_eq!(anchor.pending(&term), 4);
+    assert_eq!(anchor.hold(&term), 4);
+    assert_eq!(anchor.pending(&term), 0);
+}
+
+#[test]
+fn pending_is_zero_while_released() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    let mut anchor = ScrollbackAnchor::new();
+    anchor.hold(&term);
+    feed(&mut term, &mut sink, &lines(3));
+
+    anchor.release();
+    assert_eq!(anchor.pending(&term), 0);
+}

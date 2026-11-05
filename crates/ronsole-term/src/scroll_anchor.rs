@@ -16,30 +16,41 @@ use crate::term::Term;
 /// retained line stays pinned to it while content is evicted under it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScrollbackAnchor {
-    /// `Term::scrollback_pushed` at the last `hold`; `None` while released.
-    seen_pushed: Option<u64>,
+    /// `Term::output_scrolled_lines` at the last `hold`; `None` while released.
+    seen_scrolled: Option<u64>,
 }
 
 impl ScrollbackAnchor {
     pub const fn new() -> Self {
-        Self { seen_pushed: None }
+        Self { seen_scrolled: None }
     }
 
-    /// Lines pushed into `term`'s scrollback since the previous `hold`, by
-    /// which a scrolled-up offset (measured from the bottom) must grow to keep
-    /// the same lines in view. The first call after `new` or `release` only
-    /// records the count and returns 0.
+    /// Lines output scrolled into `term`'s history since the previous `hold`,
+    /// by which a scrolled-up offset (measured from the bottom) must grow to
+    /// keep the same lines in view. The first call after `new` or `release`
+    /// only records the count and returns 0.
     pub fn hold(&mut self, term: &Term) -> usize {
-        let pushed = term.scrollback_pushed();
-        let lines = self.seen_pushed.map_or(0, |seen| {
-            usize::try_from(pushed.wrapping_sub(seen)).unwrap_or(usize::MAX)
-        });
-        self.seen_pushed = Some(pushed);
+        let scrolled = term.output_scrolled_lines();
+        let lines = self.pending_since_seen(term);
+        self.seen_scrolled = Some(scrolled);
         lines
+    }
+
+    /// The lines that the next `hold` would return, without consuming them.
+    /// Renders use it to draw the offset that the next `hold` will apply.
+    /// 0 while released.
+    pub fn pending(&self, term: &Term) -> usize {
+        self.pending_since_seen(term)
+    }
+
+    fn pending_since_seen(&self, term: &Term) -> usize {
+        self.seen_scrolled.map_or(0, |seen| {
+            usize::try_from(term.output_scrolled_lines().wrapping_sub(seen)).unwrap_or(usize::MAX)
+        })
     }
 
     /// The viewport is at the bottom and follows output again.
     pub fn release(&mut self) {
-        self.seen_pushed = None;
+        self.seen_scrolled = None;
     }
 }

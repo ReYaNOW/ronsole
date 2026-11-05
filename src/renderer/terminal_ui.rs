@@ -1566,6 +1566,19 @@ pub(crate) fn terminal_render_scroll_offset(current: f32, max_scroll: f32, is_al
     if is_alt { 0.0 } else { current.clamp(0.0, max_scroll).round() }
 }
 
+/// The offset a frame draws: `current` plus the `pending` lines that output
+/// scrolled in since the last anchor step, so the lines stay put before that
+/// step applies them to `current`.
+pub(crate) fn terminal_anchored_scroll_offset(
+    current: f32,
+    pending: usize,
+    char_h: f32,
+    max_scroll: f32,
+    is_alt: bool,
+) -> f32 {
+    terminal_render_scroll_offset(current + pending as f32 * char_h, max_scroll, is_alt)
+}
+
 pub(crate) fn visible_row_range(
     total_lines: usize,
     visible_rows: usize,
@@ -3758,7 +3771,15 @@ impl Renderer {
         let is_alt = grid.is_alt_screen();
         let total_lines = grid.total_rows();
         let max_scroll = if is_alt { 0.0 } else { terminal_max_scroll(total_lines, char_h, body.h, s) };
-        let scroll_offset = terminal_render_scroll_offset(terminal.scroll_y.current, max_scroll, is_alt);
+        // Read under the lock taken above, so the offset matches the lines drawn from this grid.
+        let pending = terminal.scroll_anchor_pending(&grid);
+        let scroll_offset = terminal_anchored_scroll_offset(
+            terminal.scroll_y.current,
+            pending,
+            char_h,
+            max_scroll,
+            is_alt,
+        );
         let text_x = body.x + 10.0 * s;
         let (_, bottom_pad) = terminal_text_padding(s);
         let separator = if tile { None } else { terminal_focus_separator_rect(body, s) };
@@ -3987,7 +4008,7 @@ impl Renderer {
             self.clear_clip();
         }
         let scrollbar = if presentation_visible {
-            terminal_scrollbar_layout(body, s, char_h, total_lines, terminal.scroll_y.current)
+            terminal_scrollbar_layout(body, s, char_h, total_lines, terminal.scroll_y.current + pending as f32 * char_h)
         } else { None };
         if let Some(scrollbar) = scrollbar {
             self.push_rounded_rect(scrollbar.thumb.x, scrollbar.thumb.y, scrollbar.thumb.w, scrollbar.thumb.h, scrollbar.thumb.w / 2.0, SCROLLBAR);
@@ -4250,6 +4271,18 @@ mod tests {
         assert_eq!(terminal_render_scroll_offset(3.4, 100.0, false), 3.0);
         assert_eq!(terminal_render_scroll_offset(3.6, 100.0, false), 4.0);
         assert_eq!(terminal_render_scroll_offset(30.0, 100.0, true), 0.0);
+    }
+
+    #[test]
+    fn anchored_scroll_offset_adds_pending_lines_and_clamps_to_frame_limit() {
+        // 10 + 2 lines * 20 px = 50, below the limit.
+        assert_eq!(terminal_anchored_scroll_offset(10.0, 2, 20.0, 100.0, false), 50.0);
+        // 10 + 6 * 20 = 130 is clamped to this frame's limit.
+        assert_eq!(terminal_anchored_scroll_offset(10.0, 6, 20.0, 100.0, false), 100.0);
+        // Nothing pending draws the animated offset as before.
+        assert_eq!(terminal_anchored_scroll_offset(3.4, 0, 20.0, 100.0, false), 3.0);
+        // The alternate screen draws no scrollback offset.
+        assert_eq!(terminal_anchored_scroll_offset(10.0, 2, 20.0, 0.0, true), 0.0);
     }
 
     #[test]

@@ -2848,16 +2848,14 @@ impl App {
             selection_autoscrolled = self.interaction.update_selection_autoscroll(dt, terminal);
             let layout = &self.interaction.layout;
             // The last render's limit is stale once output grew the scrollback;
-            // a held anchor returns the current one.
-            let max = if active_content_hidden {
-                layout.max_scroll
+            // a held anchor returns the current one. No limit means no clamp.
+            let limit = if active_content_hidden {
+                None
             } else {
-                terminal
-                    .anchor_scroll(layout.char_h, layout.body.h, layout.scale)
-                    .unwrap_or(layout.max_scroll)
+                terminal.anchor_scroll(layout.char_h, layout.body.h, layout.scale)
             };
             terminal.scroll_y.update(dt);
-            if !active_content_hidden {
+            if let Some(max) = limit {
                 terminal.scroll_y.clamp_target(0.0, max);
                 terminal.scroll_y.clamp_current(0.0, max);
             }
@@ -2876,22 +2874,20 @@ impl App {
                 continue;
             };
             // A layout written for a hidden tile carries no content limit.
-            let Some(max) = self
+            let Some(layout) = self
                 .panel_layouts
                 .get(index)
                 .filter(|layout| layouts_current && !layout.content_hidden)
-                .map(|layout| {
-                    terminal
-                        .anchor_scroll(layout.char_h, layout.body.h, layout.scale)
-                        .unwrap_or(layout.max_scroll)
-                })
             else {
                 terminal.scroll_y.update(dt);
                 continue;
             };
+            let limit = terminal.anchor_scroll(layout.char_h, layout.body.h, layout.scale);
             terminal.scroll_y.update(dt);
-            terminal.scroll_y.clamp_target(0.0, max);
-            terminal.scroll_y.clamp_current(0.0, max);
+            if let Some(max) = limit {
+                terminal.scroll_y.clamp_target(0.0, max);
+                terminal.scroll_y.clamp_current(0.0, max);
+            }
         }
         if selection_autoscrolled {
             self.mark_dirty();
