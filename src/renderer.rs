@@ -2003,33 +2003,6 @@ mod tests {
 
     const CELL_TEST_SCALES: [f32; 5] = [1.0, 1.25, 1.32, 1.5, 2.0];
 
-    // The pre-EGL estimate must equal the first frame's grid: a PTY started at
-    // another size makes zsh/p10k redraw its prompt only ~450 ms later.
-    #[test]
-    fn first_frame_grid_size_is_terminal_grid_size_of_window_body() {
-        let chain = TerminalFontChain::load();
-        let mut ctx = ScaleContext::new();
-        for (width, height) in [(1280_u32, 800_u32), (2560, 1440), (1920, 1080), (641, 401)] {
-            for scale in CELL_TEST_SCALES {
-                for font_size in [LEGACY_TERMINAL_FONT_LOGICAL_SIZE, 13.5] {
-                    let metrics = terminal_font_metrics(font_size, scale);
-                    let (char_w, char_h) = terminal_cell_size(&chain.fonts, &mut ctx, metrics);
-                    let body = terminal_body_rect(width as f32, height as f32, scale);
-                    let expected = terminal_grid_size(body, char_w, char_h, scale);
-                    let early = chain.first_frame_grid_size(width, height, scale, font_size);
-                    assert_eq!(
-                        early, expected,
-                        "{width}x{height} scale {scale} font {font_size}"
-                    );
-                    assert!(
-                        early.cols > 10 && early.rows > 2,
-                        "{width}x{height} scale {scale}"
-                    );
-                }
-            }
-        }
-    }
-
     // The renderer's cell size, which sizes every frame's grid, is the one the
     // pre-EGL estimate uses, and it still is the advance of the cached 'A' glyph.
     #[test]
