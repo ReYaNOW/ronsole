@@ -1,7 +1,7 @@
 use crate::headless::backend::{HeadlessBackend, HeadlessCounters};
 use crate::input_types::{CursorKind, KeyInput, KeyState, Modifiers};
 use crate::platform::offscreen_gl::OffscreenContext;
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, TerminalFontChain};
 use crate::wake::WakeHandle;
 use crate::wayland_input::{
     CursorShape, ImeBatch, KeyRepeatState, PointerAxisFrame, PointerAxisSource, RepeatConfig,
@@ -2795,13 +2795,41 @@ impl Drop for WindowRuntime {
     }
 }
 
+/// Runtime parts that need no GL: the main loop's eventfd and the Regular font
+/// chain. Created before EGL so the first tab can be sized and spawned while the
+/// GL driver initializes; the `bootstrap_*` functions take them over.
+pub(crate) struct PreGlResources {
+    pub(crate) wake: WakeHandle,
+    pub(crate) fonts: TerminalFontChain,
+}
+
+impl PreGlResources {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            wake: WakeHandle::new()?,
+            fonts: TerminalFontChain::load(),
+        })
+    }
+}
+
+/// A Wayland window past its first configure, before any EGL call.
+pub(crate) struct WaylandConnection {
+    wayland: Box<DirectWaylandBackend>,
+}
+
+impl WaylandConnection {
+    /// Physical size and scale the runtime bootstrapped from this connection starts with.
+    pub(crate) fn metrics(&self) -> WaylandWindowMetrics {
+        self.wayland.metrics()
+    }
+}
+
 impl WindowRuntime {
-    pub(crate) fn bootstrap_wayland(
+    /// Connects to Wayland and waits for a renderable first configure, without EGL.
+    pub(crate) fn connect_wayland(
         logical_width: f64,
         logical_height: f64,
-        terminal_font_size: f32,
-        terminal_background: crate::config::RgbColor,
-    ) -> Result<Self, String> {
+    ) -> Result<WaylandConnection, String> {
         let wayland = DirectWaylandBackend::connect(
             logical_dimension(logical_width),
             logical_dimension(logical_height),
@@ -2814,7 +2842,19 @@ impl WindowRuntime {
         ) {
             return Err("Wayland surface is not renderable after initial configure".to_string());
         }
+        Ok(WaylandConnection {
+            wayland: Box::new(wayland),
+        })
+    }
 
+    pub(crate) fn bootstrap_wayland(
+        connection: WaylandConnection,
+        pre_gl: PreGlResources,
+        terminal_font_size: f32,
+        terminal_background: crate::config::RgbColor,
+    ) -> Result<Self, String> {
+        let wayland = connection.wayland;
+        let metrics = wayland.metrics();
         let raw_display = wayland.raw_display_handle()?;
         let gl_display = unsafe { GlutinDisplay::new(raw_display, DisplayApiPreference::Egl) }
             .map_err(|error| format!("EGL display creation failed: {error}"))?;
@@ -2831,14 +2871,13 @@ impl WindowRuntime {
         )?;
         let mut renderer = Renderer::new(
             create_glow_context(&gl_config),
+            pre_gl.fonts,
             metrics.scale_factor,
             terminal_font_size,
             terminal_background,
         )
         .map_err(|error| format!("renderer initialization failed: {error}"))?;
         renderer.resize(metrics.physical_width, metrics.physical_height);
-        let wake =
-            WakeHandle::new().map_err(|error| format!("eventfd creation failed: {error}"))?;
         let runtime = Self {
             renderer,
             target: GlTarget::Window {
@@ -2849,35 +2888,44 @@ impl WindowRuntime {
                 requested_priority,
                 swap_interval_applied,
             },
-            backend: RuntimeBackend::Wayland(Box::new(wayland)),
-            wake,
+            backend: RuntimeBackend::Wayland(wayland),
+            wake: pre_gl.wake,
         };
         trim_allocator_after_gl_bootstrap();
         Ok(runtime)
     }
 
+    /// Zero-size headless targets fail before any EGL call, with the stage
+    /// prefix `OffscreenContext::new` would leave out.
+    pub(crate) fn check_headless_size(
+        physical_width: u32,
+        physical_height: u32,
+    ) -> Result<(), String> {
+        if physical_width == 0 || physical_height == 0 {
+            return Err("EGL setup failed at CreatePbuffer: zero size".to_string());
+        }
+        Ok(())
+    }
+
     pub(crate) fn bootstrap_headless(
+        pre_gl: PreGlResources,
         physical_width: u32,
         physical_height: u32,
         scale_factor: f32,
         terminal_font_size: f32,
         terminal_background: crate::config::RgbColor,
     ) -> Result<Self, String> {
-        // OffscreenContext::new reports zero size without the stage prefix.
-        if physical_width == 0 || physical_height == 0 {
-            return Err("EGL setup failed at CreatePbuffer: zero size".to_string());
-        }
+        Self::check_headless_size(physical_width, physical_height)?;
         let offscreen = OffscreenContext::new(physical_width, physical_height)?;
         let mut renderer = Renderer::new(
             offscreen.glow(),
+            pre_gl.fonts,
             scale_factor,
             terminal_font_size,
             terminal_background,
         )
         .map_err(|error| format!("EGL setup failed at renderer: {error}"))?;
         renderer.resize(physical_width, physical_height);
-        let wake = WakeHandle::new()
-            .map_err(|error| format!("EGL setup failed at eventfd: {error}"))?;
         let runtime = Self {
             renderer,
             target: GlTarget::Offscreen(offscreen),
@@ -2886,7 +2934,7 @@ impl WindowRuntime {
                 physical_height,
                 scale_factor,
             )),
-            wake,
+            wake: pre_gl.wake,
         };
         trim_allocator_after_gl_bootstrap();
         Ok(runtime)
@@ -3946,6 +3994,7 @@ mod tests {
     fn headless_runtime(width: u32, height: u32) -> WindowRuntime {
         crate::prefer_egl_vendor();
         WindowRuntime::bootstrap_headless(
+            PreGlResources::new().expect("eventfd"),
             width,
             height,
             1.0,
@@ -3994,6 +4043,7 @@ mod tests {
     fn bootstrap_headless_rejects_zero_size_with_egl_stage() {
         crate::prefer_egl_vendor();
         let error = WindowRuntime::bootstrap_headless(
+            PreGlResources::new().expect("eventfd"),
             0,
             0,
             1.0,

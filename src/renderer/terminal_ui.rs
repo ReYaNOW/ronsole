@@ -1451,6 +1451,12 @@ pub(crate) fn terminal_grid_size(
     }
 }
 
+/// A grid dimension as the PTY takes it, saturated at `u16::MAX`.
+#[inline]
+pub(crate) fn pty_dimension(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
 #[inline]
 fn terminal_dimensions_changed(
     cols: usize,
@@ -2161,11 +2167,7 @@ impl Renderer {
 
     /// Terminal cell size in physical pixels: `(advance, line height)`.
     pub(crate) fn terminal_cell_size(&self) -> (f32, f32) {
-        (self.terminal_char_width(), self.line_height * TERMINAL_TEXT_SCALE)
-    }
-
-    fn terminal_char_width(&self) -> f32 {
-        self.ascii_advances[b'A' as usize].max(1.0) * TERMINAL_TEXT_SCALE
+        self.terminal_cell
     }
 
     fn one_line_text_advance(&mut self, c: char, text_scale: f32) -> f32 {
@@ -3745,8 +3747,7 @@ impl Renderer {
     ) -> TerminalUiLayout {
         let palette = self.palette;
         let s = self.scale_factor;
-        let char_w = self.terminal_char_width();
-        let char_h = self.line_height * TERMINAL_TEXT_SCALE;
+        let (char_w, char_h) = self.terminal_cell_size();
         let grid_size = terminal_grid_size(body, char_w, char_h, s);
         let (new_cols, new_rows) = (grid_size.cols, grid_size.rows);
         let visible_rows = new_rows;
@@ -3757,10 +3758,7 @@ impl Renderer {
         grid.mark_presentation_layout_ready();
         if resized {
             drop(grid);
-            terminal.resize_pty(
-                u16::try_from(new_cols.min(u16::MAX as usize)).unwrap_or(u16::MAX),
-                u16::try_from(new_rows.min(u16::MAX as usize)).unwrap_or(u16::MAX),
-            );
+            terminal.resize_pty(pty_dimension(new_cols), pty_dimension(new_rows));
             grid = crate::platform::lock_recover(&terminal.grid);
             prepare_terminal_grid_for_render(&mut grid, search.as_deref_mut(), new_cols, new_rows);
         }

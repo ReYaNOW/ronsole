@@ -6,7 +6,7 @@ use super::{App, AppLoopControl};
 use crate::config::AppConfig;
 use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
-use crate::runtime::WindowRuntime;
+use crate::runtime::{PreGlResources, WindowRuntime};
 use crate::terminal::Terminal;
 use std::time::Instant;
 
@@ -56,7 +56,16 @@ impl App {
         scale: f32,
         launch: TerminalLaunchSpec,
     ) -> Result<(), HeadlessRunError> {
+        WindowRuntime::check_headless_size(physical.0, physical.1)
+            .map_err(HeadlessRunError::Egl)?;
+        let pre_gl = PreGlResources::new().map_err(|error| {
+            HeadlessRunError::Egl(format!("EGL setup failed at eventfd: {error}"))
+        })?;
+        // The shell starts before EGL; an EGL error below drops the app, which
+        // reaps this tab's session.
+        self.spawn_initial_terminal(&pre_gl, physical, scale, launch);
         let runtime = WindowRuntime::bootstrap_headless(
+            pre_gl,
             physical.0,
             physical.1,
             scale,
@@ -64,7 +73,7 @@ impl App {
             self.config.terminal_background,
         )
         .map_err(HeadlessRunError::Egl)?;
-        self.prepare_bootstrapped_runtime(runtime, launch);
+        self.prepare_bootstrapped_runtime(runtime);
         Ok(())
     }
 
@@ -228,7 +237,15 @@ mod tests {
         let profile = Profile::create(Some(root.clone()), std::process::id()).expect("profile");
         let (mut app, _receiver) = App::load_headless(Some(options_for(&root)), &profile.dir, None)
             .expect("headless app");
+        let pre_gl = PreGlResources::new().expect("eventfd");
+        app.spawn_initial_terminal(
+            &pre_gl,
+            (320, 200),
+            1.0,
+            TerminalLaunchSpec::hermetic_shell_for_test(),
+        );
         let mut runtime = WindowRuntime::bootstrap_headless(
+            pre_gl,
             320,
             200,
             1.0,
@@ -237,10 +254,7 @@ mod tests {
         )
         .expect("headless runtime");
         runtime.inject_session_error("resize pbuffer: test".to_string());
-        app.prepare_bootstrapped_runtime(
-            runtime,
-            TerminalLaunchSpec::hermetic_shell_for_test(),
-        );
+        app.prepare_bootstrapped_runtime(runtime);
 
         let step = app.loop_step(None, None).expect("loop step");
         assert!(matches!(step, LoopStep::Exit(Err(_))));
@@ -363,6 +377,41 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(15), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The first tab is spawned before EGL at the grid its first frame lays out, so
+    // that frame resizes neither the grid nor the PTY, at integer and fractional scale.
+    #[test]
+    fn first_tab_starts_at_first_frame_grid() {
+        crate::prefer_egl_vendor();
+        for (physical, scale) in [((1280, 800), 1.0), ((2560, 1440), 1.32)] {
+            let root = workspace_root(&format!("early-grid-{}", physical.0));
+            let profile = Profile::create(Some(root.clone()), std::process::id()).expect("profile");
+            let (mut app, _receiver) =
+                App::load_headless(None, &profile.dir, None).expect("headless app");
+            app.start_headless(
+                physical,
+                scale,
+                TerminalLaunchSpec::hermetic_shell_for_test(),
+            )
+            .expect("headless runtime starts");
+            let size = |app: &App| {
+                let grid = crate::platform::lock_recover(&app.terminals[0].grid);
+                (grid.cols(), grid.rows())
+            };
+            let spawned = size(&app);
+            app.forced_step().expect("first frame");
+            assert_eq!(app.panel_layouts.len(), 1, "scale {scale}");
+            let layout = &app.panel_layouts[0];
+            assert_eq!((layout.cols, layout.visible_rows), spawned, "scale {scale}");
+            assert_eq!(
+                size(&app),
+                spawned,
+                "first frame resized the grid at scale {scale}"
+            );
+            drop(app);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::launch::TerminalLaunchSpec;
 use crate::platform::signals;
 use crate::platform::single_instance::{InstanceMessage, PrimaryInstance};
 use crate::runtime::{
-    WaylandPollOutcome, WaylandRuntimeEvents, WaylandWindowMetrics, WindowRuntime,
+    PreGlResources, WaylandPollOutcome, WaylandRuntimeEvents, WaylandWindowMetrics, WindowRuntime,
     poll_timeout_millis,
 };
 use crate::wayland_input::WaylandInputEvent;
@@ -89,14 +89,27 @@ impl App {
         if let Err(error) = signals::install() {
             eprintln!("Ronsole: signal shutdown unavailable: {error}");
         }
+        let connection =
+            WindowRuntime::connect_wayland(self.config.window_width, self.config.window_height)?;
+        let pre_gl =
+            PreGlResources::new().map_err(|error| format!("eventfd creation failed: {error}"))?;
+        // The shell starts before EGL: its prompt is ready by the first frame.
+        // An EGL error below drops the app, which reaps this tab's session.
+        let metrics = connection.metrics();
+        self.spawn_initial_terminal(
+            &pre_gl,
+            (metrics.physical_width, metrics.physical_height),
+            metrics.scale_factor,
+            initial_launch,
+        );
         let runtime = WindowRuntime::bootstrap_wayland(
-            self.config.window_width,
-            self.config.window_height,
+            connection,
+            pre_gl,
             self.config.terminal_font_size,
             self.config.terminal_background,
         )?;
         let wake = runtime.wake_handle();
-        self.prepare_bootstrapped_runtime(runtime, initial_launch);
+        self.prepare_bootstrapped_runtime(runtime);
 
         let (launch_tx, launch_rx) = sync_channel(EXTERNAL_LAUNCH_QUEUE_CAPACITY);
         primary_instance
@@ -189,20 +202,11 @@ impl App {
 
     /// Installs a freshly bootstrapped runtime and sizes the app to its physical
     /// target. Shared by the Wayland and headless entry points.
-    pub(super) fn prepare_bootstrapped_runtime(
-        &mut self,
-        mut runtime: WindowRuntime,
-        initial_launch: TerminalLaunchSpec,
-    ) {
+    pub(super) fn prepare_bootstrapped_runtime(&mut self, mut runtime: WindowRuntime) {
         // The renderer starts with default colours; apply the configured ones before its first frame.
         let _ = runtime.set_terminal_colors(&self.config);
         let metrics = runtime.wayland_metrics();
-        self.on_runtime_ready(
-            runtime,
-            metrics.physical_width,
-            metrics.physical_height,
-            initial_launch,
-        );
+        self.on_runtime_ready(runtime, metrics.physical_width, metrics.physical_height);
         self.on_resize_with_logical_size(
             metrics.physical_width,
             metrics.physical_height,

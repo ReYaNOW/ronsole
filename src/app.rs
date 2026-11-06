@@ -16,8 +16,8 @@ use crate::platform::{
 use crate::platform::single_instance::BridgeResult;
 use crate::renderer::{
     CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
-    SettingsTab, TerminalTabHit, TerminalUiLayout, settings_color_value, terminal_body_rect,
-    terminal_palette,
+    SettingsTab, TerminalTabHit, TerminalUiLayout, pty_dimension, settings_color_value,
+    terminal_body_rect, terminal_palette,
 };
 use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
@@ -32,6 +32,7 @@ use crate::terminal::{
     screen_hash, sync_reserve_wake,
 };
 use crate::terminal_process::{TerminalCleanupWorker, TerminalProcess, shutdown_terminal_processes};
+use crate::wake::WakeHandle;
 use ronsole_term::TermPalette;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -844,18 +845,50 @@ impl App {
         })
     }
 
-    fn add_terminal_with_launch(&mut self, mut launch: TerminalLaunchSpec) -> Option<usize> {
+    fn add_terminal_with_launch(&mut self, launch: TerminalLaunchSpec) -> Option<usize> {
         // Leaves grid mode at the request, before the runtime check can return early.
         self.exit_claude_grid(None);
         let wake = self.runtime.as_ref()?.wake_handle();
+        Some(self.spawn_terminal_tab(wake, launch, crate::terminal::DEFAULT_SPAWN_GRID))
+    }
+
+    /// Spawns the first tab before EGL starts, with its grid and PTY at the size
+    /// the first frame lays out for a `physical` target at `scale`: the shell
+    /// draws its first prompt at the final width while the GL driver initializes,
+    /// and no resize follows. Output wakes `pre_gl.wake`, the runtime's eventfd.
+    pub(crate) fn spawn_initial_terminal(
+        &mut self,
+        pre_gl: &crate::runtime::PreGlResources,
+        physical: (u32, u32),
+        scale: f32,
+        launch: TerminalLaunchSpec,
+    ) {
+        let size = pre_gl.fonts.first_frame_grid_size(
+            physical.0,
+            physical.1,
+            scale,
+            self.config.terminal_font_size,
+        );
+        let grid = (pty_dimension(size.cols), pty_dimension(size.rows));
+        let _ = self.spawn_terminal_tab(pre_gl.wake.clone(), launch, grid);
+    }
+
+    /// The one tab factory: spawns the shell at `grid` and queues its activation.
+    fn spawn_terminal_tab(
+        &mut self,
+        wake: WakeHandle,
+        mut launch: TerminalLaunchSpec,
+        grid: (u16, u16),
+    ) -> usize {
         launch.shell.clone_from(&self.shell_override);
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
-        let terminal = Terminal::spawn(
+        let terminal = Terminal::spawn_sized(
             Some(wake),
             display_number,
             launch,
             self.new_terminal_palette(),
+            grid,
         );
         let index = self.terminals.len();
         self.terminals.push(terminal);
@@ -864,7 +897,7 @@ impl App {
         }
         self.request_terminal_activation(index, true);
         self.request_frame();
-        Some(index)
+        index
     }
 
     /// Palette a tab created now starts with: the configured background, with
@@ -2033,13 +2066,9 @@ impl App {
 }
 
 impl App {
-    fn on_runtime_ready(
-        &mut self,
-        runtime: WindowRuntime,
-        width: u32,
-        height: u32,
-        initial_launch: TerminalLaunchSpec,
-    ) {
+    /// Installs the runtime. The first tab already runs (`spawn_initial_terminal`);
+    /// the dirty flag set here draws the output it produced while EGL started.
+    fn on_runtime_ready(&mut self, runtime: WindowRuntime, width: u32, height: u32) {
         self.zero_sized = width == 0 || height == 0;
         if std::env::var_os("RONSOLE_GL_DIAGNOSTICS")
             .is_some_and(|value| value != std::ffi::OsStr::new("0"))
@@ -2049,7 +2078,6 @@ impl App {
         self.runtime = Some(runtime);
         self.refresh_grid_metrics();
         self.last_frame = Instant::now();
-        let _ = self.add_terminal_with_launch(initial_launch);
         self.flush_pending_external_launches();
         self.mark_dirty();
     }
@@ -3732,24 +3760,71 @@ mod tests {
         assert!(!app.animation_active);
     }
 
+    /// Both entry points spawn the first tab after the pre-GL resources exist and
+    /// before the EGL bootstrap, and hand the same eventfd to the runtime.
+    #[test]
+    fn first_tab_spawns_before_egl_bootstrap() {
+        let cases = [
+            (
+                include_str!("app/direct_wayland.rs"),
+                "    fn run_direct_wayland_inner",
+                "WindowRuntime::bootstrap_wayland(",
+            ),
+            (
+                include_str!("app/headless_run.rs"),
+                "    pub(crate) fn start_headless",
+                "WindowRuntime::bootstrap_headless(",
+            ),
+        ];
+        for (source, entry, bootstrap) in cases {
+            let body = source
+                .split(entry)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    }\n").next())
+                .expect("startup entry point must remain present");
+            let pre_gl = body
+                .find("PreGlResources::new()")
+                .expect("pre-GL resources");
+            let spawn = body
+                .find("self.spawn_initial_terminal(")
+                .expect("early spawn");
+            let egl = body.find(bootstrap).expect("EGL bootstrap");
+            let install = body
+                .find("self.prepare_bootstrapped_runtime(runtime)")
+                .expect("install");
+            assert!(pre_gl < spawn && spawn < egl && egl < install, "{entry}");
+            assert!(
+                body[egl..].contains("pre_gl,"),
+                "{entry}: runtime takes the early eventfd"
+            );
+        }
+        let runtime = include_str!("runtime.rs");
+        let runtime = runtime.split("\n#[cfg(test)]").next().unwrap_or(runtime);
+        assert_eq!(runtime.matches("WakeHandle::new()").count(), 1);
+    }
+
     #[test]
     fn terminal_tab_routes_share_factory_close_and_non_blocking_presentation_lifecycle() {
         let source = include_str!("app.rs");
         let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         let renderer = include_str!("renderer/terminal_ui.rs");
 
-        assert_eq!(production.matches("Terminal::spawn(").count(), 1);
+        assert_eq!(production.matches("Terminal::spawn_sized(").count(), 1);
         assert_eq!(production.matches("fn add_terminal_with_launch").count(), 1);
+        // One factory: the runtime-backed tab route and the pre-EGL first tab.
+        assert_eq!(production.matches("self.spawn_terminal_tab(").count(), 2);
         assert!(production.contains("self.add_terminal_with_launch(TerminalLaunchSpec {"));
         assert_eq!(production.matches("self.add_terminal()").count(), 2);
+        // The first tab is spawned before EGL, not when the runtime is installed.
         let startup = production
             .split("    fn on_runtime_ready")
             .nth(1)
             .and_then(|tail| tail.split("    fn on_close_requested").next())
             .expect("runtime startup path must remain present");
-        assert_eq!(startup.matches("add_terminal_with_launch(").count(), 1);
-        assert!(startup.contains("self.add_terminal_with_launch(initial_launch)"));
+        assert!(!startup.contains("add_terminal_with_launch("));
+        assert!(!startup.contains("spawn_terminal_tab("));
         assert!(!startup.contains("self.add_terminal()"));
+        assert!(startup.contains("self.mark_dirty()"));
         assert!(production.contains("GlobalShortcut::NewTab"));
         assert!(production.contains("TerminalTabHit::Add"));
 

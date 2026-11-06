@@ -14,8 +14,6 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const INITIAL_COLS: u16 = 200;
-const INITIAL_ROWS: u16 = 60;
 /// Time every process group of a closing tab session gets after SIGTERM before
 /// the remaining groups are SIGKILLed. Long enough for TUI programs (Claude Code
 /// CLI) to restore terminal state and clear their crash markers.
@@ -376,6 +374,7 @@ impl TerminalProcess {
         host: HostChannels,
         launch: TerminalLaunchSpec,
         tab_token: &TabToken,
+        (cols, rows): (u16, u16),
     ) -> io::Result<Self> {
         let (command, cwd, process_title, spawn_target) =
             terminal_launch_command(launch, tab_token)?;
@@ -385,8 +384,8 @@ impl TerminalProcess {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
-                rows: INITIAL_ROWS,
-                cols: INITIAL_COLS,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
