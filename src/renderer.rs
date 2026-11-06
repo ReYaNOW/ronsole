@@ -1,7 +1,8 @@
 mod terminal_ui;
 pub(crate) use terminal_ui::{
     CloseConfirmHit, CloseConfirmView, SettingsColorField, SettingsColorView, SettingsHit,
-    SettingsTab, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout, settings_color_value,
+    SettingsTab, TerminalGridSize, TerminalTabHit, TerminalTabStripLayout, TerminalUiLayout,
+    pty_dimension, settings_color_value,
     terminal_body_rect, terminal_cell_render_colors, terminal_cell_span_x_bounds, terminal_grid_size, terminal_max_scroll, terminal_palette,
     terminal_render_color, terminal_row_draw_y, terminal_scrollbar_drag_target,
     terminal_text_viewport_height, visible_row_range,
@@ -147,6 +148,65 @@ fn terminal_font_metrics(logical_size: f32, scale_factor: f32) -> TerminalFontMe
             .round()
             .max(1.0),
         x_height: terminal_regular_x_height_em() * logical_size * scale_factor,
+    }
+}
+
+/// Scale factor the renderer works at for a requested output scale.
+#[inline]
+fn renderer_scale_factor(scale_factor: f32) -> f32 {
+    scale_factor.max(0.1)
+}
+
+/// Terminal cell size in physical pixels, `(advance of 'A', line height)`, for the
+/// Regular chain `fonts` at `metrics`. GL-free, and the only source of the cell size:
+/// the renderer and the pre-EGL grid estimate (`TerminalFontChain::first_frame_grid_size`)
+/// both call it, so the first tab's PTY starts at the grid the first frame draws.
+fn terminal_cell_size(
+    fonts: &[FontData],
+    scale_context: &mut ScaleContext,
+    metrics: TerminalFontMetrics,
+) -> (f32, f32) {
+    let advance = rasterize_glyph(fonts, None, scale_context, 'A', metrics.raster_size, false)
+        .map_or(0.0, |glyph| glyph.advance);
+    (
+        advance.max(1.0) * terminal_ui::TERMINAL_TEXT_SCALE,
+        metrics.line_height * terminal_ui::TERMINAL_TEXT_SCALE,
+    )
+}
+
+/// The Regular terminal font chain, loaded before the GL context exists so the
+/// first tab can be sized and spawned while EGL initializes. `Renderer::new`
+/// takes it over, so the chain is mapped once.
+pub(crate) struct TerminalFontChain {
+    fonts: Vec<FontData>,
+}
+
+impl TerminalFontChain {
+    pub(crate) fn load() -> Self {
+        Self {
+            fonts: load_terminal_fonts(),
+        }
+    }
+
+    /// Grid the first frame lays out in the single-panel window body of a
+    /// `width` x `height` physical target: the renderer's cell size at the
+    /// renderer's scale and font size, fed to `terminal_grid_size`.
+    pub(crate) fn first_frame_grid_size(
+        &self,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        terminal_font_logical_size: f32,
+    ) -> TerminalGridSize {
+        let scale_factor = renderer_scale_factor(scale_factor);
+        let metrics = terminal_font_metrics(
+            crate::config::normalize_terminal_font_size(terminal_font_logical_size),
+            scale_factor,
+        );
+        // The rasterized 'A' is dropped; the renderer caches its own copy in `prewarm_ascii`.
+        let (char_w, char_h) = terminal_cell_size(&self.fonts, &mut ScaleContext::new(), metrics);
+        let body = terminal_body_rect(width as f32, height as f32, scale_factor);
+        terminal_grid_size(body, char_w, char_h, scale_factor)
     }
 }
 
@@ -548,7 +608,8 @@ pub struct Renderer {
     color_atlas_x: i32,
     color_atlas_y: i32,
     color_row_h: i32,
-    ascii_advances: [f32; 128],
+    /// `terminal_cell_size` at the current font size and scale.
+    terminal_cell: (f32, f32),
     terminal_font_logical_size: f32,
     terminal_font_size: f32,
     ui_font_size: f32,
@@ -607,11 +668,12 @@ impl Renderer {
 
     pub fn new(
         gl: glow::Context,
+        font_chain: TerminalFontChain,
         scale_factor: f32,
         terminal_font_logical_size: f32,
         terminal_background: crate::config::RgbColor,
     ) -> Result<Self, String> {
-        let scale_factor = scale_factor.max(0.1);
+        let scale_factor = renderer_scale_factor(scale_factor);
         let terminal_font_logical_size =
             crate::config::normalize_terminal_font_size(terminal_font_logical_size);
         let terminal_metrics = terminal_font_metrics(terminal_font_logical_size, scale_factor);
@@ -645,7 +707,9 @@ impl Renderer {
         let (vao, vbo) = create_vertex_buffer(&gl, program)?;
         let alpha_texture = create_alpha_texture(&gl)?;
 
-        let fonts = load_terminal_fonts();
+        let fonts = font_chain.fonts;
+        let mut scale_context = ScaleContext::new();
+        let terminal_cell = terminal_cell_size(&fonts, &mut scale_context, terminal_metrics);
 
         let mut ui_fonts = Vec::with_capacity(fonts.len() + 3);
         ui_fonts.push(FontData::new_static(UI_FONT));
@@ -678,7 +742,7 @@ impl Renderer {
             fonts,
             ui_fonts,
             faces: TerminalFaces::default(),
-            scale_context: ScaleContext::new(),
+            scale_context,
             glyphs: FxHashMap::default(),
             ui_glyphs: FxHashMap::default(),
             alpha_atlas_x: 2,
@@ -687,7 +751,7 @@ impl Renderer {
             color_atlas_x: 2,
             color_atlas_y: 2,
             color_row_h: 0,
-            ascii_advances: [0.0; 128],
+            terminal_cell,
             terminal_font_logical_size,
             terminal_font_size: terminal_metrics.raster_size,
             ui_font_size: ui_font_size(scale_factor),
@@ -797,6 +861,8 @@ impl Renderer {
         self.line_height = terminal_metrics.line_height;
         self.baseline_offset = terminal_metrics.baseline_offset;
         self.x_height = terminal_metrics.x_height;
+        self.terminal_cell =
+            terminal_cell_size(&self.fonts, &mut self.scale_context, terminal_metrics);
         self.reset_atlases();
         self.prewarm_ascii();
         self.prewarm_search_icons();
@@ -817,6 +883,8 @@ impl Renderer {
         self.line_height = terminal_metrics.line_height;
         self.baseline_offset = terminal_metrics.baseline_offset;
         self.x_height = terminal_metrics.x_height;
+        self.terminal_cell =
+            terminal_cell_size(&self.fonts, &mut self.scale_context, terminal_metrics);
         self.reset_atlases();
         self.prewarm_ascii();
         self.prewarm_search_icons();
@@ -837,11 +905,8 @@ impl Renderer {
     }
 
     fn prewarm_ascii(&mut self) {
-        self.ascii_advances.fill(0.0);
         for byte in 32..128u8 {
-            if let Some(glyph) = self.get_glyph(byte as char, None, GLYPH_FACE_REGULAR) {
-                self.ascii_advances[byte as usize] = glyph.advance;
-            }
+            let _ = self.get_glyph(byte as char, None, GLYPH_FACE_REGULAR);
         }
     }
 
@@ -1936,6 +2001,42 @@ mod tests {
         );
     }
 
+    const CELL_TEST_SCALES: [f32; 5] = [1.0, 1.25, 1.32, 1.5, 2.0];
+
+    // The renderer's cell size, which sizes every frame's grid, is the one the
+    // pre-EGL estimate uses, and it still is the advance of the cached 'A' glyph.
+    #[test]
+    fn renderer_cell_size_is_font_chain_cell_size() {
+        crate::prefer_egl_vendor();
+        let ctx = crate::platform::offscreen_gl::OffscreenContext::new(64, 64)
+            .expect("offscreen EGL context");
+        let chain = TerminalFontChain::load();
+        let mut renderer = Renderer::new(
+            ctx.glow(),
+            TerminalFontChain::load(),
+            1.0,
+            LEGACY_TERMINAL_FONT_LOGICAL_SIZE,
+            crate::config::RgbColor { r: 0, g: 0, b: 0 },
+        )
+        .expect("renderer");
+        let mut scale_context = ScaleContext::new();
+        for scale in CELL_TEST_SCALES {
+            renderer.update_scale_factor(scale);
+            let metrics = terminal_font_metrics(LEGACY_TERMINAL_FONT_LOGICAL_SIZE, scale);
+            let expected = terminal_cell_size(&chain.fonts, &mut scale_context, metrics);
+            assert_eq!(renderer.terminal_cell_size(), expected, "scale {scale}");
+            let glyph = renderer
+                .get_glyph('A', None, GLYPH_FACE_REGULAR)
+                .expect("glyph A");
+            assert_eq!(
+                expected.0,
+                glyph.advance.max(1.0) * terminal_ui::TERMINAL_TEXT_SCALE,
+                "scale {scale}"
+            );
+        }
+        drop(renderer);
+    }
+
     // An alpha-atlas overflow reset the atlas mid-frame while quads sampling the old
     // contents were still queued, so they drew from a cleared texture.
     #[test]
@@ -1945,6 +2046,7 @@ mod tests {
             .expect("offscreen EGL context");
         let mut renderer = Renderer::new(
             ctx.glow(),
+            TerminalFontChain::load(),
             1.0,
             LEGACY_TERMINAL_FONT_LOGICAL_SIZE,
             crate::config::RgbColor { r: 0, g: 0, b: 0 },

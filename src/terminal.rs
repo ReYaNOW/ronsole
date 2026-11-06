@@ -23,6 +23,10 @@ pub(crate) use ronsole_term::{
 /// Scrollback capacity of every Ronsole terminal grid.
 const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 
+/// `(cols, rows)` a tab opens at when its first layout is not known yet;
+/// its first frame resizes the grid and the PTY.
+pub(crate) const DEFAULT_SPAWN_GRID: (u16, u16) = (200, 60);
+
 /// Builds the terminal model with Ronsole's identity and the given palette.
 fn new_term(cols: usize, rows: usize, palette: TermPalette) -> Term {
     Term::new(TermConfig {
@@ -2174,11 +2178,25 @@ impl Terminal {
         terminal
     }
 
+    /// `spawn_sized` at `DEFAULT_SPAWN_GRID`.
+    #[cfg(test)]
     pub(crate) fn spawn(
         wake: Option<crate::wake::WakeHandle>,
         display_number: u64,
         launch: TerminalLaunchSpec,
         palette: TermPalette,
+    ) -> Self {
+        Self::spawn_sized(wake, display_number, launch, palette, DEFAULT_SPAWN_GRID)
+    }
+
+    /// Starts a tab whose grid and PTY open at `(cols, rows)`; the first frame
+    /// resizes both when its layout differs.
+    pub(crate) fn spawn_sized(
+        wake: Option<crate::wake::WakeHandle>,
+        display_number: u64,
+        launch: TerminalLaunchSpec,
+        palette: TermPalette,
+        (cols, rows): (u16, u16),
     ) -> Self {
         let hold = launch.hold;
         let bridge_launch = launch
@@ -2190,7 +2208,11 @@ impl Terminal {
                 display_number,
             ),
         ));
-        let grid = Arc::new(Mutex::new(new_term(200, 60, palette)));
+        let grid = Arc::new(Mutex::new(new_term(
+            usize::from(cols),
+            usize::from(rows),
+            palette,
+        )));
         let bridge_screen_lock = Arc::new(Mutex::new(()));
         let tab_token = crate::terminal_process::TabToken::generate();
         let (reply_tx, reply_rx) = terminal_reply_channel();
@@ -2207,6 +2229,7 @@ impl Terminal {
             },
             launch,
             &tab_token,
+            (cols, rows),
         ) {
             Ok(process) => Some(process),
             Err(error) => {

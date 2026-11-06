@@ -6,7 +6,7 @@ use super::{App, AppLoopControl};
 use crate::config::AppConfig;
 use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
-use crate::runtime::WindowRuntime;
+use crate::runtime::{PreGlResources, WindowRuntime};
 use crate::terminal::Terminal;
 use std::time::Instant;
 
@@ -56,7 +56,16 @@ impl App {
         scale: f32,
         launch: TerminalLaunchSpec,
     ) -> Result<(), HeadlessRunError> {
+        WindowRuntime::check_headless_size(physical.0, physical.1)
+            .map_err(HeadlessRunError::Egl)?;
+        let pre_gl = PreGlResources::new().map_err(|error| {
+            HeadlessRunError::Egl(format!("EGL setup failed at eventfd: {error}"))
+        })?;
+        // The shell starts before EGL; an EGL error below drops the app, which
+        // reaps this tab's session.
+        self.spawn_initial_terminal(&pre_gl, physical, scale, launch);
         let runtime = WindowRuntime::bootstrap_headless(
+            pre_gl,
             physical.0,
             physical.1,
             scale,
@@ -64,7 +73,7 @@ impl App {
             self.config.terminal_background,
         )
         .map_err(HeadlessRunError::Egl)?;
-        self.prepare_bootstrapped_runtime(runtime, launch);
+        self.prepare_bootstrapped_runtime(runtime);
         Ok(())
     }
 
@@ -211,6 +220,7 @@ mod tests {
     use crate::headless::Profile;
     use crate::headless::backend::HeadlessCounters;
     use crate::runtime::WaylandPollOutcome;
+    use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
     fn options_for(root: &std::path::Path) -> AutomationOptions {
@@ -228,7 +238,15 @@ mod tests {
         let profile = Profile::create(Some(root.clone()), std::process::id()).expect("profile");
         let (mut app, _receiver) = App::load_headless(Some(options_for(&root)), &profile.dir, None)
             .expect("headless app");
+        let pre_gl = PreGlResources::new().expect("eventfd");
+        app.spawn_initial_terminal(
+            &pre_gl,
+            (320, 200),
+            1.0,
+            TerminalLaunchSpec::hermetic_shell_for_test(),
+        );
         let mut runtime = WindowRuntime::bootstrap_headless(
+            pre_gl,
             320,
             200,
             1.0,
@@ -237,10 +255,7 @@ mod tests {
         )
         .expect("headless runtime");
         runtime.inject_session_error("resize pbuffer: test".to_string());
-        app.prepare_bootstrapped_runtime(
-            runtime,
-            TerminalLaunchSpec::hermetic_shell_for_test(),
-        );
+        app.prepare_bootstrapped_runtime(runtime);
 
         let step = app.loop_step(None, None).expect("loop step");
         assert!(matches!(step, LoopStep::Exit(Err(_))));
@@ -362,6 +377,161 @@ mod tests {
         assert_eq!(report.flow, LoopFlow::Wait);
         assert!(elapsed >= Duration::from_millis(15), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const EARLY_SPAWN_MARKER: &str = "RONSOLE-EARLY-SPAWN";
+
+    /// Text of every grid row, joined with newlines. The PTY reader fills the
+    /// grid without a frame.
+    fn grid_text(terminal: &Terminal) -> String {
+        let grid = crate::platform::lock_recover(&terminal.grid);
+        let mut text = String::new();
+        for row in 0..grid.total_rows() {
+            if let Some(line) = grid.row(row) {
+                text.extend(line.iter().map(|cell| cell.ch()));
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    /// Polls the grid until `predicate` holds, drawing no frame.
+    fn wait_for_grid_text(
+        terminal: &Terminal,
+        timeout: Duration,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let text = grid_text(terminal);
+            if predicate(&text) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grid never showed the expected text: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// First-tab command: prints `marker`, then the PTY size the child actually
+    /// sees (`stty size` prints rows then cols), then stays alive so the tab is
+    /// not closed before its first frame.
+    fn pty_probe_launch(marker: &str) -> TerminalLaunchSpec {
+        TerminalLaunchSpec {
+            command: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(format!("printf '{marker}\\n'; stty size; exec sleep 60")),
+            ],
+            ..TerminalLaunchSpec::default()
+        }
+    }
+
+    // The first tab is spawned before EGL at the grid its first frame lays out:
+    // the child's PTY has those rows and cols, its marker is in the grid before
+    // any frame, and that frame resizes nothing, at integer and fractional scale
+    // and at an odd window size.
+    #[test]
+    fn first_tab_starts_at_first_frame_grid() {
+        crate::prefer_egl_vendor();
+        for (physical, scale) in [
+            ((1280, 800), 1.0),
+            ((1280, 800), 1.25),
+            ((2560, 1440), 1.32),
+            ((1280, 800), 1.5),
+            ((1280, 800), 2.0),
+            ((1601, 937), 1.32),
+        ] {
+            let root = workspace_root(&format!("early-grid-{}-{}", physical.0, physical.1));
+            let profile = Profile::create(Some(root.clone()), std::process::id()).expect("profile");
+            let (mut app, _receiver) =
+                App::load_headless(None, &profile.dir, None).expect("headless app");
+            app.start_headless(physical, scale, pty_probe_launch(EARLY_SPAWN_MARKER))
+                .expect("headless runtime starts");
+            let size = |app: &App| {
+                let grid = crate::platform::lock_recover(&app.terminals[0].grid);
+                (grid.cols(), grid.rows())
+            };
+            let spawned = size(&app);
+            // `stty size` reports rows first, then cols.
+            let pty_size = format!("{} {}", spawned.1, spawned.0);
+            // No frame has been drawn yet, so this output predates the first frame.
+            wait_for_grid_text(&app.terminals[0], Duration::from_secs(5), |text| {
+                text.contains(EARLY_SPAWN_MARKER)
+                    && text.lines().any(|line| line.trim() == pty_size)
+            });
+            app.forced_step().expect("first frame");
+            assert_eq!(app.panel_layouts.len(), 1, "scale {scale}");
+            let layout = &app.panel_layouts[0];
+            assert_eq!((layout.cols, layout.visible_rows), spawned, "scale {scale}");
+            assert_eq!(
+                size(&app),
+                spawned,
+                "first frame resized the grid at scale {scale}"
+            );
+            assert!(
+                grid_text(&app.terminals[0]).contains(EARLY_SPAWN_MARKER),
+                "the first frame lost the pre-frame marker at scale {scale}"
+            );
+            drop(app);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // The window path spawns the first tab before EGL and runs `on_exiting` when
+    // the EGL bootstrap fails; that teardown must kill and reap the early shell.
+    #[test]
+    fn early_spawn_is_reaped_when_egl_bootstrap_fails() {
+        let root = workspace_root("early-egl-failure");
+        let profile = Profile::create(Some(root.clone()), std::process::id()).expect("profile");
+        let (mut app, _receiver) =
+            App::load_headless(None, &profile.dir, None).expect("headless app");
+        let pid_path = root.join("shell.pid");
+        let launch = TerminalLaunchSpec {
+            command: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(format!("echo $$ > {}; exec sleep 60", pid_path.display())),
+            ],
+            ..TerminalLaunchSpec::default()
+        };
+        let pre_gl = PreGlResources::new().expect("eventfd");
+        app.spawn_initial_terminal(&pre_gl, (640, 400), 1.0, launch);
+        let pid = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the early shell never reported its pid"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "the early shell {pid} is not running"
+        );
+        drop(pre_gl);
+        app.on_exiting();
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "shell {pid} outlived the app exit"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "shell {pid} was not reaped"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
