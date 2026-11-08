@@ -193,6 +193,13 @@ impl TerminalTitleState {
         output.push_str(self.resolved());
         output.push_str(&self.display_suffix);
     }
+
+    /// The resolved title alone, without the terminal display suffix; the tab
+    /// strip appends its own tab number instead.
+    pub(crate) fn write_title(&self, output: &mut String) {
+        output.clear();
+        output.push_str(self.resolved());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

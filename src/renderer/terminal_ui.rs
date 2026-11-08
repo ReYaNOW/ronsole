@@ -2562,7 +2562,7 @@ impl Renderer {
         titles.resize_with(tabs.len(), || String::with_capacity(96));
         for (label, title) in tabs.iter().zip(titles.iter_mut()) {
             match terminals.get(label.title_terminal) {
-                Some(terminal) => terminal.write_display_title(title),
+                Some(terminal) => write_tab_label(terminal, label.number, title),
                 None => title.clear(),
             }
         }
@@ -3674,12 +3674,17 @@ impl Renderer {
         let mut titles = std::mem::take(&mut self.tile_titles);
         titles.resize_with(panels.len(), TileTitleCache::default);
         let mut scratch = std::mem::take(&mut self.tile_title_scratch);
+        // Whether the focused panel is a grid tile, which draws its own frame.
+        let mut active_is_tile = false;
         for (index, panel) in panels.iter().enumerate() {
             let Some(terminal) = terminals.get(panel.terminal) else {
                 panel_layouts.push(TerminalUiLayout::default());
                 continue;
             };
             let is_active = panel.terminal == active_terminal;
+            if is_active {
+                active_is_tile = panel.header.is_some();
+            }
             if let Some(header) = panel.header {
                 let pad = (TILE_TITLE_PAD * s).round();
                 let text_w = (header.w - 2.0 * pad).max(0.0);
@@ -3750,7 +3755,7 @@ impl Renderer {
         }
         self.tile_titles = titles;
         self.tile_title_scratch = scratch;
-        if split_tab
+        if split_focus_border_visible(split_tab, active_is_tile)
             && let Some(inner) = pane_focus_border(active_layout.body, s)
         {
             let body = active_layout.body;
@@ -4150,10 +4155,46 @@ impl Renderer {
     }
 }
 
+/// Writes one tab-strip label: the title of the tab's active pane without the
+/// terminal's own display suffix, followed by the tab's number. A title that
+/// already ends with a number keeps it.
+pub(crate) fn write_tab_label(terminal: &Terminal, number: usize, out: &mut String) {
+    use std::fmt::Write as _;
+    terminal.write_title(out);
+    let _ = write!(out, " ({number})");
+}
+
+/// The pane focus border belongs to the split panes of a tab; a grid tile draws
+/// its own frame through the panel header.
+pub(crate) fn split_focus_border_visible(split_tab: bool, active_is_tile: bool) -> bool {
+    split_tab && !active_is_tile
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ronsole_term::{TermConfig, TermIdentity, UnderlineStyle};
+
+    #[test]
+    fn tab_label_uses_tab_number_not_terminal_number() {
+        // The terminal's own display suffix is ` (7)`; the strip shows tab 1.
+        let terminal = Terminal::new_for_test(80, 24, 7, crate::split::PaneId::new(1));
+        let mut label = String::new();
+        write_tab_label(&terminal, 1, &mut label);
+        assert_eq!(label, "terminal (1)");
+
+        // A title that already ends with its own number keeps it.
+        terminal.set_programmed_title_for_test("build (2)".to_string());
+        write_tab_label(&terminal, 1, &mut label);
+        assert_eq!(label, "build (2) (1)");
+    }
+
+    #[test]
+    fn split_focus_border_hidden_for_grid_tile() {
+        assert!(!split_focus_border_visible(true, true));
+        assert!(split_focus_border_visible(true, false));
+        assert!(!split_focus_border_visible(false, false));
+    }
 
     #[test]
     fn terminal_cell_face_from_flags_selects_bundled_face() {

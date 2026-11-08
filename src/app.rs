@@ -3592,10 +3592,15 @@ impl App {
             }
         }
         // Panels other than the active terminal. Their layouts come from the last
-        // render, and a stale one is trusted only in the current grid generation:
-        // after a membership change the same index names another tile. Split
-        // panes need the same animation step outside grid mode.
-        let layouts_current = self.panel_layouts_grid_generation == self.grid_generation;
+        // render, and a stale one is trusted only in the current generation: after
+        // a membership change the same index names another terminal. Grid input
+        // matches tile geometry, so grid mode tracks its own generation; split
+        // panes outside it are invalidated by every layout change.
+        let layouts_current = if self.grid_open() {
+            self.panel_layouts_grid_generation == self.grid_generation
+        } else {
+            self.panel_layouts_generation == self.layout_generation
+        };
         for (index, panel) in self.panels.iter().enumerate() {
             if panel.terminal == active {
                 continue;
@@ -6771,6 +6776,57 @@ mod tests {
         // cleanup can refuse the close.
         app.terminals.remove(0);
         app.active_terminal = 0;
+
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[1].scroll_y.target, 20.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inactive_pane_scroll_ignores_stale_layout_after_close() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "split-inactive-stale-layout",
+                2,
+            );
+        // Tab 0 holds two panes; tab 1 holds one terminal at terminal index 2.
+        let first_pane = app.terminals[0].pane_id();
+        let second_pane = app.terminals[1].pane_id();
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(first_pane)),
+            second: Box::new(SplitNode::Leaf(second_pane)),
+        };
+        app.tabs[0].active_pane = second_pane;
+        app.tabs.remove(1);
+        let other_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(3, other_pane));
+        app.active_tab = 0;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        app.set_grid_metrics(GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        feed_batch(&app.terminals[2], &"history line\r\n".repeat(200));
+        // The frame records layouts for both panes of tab 0.
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+
+        app.terminals[2].scroll_y.target = 20.0;
+        app.terminals[2].scroll_y.current = 20.0;
+        // A stale layout whose body swallows every scrollable line: trusting it
+        // would clamp the terminal that now sits at its index.
+        app.panel_layouts[1].body.h = 1_000_000.0;
+
+        // Closing pane 0 shifts the other tab's terminal from index 2 to 1.
+        assert!(!app.close_pane(first_pane));
+        assert!(app.layout_generation > app.panel_layouts_generation);
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.terminals[1].pane_id(), other_pane);
 
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert_eq!(app.terminals[1].scroll_y.target, 20.0);

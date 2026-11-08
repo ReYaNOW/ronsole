@@ -2720,6 +2720,16 @@ impl Terminal {
         crate::platform::lock_recover(&self.title_cache).write_resolved(output);
     }
 
+    /// The resolved title without this terminal's display number suffix.
+    pub(crate) fn write_title(&self, output: &mut String) {
+        crate::platform::lock_recover(&self.title_cache).write_title(output);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_programmed_title_for_test(&self, text: String) {
+        crate::platform::lock_recover(&self.title_cache).set_programmed(text);
+    }
+
     /// Whether this tab's foreground process group leader is a `claude` process.
     pub(crate) fn claude_foreground(&self) -> bool {
         crate::platform::lock_recover(&self.title_cache).claude_foreground()
