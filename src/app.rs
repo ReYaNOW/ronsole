@@ -1889,10 +1889,6 @@ impl App {
     /// the terminal storage and the focus untouched. Returns true when the
     /// window must close.
     fn close_pane(&mut self, pane: PaneId) -> bool {
-        // The drag node may be the leaf being closed: restore before the tree moves.
-        // The removed terminal shifts the indices the pointer owner holds.
-        self.cancel_divider_drag();
-        self.reset_split_pointer_owner();
         let Some(index) = self.terminal_index_of_pane(pane) else {
             return false;
         };
@@ -1917,6 +1913,13 @@ impl App {
                 return false;
             }
         }
+        // The cleanup is accepted (or no process needs it): the terminal really
+        // leaves storage. Only now end the live pointer gesture, because a
+        // refused cleanup keeps both the pane and its owner.
+        // The drag node may be the leaf being closed: restore before the tree moves.
+        // The removed terminal shifts the indices the pointer owner holds.
+        self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         let tree_successor = if last_pane_of_tab {
             self.remove_last_pane_of_tab(tab);
             None
@@ -1942,10 +1945,6 @@ impl App {
     /// second dialog. A refused cleanup stops the close; the panes removed so far
     /// stay removed. Returns true when the window must close.
     fn close_tab(&mut self, tab: TabId) -> bool {
-        // The drag node may be removed with the tab: restore before the tree moves.
-        // The removed terminals shift the indices the pointer owner holds.
-        self.cancel_divider_drag();
-        self.reset_split_pointer_owner();
         let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
             return false;
         };
@@ -1976,6 +1975,13 @@ impl App {
                     break;
                 }
             }
+            // The hand-off is accepted: this pane really leaves storage. End
+            // the live pointer gesture only now; a refused cleanup leaves the
+            // pane alive and its owner untouched.
+            // The drag node may be removed with the tab: restore before the
+            // tree moves, and before the removed terminal shifts its index.
+            self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
             if last_pane_of_tab {
                 self.remove_last_pane_of_tab(tab);
                 break;
@@ -2989,8 +2995,9 @@ impl App {
             }
             if self.terminals[index].is_closed() {
                 // A removal shifts the indices the split pointer owner holds;
-                // `close_pane` resets the owner before it does. An idle pass
-                // must leave the pressed pointer with its owner.
+                // `close_pane` resets the owner only right before it removes
+                // the terminal. An idle pass must leave the pressed pointer
+                // with its owner.
                 let pane = self.terminals[index].pane_id();
                 if self.close_pane(pane) {
                     return true;
@@ -3721,8 +3728,14 @@ impl App {
             return false;
         }
         // A press that never reached the terminal (grid header, gap, stale
-        // generation) owns its release, even when that mode has ended since.
+        // generation, protocol area) owns its release, even when that mode has
+        // ended since. The button is physically up again, so its held flag
+        // must clear even though no event reaches the terminal.
         if state == KeyState::Released && self.take_suppressed_release(button) {
+            self.interaction.cancel_pointer_press(button);
+            if !self.interaction.mouse_buttons_pressed() {
+                self.split_pointer_owner = None;
+            }
             return false;
         }
         if self.close_confirm.is_some() {
@@ -3825,16 +3838,16 @@ impl App {
             return false;
         }
         let active = self.active_terminal;
-        // A press claims the split pointer only when it is the first of the
-        // gesture and the terminal actually receives it as mouse input: a
-        // press swallowed by a protocol area (search, scrollbar, link) claims
-        // nothing and needs no paired release.
+        // A press claims the split pointer when it is the first one the
+        // terminal actually receives as mouse input: a press swallowed by a
+        // protocol area (search, scrollbar, link) claims nothing and needs no
+        // paired release. Bits of other buttons, including ones the terminal
+        // never received, must not block the claim.
         let claims_split_pointer = !self.grid_open()
             && self.active_tab_split()
             && !split_pointer_owned
             && state == KeyState::Pressed
-            && self.interaction.pointer_capture == crate::input::PointerCapture::None
-            && !self.interaction.mouse_buttons_pressed();
+            && self.interaction.pointer_capture == crate::input::PointerCapture::None;
         // A split-pane press keeps its release: the terminal that received the
         // press gets it with its own layout, even when the pointer has left its
         // body. A live capture stays with the active terminal. Presses that
@@ -3852,6 +3865,7 @@ impl App {
         let saved_layout = self.interaction.layout;
         self.interaction.layout = target_layout;
         let mut press_delivered = false;
+        let mut press_rejected = false;
         if let (Some(runtime), Some(terminal)) =
             (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
@@ -3866,12 +3880,18 @@ impl App {
                 split_owner.is_some(),
             );
             press_delivered = outcome.delivered();
+            press_rejected = outcome.rejected();
             if outcome.handled() {
                 self.sync_animation_state();
                 self.request_frame();
             }
         }
         self.interaction.layout = saved_layout;
+        if press_rejected {
+            // The terminal application never saw the press: its release must
+            // not reach the application as an unpaired report.
+            self.suppress_release(button);
+        }
         if claims_split_pointer && press_delivered {
             self.split_pointer_owner = Some(target_terminal);
         }
@@ -10456,6 +10476,158 @@ mod tests {
         app.on_pointer_button(KeyState::Released, PointerButton::Right);
         assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_survives_refused_close_cleanup() {
+        let (mut app, root) = split_pointer_app("t7-owner-refused-close");
+        // Only a live process hand-off can be refused, so the closing pane is
+        // replaced by a spawned shell while the gesture stays in the test pane.
+        let other_pane = app.terminals[1].pane_id();
+        app.terminals[1] = test_shell(2, other_pane);
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // A stopped worker refuses every cleanup request: the pane stays, so
+        // the live gesture must stay with its owner and keep receiving.
+        app.terminal_cleanup.shutdown_and_join();
+        assert!(!app.close_pane(other_pane));
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let motion_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(motion_len > pressed_len);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > motion_len);
+        assert!(app.split_pointer_owner.is_none());
+
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_assigned_after_rejected_press_of_other_button() {
+        let (mut app, root) = split_pointer_app("t7-owner-other-button");
+        // Any-motion reporting makes a delivered motion visible in the bytes.
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[1]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before = app.terminals[1].input_bytes_for_test().len();
+        // The rejected right press leaves its held bit set; the next delivered
+        // press still claims the owner for the pane that received it.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), before);
+
+        let body = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, body.0, body.1);
+        let moved_len = app.terminals[1].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.split_pointer_owner, Some(1));
+        assert!(app.terminals[1].input_bytes_for_test().len() > moved_len);
+
+        // Motion and release in the neighbour pane stay with the claimed pane.
+        let pressed_len = app.terminals[1].input_bytes_for_test().len();
+        let neighbour = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, neighbour.0, neighbour.1);
+        assert!(app.terminals[1].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        let motion_len = app.terminals[1].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().len() > motion_len);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        // The retained right press still holds the owner after the left release.
+        assert_eq!(app.split_pointer_owner, Some(1));
+        let release_len = app.terminals[1].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), release_len);
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.interaction.pressed_mouse_buttons(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_of_rejected_press_never_reaches_terminal() {
+        let (mut app, root) = split_pointer_app("t7-rejected-release");
+        // Press reporting draws the scrollbar and makes every report visible.
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
+
+        // Moving into the body must not turn the withheld press into a lone
+        // release report.
+        let body = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, body.0, body.1);
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
+
+        // The next ordinary right click in the body reaches the terminal whole.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > before);
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejected_press_mark_clears_on_next_press() {
+        let (mut app, root) = split_pointer_app("t7-rejected-mark-clears");
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.suppressed_release.contains(&PointerButton::Right));
+
+        // A new press of the same button clears the stale mark, so its own
+        // press and release both reach the terminal.
+        let body = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, body.0, body.1);
+        let before = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.suppressed_release.is_empty());
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > before);
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

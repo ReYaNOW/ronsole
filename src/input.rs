@@ -151,15 +151,23 @@ pub(crate) enum MouseInputOutcome {
     Consumed,
     /// A mouse-reporting sequence was written to the terminal application.
     Delivered,
+    /// A press the application can report was withheld by one of the pane's
+    /// protocol areas. The application never saw the press, so its release must
+    /// not reach the application alone.
+    Rejected,
 }
 
 impl MouseInputOutcome {
     pub(crate) fn handled(self) -> bool {
-        self != Self::Ignored
+        matches!(self, Self::Consumed | Self::Delivered)
     }
 
     pub(crate) fn delivered(self) -> bool {
         self == Self::Delivered
+    }
+
+    pub(crate) fn rejected(self) -> bool {
+        self == Self::Rejected
     }
 }
 
@@ -284,6 +292,13 @@ impl TerminalInteraction {
     pub(crate) fn cancel_pointer_interaction(&mut self, terminal: &mut Terminal) {
         self.finish_terminal_selection(terminal);
         self.cancel_pointer_interaction_state(&mut terminal.scroll_y);
+    }
+
+    /// Clears the held flag of `button` without forwarding a release: the
+    /// terminal application must not see a release whose press it never saw,
+    /// yet the button is physically up again for motion reporting.
+    pub(crate) fn cancel_pointer_press(&mut self, button: PointerButton) {
+        update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, KeyState::Released);
     }
 
     /// Whether any pointer button is still held for terminal mouse reporting.
@@ -1062,6 +1077,16 @@ impl TerminalInteraction {
         {
             self.begin_terminal_selection_at(terminal, pos, click_count);
             return MouseInputOutcome::Consumed;
+        }
+        // The press is inside the body but over a protocol area of this pane:
+        // mouse tracking would report it, except that the area owns the event.
+        // The release of such a press must never reach the application alone.
+        if !claimed
+            && state == KeyState::Pressed
+            && tracking
+            && !terminal_protocol_pointer_target(self.layout, x, y)
+        {
+            return MouseInputOutcome::Rejected;
         }
         MouseInputOutcome::Ignored
     }
