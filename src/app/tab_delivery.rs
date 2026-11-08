@@ -110,8 +110,8 @@ impl App {
     }
 
     /// Read-only `TAB_STATUS_REQUEST` answer. `focused` is the focus of the
-    /// application window; `active` means the tab is on screen: the presented
-    /// active tab, or a tile while grid mode is open.
+    /// application window; `active` means the addressed panel is on screen: a
+    /// pane of the presented active tab, or a tile while grid mode is open.
     pub(super) fn handle_tab_status(&mut self, envelope: TabStatusEnvelope) {
         if envelope.peer.uid != effective_uid() {
             let _ = envelope.reply.send(TabStatusReply::PeerRejected);
@@ -507,10 +507,14 @@ mod tests {
     use std::io::Read;
     use crate::launch::TerminalLaunchSpec;
     use crate::app::AppLoopControl;
-    use crate::app::headless_run::test_support::{insert_test_terminal, push_test_terminal};
+    use crate::app::headless_run::test_support::{
+        attach_test_pane, insert_test_terminal, push_test_terminal,
+        started_headless_with_test_terminals,
+    };
+    use crate::split::{SplitAxis, split_leaf_at};
     use std::cell::Cell;
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, channel};
     use std::time::SystemTime;
 
@@ -549,6 +553,41 @@ mod tests {
         LEADER_STARTTIME.with(|cell| cell.set(starttime));
     }
 
+    /// Command for a fixture pane: clears the screen, prints `screen` and
+    /// `__READY__`, then copies PTY input into `out` in its working directory.
+    fn screen_script(screen: &str) -> Vec<OsString> {
+        let script = "stty raw -echo; i=0; while [ $i -lt 80 ]; do printf '\\r\\n'; \
+                      i=$((i+1)); done; printf '%s' \"$1\"; printf __READY__; \
+                      exec cat > out";
+        vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(script),
+            OsString::from("sh"),
+            OsString::from(screen),
+        ]
+    }
+
+    /// Waits until the pane printed `__READY__` and started copying input.
+    fn wait_screen_ready(terminal: &Terminal, out: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let ready = {
+                let grid = crate::platform::lock_recover(&terminal.grid);
+                (0..grid.rows())
+                    .filter_map(|y| grid.visible_row(y))
+                    .flat_map(|line| line.iter().map(|cell| cell.ch()))
+                    .collect::<String>()
+                    .contains("__READY__")
+            };
+            if ready && out.exists() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "PTY fixture did not become ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     struct Fixture {
         app: App,
         root: PathBuf,
@@ -568,20 +607,11 @@ mod tests {
                 std::process::id()
             ));
             std::fs::create_dir_all(&root).unwrap();
-            let script = "stty raw -echo; i=0; while [ $i -lt 80 ]; do printf '\\r\\n'; \
-                          i=$((i+1)); done; printf '%s' \"$1\"; printf __READY__; \
-                          exec cat > out";
             let launch = TerminalLaunchSpec {
                 shell: None,
                 working_directory: Some(root.clone()),
                 inherited_directory: None,
-                command: vec![
-                    OsString::from("/bin/sh"),
-                    OsString::from("-c"),
-                    OsString::from(script),
-                    OsString::from("sh"),
-                    OsString::from(screen),
-                ],
+                command: screen_script(screen),
                 hold: false,
                 bridge_launch_id: None,
             };
@@ -595,22 +625,7 @@ mod tests {
                 pane,
             );
             let token = terminal.tab_token().to_owned();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                let ready = {
-                    let grid = crate::platform::lock_recover(&terminal.grid);
-                    (0..grid.rows())
-                        .filter_map(|y| grid.visible_row(y))
-                        .flat_map(|line| line.iter().map(|cell| cell.ch()))
-                        .collect::<String>()
-                        .contains("__READY__")
-                };
-                if ready && root.join("out").exists() {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "PTY fixture did not become ready");
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            wait_screen_ready(&terminal, &root.join("out"));
             set_leader(Some(100));
             ORIGIN_OK.with(|cell| cell.set(true));
             CLAUDE_PROCESS.with(|cell| cell.set(None));
@@ -683,18 +698,60 @@ mod tests {
         }
 
         fn wait_out(&self, expected: &[u8]) {
+            self.wait_out_at(&self.root.join("out"), expected);
+        }
+
+        fn wait_out_at(&self, path: &Path, expected: &[u8]) {
             let deadline = Instant::now() + Duration::from_secs(3);
-            while self.out() != expected {
+            while std::fs::read(path).unwrap_or_default() != expected {
                 assert!(
                     Instant::now() < deadline,
-                    "PTY got {:?}, expected {:?}",
-                    String::from_utf8_lossy(&self.out()),
+                    "{path:?} got {:?}, expected {:?}",
+                    String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()),
                     String::from_utf8_lossy(expected)
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
             std::thread::sleep(Duration::from_millis(40));
-            assert_eq!(self.out(), expected, "extra bytes reached the PTY");
+            assert_eq!(
+                std::fs::read(path).unwrap_or_default(),
+                expected,
+                "extra bytes reached the PTY"
+            );
+        }
+
+        /// Spawns another PTY pane with the fixture screen and splits it into
+        /// tab 0. Returns its token and the file its process writes input to.
+        fn spawn_pane(&mut self, number: u64, screen: &str) -> (String, PathBuf) {
+            let dir = self.root.join(format!("pane-{number}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let launch = TerminalLaunchSpec {
+                shell: None,
+                working_directory: Some(dir.clone()),
+                inherited_directory: None,
+                command: screen_script(screen),
+                hold: false,
+                bridge_launch_id: None,
+            };
+            let pane = self.app.issue_pane_id();
+            let terminal = Terminal::spawn(
+                None,
+                number,
+                launch,
+                crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+                pane,
+            );
+            let token = terminal.tab_token().to_owned();
+            let out = dir.join("out");
+            wait_screen_ready(&terminal, &out);
+            let active_pane = self.app.tabs[0].active_pane;
+            assert!(
+                split_leaf_at(&mut self.app.tabs[0].layout, active_pane, SplitAxis::SideBySide, pane),
+                "tab 0 does not own its active pane"
+            );
+            self.app.terminals.push(terminal);
+            self.app.bump_layout_generation();
+            (token, out)
         }
 
         fn held(&self) -> bool {
@@ -1126,8 +1183,12 @@ mod tests {
     }
 
     fn tab_status_call(fx: &mut Fixture, token: &str, uid: u32) -> TabStatusReply {
+        tab_status_call_app(&mut fx.app, token, uid)
+    }
+
+    fn tab_status_call_app(app: &mut App, token: &str, uid: u32) -> TabStatusReply {
         let (reply, response) = channel();
-        fx.app.handle_tab_status(TabStatusEnvelope {
+        app.handle_tab_status(TabStatusEnvelope {
             token: token.to_owned(),
             peer: PeerCred { uid, pid: 4242 },
             reply,
@@ -1171,10 +1232,10 @@ mod tests {
         assert_eq!(tab_status_call(&mut fx, &token, uid), status(false, true));
         // Presented, but the addressed tab is not the active one.
         fx.app.focused = true;
-        fx.app.active_terminal = 1;
+        fx.app.activate_ready_terminal(1, false);
         assert_eq!(tab_status_call(&mut fx, &token, uid), status(true, false));
         // Active index without presentation is not active.
-        fx.app.active_terminal = 0;
+        fx.app.activate_ready_terminal(0, false);
         fx.app.active_terminal_presented = false;
         assert_eq!(tab_status_call(&mut fx, &token, uid), status(true, false));
     }
@@ -1300,5 +1361,184 @@ mod tests {
         assert_eq!(app.tab_waiters.len(), TAB_WAIT_LIMIT);
         let mut byte = [0];
         assert_eq!(clients[0].read(&mut byte).unwrap(), 0);
+    }
+
+    /// A split tab is one screen: every pane of the presented active tab is an
+    /// active target, while a pane of another tab is not.
+    #[test]
+    fn two_panes_same_tab_both_report_active_when_tab_presented() {
+        let mut app = App::new();
+        let first_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 1, first_pane));
+        let second_pane = attach_test_pane(&mut app, 0, 2);
+        let other_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 3, other_pane));
+        let tokens: Vec<String> = app
+            .terminals
+            .iter()
+            .map(|terminal| terminal.tab_token().to_owned())
+            .collect();
+        let uid = effective_uid();
+        let status =
+            |focused: bool, active: bool| TabStatusReply::Status(TabStatus { focused, active });
+
+        app.focused = true;
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        assert_eq!(tab_status_call_app(&mut app, &tokens[0], uid), status(true, true));
+        assert_eq!(tab_status_call_app(&mut app, &tokens[1], uid), status(true, true));
+        assert_eq!(tab_status_call_app(&mut app, &tokens[2], uid), status(true, false));
+
+        // The second pane is on screen whether or not it owns the keyboard focus.
+        app.activate_ready_terminal(1, false);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.tabs[0].active_pane, second_pane);
+        assert_eq!(tab_status_call_app(&mut app, &tokens[0], uid), status(true, true));
+        assert_eq!(tab_status_call_app(&mut app, &tokens[1], uid), status(true, true));
+
+        // Window focus does not change which panes are on screen.
+        app.focused = false;
+        assert_eq!(tab_status_call_app(&mut app, &tokens[1], uid), status(false, true));
+        app.focused = true;
+        app.active_terminal_presented = false;
+        assert_eq!(tab_status_call_app(&mut app, &tokens[0], uid), status(true, false));
+        assert_eq!(tab_status_call_app(&mut app, &tokens[1], uid), status(true, false));
+    }
+
+    #[test]
+    fn tab_input_goes_to_its_own_pane_by_token() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        let first_out = fx.root.join("out");
+        let first_token = fx.token.clone();
+        let (second_token, second_out) = fx.spawn_pane(2, EMPTY_BOX);
+
+        let first_reply = fx.send(&first_token, TabInputKind::Line, OP_A, "/effort first-marker", 0);
+        let second_reply = fx.send(&second_token, TabInputKind::Line, OP_B, "/effort second-marker", 0);
+        fx.advance(100);
+        fx.advance(250);
+        assert_eq!(first_reply.try_recv(), Ok(TabInputCode::InputDelivered));
+        assert_eq!(second_reply.try_recv(), Ok(TabInputCode::InputDelivered));
+        fx.wait_out_at(&first_out, b"/effort first-marker\r");
+        fx.wait_out_at(&second_out, b"/effort second-marker\r");
+        fx.advance(350);
+    }
+
+    #[test]
+    fn clear_input_reaches_pane_of_its_own_session() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        let (second_token, second_out) = fx.spawn_pane(2, EMPTY_BOX);
+
+        let reply = fx.send(&second_token, TabInputKind::Clear, OP_B, "/clear", 0);
+        fx.advance(100);
+        assert!(fx.app.terminals[1].input_hold_active());
+        assert!(!fx.app.terminals[0].input_hold_active());
+        fx.advance(250);
+        assert_eq!(reply.try_recv(), Ok(TabInputCode::InputDelivered));
+        fx.wait_out_at(&second_out, b"/clear\r");
+        assert!(fx.out().is_empty(), "the first pane must see no /clear");
+        fx.advance(350);
+        assert!(!fx.app.terminals[1].input_hold_active());
+        assert_eq!(
+            fx.app.tab_input.records[0]
+                .clear_op
+                .as_ref()
+                .map(|clear| clear.op),
+            Some(OP_B)
+        );
+    }
+
+    #[test]
+    fn token_addressing_survives_tab_drag_and_other_tab_close() {
+        let mut fx = Fixture::new(EMPTY_BOX);
+        let first_out = fx.root.join("out");
+        let (second_token, second_out) = fx.spawn_pane(2, EMPTY_BOX);
+        // A third tab before the split tab: closing it shifts terminal indices.
+        let third_pane = fx.app.issue_pane_id();
+        insert_test_terminal(&mut fx.app, 0, Terminal::new_for_test(80, 8, 3, third_pane));
+        let first_pane = fx.app.terminals[1].pane_id();
+        fx.app.tabs[0].active_pane = first_pane;
+        fx.app.active_tab = 0;
+        fx.app.active_terminal = 1;
+        fx.app.active_terminal_presented = true;
+        assert_eq!(fx.app.find_tab_by_token(&second_token), Some(2));
+
+        // Drag the two-pane tab past the third tab, then close the third tab.
+        fx.app.reorder_terminal_tab(0, 1);
+        assert_eq!(fx.app.active_tab, 1);
+        assert!(!fx.app.close_terminal_tab_at(0));
+        assert_eq!(fx.app.active_tab, 0);
+        assert_eq!(fx.app.find_tab_by_token(&second_token), Some(1));
+        assert_eq!(fx.app.find_tab_by_token(&fx.token), Some(0));
+
+        let uid = effective_uid();
+        let status = TabStatusReply::Status(TabStatus {
+            focused: true,
+            active: true,
+        });
+        assert_eq!(tab_status_call(&mut fx, &second_token, uid), status);
+
+        // The shifted token still routes input into its own pane.
+        let reply = fx.send(&second_token, TabInputKind::Line, OP_B, "/effort after-drag", 0);
+        fx.advance(100);
+        fx.advance(250);
+        assert_eq!(reply.try_recv(), Ok(TabInputCode::InputDelivered));
+        fx.wait_out_at(&second_out, b"/effort after-drag\r");
+        assert!(std::fs::read(&first_out).unwrap_or_default().is_empty());
+        fx.advance(350);
+    }
+
+    #[test]
+    fn tab_wait_resolves_when_pane_visible_and_reports_gone_after_close() {
+        let mut app = App::new();
+        let first_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 1, first_pane));
+        let second_pane = attach_test_pane(&mut app, 0, 2);
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        let second_token = app.terminals[1].tab_token().to_owned();
+        let uid = effective_uid();
+
+        // The second pane is on screen even though the first owns the focus.
+        let mut visible = tab_wait_call(&mut app, &second_token, uid);
+        assert_eq!(read_tab_wait_status(&mut visible), 0);
+        assert!(app.tab_waiters.is_empty());
+
+        assert!(!app.close_pane(second_pane));
+        let mut gone = tab_wait_call(&mut app, &second_token, uid);
+        assert_eq!(read_tab_wait_status(&mut gone), 1);
+        assert!(app.tab_waiters.is_empty());
+    }
+
+    /// A tab with one Claude pane and one shell pane gives the grid one tile;
+    /// leaving the grid restores the tab's split.
+    #[test]
+    fn mixed_tab_gives_one_tile_and_exit_restores_split() {
+        let (mut app, _receiver, _profile, root) =
+            started_headless_with_test_terminals("t9-mixed-tab", 1);
+        let shell_pane = attach_test_pane(&mut app, 0, 2);
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(false);
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        assert_eq!(app.on_frame(), Ok(true));
+        assert_eq!(app.panels.len(), 2);
+
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.grid_tile_count(), 1);
+        assert_eq!(
+            app.claude_grid.as_ref().map(|grid| grid.members.clone()),
+            Some(vec![0])
+        );
+        assert_eq!(app.on_frame(), Ok(true));
+        assert_eq!(app.panels.len(), 1);
+        assert_eq!(app.panels[0].terminal, 0);
+
+        app.toggle_claude_grid(Instant::now());
+        assert!(!app.grid_open());
+        assert_eq!(app.tabs.len(), 1);
+        assert!(crate::app::split_contains_pane(&app.tabs[0].layout, shell_pane));
+        assert_eq!(app.on_frame(), Ok(true));
+        assert_eq!(app.panels.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

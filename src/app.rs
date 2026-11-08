@@ -3276,14 +3276,18 @@ impl App {
             .is_some_and(|grid| grid.members.contains(&index))
     }
 
-    /// Whether the tab at `index` is on screen: a tile while grid mode is open,
-    /// otherwise the presented active tab.
+    /// Whether the panel of the terminal at `index` is on screen: a tile while
+    /// grid mode is open, otherwise any pane of the presented active tab. A pane
+    /// without the keyboard focus is still visible, so `tab-status` reports it
+    /// active (§9).
     fn tab_visible(&self, index: usize) -> bool {
         if self.claude_grid.is_some() {
-            self.grid_contains(index)
-        } else {
-            index == self.active_terminal && self.active_terminal_presented
+            return self.grid_contains(index);
         }
+        self.active_terminal_presented
+            && self.terminals.get(index).is_some_and(|terminal| {
+                self.tab_index_of_pane(terminal.pane_id()) == Some(self.active_tab)
+            })
     }
 
     /// Tile that takes focus after `removed` terminals disappear: the next grid
@@ -4111,7 +4115,9 @@ impl App {
             return;
         }
         self.cancel_terminal_presentation_intents();
-        self.activate_ready_terminal(terminal, false);
+        if let Some(pane) = self.terminals.get(terminal).map(Terminal::pane_id) {
+            self.activate_pane(pane, false);
+        }
         if let Some(layout) = self.panel_layouts.get(index) {
             self.interaction.layout = *layout;
         }
