@@ -968,11 +968,22 @@ impl App {
             self.terminals.len(),
             "split leaves and terminals disagree"
         );
-        for terminal in &self.terminals {
+        for (position, terminal) in self.terminals.iter().enumerate() {
+            let pane = terminal.pane_id();
+            // Two terminals with one pane id would each claim the same leaf, so
+            // the per-terminal count below cannot see a leaf that no terminal
+            // owns. Reject duplicates before comparing the two multisets.
+            assert!(
+                self.terminals[position + 1..]
+                    .iter()
+                    .all(|other| other.pane_id() != pane),
+                "two terminals share pane id {}",
+                pane.raw()
+            );
             let owned: usize = self
                 .tabs
                 .iter()
-                .map(|tab| split_leaf_count(&tab.layout, Some(terminal.pane_id())))
+                .map(|tab| split_leaf_count(&tab.layout, Some(pane)))
                 .sum();
             assert_eq!(owned, 1, "a terminal must own exactly one split leaf");
         }
@@ -1338,6 +1349,14 @@ impl App {
             self.active_terminal_presented = false;
         }
         let mut removed = self.terminals.remove(index);
+        // The closed terminal takes its tab with it: a tab whose pane is gone
+        // would stay in the strip as a phantom entry. The removed tab shifts
+        // the indices the active tab and an open dialog point at.
+        if let Some(tab_index) = self.tab_index_of_pane(removed.pane_id()) {
+            self.tabs.remove(tab_index);
+            self.active_tab =
+                active_index_after_remove(self.active_tab, tab_index, self.tabs.len());
+        }
         // Removing a tab shifts the indices a `CloseTarget::Tab` points at, so an open
         // dialog no longer names the tab it was opened for. Cancel it instead.
         self.cancel_close_dialog();
@@ -6425,6 +6444,88 @@ mod tests {
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
         assert!(app.terminals[2].input_bytes_for_test().is_empty());
+        app.debug_assert_invariants();
+    }
+
+    /// Closing the active terminal drops its tab too, so the strip stays in
+    /// step with `terminals` and the successor is still activatable.
+    #[test]
+    fn close_active_terminal_keeps_tabs_in_sync() {
+        let mut app = App::new();
+        for number in 1..=3 {
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, number, pane));
+        }
+        app.active_terminal = 1;
+        app.active_tab = 1;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_terminal_tab_at(1));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.tabs.len(), app.terminals.len());
+        app.debug_assert_invariants();
+        app.activate_ready_terminal(1, false);
+        assert_eq!(app.active_terminal, 1);
+        app.debug_assert_invariants();
+    }
+
+    /// Closing a background terminal removes only its own tab; the active
+    /// terminal and tab follow the index shift.
+    #[test]
+    fn close_background_terminal_keeps_tabs_in_sync() {
+        let mut app = App::new();
+        for number in 1..=3 {
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, number, pane));
+        }
+        app.active_terminal = 2;
+        app.active_tab = 2;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_terminal_tab_at(0));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.tabs.len(), app.terminals.len());
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    /// The last terminal takes the last tab with it: nothing is left to draw.
+    #[test]
+    fn closing_only_terminal_clears_tabs() {
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        app.active_terminal = 0;
+        app.active_tab = 0;
+        app.active_terminal_presented = true;
+
+        assert!(app.close_terminal_tab_at(0));
+
+        assert!(app.terminals.is_empty());
+        assert!(app.tabs.is_empty());
+        app.debug_assert_invariants();
+    }
+
+    /// Two terminals with one pane id pass the leaf count; the strip keeps a
+    /// second, distinct leaf, so the per-terminal counts still say one leaf
+    /// each. Only the duplicate-id check can see the split.
+    #[test]
+    #[should_panic(expected = "two terminals share pane id")]
+    fn debug_assert_invariants_rejects_duplicate_pane_ids() {
+        let mut app = App::new();
+        let shared = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, shared));
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, shared));
+        let unowned = app.issue_pane_id();
+        app.tabs[1].layout = SplitNode::Leaf(unowned);
+        app.tabs[1].active_pane = unowned;
+        app.active_terminal = 0;
+        app.active_tab = 0;
+
         app.debug_assert_invariants();
     }
 
