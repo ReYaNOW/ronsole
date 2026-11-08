@@ -26,8 +26,9 @@ use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
 use crate::split::{
-    PaneId, SplitAxis, SplitNode, divider_at, layout_panes, leaf_count, min_extent, node_at_path,
-    node_at_path_mut, pane_min, remove_leaf, split_child_rects, split_leaf_at, successor,
+    PaneDirection, PaneId, SplitAxis, SplitNode, divider_at, layout_panes, leaf_count, min_extent,
+    node_at_path, node_at_path_mut, pane_in_direction, pane_min, remove_leaf, split_child_rects,
+    split_leaf_at, successor,
 };
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
@@ -88,6 +89,8 @@ enum GlobalShortcut {
     ToggleClaudeGrid,
     SplitRight,
     SplitDown,
+    FocusPane(PaneDirection),
+    ClosePane,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -145,6 +148,15 @@ fn exact_global_modifiers(modifiers: Modifiers, shift: bool) -> bool {
         && !modifiers.super_key()
 }
 
+/// Alt without Ctrl, Shift and Super: the modifier set of the pane focus keys.
+#[inline]
+fn exact_alt_modifiers(modifiers: Modifiers) -> bool {
+    modifiers.alt_key()
+        && !modifiers.control_key()
+        && !modifiers.shift_key()
+        && !modifiers.super_key()
+}
+
 fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShortcut> {
     match key {
         PhysicalKey::Code(KeyCode::F1) if modifiers.is_empty() => {
@@ -170,6 +182,21 @@ fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShort
         }
         PhysicalKey::Code(KeyCode::KeyE) if exact_global_modifiers(modifiers, true) => {
             Some(GlobalShortcut::SplitDown)
+        }
+        PhysicalKey::Code(KeyCode::KeyW) if exact_global_modifiers(modifiers, true) => {
+            Some(GlobalShortcut::ClosePane)
+        }
+        PhysicalKey::Code(KeyCode::ArrowLeft) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Left))
+        }
+        PhysicalKey::Code(KeyCode::ArrowRight) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Right))
+        }
+        PhysicalKey::Code(KeyCode::ArrowUp) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Up))
+        }
+        PhysicalKey::Code(KeyCode::ArrowDown) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Down))
         }
         _ => None,
     }
@@ -2921,12 +2948,30 @@ impl App {
 
     /// Whether the window handles `shortcut` now. Pane commands are not
     /// intercepted while grid mode shows tiles: there every pane key belongs to
-    /// the focused tile's terminal.
+    /// the focused tile's terminal. Focus and close commands also need a split
+    /// tab, so a single-pane tab keeps sending those keys to its shell.
     #[inline]
     fn shortcut_intercepted(&self, shortcut: GlobalShortcut) -> bool {
         match shortcut {
             GlobalShortcut::SplitRight | GlobalShortcut::SplitDown => self.claude_grid.is_none(),
+            GlobalShortcut::FocusPane(_) | GlobalShortcut::ClosePane => {
+                self.claude_grid.is_none() && self.active_tab_split()
+            }
             _ => true,
+        }
+    }
+
+    /// Moves the focus to the pane next to the active one along `direction`.
+    /// Input can arrive before the next frame, so the pane rects of the last
+    /// frame may predate the current tree: rebuild before hit-testing. Without
+    /// a candidate the focus stays.
+    fn focus_pane_in_direction(&mut self, direction: PaneDirection) {
+        self.rebuild_panels();
+        let Some(active_pane) = self.tabs.get(self.active_tab).map(|tab| tab.active_pane) else {
+            return;
+        };
+        if let Some(pane) = pane_in_direction(&self.pane_rects, active_pane, direction) {
+            self.activate_pane(pane, false);
         }
     }
 
@@ -2954,6 +2999,14 @@ impl App {
             }
             GlobalShortcut::SplitDown => {
                 self.split_active_pane(SplitAxis::Stacked);
+            }
+            GlobalShortcut::FocusPane(direction) => self.focus_pane_in_direction(direction),
+            GlobalShortcut::ClosePane => {
+                if let Some(pane) = self.tabs.get(self.active_tab).map(|tab| tab.active_pane)
+                    && self.close_pane(pane)
+                {
+                    return true;
+                }
             }
         }
         false
@@ -7713,6 +7766,26 @@ mod tests {
         app.on_key(shortcut_key(code))
     }
 
+    /// Alt+`code` through `App::on_key`; returns the key result.
+    fn press_alt(app: &mut App, code: KeyCode) -> bool {
+        app.on_modifiers(Modifiers::ALT);
+        app.on_key(shortcut_key(code))
+    }
+
+    /// Two-pane side-by-side tab with the right pane focused. Returns the left
+    /// and right pane ids.
+    fn focused_right_split_app(tag: &str) -> (App, PaneId, PaneId, PathBuf) {
+        let (mut app, _receiver, _profile, root) = headless_split_app(tag, 1);
+        let left = app.tabs[0].active_pane;
+        let right = attach_test_pane(&mut app, 0, 2);
+        app.tabs[0].active_pane = right;
+        app.active_terminal = app
+            .terminal_index_of_pane(right)
+            .expect("the right pane has a terminal");
+        app.rebuild_panels();
+        (app, left, right, root)
+    }
+
     #[test]
     fn ctrl_shift_d_splits_active_pane_into_two() {
         let (mut app, _receiver, _profile, root) = headless_split_app("split-right", 1);
@@ -7769,6 +7842,105 @@ mod tests {
         assert_eq!(left.x, top.x);
         assert_eq!(left.w, top.w);
         assert!(left.y < top.y);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_left_moves_focus_to_left_pane() {
+        let (mut app, left, _right, root) = focused_right_split_app("alt-left");
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_down_moves_focus_to_lower_pane() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("alt-down", 1);
+        let top = app.tabs[0].active_pane;
+        let bottom = attach_test_pane_at(&mut app, top, SplitAxis::Stacked, 2);
+        app.rebuild_panels();
+
+        let _ = press_alt(&mut app, KeyCode::ArrowDown);
+
+        assert_eq!(app.tabs[0].active_pane, bottom);
+        assert_eq!(
+            app.active_terminal,
+            app.terminal_index_of_pane(bottom)
+                .expect("the lower pane has a terminal")
+        );
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_arrows_go_to_terminal_when_single_pane() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("alt-single", 1);
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+        let _ = press_alt(&mut app, KeyCode::ArrowDown);
+
+        // Legacy cursor-key encoding with the Alt modifier, as the terminal
+        // encoder defines it.
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[1;3D\x1b[1;3B");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_arrows_not_intercepted_in_grid() {
+        let mut app = grid_mode_app(&[true, true]);
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+
+        assert!(app.grid_open());
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.tabs[0].active_pane, app.terminals[0].pane_id());
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[1;3D");
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn alt_arrows_with_two_panes_do_not_reach_shell() {
+        let (mut app, left, _right, root) = focused_right_split_app("alt-two-panes");
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_shift_w_closes_active_pane_only_with_two_panes() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("close-w-single", 1);
+        let single = app.tabs[0].active_pane;
+
+        let _ = press_ctrl_shift(&mut app, KeyCode::KeyW);
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.tabs[0].active_pane, single);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (mut app, left, right, root) = focused_right_split_app("close-w-split");
+        app.active_terminal_presented = true;
+
+        let _ = press_ctrl_shift(&mut app, KeyCode::KeyW);
+
+        assert!(app.terminal_index_of_pane(right).is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), left);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert_eq!(app.active_terminal, 0);
         app.debug_assert_invariants();
         let _ = std::fs::remove_dir_all(&root);
     }
