@@ -513,6 +513,7 @@ enum GridHint {
     NoClaudeTabs,
     TooManyTabs,
     SplitTooSmall,
+    SpawnFailed,
 }
 
 impl GridHint {
@@ -521,6 +522,7 @@ impl GridHint {
             Self::NoClaudeTabs => "Нет вкладок с Claude",
             Self::TooManyTabs => "Слишком много вкладок с Claude для окна",
             Self::SplitTooSmall => "Панель слишком мала для сплита",
+            Self::SpawnFailed => "Не удалось запустить панель",
         }
     }
 }
@@ -665,6 +667,9 @@ pub struct App {
     grid_generation: u64,
     /// `layout_generation` at the time `panel_layouts` were rendered.
     panel_layouts_generation: u64,
+    /// `grid_generation` at the time `panel_layouts` were rendered. Grid input
+    /// matches against tile geometry only, so a focus change never stales it.
+    panel_layouts_grid_generation: u64,
     /// Hint shown on the tab strip until its deadline.
     grid_hint: Option<(GridHint, Instant)>,
     /// Scratch for the tab indices of the current composition; swapped with `ClaudeGrid::members`.
@@ -769,6 +774,7 @@ impl App {
             claude_grid: None,
             grid_generation: 0,
             panel_layouts_generation: 0,
+            panel_layouts_grid_generation: 0,
             grid_hint: None,
             grid_members_scratch: Vec::new(),
             grid_tile_rects: Vec::new(),
@@ -1185,9 +1191,8 @@ impl App {
             .terminals
             .get(self.active_terminal)
             .and_then(|terminal| terminal.osc7_cwd.clone());
-        self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
-        let _ = self.spawn_terminal(
+        let index = self.spawn_terminal(
             wake,
             display_number,
             TerminalLaunchSpec {
@@ -1197,6 +1202,14 @@ impl App {
             crate::terminal::DEFAULT_SPAWN_GRID,
             pane_id,
         );
+        // A failed spawn leaves a process-less error terminal: drop it and keep
+        // the tree, the focus and the pending activation untouched.
+        if !self.terminals[index].has_process() {
+            self.terminals.pop();
+            self.set_grid_hint(GridHint::SpawnFailed, Instant::now());
+            return false;
+        }
+        self.cancel_terminal_presentation_intents();
         let applied = split_leaf_at(&mut self.tabs[tab_index].layout, active_pane, axis, pane_id);
         debug_assert!(applied, "the preview split already succeeded");
         if !applied {
@@ -2380,7 +2393,7 @@ impl App {
     /// Grid-mode hover: only the tile under the pointer, with its own layout,
     /// may hold a link. Outdated layouts skip the hover entirely.
     fn update_grid_link_hover(&mut self, modal_active: bool, x: f32, y: f32) -> bool {
-        if self.panel_layouts_generation != self.layout_generation {
+        if self.panel_layouts_grid_generation != self.grid_generation {
             return false;
         }
         let target = match panel_hit(&self.panels, x, y) {
@@ -3384,7 +3397,7 @@ impl App {
                 return false;
             }
         };
-        if self.panel_layouts_generation != self.layout_generation {
+        if self.panel_layouts_grid_generation != self.grid_generation {
             // The frame's geometry is outdated: a press only chooses the tile under it.
             self.suppressed_release = Some(button);
             self.select_grid_tile(index);
@@ -3464,7 +3477,7 @@ impl App {
         if self.grid_open() {
             // The wheel scrolls the tile under the pointer and never moves focus.
             self.rebuild_panels();
-            if self.panel_layouts_generation != self.layout_generation {
+            if self.panel_layouts_grid_generation != self.grid_generation {
                 return;
             }
             let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
@@ -3540,10 +3553,10 @@ impl App {
             }
         }
         // Grid tiles other than the active tab. Their layouts come from the last
-        // render, and a stale one is trusted only in the current panel generation:
+        // render, and a stale one is trusted only in the current grid generation:
         // after a membership change the same index names another tile. Outside grid
         // mode `self.panels` is the previous frame's list, so it is not read at all.
-        let layouts_current = self.panel_layouts_generation == self.layout_generation;
+        let layouts_current = self.panel_layouts_grid_generation == self.grid_generation;
         let in_grid = self.grid_open();
         for (index, panel) in self.panels.iter().enumerate() {
             if !in_grid || panel.terminal == active {
@@ -3618,6 +3631,7 @@ impl App {
         match render_result {
             Some(Ok(layout)) => {
                 self.panel_layouts_generation = self.layout_generation;
+                self.panel_layouts_grid_generation = self.grid_generation;
                 self.interaction.update_layout(layout);
                 let active = self.active_terminal;
                 let active_content_hidden = self
@@ -6129,7 +6143,7 @@ mod tests {
         let generation = app.grid_generation;
         app.on_resize_with_logical_size(800, 400, None);
         assert_ne!(app.grid_generation, generation);
-        assert_ne!(app.panel_layouts_generation, app.grid_generation);
+        assert_ne!(app.panel_layouts_grid_generation, app.grid_generation);
 
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
@@ -6183,7 +6197,7 @@ mod tests {
             );
         grid_pointer_enable_tracking(&app.terminals[0]);
         assert_eq!(app.on_frame(), Ok(true));
-        app.panel_layouts_generation = app.grid_generation.wrapping_add(1);
+        app.panel_layouts_grid_generation = app.grid_generation.wrapping_add(1);
         assert!(!app.grid_open());
 
         let point = grid_pointer_point(&app, 0, false);
@@ -7013,6 +7027,51 @@ mod tests {
         let hint = app.tab_strip_hint(Instant::now()).expect("a hint is shown");
         assert!(
             hint.contains("Панель слишком мала для сплита"),
+            "unexpected hint {hint:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_spawn_failure_keeps_tree_and_shows_hint() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-spawn-failure", 1);
+        app.shell_override = Some(PathBuf::from("/definitely/missing/ronsole-test-shell"));
+        let terminals_before = app.terminals.len();
+        let active_terminal_before = app.active_terminal;
+        let active_pane_before = app.tabs[0].active_pane;
+        let pending_reveal_before = app.pending_tab_reveal;
+        let intents_before: Vec<_> = app
+            .terminals
+            .iter()
+            .map(|terminal| {
+                (
+                    terminal.presentation_intent,
+                    terminal.reveal_right_tail_when_presented,
+                )
+            })
+            .collect();
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+
+        assert_eq!(app.terminals.len(), terminals_before);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.active_terminal, active_terminal_before);
+        assert_eq!(app.tabs[0].active_pane, active_pane_before);
+        assert_eq!(app.pending_tab_reveal, pending_reveal_before);
+        let intents_after: Vec<_> = app
+            .terminals
+            .iter()
+            .map(|terminal| {
+                (
+                    terminal.presentation_intent,
+                    terminal.reveal_right_tail_when_presented,
+                )
+            })
+            .collect();
+        assert_eq!(intents_after, intents_before);
+        let hint = app.tab_strip_hint(Instant::now()).expect("a hint is shown");
+        assert!(
+            hint.contains("Не удалось запустить панель"),
             "unexpected hint {hint:?}"
         );
         let _ = std::fs::remove_dir_all(&root);

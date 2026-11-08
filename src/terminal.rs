@@ -2782,7 +2782,6 @@ impl Terminal {
         if finished { self.process.take() } else { None }
     }
 
-    #[cfg(test)]
     pub(crate) fn has_process(&self) -> bool {
         self.process.is_some()
     }
