@@ -2242,6 +2242,10 @@ impl App {
     }
 
     fn cancel_pointer_interactions(&mut self) {
+        // A live divider drag is a pointer interaction too: cancel it before the
+        // pointer state is dropped, so the node keeps its pre-drag ratio and the
+        // lost release stays swallowed instead of resuming as a plain click.
+        self.cancel_divider_drag();
         self.terminal_tab_drag = None;
         self.split_pointer_owner = None;
         let active = self.active_terminal;
@@ -9487,6 +9491,27 @@ mod tests {
         (app, root)
     }
 
+    /// Splits `pane` of tab 0 along `axis` with a fresh test terminal, without
+    /// spawning. `attach_test_pane` always splits the active pane side by side;
+    /// nested layouts need the pane and the axis chosen.
+    fn attach_test_pane_at(
+        app: &mut App,
+        pane: PaneId,
+        axis: SplitAxis,
+        display_number: u64,
+    ) -> PaneId {
+        let new_pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(80, 24, display_number, new_pane);
+        crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
+        app.terminals.push(terminal);
+        assert!(
+            split_leaf_at(&mut app.tabs[0].layout, pane, axis, new_pane),
+            "pane is not a leaf of tab 0"
+        );
+        app.bump_layout_generation();
+        new_pane
+    }
+
     /// Centre of panel `index` in global window coordinates.
     fn panel_body_point(app: &App, index: usize) -> (f32, f32) {
         let rect = app.panels[index].body;
@@ -9557,6 +9582,82 @@ mod tests {
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
         assert!(app.suppressed_release.is_empty());
         assert!(app.terminals[1].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn click_on_nested_bottom_right_pane_delivers_press_and_release() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-click-nested-bottom-right",
+                1,
+            );
+        // Split down, then split both branches right. Terminals keep creation
+        // order, so the bottom-right pane is terminal 2 in panel 3: the panel
+        // index and the terminal index deliberately disagree.
+        let top_left = app.tabs[0].active_pane;
+        let bottom_left = attach_test_pane_at(&mut app, top_left, SplitAxis::Stacked, 2);
+        let bottom_right = attach_test_pane_at(&mut app, bottom_left, SplitAxis::SideBySide, 3);
+        attach_test_pane_at(&mut app, top_left, SplitAxis::SideBySide, 4);
+        app.on_scale_changed(1.333, 800, 600);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        assert_eq!(app.panels.len(), 4);
+        let index = app
+            .panels
+            .iter()
+            .position(|panel| panel.terminal == 2)
+            .expect("the bottom-right pane has a panel");
+        assert_eq!(index, 3);
+        assert_ne!(index, app.panels[index].terminal);
+        // The clicked panel is laid out below the top-right pane and right of
+        // the bottom-left one, so it is the bottom-right pane.
+        let body = app.panels[index].body;
+        assert!(body.x > app.panels[2].body.x);
+        assert!(body.y > app.panels[1].body.y);
+
+        for terminal in &app.terminals {
+            grid_pointer_enable_tracking(terminal);
+        }
+        let point = panel_body_point(&app, index);
+        let layout = app.panel_layouts[index];
+        assert_eq!(layout.body, body);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 2);
+        assert_eq!(app.tabs[0].active_pane, bottom_right);
+        assert_eq!(app.interaction.layout.body, layout.body);
+        assert!(app.divider_drag.is_none());
+        // The expected press comes from the panel's own layout, not from the
+        // bytes the handler wrote.
+        assert_eq!(
+            app.terminals[2].input_bytes_for_test(),
+            expected_x10_press(layout, point)
+        );
+        // Terminal 3 owns the top-right pane; a handler that used the panel
+        // index as the terminal index would send it the press.
+        for other in [0, 1, 3] {
+            assert!(
+                app.terminals[other].input_bytes_for_test().is_empty(),
+                "terminal {other} must not receive the press"
+            );
+        }
+
+        // The paired release stays with the clicked pane, not with a suppression
+        // mark, and focus does not move.
+        let pressed_len = app.terminals[2].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        assert!(app.terminals[2].input_bytes_for_test().len() > pressed_len);
+        assert_eq!(app.active_terminal, 2);
+        for other in [0, 1, 3] {
+            assert!(
+                app.terminals[other].input_bytes_for_test().is_empty(),
+                "terminal {other} must not receive the release"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9790,6 +9891,58 @@ mod tests {
 
         app.select_terminal_tab_from_user(1);
         assert!(app.divider_drag.is_none());
+        assert_eq!(split_root_ratio(&app, 0), original);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_cancelled_by_focus_loss_restores_ratio() {
+        let (mut app, root) = split_pointer_app("t7-cancel-focus");
+        for terminal in &app.terminals {
+            grid_pointer_enable_tracking(terminal);
+        }
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 50.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+
+        app.on_focus_changed(false);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(split_root_ratio(&app, 0), original);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+
+        // The lost release cannot resume the drag: motion leaves the ratio
+        // alone and the release never reaches a terminal.
+        split_pointer_move(&mut app, start.0 + 90.0, start.1);
+        assert_eq!(split_root_ratio(&app, 0), original);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        for terminal in &app.terminals {
+            assert!(terminal.input_bytes_for_test().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_cancelled_by_settings_restores_ratio() {
+        let (mut app, root) = split_pointer_app("t7-cancel-settings");
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 50.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+
+        app.toggle_settings();
+        assert!(app.settings_open);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(split_root_ratio(&app, 0), original);
+
+        // Motion under the open modal never pulls the divider.
+        split_pointer_move(&mut app, start.0 + 100.0, start.1);
         assert_eq!(split_root_ratio(&app, 0), original);
         assert!(app.suppressed_release.contains(&PointerButton::Left));
         let _ = std::fs::remove_dir_all(&root);
