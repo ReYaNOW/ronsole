@@ -140,6 +140,29 @@ impl Default for TerminalInteraction {
     }
 }
 
+/// What one pointer-button event did with its terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MouseInputOutcome {
+    /// The event did not target this terminal.
+    Ignored,
+    /// An interaction consumed the event without forwarding it to the terminal
+    /// application: a pointer capture, a selection, a protocol control or a
+    /// link.
+    Consumed,
+    /// A mouse-reporting sequence was written to the terminal application.
+    Delivered,
+}
+
+impl MouseInputOutcome {
+    pub(crate) fn handled(self) -> bool {
+        self != Self::Ignored
+    }
+
+    pub(crate) fn delivered(self) -> bool {
+        self == Self::Delivered
+    }
+}
+
 impl TerminalInteraction {
     pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {
         // No host modifier means no modifier key is down, so a release that never
@@ -266,6 +289,12 @@ impl TerminalInteraction {
     /// Whether any pointer button is still held for terminal mouse reporting.
     pub(crate) fn mouse_buttons_pressed(&self) -> bool {
         self.pressed_mouse_buttons != 0
+    }
+
+    /// Buttons still held for terminal mouse reporting, as a mask of
+    /// `mouse_button_bit`.
+    pub(crate) fn pressed_mouse_buttons(&self) -> u8 {
+        self.pressed_mouse_buttons
     }
 
     fn cancel_pointer_interaction_state(&mut self, scroll: &mut crate::scroll::ScrollState) {
@@ -442,7 +471,7 @@ impl TerminalInteraction {
 
     #[cfg(test)]
     pub(crate) fn pressed_mouse_buttons_for_test(&self) -> u8 {
-        self.pressed_mouse_buttons
+        self.pressed_mouse_buttons()
     }
 
     /// Clipboard backed by an in-process buffer instead of the Wayland clipboard.
@@ -842,20 +871,22 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
     ) -> bool {
-        self.mouse_button_event(state, button, terminal, search_cursor_from_x, false)
+        self.mouse_input_outcome(state, button, terminal, search_cursor_from_x, false)
+            .handled()
     }
 
-    /// Pointer button event for the terminal that owns the pressed pointer: the
-    /// protocol areas and the pane body never drop it, and it is encoded at the
-    /// real pointer coordinates.
-    pub(crate) fn mouse_input_claimed(
+    /// Pointer button event with its outcome. `claimed` means the terminal owns
+    /// the pressed pointer: its protocol areas and its body never drop the
+    /// event, and it is encoded at the real pointer coordinates.
+    pub(crate) fn mouse_input_outcome(
         &mut self,
         state: KeyState,
         button: PointerButton,
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
-    ) -> bool {
-        self.mouse_button_event(state, button, terminal, search_cursor_from_x, true)
+        claimed: bool,
+    ) -> MouseInputOutcome {
+        self.mouse_button_event(state, button, terminal, search_cursor_from_x, claimed)
     }
 
     fn mouse_button_event(
@@ -865,7 +896,7 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
         claimed: bool,
-    ) -> bool {
+    ) -> MouseInputOutcome {
         let x = self.mouse_x;
         let y = self.mouse_y;
         update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, state);
@@ -881,12 +912,12 @@ impl TerminalInteraction {
             if capture == PointerCapture::TerminalScrollbar {
                 terminal.scroll_y.end_drag();
             }
-            return true;
+            return MouseInputOutcome::Consumed;
         }
 
         if state == KeyState::Released && button == PointerButton::Left && self.link_press_pending {
             self.link_press_pending = false;
-            return true;
+            return MouseInputOutcome::Consumed;
         }
 
         if let Some(search) = self.layout.search
@@ -898,25 +929,25 @@ impl TerminalInteraction {
                 TerminalSearchHit::Close => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.close_search(terminal);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Next => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.search.next();
                     self.jump_to_search_match(terminal);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Previous => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.search.previous();
                     self.jump_to_search_match(terminal);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::CaseToggle => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.search.toggle_case();
                     self.refresh_search(terminal, SearchRefreshCause::User);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Input => {
                     let local_x = x - search.input.x - 5.0 * self.layout.scale;
@@ -924,11 +955,11 @@ impl TerminalInteraction {
                         search_cursor_from_x(&self.search.text, local_x, self.search.scroll_x);
                     begin_search_pointer_selection(&mut self.search, cursor);
                     self.pointer_capture = PointerCapture::SearchInput;
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Chrome => {
                     self.pointer_capture = PointerCapture::SearchControl;
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::None => {}
             }
@@ -947,11 +978,11 @@ impl TerminalInteraction {
             terminal.scroll_y.velocity = 0.0;
             terminal.scroll_y.is_dragging = true;
             self.pointer_capture = PointerCapture::TerminalScrollbar;
-            return true;
+            return MouseInputOutcome::Consumed;
         }
 
         if !claimed && !self.layout.body.contains(x, y) {
-            return false;
+            return MouseInputOutcome::Ignored;
         }
         let left_press = state == KeyState::Pressed && button == PointerButton::Left;
         let press_cell = if left_press {
@@ -982,7 +1013,7 @@ impl TerminalInteraction {
                 PointerButton::Left,
                 KeyState::Released,
             );
-            return true;
+            return MouseInputOutcome::Consumed;
         }
         if state == KeyState::Pressed {
             let search_owned_selection = self.search.owns_grid_selection();
@@ -1022,7 +1053,7 @@ impl TerminalInteraction {
         };
         if let Some(sequence) = sequence {
             let _ = terminal.write_input(&sequence);
-            return true;
+            return MouseInputOutcome::Delivered;
         }
 
         if !tracking
@@ -1030,9 +1061,9 @@ impl TerminalInteraction {
             && let Some(pos) = press_cell
         {
             self.begin_terminal_selection_at(terminal, pos, click_count);
-            return true;
+            return MouseInputOutcome::Consumed;
         }
-        false
+        MouseInputOutcome::Ignored
     }
 
     pub(crate) fn mouse_wheel(
@@ -1636,14 +1667,21 @@ fn terminal_mouse_button(button: PointerButton) -> Option<MouseButton> {
     }
 }
 
-fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: KeyState) {
-    // Bit per button: left 1, middle 2, right 4.
-    let bit = match button {
+/// Bit of `button` in `pressed_mouse_buttons`: left 1, middle 2, right 4.
+pub(crate) fn mouse_button_bit(button: PointerButton) -> u8 {
+    match button {
         PointerButton::Left => 1u8,
         PointerButton::Middle => 2,
         PointerButton::Right => 4,
-        PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => return,
-    };
+        PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => 0,
+    }
+}
+
+fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: KeyState) {
+    let bit = mouse_button_bit(button);
+    if bit == 0 {
+        return;
+    }
     if state == KeyState::Pressed {
         *buttons |= bit;
     } else {

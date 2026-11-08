@@ -3,7 +3,9 @@ use crate::config::{
     DEFAULT_TERMINAL_BOLD_FOREGROUND, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FOREGROUND,
     DEFAULT_TERMINAL_PALETTE, RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
 };
-use crate::input::{MULTI_CLICK_WINDOW, TerminalInteraction, terminal_scroll_animating};
+use crate::input::{
+    MULTI_CLICK_WINDOW, TerminalInteraction, mouse_button_bit, terminal_scroll_animating,
+};
 use crate::input_types::{
     CursorKind, KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton,
     PointerPosition, ScrollDelta,
@@ -2242,12 +2244,25 @@ impl App {
     /// Ends the split pointer ownership before a structural change or a mode
     /// switch. The terminal indices behind the owner may shift and the pressed
     /// pane may disappear, so a later release must not reach another terminal:
-    /// dropping the layout makes the ordinary pointer path reject it.
+    /// every button the owner still holds gets its release swallowed and its
+    /// press state cancelled. The layout stays actual for ordinary input.
     fn reset_split_pointer_owner(&mut self) {
-        if self.split_pointer_owner.take().is_none() {
+        let Some(owner) = self.split_pointer_owner.take() else {
             return;
+        };
+        let pressed = self.interaction.pressed_mouse_buttons();
+        for button in [
+            PointerButton::Left,
+            PointerButton::Middle,
+            PointerButton::Right,
+        ] {
+            if pressed & mouse_button_bit(button) != 0 {
+                self.suppress_release(button);
+            }
         }
-        self.interaction.layout = TerminalUiLayout::default();
+        if let Some(terminal) = self.terminals.get_mut(owner) {
+            self.interaction.cancel_pointer_interaction(terminal);
+        }
     }
 
     fn cancel_pointer_interactions(&mut self) {
@@ -2963,9 +2978,6 @@ impl App {
     }
 
     fn remove_closed_terminals(&mut self) -> bool {
-        // Closed terminals leave through `close_pane`, which moves the indices
-        // the split pointer owner holds.
-        self.reset_split_pointer_owner();
         let mut index = self.terminals.len();
         while index > 0 {
             index -= 1;
@@ -2976,6 +2988,9 @@ impl App {
                 continue;
             }
             if self.terminals[index].is_closed() {
+                // A removal shifts the indices the split pointer owner holds;
+                // `close_pane` resets the owner before it does. An idle pass
+                // must leave the pressed pointer with its owner.
                 let pane = self.terminals[index].pane_id();
                 if self.close_pane(pane) {
                     return true;
@@ -3810,6 +3825,16 @@ impl App {
             return false;
         }
         let active = self.active_terminal;
+        // A press claims the split pointer only when it is the first of the
+        // gesture and the terminal actually receives it as mouse input: a
+        // press swallowed by a protocol area (search, scrollbar, link) claims
+        // nothing and needs no paired release.
+        let claims_split_pointer = !self.grid_open()
+            && self.active_tab_split()
+            && !split_pointer_owned
+            && state == KeyState::Pressed
+            && self.interaction.pointer_capture == crate::input::PointerCapture::None
+            && !self.interaction.mouse_buttons_pressed();
         // A split-pane press keeps its release: the terminal that received the
         // press gets it with its own layout, even when the pointer has left its
         // body. A live capture stays with the active terminal. Presses that
@@ -3826,31 +3851,30 @@ impl App {
             split_owner.unwrap_or((active, self.interaction.layout));
         let saved_layout = self.interaction.layout;
         self.interaction.layout = target_layout;
+        let mut press_delivered = false;
         if let (Some(runtime), Some(terminal)) =
             (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
             // The owner of the pressed pointer gets the event even over a
             // protocol area or outside its pane body: its app must see the
             // release of a button it saw pressed.
-            let handled = if split_owner.is_some() {
-                self.interaction.mouse_input_claimed(
-                    state,
-                    button,
-                    terminal,
-                    |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
-                )
-            } else {
-                self.interaction
-                    .mouse_input(state, button, terminal, |text, x, scroll| {
-                        runtime.terminal_search_cursor_from_x(text, x, scroll)
-                    })
-            };
-            if handled {
+            let outcome = self.interaction.mouse_input_outcome(
+                state,
+                button,
+                terminal,
+                |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
+                split_owner.is_some(),
+            );
+            press_delivered = outcome.delivered();
+            if outcome.handled() {
                 self.sync_animation_state();
                 self.request_frame();
             }
         }
         self.interaction.layout = saved_layout;
+        if claims_split_pointer && press_delivered {
+            self.split_pointer_owner = Some(target_terminal);
+        }
         // The owner lives only while some button is still held.
         if state == KeyState::Released && !self.interaction.mouse_buttons_pressed() {
             self.split_pointer_owner = None;
@@ -3912,22 +3936,9 @@ impl App {
         }
         match panel_hit(&self.panels, self.pointer_x, self.pointer_y) {
             Some(PanelHit::Body(index)) => {
+                // The pane becomes active here; the caller claims the pointer
+                // only after the terminal actually received the press.
                 self.select_split_panel(index);
-                // A press a terminal reads as mouse input keeps the pointer
-                // until every button is released, so its app sees the drag.
-                let terminal = self.panels.get(index).map(|panel| panel.terminal);
-                // Only the first press of a gesture claims the pointer: later
-                // presses must not move the owner to another terminal.
-                if let Some(terminal) = terminal
-                    && !self.interaction.mouse_buttons_pressed()
-                    && self.terminals.get(terminal).is_some_and(|terminal| {
-                        crate::platform::lock_recover(&terminal.grid)
-                            .mouse_tracking()
-                            .enabled()
-                    })
-                {
-                    self.split_pointer_owner = Some(terminal);
-                }
                 true
             }
             Some(PanelHit::Header(_)) | None => {
@@ -10343,6 +10354,107 @@ mod tests {
         let right = panel_body_point(&app, 1);
         split_pointer_move(&mut app, right.0, right.1);
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_survives_idle_main_loop_pass() {
+        let (mut app, root) = split_pointer_app("t7-owner-idle-pass");
+        // Any-motion reporting, so a delivered motion shows up in the bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // The main-loop pass runs `remove_closed_terminals`; with nothing
+        // closed it must leave the pressed pointer with its owner.
+        let _ = app.on_about_to_wait();
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let motion_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(motion_len > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > motion_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_reset_suppresses_live_release_for_new_tab() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-owner-reset-tab",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        feed_batch(&app.terminals[0], "\x1b[?1000h");
+        feed_batch(&app.terminals[1], "\x1b[?1000h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+
+        // Switching tabs resets the owner while the button is still held.
+        app.select_terminal_tab_from_user(1);
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // The frame rebuilt the actual layout of the new tab. Its terminal must
+        // not receive the release the reset owner still owes.
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // The suppressed release must not poison the next ordinary click.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let pressed_len = app.terminals[1].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn press_over_protocol_area_does_not_claim_owner() {
+        let (mut app, root) = split_pointer_app("t7-protocol-press");
+        // Scrollback makes the pane draw a scrollbar; tracking makes a
+        // delivered press visible in the terminal bytes.
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before = app.terminals[0].input_bytes_for_test().len();
+        // The protocol-area gate drops this press, so the terminal never saw it
+        // and the pointer must not be claimed for its release.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
