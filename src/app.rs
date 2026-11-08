@@ -9,7 +9,7 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::panels::{Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
+use crate::panels::{GRID_TILE_GAP, Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
 use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
@@ -24,8 +24,8 @@ use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
 use crate::split::{
-    PaneId, SplitAxis, SplitNode, layout_panes, leaf_count, pane_min, remove_leaf, split_leaf_at,
-    successor,
+    PaneId, SplitAxis, SplitNode, divider_at, layout_panes, leaf_count, min_extent, node_at_path,
+    node_at_path_mut, pane_min, remove_leaf, split_child_rects, split_leaf_at, successor,
 };
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
@@ -549,6 +549,18 @@ struct Tab {
     title_number: usize,
 }
 
+/// A divider drag in flight: the tab and the split node addressed from its
+/// root, the button that owns the drag, the structure generation the geometry
+/// belongs to and the saved ratio to restore when the drag is cancelled.
+struct DividerDrag {
+    tab: TabId,
+    path: Vec<u8>,
+    axis: SplitAxis,
+    button: PointerButton,
+    structure_generation: u64,
+    ratio_at_start: f32,
+}
+
 /// Whether `pane` is one of the leaves of this split subtree.
 fn split_contains_pane(node: &SplitNode, pane: PaneId) -> bool {
     match node {
@@ -580,6 +592,80 @@ fn collect_split_panes(node: &SplitNode, panes: &mut Vec<PaneId>) {
             collect_split_panes(second, panes);
         }
     }
+}
+
+/// Absolute rect of the split node addressed by `path` in a tab body, walked
+/// through the same `split_child_rects` call the layout uses. `None` when the
+/// path leaves the tree or ends on a leaf.
+fn split_node_rect(
+    root: &SplitNode,
+    body: Rect,
+    path: &[u8],
+    scale: f32,
+    char_w: f32,
+    char_h: f32,
+) -> Option<Rect> {
+    let gap = (GRID_TILE_GAP * scale).round();
+    let mut node = root;
+    let mut rect = body;
+    for step in path {
+        let SplitNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return None;
+        };
+        let first_min = min_extent(first, *axis, char_w, char_h, scale);
+        let second_min = min_extent(second, *axis, char_w, char_h, scale);
+        let (first_rect, second_rect) =
+            split_child_rects(rect, *axis, *ratio, gap, first_min, second_min);
+        match step {
+            0 => {
+                node = first;
+                rect = first_rect;
+            }
+            1 => {
+                node = second;
+                rect = second_rect;
+            }
+            _ => return None,
+        }
+    }
+    matches!(node, SplitNode::Split { .. }).then_some(rect)
+}
+
+/// Ratio that puts the divider of `node_rect` at `coord` along `axis`. The
+/// first branch keeps its minimum and the second keeps its own, judged on the
+/// same `available` span [`split_child_rects`] uses; a node too small for both
+/// minimums follows the pointer unclamped.
+fn dragged_ratio(
+    node_rect: Rect,
+    axis: SplitAxis,
+    saved_ratio: f32,
+    gap: f32,
+    first_min: f32,
+    second_min: f32,
+    coord: f32,
+) -> f32 {
+    let (extent, start) = match axis {
+        SplitAxis::SideBySide => (node_rect.w, node_rect.x),
+        SplitAxis::Stacked => (node_rect.h, node_rect.y),
+    };
+    let node_gap = if extent < gap { 0.0 } else { gap };
+    let available = (extent - node_gap).max(0.0);
+    if available <= 0.0 {
+        return saved_ratio;
+    }
+    let first_floor = first_min.ceil();
+    let second_floor = second_min.ceil();
+    let mut first_extent = (coord - start).clamp(0.0, available);
+    if available >= first_floor + second_floor {
+        first_extent = first_extent.clamp(first_floor, available - second_floor);
+    }
+    first_extent / available
 }
 
 pub struct App {
@@ -678,8 +764,13 @@ pub struct App {
     grid_members_scratch: Vec<usize>,
     /// Scratch for the tile rectangles `rebuild_panels` gets from `grid_tiles`.
     grid_tile_rects: Vec<(Rect, Rect)>,
-    /// Pointer state reserved for grid tile handling.
-    suppressed_release: Option<PointerButton>,
+    /// Pointer state reserved for grid tile handling. Buttons whose press never
+    /// reached the terminal and whose release must be swallowed even when the
+    /// mode that owned the press has ended. `Vec`, not a bitmask:
+    /// `PointerButton::Other` carries an arbitrary identity.
+    suppressed_release: Vec<PointerButton>,
+    /// The divider drag in flight, if any. Only the button that started it ends it.
+    divider_drag: Option<DividerDrag>,
     last_header_press: Option<(Instant, usize)>,
     hovered_panel_terminal: Option<usize>,
     /// Earliest end of the banner hiding among grid tiles that the last grid
@@ -781,7 +872,8 @@ impl App {
             grid_hint: None,
             grid_members_scratch: Vec::new(),
             grid_tile_rects: Vec::new(),
-            suppressed_release: None,
+            suppressed_release: Vec::new(),
+            divider_drag: None,
             last_header_press: None,
             hovered_panel_terminal: None,
             withheld_until: None,
@@ -894,6 +986,153 @@ impl App {
         self.bump_layout_generation();
     }
 
+    /// Marks the next release of `button` as swallowed. Idempotent: one press
+    /// owns one release.
+    fn suppress_release(&mut self, button: PointerButton) {
+        if !self.suppressed_release.contains(&button) {
+            self.suppressed_release.push(button);
+        }
+    }
+
+    /// Takes exactly one suppression mark of `button`; `true` when the release
+    /// must not reach the terminal.
+    fn take_suppressed_release(&mut self, button: PointerButton) -> bool {
+        let Some(index) = self
+            .suppressed_release
+            .iter()
+            .position(|entry| *entry == button)
+        else {
+            return false;
+        };
+        self.suppressed_release.remove(index);
+        true
+    }
+
+    /// Ends the live drag, if any, restoring the saved ratio of its node while
+    /// the node still exists. Called before every structural mutation that can
+    /// move or delete the node, and on every mode change that ends the drag.
+    fn cancel_divider_drag(&mut self) {
+        let Some(drag) = self.divider_drag.take() else {
+            return;
+        };
+        let mut restored = false;
+        if let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == drag.tab)
+            && let Some(SplitNode::Split { ratio, .. }) =
+                node_at_path_mut(&mut self.tabs[tab_index].layout, &drag.path)
+            && *ratio != drag.ratio_at_start
+        {
+            *ratio = drag.ratio_at_start;
+            restored = true;
+        }
+        if restored {
+            self.bump_layout_generation();
+        }
+        self.suppress_release(drag.button);
+    }
+
+    /// Moves the divider of the live drag to the pointer. The saved ratio comes
+    /// from the node geometry of the current frame, clamped to the minimums of
+    /// both branches. A structure change since the press ends the drag without
+    /// a rollback: the node may no longer exist and its current ratio stands.
+    fn update_divider_drag(&mut self, x: f32, y: f32) {
+        let Some(drag) = self.divider_drag.take() else {
+            return;
+        };
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == drag.tab) else {
+            self.suppress_release(drag.button);
+            return;
+        };
+        if self.structure_generation != drag.structure_generation {
+            self.suppress_release(drag.button);
+            return;
+        }
+        let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let axis = drag.axis;
+        let gap = (GRID_TILE_GAP * metrics.scale).round();
+        let coord = match axis {
+            SplitAxis::SideBySide => x,
+            SplitAxis::Stacked => y,
+        };
+        let ratio = {
+            let layout = &self.tabs[tab_index].layout;
+            let rect = split_node_rect(
+                layout,
+                body,
+                &drag.path,
+                metrics.scale,
+                metrics.char_w,
+                metrics.char_h,
+            );
+            let node = node_at_path(layout, &drag.path);
+            match (rect, node) {
+                (Some(rect), Some(SplitNode::Split { ratio, first, second, .. })) => {
+                    let first_min =
+                        min_extent(first, axis, metrics.char_w, metrics.char_h, metrics.scale);
+                    let second_min =
+                        min_extent(second, axis, metrics.char_w, metrics.char_h, metrics.scale);
+                    Some(dragged_ratio(
+                        rect, axis, *ratio, gap, first_min, second_min, coord,
+                    ))
+                }
+                _ => None,
+            }
+        };
+        let Some(ratio) = ratio else {
+            self.suppress_release(drag.button);
+            return;
+        };
+        if let Some(SplitNode::Split { ratio: saved, .. }) =
+            node_at_path_mut(&mut self.tabs[tab_index].layout, &drag.path)
+            && *saved != ratio
+        {
+            *saved = ratio;
+            self.bump_layout_generation();
+            self.request_frame();
+        }
+        self.divider_drag = Some(drag);
+    }
+
+    /// Terminal and layout of the split pane under the pointer, with global
+    /// coordinates. A live pointer capture keeps its terminal, so the wheel and
+    /// the motion follow it. `None` when the rendered geometry is stale or no
+    /// body is under the pointer: both callers then keep the active pane.
+    fn split_panel_under_pointer(&self) -> Option<(usize, TerminalUiLayout)> {
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            return Some((self.active_terminal, self.interaction.layout));
+        }
+        if self.panel_layouts_generation != self.layout_generation {
+            return None;
+        }
+        let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
+        else {
+            return None;
+        };
+        let terminal = self.panels.get(index)?.terminal;
+        let layout = *self.panel_layouts.get(index)?;
+        Some((terminal, layout))
+    }
+
+    /// Makes the pane of panel `index` active and points the terminal
+    /// interaction at that panel's layout, with global pointer coordinates.
+    /// The split-tab counterpart of `select_grid_tile`.
+    fn select_split_panel(&mut self, index: usize) {
+        let Some(pane) = self
+            .panels
+            .get(index)
+            .and_then(|panel| self.terminals.get(panel.terminal))
+            .map(Terminal::pane_id)
+        else {
+            return;
+        };
+        self.cancel_terminal_presentation_intents();
+        self.activate_pane(pane, false);
+        if let Some(layout) = self.panel_layouts.get(index) {
+            self.interaction.layout = *layout;
+        }
+        self.request_frame();
+    }
+
     fn tab_index_of_pane(&self, pane: PaneId) -> Option<usize> {
         self.tabs
             .iter()
@@ -917,6 +1156,9 @@ impl App {
             return;
         };
         if tab_index != self.active_tab {
+            // Switching tabs ends a divider drag of the tab being left, before
+            // its tree can move.
+            self.cancel_divider_drag();
             self.active_tab = tab_index;
             self.bump_structure_generation();
         }
@@ -1058,6 +1300,7 @@ impl App {
     }
 
     fn select_terminal_tab_from_user(&mut self, index: usize) {
+        self.cancel_divider_drag();
         self.exit_claude_grid(None);
         let Some(pane) = self.tabs.get(index).map(|tab| tab.active_pane) else {
             return;
@@ -1113,6 +1356,8 @@ impl App {
         launch: TerminalLaunchSpec,
         grid: (u16, u16),
     ) -> usize {
+        // A new tab is a structural change: a live drag ends before it.
+        self.cancel_divider_drag();
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
         let pane_id = self.issue_pane_id();
@@ -1160,6 +1405,9 @@ impl App {
     /// when a pane of the split would fall below `pane_min`; nothing is spawned
     /// and the tree does not change then.
     fn split_active_pane(&mut self, axis: SplitAxis) -> bool {
+        // A split changes the tree under a live drag; the saved ratio goes back
+        // before the preview is laid out from it.
+        self.cancel_divider_drag();
         let metrics = self.grid_metrics;
         let tab_index = self.active_tab;
         let Some(tab) = self.tabs.get(tab_index) else {
@@ -1618,6 +1866,8 @@ impl App {
     /// the terminal storage and the focus untouched. Returns true when the
     /// window must close.
     fn close_pane(&mut self, pane: PaneId) -> bool {
+        // The drag node may be the leaf being closed: restore before the tree moves.
+        self.cancel_divider_drag();
         let Some(index) = self.terminal_index_of_pane(pane) else {
             return false;
         };
@@ -1667,6 +1917,8 @@ impl App {
     /// second dialog. A refused cleanup stops the close; the panes removed so far
     /// stay removed. Returns true when the window must close.
     fn close_tab(&mut self, tab: TabId) -> bool {
+        // The drag node may be removed with the tab: restore before the tree moves.
+        self.cancel_divider_drag();
         let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
             return false;
         };
@@ -1952,6 +2204,8 @@ impl App {
         if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
             return;
         }
+        // The tab order is structural: a live drag across it must not keep pulling.
+        self.cancel_divider_drag();
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
         self.active_tab = active_index_after_move(self.active_tab, from, to);
@@ -2390,7 +2644,7 @@ impl App {
     fn update_link_hover(&mut self) {
         let modal_active = self.settings_modal_active() || self.close_confirm.is_some();
         let (x, y) = (self.pointer_x, self.pointer_y);
-        let changed = if self.grid_open() {
+        let changed = if self.grid_open() || self.active_tab_split() {
             self.update_grid_link_hover(modal_active, x, y)
         } else {
             // Grid mode is closed: a link still hovered in a tile is dropped first.
@@ -2412,10 +2666,16 @@ impl App {
         self.refresh_cursor_icon();
     }
 
-    /// Grid-mode hover: only the tile under the pointer, with its own layout,
-    /// may hold a link. Outdated layouts skip the hover entirely.
+    /// Panel-mode hover: only the panel under the pointer, with its own layout,
+    /// may hold a link. Outdated layouts skip the hover entirely. Grid tiles
+    /// track the grid generation, split panes the layout generation.
     fn update_grid_link_hover(&mut self, modal_active: bool, x: f32, y: f32) -> bool {
-        if self.panel_layouts_grid_generation != self.grid_generation {
+        let current = if self.grid_open() {
+            self.panel_layouts_grid_generation == self.grid_generation
+        } else {
+            self.panel_layouts_generation == self.layout_generation
+        };
+        if !current {
             return false;
         }
         let target = match panel_hit(&self.panels, x, y) {
@@ -2719,6 +2979,8 @@ impl App {
     /// generation.
     fn set_grid_metrics(&mut self, metrics: GridMetrics) {
         if metrics != self.grid_metrics {
+            // The divider geometry of a live drag belongs to the old metrics.
+            self.cancel_divider_drag();
             if self.claude_grid.is_some() {
                 self.bump_grid_generation();
             } else {
@@ -2961,6 +3223,8 @@ impl App {
     /// Ctrl+Shift+S. Opens grid mode over the Claude tabs, or leaves it onto the
     /// focused tile.
     fn toggle_claude_grid(&mut self, now: Instant) {
+        // Entering or leaving grid mode ends a divider drag of the split view.
+        self.cancel_divider_drag();
         if self.claude_grid.is_some() {
             self.exit_claude_grid(Some(self.active_terminal));
             return;
@@ -2995,6 +3259,7 @@ impl App {
     /// as a tab click); `None` keeps the active tab. Does nothing when grid mode
     /// is closed.
     fn exit_claude_grid(&mut self, target: Option<usize>) {
+        self.cancel_divider_drag();
         if self.claude_grid.take().is_none() {
             return;
         }
@@ -3205,8 +3470,13 @@ impl App {
         let previous_y = self.pointer_y;
         self.pointer_x = position.x;
         self.pointer_y = position.y;
-        if self.grid_open() {
-            // Hit-tests of this event use the tile list as it is now.
+        if self.divider_drag.is_some() {
+            // A live drag owns the pointer: motion moves the divider only.
+            self.update_divider_drag(self.pointer_x, self.pointer_y);
+            return;
+        }
+        if self.grid_open() || self.active_tab_split() {
+            // Hit-tests of this event use the panel list as it is now.
             self.rebuild_panels();
         }
         self.update_link_hover();
@@ -3264,8 +3534,19 @@ impl App {
             return;
         }
         let active = self.active_terminal;
+        let target = if self.active_tab_split() && !self.grid_open() {
+            // The pane under the pointer takes the motion with its own layout;
+            // focus does not change. A captured pointer keeps its terminal.
+            self.split_panel_under_pointer()
+                .unwrap_or((active, self.interaction.layout))
+        } else {
+            (active, self.interaction.layout)
+        };
+        let (target_terminal, target_layout) = target;
+        let saved_layout = self.interaction.layout;
+        self.interaction.layout = target_layout;
         if let (Some(runtime), Some(terminal)) =
-            (self.runtime.as_mut(), self.terminals.get_mut(active))
+            (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
             let changed = self.interaction.cursor_moved(
                 self.pointer_x,
@@ -3278,6 +3559,7 @@ impl App {
                 self.request_frame();
             }
         }
+        self.interaction.layout = saved_layout;
     }
 
     pub(crate) fn on_pointer_leave(&mut self, width: u32, height: u32) {
@@ -3303,15 +3585,43 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
-        // A new press of the same button means the release owed by an earlier
-        // suppressed press was lost; that stale mark must not swallow this press's release.
-        if state == KeyState::Pressed && self.suppressed_release == Some(button) {
-            self.suppressed_release = None;
+        if state == KeyState::Pressed {
+            if self
+                .divider_drag
+                .as_ref()
+                .is_some_and(|drag| drag.button == button)
+            {
+                // The owner pressed again while its release is still missing: the
+                // old drag ends with its last recorded ratio and this press is
+                // routed as a new one.
+                self.divider_drag = None;
+                self.take_suppressed_release(button);
+            } else if self.divider_drag.is_some() {
+                // Another button never takes over a live drag; its press and
+                // its release are both swallowed.
+                self.suppress_release(button);
+                return false;
+            } else {
+                // A new press of the same button means the release owed by an
+                // earlier suppressed press was lost; that stale mark must not
+                // swallow this press's release.
+                self.take_suppressed_release(button);
+            }
+        }
+        if state == KeyState::Released
+            && self
+                .divider_drag
+                .as_ref()
+                .is_some_and(|drag| drag.button == button)
+        {
+            // The release that ends a drag belongs to the press that started it.
+            self.divider_drag = None;
+            self.take_suppressed_release(button);
+            return false;
         }
         // A press that never reached the terminal (grid header, gap, stale
-        // generation) owns its release, even when grid mode has closed since.
-        if state == KeyState::Released && self.suppressed_release == Some(button) {
-            self.suppressed_release = None;
+        // generation) owns its release, even when that mode has ended since.
+        if state == KeyState::Released && self.take_suppressed_release(button) {
             return false;
         }
         if self.close_confirm.is_some() {
@@ -3408,7 +3718,9 @@ impl App {
             self.request_frame();
             return false;
         }
-        if self.grid_open() && !self.route_grid_pointer_button(state, button) {
+        if (self.grid_open() || self.active_tab_split())
+            && !self.route_pointer_button(state, button)
+        {
             return false;
         }
         let active = self.active_terminal;
@@ -3433,11 +3745,94 @@ impl App {
         false
     }
 
+    /// Pointer-button routing for a tab that draws more than one panel: grid
+    /// mode over its tiles, or the split layout of the active tab. Returns
+    /// `false` when the event is handled here and must not reach a terminal,
+    /// `true` when it goes on to the terminal's mouse handling.
+    fn route_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        // Hit-tests of this event use the panel list as it is now.
+        self.rebuild_panels();
+        if state == KeyState::Released {
+            return true;
+        }
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            // A captured pointer belongs to its terminal until its release.
+            return true;
+        }
+        if self.grid_open() {
+            return self.route_grid_pointer_button(state, button);
+        }
+        self.route_split_pointer_button(button)
+    }
+
+    /// Split-tab routing of one press: the divider first (its band lies over
+    /// the bodies), then the pane body, whose terminal receives the event with
+    /// the panel's own layout and global pointer coordinates.
+    fn route_split_pointer_button(&mut self, button: PointerButton) -> bool {
+        if self.panel_layouts_generation != self.layout_generation {
+            // The frame's geometry is outdated: a press only chooses the pane
+            // under it and owns its release, like the grid-generation contract.
+            self.suppress_release(button);
+            if let Some(PanelHit::Body(index) | PanelHit::Header(index)) =
+                panel_hit(&self.panels, self.pointer_x, self.pointer_y)
+            {
+                self.select_split_panel(index);
+            }
+            return false;
+        }
+        if let Some(drag) = self.divider_drag_at(button) {
+            // The drag never changes focus and its release is swallowed.
+            self.divider_drag = Some(drag);
+            self.suppress_release(button);
+            return false;
+        }
+        match panel_hit(&self.panels, self.pointer_x, self.pointer_y) {
+            Some(PanelHit::Body(index)) => {
+                self.select_split_panel(index);
+                true
+            }
+            Some(PanelHit::Header(_)) | None => {
+                // Split panels draw no headers; a gap routes nothing.
+                self.suppress_release(button);
+                false
+            }
+        }
+    }
+
+    /// Drag that a press at the pointer starts when it lands on a split
+    /// divider: the node path, its axis and its saved ratio.
+    fn divider_drag_at(&self, button: PointerButton) -> Option<DividerDrag> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let hit = divider_at(
+            &tab.layout,
+            body,
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+            self.pointer_x,
+            self.pointer_y,
+        )?;
+        let ratio_at_start = match node_at_path(&tab.layout, &hit.path) {
+            Some(SplitNode::Split { ratio, .. }) => *ratio,
+            _ => return None,
+        };
+        Some(DividerDrag {
+            tab: tab.id,
+            path: hit.path,
+            axis: hit.axis,
+            button,
+            structure_generation: self.structure_generation,
+            ratio_at_start,
+        })
+    }
+
     /// Grid-mode routing of one pointer button event. Returns `false` when the
     /// event is handled here and must not reach the active terminal, `true` when
-    /// it goes on to the terminal's mouse handling.
+    /// it goes on to the terminal's mouse handling. The caller rebuilds the
+    /// panels first.
     fn route_grid_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
-        self.rebuild_panels();
         if state == KeyState::Released {
             return true;
         }
@@ -3450,13 +3845,13 @@ impl App {
             Some(PanelHit::Body(index)) => (index, false),
             None => {
                 // A gap between tiles routes nothing; its release is swallowed.
-                self.suppressed_release = Some(button);
+                self.suppress_release(button);
                 return false;
             }
         };
         if self.panel_layouts_grid_generation != self.grid_generation {
             // The frame's geometry is outdated: a press only chooses the tile under it.
-            self.suppressed_release = Some(button);
+            self.suppress_release(button);
             self.select_grid_tile(index);
             self.request_frame();
             return false;
@@ -3465,7 +3860,7 @@ impl App {
             self.select_grid_tile(index);
             return true;
         }
-        self.suppressed_release = Some(button);
+        self.suppress_release(button);
         if button == PointerButton::Left {
             let terminal = self.panels[index].terminal;
             let now = Instant::now();
@@ -3546,6 +3941,22 @@ impl App {
                 return;
             };
             let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
+                return;
+            };
+            if self.interaction.mouse_wheel(delta, terminal, layout) {
+                self.sync_animation_state();
+                self.request_frame();
+            }
+            return;
+        }
+        if self.active_tab_split() {
+            // The wheel scrolls the pane under the pointer (or the captured one)
+            // and never moves focus.
+            self.rebuild_panels();
+            let Some((index, layout)) = self.split_panel_under_pointer() else {
+                return;
+            };
+            let Some(terminal) = self.terminals.get_mut(index) else {
                 return;
             };
             if self.interaction.mouse_wheel(delta, terminal, layout) {
@@ -6255,7 +6666,7 @@ mod tests {
         // The release arrives after the exit and must not reach the PTY.
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6296,7 +6707,7 @@ mod tests {
         grid_pointer_enable_tracking(&app.terminals[0]);
         app.toggle_claude_grid(Instant::now());
         assert_eq!(app.on_frame(), Ok(true));
-        app.suppressed_release = Some(PointerButton::Left);
+        app.suppressed_release = vec![PointerButton::Left];
         (app, root)
     }
 
@@ -6306,7 +6717,7 @@ mod tests {
         let point = grid_pointer_point(&app, 0, false);
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         // The press is routed as usual, so the body of the active tile gets bytes.
         assert!(!app.terminals[0].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -6318,7 +6729,7 @@ mod tests {
         let point = grid_pointer_point(&app, 0, false);
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6383,11 +6794,11 @@ mod tests {
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
         assert_eq!(app.active_terminal, 1);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
 
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6408,12 +6819,12 @@ mod tests {
         let header = grid_pointer_point(&app, 0, true);
         grid_pointer_move(&mut app, header);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
 
         let body = grid_pointer_point(&app, 0, false);
         grid_pointer_move(&mut app, body);
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6434,9 +6845,9 @@ mod tests {
         grid_pointer_move(&mut app, header);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
         app.on_pointer_button(KeyState::Released, PointerButton::Right);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8984,5 +9395,347 @@ mod tests {
             tab_wheel_delta(ScrollDelta::Pixel { x: 0.0, y: -12.5 }, 1.0,),
             12.5
         );
+    }
+
+    /// Tab 0 split side by side (left: the founding terminal, right: a test
+    /// pane), one rendered frame, so `panels` and `panel_layouts` describe it.
+    fn split_pointer_app(tag: &str) -> (App, PathBuf) {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(tag, 1);
+        attach_test_pane(&mut app, 0, 2);
+        assert_eq!(app.on_frame(), Ok(true));
+        (app, root)
+    }
+
+    /// Centre of panel `index` in global window coordinates.
+    fn panel_body_point(app: &App, index: usize) -> (f32, f32) {
+        let rect = app.panels[index].body;
+        (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5)
+    }
+
+    /// Point in the gap between the two bodies of a side-by-side split.
+    fn split_divider_point(app: &App) -> (f32, f32) {
+        let first = app.panels[0].body;
+        let second = app.panels[1].body;
+        (
+            (first.x + first.w + second.x) * 0.5,
+            first.y + first.h * 0.5,
+        )
+    }
+
+    fn split_pointer_move(app: &mut App, x: f32, y: f32) {
+        app.on_pointer_motion(PointerPosition { x, y });
+    }
+
+    /// Saved ratio of the root split of `tab`; panics when the tab is a leaf.
+    fn split_root_ratio(app: &App, tab: usize) -> f32 {
+        match crate::split::node_at_path(&app.tabs[tab].layout, &[]) {
+            Some(SplitNode::Split { ratio, .. }) => *ratio,
+            _ => panic!("tab {tab} is not split"),
+        }
+    }
+
+    /// Legacy X10 press of the left button at a global point, from the panel's
+    /// own layout: the same formula the grid tests use.
+    fn expected_x10_press(layout: TerminalUiLayout, (x, y): (f32, f32)) -> Vec<u8> {
+        let col = ((x - layout.text_x) / layout.char_w).floor() as usize + 1;
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - y
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows - rows_from_bottom;
+        let mut expected = b"\x1b[M".to_vec();
+        expected.extend_from_slice(&[32, col as u8 + 32, row as u8 + 32]);
+        expected
+    }
+
+    #[test]
+    fn click_on_second_pane_focuses_it_and_delivers_press() {
+        let (mut app, root) = split_pointer_app("t7-click-second");
+        // Fractional scale: global coordinates and a `text_x` that already holds
+        // `body.x` must still reach the right pane.
+        app.on_scale_changed(1.25, 640, 400);
+        assert_eq!(app.on_frame(), Ok(true));
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        let point = panel_body_point(&app, 1);
+        let layout = app.panel_layouts[1];
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.interaction.layout.body, layout.body);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(
+            app.terminals[1].input_bytes_for_test(),
+            expected_x10_press(layout, point)
+        );
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        // The paired release is delivered to the same pane, not lost to a mark.
+        let pressed_len = app.terminals[1].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn click_in_gap_starts_divider_drag_and_changes_no_focus() {
+        let (mut app, root) = split_pointer_app("t7-click-gap");
+        let start = split_divider_point(&app);
+        let original = split_root_ratio(&app, 0);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.divider_drag.is_some());
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        split_pointer_move(&mut app, start.0 + 24.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn click_near_border_starts_drag_when_node_narrower_than_gap() {
+        let (mut app, root) = split_pointer_app("t7-narrow-node");
+        // The body is narrower than the 6 px gap: the branches touch and the
+        // divider band lies over both bodies at the seam.
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            width: 4.0,
+            ..current
+        });
+        assert_eq!(app.on_frame(), Ok(true));
+        let first = app.panels[0].body;
+        let seam = (first.x + first.w, first.y + first.h * 0.5);
+        assert!(app.panels[1].body.contains(seam.0, seam.1));
+
+        split_pointer_move(&mut app, seam.0, seam.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert!(app.divider_drag.is_some());
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_finishes_on_release_and_motion_does_not_move_it() {
+        let (mut app, root) = split_pointer_app("t7-drag-finish");
+        let start = split_divider_point(&app);
+        let original = split_root_ratio(&app, 0);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 30.0, start.1);
+        let moved = split_root_ratio(&app, 0);
+        assert!(moved > original);
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.divider_drag.is_none());
+        assert!(!app.suppressed_release.contains(&PointerButton::Left));
+        split_pointer_move(&mut app, start.0 - 30.0, start.1);
+        assert_eq!(split_root_ratio(&app, 0), moved);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lost_release_does_not_leave_drag_active() {
+        let (mut app, root) = split_pointer_app("t7-lost-release");
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 40.0, start.1);
+        let moved = split_root_ratio(&app, 0);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // The same button is pressed with the first release still lost: the old
+        // drag finishes with its recorded ratio and the press starts a new one.
+        // The pointer already sits on the divider the last motion left behind.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(
+            app.divider_drag.as_ref().map(|drag| drag.ratio_at_start),
+            Some(moved)
+        );
+        assert_eq!(split_root_ratio(&app, 0), moved);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_button_press_does_not_replace_drag_owner() {
+        for (name, second) in [
+            ("t7-second-button-8", PointerButton::Other(8)),
+            ("t7-second-button-9", PointerButton::Other(9)),
+        ] {
+            let (mut app, root) = split_pointer_app(name);
+            grid_pointer_enable_tracking(&app.terminals[0]);
+            grid_pointer_enable_tracking(&app.terminals[1]);
+            let start = split_divider_point(&app);
+            split_pointer_move(&mut app, start.0, start.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            let point = panel_body_point(&app, 1);
+            split_pointer_move(&mut app, point.0, point.1);
+            app.on_pointer_button(KeyState::Pressed, second);
+
+            // The live drag keeps its owner; the second press is swallowed.
+            assert_eq!(
+                app.divider_drag.as_ref().map(|drag| drag.button),
+                Some(PointerButton::Left)
+            );
+            assert!(app.suppressed_release.contains(&second));
+            assert!(app.terminals[0].input_bytes_for_test().is_empty());
+            assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+            // Owner release first, then the second button's suppressed release.
+            app.on_pointer_button(KeyState::Released, PointerButton::Left);
+            assert!(app.divider_drag.is_none());
+            app.on_pointer_button(KeyState::Released, second);
+            assert!(!app.suppressed_release.contains(&second));
+            assert!(app.terminals[0].input_bytes_for_test().is_empty());
+            assert!(app.terminals[1].input_bytes_for_test().is_empty());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // The opposite release order: the second button's release arrives first.
+        let (mut app, root) = split_pointer_app("t7-second-button-reverse");
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Other(8));
+        app.on_pointer_button(KeyState::Released, PointerButton::Other(8));
+        assert!(app.divider_drag.is_some());
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.divider_drag.is_none());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_drag_then_normal_click_reaches_terminal() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-cancel-click",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(app.divider_drag.is_some());
+
+        app.select_terminal_tab_from_user(1);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(app.active_tab, 1);
+        app.select_terminal_tab_from_user(0);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // The mark left by the cancelled drag must not swallow this press.
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_resizes_ratio_and_both_ptys() {
+        let (mut app, root) = split_pointer_app("t7-drag-ptys");
+        let before = app.panel_layouts.clone();
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 48.0, start.1);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        assert!(split_root_ratio(&app, 0) > original);
+        assert!(app.panel_layouts[0].cols > before[0].cols);
+        assert!(app.panel_layouts[1].cols < before[1].cols);
+        let left_cols = crate::platform::lock_recover(&app.terminals[0].grid).cols();
+        let right_cols = crate::platform::lock_recover(&app.terminals[1].grid).cols();
+        assert_eq!(left_cols, app.panel_layouts[0].cols);
+        assert_eq!(right_cols, app.panel_layouts[1].cols);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_layout_generation_only_selects_pane_and_suppresses_release() {
+        let (mut app, root) = split_pointer_app("t7-stale");
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        app.bump_layout_generation();
+        assert_ne!(app.panel_layouts_generation, app.layout_generation);
+
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drag_cancelled_by_tab_switch_restores_ratio() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-ratio-restore",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 50.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+
+        app.select_terminal_tab_from_user(1);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(split_root_ratio(&app, 0), original);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wheel_and_motion_follow_panel_under_pointer() {
+        let (mut app, root) = split_pointer_app("t7-pointer-follow");
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        // Any-motion reporting, so a motion into the inactive pane is visible.
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+
+        assert_eq!(app.active_terminal, 0);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        let before_scroll = app.terminals[1].scroll_y.target;
+        // Motion reporting would consume the wheel as a mouse event; the wheel
+        // of an app without tracking scrolls the scrollback.
+        feed_batch(&app.terminals[1], "\x1b[?1003l");
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+        assert_eq!(app.active_terminal, 0);
+        assert_ne!(app.terminals[1].scroll_y.target, before_scroll);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
