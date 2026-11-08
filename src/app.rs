@@ -1534,16 +1534,12 @@ impl App {
         let was_active_tab = tab_index == self.active_tab;
         let mut panes = Vec::new();
         collect_split_panes(&self.tabs[tab_index].layout, &mut panes);
-        let mut removed_indices: Vec<usize> = panes
-            .iter()
-            .filter_map(|&pane| self.terminal_index_of_pane(pane))
-            .collect();
-        removed_indices.sort_unstable();
-        // The successor is picked before the first mutation, while the tiles
-        // still carry the indices of the current `terminals`.
-        let grid_successor = (self.claude_grid.is_some() && was_active_tab)
-            .then(|| self.grid_successor_after_removal(&removed_indices))
-            .flatten();
+        // The tile that holds the focus now: §6.4 keeps the focus on it when a
+        // refused cleanup stops the close before its own pane leaves.
+        let focused_pane = self
+            .terminals
+            .get(self.active_terminal)
+            .map(Terminal::pane_id);
         let mut tree_successor = None;
         for pane in panes {
             let Some(index) = self.terminal_index_of_pane(pane) else {
@@ -1573,6 +1569,17 @@ impl App {
                 }
             }
         }
+        // The successor is picked over the tiles that actually survived: a
+        // refusal leaves the focused tile alive and the focus alone, and only a
+        // vanished tile hands the focus to its grid neighbour.
+        let grid_successor = if self.claude_grid.is_some()
+            && was_active_tab
+            && focused_pane.is_none_or(|pane| self.terminal_index_of_pane(pane).is_none())
+        {
+            self.grid_successor_after_focused_removal()
+        } else {
+            None
+        };
         self.terminal_tab_drag = None;
         self.cancel_close_dialog();
         self.pending_tab_reveal = Some(false);
@@ -1735,7 +1742,9 @@ impl App {
     }
 
     /// Focus on a pane of the tree: through `activate_pane` when the pane can
-    /// present now, otherwise as a deferred activation.
+    /// present now, otherwise as a deferred activation. The deferred path moves
+    /// the logical focus at once — the tab, its active pane and the active
+    /// terminal name the choice — while the presentation waits.
     fn focus_pane_after_removal(&mut self, pane: PaneId) {
         let Some(index) = self.terminal_index_of_pane(pane) else {
             return;
@@ -1744,8 +1753,24 @@ impl App {
             self.cancel_terminal_presentation_intents();
             self.activate_pane(pane, false);
         } else {
+            self.select_pane_for_deferred_activation(pane, index);
             self.request_terminal_activation(index, false);
         }
+    }
+
+    /// Points the focus at `pane` without presenting it. `active_terminal_presented`
+    /// stays false and no focus report is written, so the `activate_pane` that
+    /// runs when the pane is ready still presents it and reports the focus gain.
+    fn select_pane_for_deferred_activation(&mut self, pane: PaneId, index: usize) {
+        if let Some(tab_index) = self.tab_index_of_pane(pane) {
+            if tab_index != self.active_tab {
+                self.active_tab = tab_index;
+                self.bump_structure_generation();
+            }
+            self.tabs[tab_index].active_pane = pane;
+        }
+        self.active_terminal = index;
+        self.active_terminal_presented = false;
     }
 
     fn close_confirm_hit_test(&self, x: f32, y: f32) -> CloseConfirmHit {
@@ -2693,6 +2718,26 @@ impl App {
                     .find(|&member| member < pivot)
             })?;
         Some(target - removed.iter().filter(|&&index| index < target).count())
+    }
+
+    /// Tile that takes the focus once the focused tile has left while the grid
+    /// is open: the first surviving member at or after the slot the tile
+    /// occupied, else the last member before it (§6.4). `remove_terminal_at`
+    /// leaves `active_terminal` on that slot, so it is the pivot of the search.
+    fn grid_successor_after_focused_removal(&mut self) -> Option<usize> {
+        self.collect_claude_members();
+        let slot = self.active_terminal;
+        self.grid_members_scratch
+            .iter()
+            .copied()
+            .find(|&member| member >= slot)
+            .or_else(|| {
+                self.grid_members_scratch
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&member| member < slot)
+            })
     }
 
     /// Whether the current members fit the window body at the current metrics (Q9).
@@ -6939,6 +6984,190 @@ mod tests {
         assert_eq!(app.tabs[0].active_pane, kept);
         assert_eq!(app.active_terminal, 0);
         assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_tab_refusal_in_grid_keeps_focus_on_live_tile() {
+        let mut app = App::new();
+        let shell = app.issue_pane_id();
+        let other = app.issue_pane_id();
+        let focused = app.issue_pane_id();
+        push_test_terminal(&mut app, test_shell(1, shell));
+        push_test_terminal(&mut app, presentation_ready_terminal(2, other));
+        push_test_terminal(&mut app, presentation_ready_terminal(3, focused));
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.terminals[2].set_claude_foreground_for_test(true);
+        // The focused tile moves into the shell's tab, in tree order after the
+        // shell, so the refused cleanup arrives on the first pane of the close.
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(shell)),
+            second: Box::new(SplitNode::Leaf(focused)),
+        };
+        app.tabs[0].active_pane = focused;
+        app.tabs.remove(2);
+        app.active_tab = 0;
+        app.active_terminal = 2;
+        app.active_terminal_presented = true;
+        app.grid_metrics = GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        assert_eq!(app.active_terminal, 2);
+        app.terminal_cleanup.shutdown_and_join();
+        let tab = app.tabs[0].id;
+
+        assert!(!app.close_tab(tab));
+
+        // Nothing left, so the live focused tile keeps the focus (§6.4).
+        assert_eq!(app.terminals.len(), 3);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 2);
+        assert_eq!(app.terminals[2].pane_id(), focused);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.tabs[0].active_pane, focused);
+        assert!(
+            app.terminals[0].has_process(),
+            "the refused shell keeps its process"
+        );
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn close_tab_partial_refusal_focuses_actual_surviving_tile() {
+        let mut app = App::new();
+        let outside = app.issue_pane_id();
+        let focused = app.issue_pane_id();
+        let shell = app.issue_pane_id();
+        let plain = app.issue_pane_id();
+        let next_tile = app.issue_pane_id();
+        let last_tile = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(1, outside));
+        push_test_terminal(&mut app, presentation_ready_terminal(2, focused));
+        push_test_terminal(&mut app, test_shell(3, shell));
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 4, plain));
+        push_test_terminal(&mut app, presentation_ready_terminal(5, next_tile));
+        push_test_terminal(&mut app, presentation_ready_terminal(6, last_tile));
+        for index in [0, 1, 4, 5] {
+            app.terminals[index].set_claude_foreground_for_test(true);
+        }
+        // The closed tab owns panes 1..4 in tree order [focused, shell, plain,
+        // next]: the focused tile leaves first, then the live shell refuses.
+        app.tabs[1].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(focused)),
+            second: Box::new(SplitNode::Split {
+                axis: SplitAxis::Stacked,
+                ratio: 0.5,
+                first: Box::new(SplitNode::Leaf(shell)),
+                second: Box::new(SplitNode::Split {
+                    axis: SplitAxis::Stacked,
+                    ratio: 0.5,
+                    first: Box::new(SplitNode::Leaf(plain)),
+                    second: Box::new(SplitNode::Leaf(next_tile)),
+                }),
+            }),
+        };
+        app.tabs[1].active_pane = focused;
+        app.tabs.remove(4);
+        app.tabs.remove(3);
+        app.tabs.remove(2);
+        app.active_tab = 1;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        app.grid_metrics = GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1, 4, 5]));
+        app.terminal_cleanup.shutdown_and_join();
+        let tab = app.tabs[1].id;
+
+        assert!(!app.close_tab(tab));
+
+        // The focused tile left before the refusal: the next live tile in grid
+        // order is `next_tile` alone, not the shell's neighbour `plain`.
+        assert_eq!(app.terminals.len(), 5);
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 3);
+        assert_eq!(app.terminals[3].pane_id(), next_tile);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.tabs[1].active_pane, next_tile);
+        assert!(
+            app.terminals[1].has_process(),
+            "the refused shell keeps its process"
+        );
+        assert!(app.grid_open());
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn close_active_pane_with_unready_successor_keeps_invariant() {
+        let mut app = App::new();
+        let outside = app.issue_pane_id();
+        let pending = app.issue_pane_id();
+        let other = app.issue_pane_id();
+        let closed = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(1, outside));
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pending));
+        push_test_terminal(&mut app, presentation_ready_terminal(3, other));
+        push_test_terminal(&mut app, presentation_ready_terminal(4, closed));
+        // The closed tab owns the ready focused pane and the unready successor;
+        // the closed pane sits last in `terminals`, so its removal leaves
+        // `active_terminal` on the pane of the neighbour tab.
+        app.tabs[1].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(pending)),
+            second: Box::new(SplitNode::Leaf(closed)),
+        };
+        app.tabs[1].active_pane = closed;
+        app.tabs.remove(3);
+        app.active_tab = 1;
+        app.active_terminal = 3;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_pane(closed));
+
+        // The logical focus already names the successor; the presentation waits.
+        assert_eq!(app.terminals.len(), 3);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.tabs[1].active_pane, pending);
+        assert_eq!(app.active_terminal, 1);
+        assert!(!app.active_terminal_presented);
+        assert_eq!(
+            app.terminals[1].presentation_intent,
+            TerminalPresentationIntent::ActivateWhenReady
+        );
+        app.debug_assert_invariants();
+
+        crate::platform::lock_recover(&app.terminals[1].grid).mark_presentation_ready();
+        assert!(app.process_terminal_presentation_intents());
+
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        assert_eq!(
+            app.terminals[1].presentation_intent,
+            TerminalPresentationIntent::None
+        );
         app.debug_assert_invariants();
     }
 
