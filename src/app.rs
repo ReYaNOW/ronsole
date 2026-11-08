@@ -23,7 +23,10 @@ use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
-use crate::split::{PaneId, SplitNode, leaf_count, remove_leaf, successor};
+use crate::split::{
+    PaneId, SplitAxis, SplitNode, layout_panes, leaf_count, pane_min, remove_leaf, split_leaf_at,
+    successor,
+};
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
@@ -81,6 +84,8 @@ enum GlobalShortcut {
     CloseTab,
     Search,
     ToggleClaudeGrid,
+    SplitRight,
+    SplitDown,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -157,6 +162,12 @@ fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShort
         }
         PhysicalKey::Code(KeyCode::KeyS) if exact_global_modifiers(modifiers, true) => {
             Some(GlobalShortcut::ToggleClaudeGrid)
+        }
+        PhysicalKey::Code(KeyCode::KeyD) if exact_global_modifiers(modifiers, true) => {
+            Some(GlobalShortcut::SplitRight)
+        }
+        PhysicalKey::Code(KeyCode::KeyE) if exact_global_modifiers(modifiers, true) => {
+            Some(GlobalShortcut::SplitDown)
         }
         _ => None,
     }
@@ -501,6 +512,7 @@ struct ClaudeGrid {
 enum GridHint {
     NoClaudeTabs,
     TooManyTabs,
+    SplitTooSmall,
 }
 
 impl GridHint {
@@ -508,6 +520,7 @@ impl GridHint {
         match self {
             Self::NoClaudeTabs => "Нет вкладок с Claude",
             Self::TooManyTabs => "Слишком много вкладок с Claude для окна",
+            Self::SplitTooSmall => "Панель слишком мала для сплита",
         }
     }
 }
@@ -640,13 +653,17 @@ pub struct App {
     grid_metrics: GridMetrics,
     /// Panels drawn in the current frame; rebuilt by `rebuild_panels` before each render.
     panels: Vec<Panel>,
+    /// Outside grid mode, the body of every pane of the active tab, in tree
+    /// order, as laid out for the current frame. Reused by every rebuild.
+    pane_rects: Vec<(PaneId, Rect)>,
     /// Layouts of `panels` from the last render, in `panels` order.
     panel_layouts: Vec<TerminalUiLayout>,
     /// `None` while the ordinary single-panel view is shown.
     claude_grid: Option<ClaudeGrid>,
-    /// Grows whenever the panel composition, order, metrics or mode change.
+    /// Grows whenever the grid composition changes: its members, their order,
+    /// or grid mode opening and closing.
     grid_generation: u64,
-    /// `grid_generation` at the time `panel_layouts` were rendered.
+    /// `layout_generation` at the time `panel_layouts` were rendered.
     panel_layouts_generation: u64,
     /// Hint shown on the tab strip until its deadline.
     grid_hint: Option<(GridHint, Instant)>,
@@ -747,6 +764,7 @@ impl App {
             automation: None,
             grid_metrics: GridMetrics::default(),
             panels: Vec::new(),
+            pane_rects: Vec::new(),
             panel_layouts: Vec::new(),
             claude_grid: None,
             grid_generation: 0,
@@ -1079,23 +1097,13 @@ impl App {
     fn spawn_terminal_tab(
         &mut self,
         wake: WakeHandle,
-        mut launch: TerminalLaunchSpec,
+        launch: TerminalLaunchSpec,
         grid: (u16, u16),
     ) -> usize {
-        launch.shell.clone_from(&self.shell_override);
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
         let pane_id = self.issue_pane_id();
-        let terminal = Terminal::spawn_sized(
-            Some(wake),
-            display_number,
-            launch,
-            self.new_terminal_palette(),
-            grid,
-            pane_id,
-        );
-        let index = self.terminals.len();
-        self.terminals.push(terminal);
+        let index = self.spawn_terminal(wake, display_number, launch, grid, pane_id);
         let id = self.issue_tab_id();
         self.tabs.push(Tab {
             id,
@@ -1107,6 +1115,97 @@ impl App {
         self.request_terminal_activation(index, true);
         self.request_frame();
         index
+    }
+
+    /// Spawns one shell at `grid` under the caller's pane id and display
+    /// number and returns its index in `terminals`. The caller owns the tab and
+    /// the split tree.
+    fn spawn_terminal(
+        &mut self,
+        wake: WakeHandle,
+        display_number: u64,
+        mut launch: TerminalLaunchSpec,
+        grid: (u16, u16),
+        pane_id: PaneId,
+    ) -> usize {
+        launch.shell.clone_from(&self.shell_override);
+        let terminal = Terminal::spawn_sized(
+            Some(wake),
+            display_number,
+            launch,
+            self.new_terminal_palette(),
+            grid,
+            pane_id,
+        );
+        let index = self.terminals.len();
+        self.terminals.push(terminal);
+        index
+    }
+
+    /// Splits the active pane of the active tab along `axis`: the new pane gets
+    /// its own shell in the active pane's directory. Refuses, showing a hint,
+    /// when a pane of the split would fall below `pane_min`; nothing is spawned
+    /// and the tree does not change then.
+    fn split_active_pane(&mut self, axis: SplitAxis) -> bool {
+        let metrics = self.grid_metrics;
+        let tab_index = self.active_tab;
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return false;
+        };
+        let active_pane = tab.active_pane;
+        // The split is laid out on a copy first: a pane below the minimum must
+        // not spawn a shell and must not reach the real tree.
+        let mut preview = tab.layout.clone();
+        let pane_id = self.issue_pane_id();
+        if !split_leaf_at(&mut preview, active_pane, axis, pane_id) {
+            return false;
+        }
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let (min_w, min_h) = pane_min(metrics.char_w, metrics.char_h, metrics.scale);
+        let mut scratch: Vec<(PaneId, Rect)> = Vec::with_capacity(leaf_count(&preview));
+        layout_panes(
+            &preview,
+            body,
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+            &mut scratch,
+        );
+        if scratch
+            .iter()
+            .any(|&(_, rect)| rect.w < min_w || rect.h < min_h)
+        {
+            self.set_grid_hint(GridHint::SplitTooSmall, Instant::now());
+            return false;
+        }
+        let Some(wake) = self.runtime.as_ref().map(|runtime| runtime.wake_handle()) else {
+            return false;
+        };
+        let inherited_directory = self
+            .terminals
+            .get(self.active_terminal)
+            .and_then(|terminal| terminal.osc7_cwd.clone());
+        self.cancel_terminal_presentation_intents();
+        let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
+        let _ = self.spawn_terminal(
+            wake,
+            display_number,
+            TerminalLaunchSpec {
+                inherited_directory,
+                ..TerminalLaunchSpec::default()
+            },
+            crate::terminal::DEFAULT_SPAWN_GRID,
+            pane_id,
+        );
+        let applied = split_leaf_at(&mut self.tabs[tab_index].layout, active_pane, axis, pane_id);
+        debug_assert!(applied, "the preview split already succeeded");
+        if !applied {
+            return false;
+        }
+        self.activate_pane(pane_id, false);
+        self.bump_structure_generation();
+        self.request_frame();
+        true
     }
 
     /// Palette a tab created now starts with: the configured background, with
@@ -2281,7 +2380,7 @@ impl App {
     /// Grid-mode hover: only the tile under the pointer, with its own layout,
     /// may hold a link. Outdated layouts skip the hover entirely.
     fn update_grid_link_hover(&mut self, modal_active: bool, x: f32, y: f32) -> bool {
-        if self.panel_layouts_generation != self.grid_generation {
+        if self.panel_layouts_generation != self.layout_generation {
             return false;
         }
         let target = match panel_hit(&self.panels, x, y) {
@@ -2463,6 +2562,17 @@ impl App {
         true
     }
 
+    /// Whether the window handles `shortcut` now. Pane commands are not
+    /// intercepted while grid mode shows tiles: there every pane key belongs to
+    /// the focused tile's terminal.
+    #[inline]
+    fn shortcut_intercepted(&self, shortcut: GlobalShortcut) -> bool {
+        match shortcut {
+            GlobalShortcut::SplitRight | GlobalShortcut::SplitDown => self.claude_grid.is_none(),
+            _ => true,
+        }
+    }
+
     fn handle_global_key(&mut self, shortcut: GlobalShortcut) -> bool {
         match shortcut {
             GlobalShortcut::ToggleSettings => self.toggle_settings(),
@@ -2482,6 +2592,12 @@ impl App {
                 }
             }
             GlobalShortcut::ToggleClaudeGrid => self.toggle_claude_grid(Instant::now()),
+            GlobalShortcut::SplitRight => {
+                self.split_active_pane(SplitAxis::SideBySide);
+            }
+            GlobalShortcut::SplitDown => {
+                self.split_active_pane(SplitAxis::Stacked);
+            }
         }
         false
     }
@@ -2561,12 +2677,18 @@ impl App {
         self.shutdown_all();
     }
 
-    /// The only writer of `grid_metrics`. A change while grid mode is open
-    /// starts a new generation at once, so input that arrives before the next
-    /// frame is not matched against the old tile geometry.
+    /// The only writer of `grid_metrics`. Any change starts new generations at
+    /// once: the panels and their layouts of the last frame were computed from
+    /// the old metrics, so input that arrives before the next frame must not be
+    /// matched against that geometry. Grid mode also starts a new composition
+    /// generation.
     fn set_grid_metrics(&mut self, metrics: GridMetrics) {
-        if self.claude_grid.is_some() && metrics != self.grid_metrics {
-            self.bump_grid_generation();
+        if metrics != self.grid_metrics {
+            if self.claude_grid.is_some() {
+                self.bump_grid_generation();
+            } else {
+                self.bump_structure_generation();
+            }
         }
         self.grid_metrics = metrics;
     }
@@ -2589,13 +2711,28 @@ impl App {
         self.set_grid_metrics(metrics);
     }
 
-    /// Ordinary mode: one panel, the active terminal filling the window body.
-    /// Grid mode: one tile per member, in tab order.
+    /// Ordinary mode: one panel per pane of the active tab, laid out from its
+    /// split tree. Grid mode: one tile per member, in tab order.
     fn rebuild_panels(&mut self) {
         let metrics = self.grid_metrics;
         let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
         self.panels.clear();
-        let Some(grid) = self.claude_grid.as_ref() else {
+        if let Some(grid) = self.claude_grid.as_ref() {
+            grid_tiles(body, grid.members.len(), metrics.scale, &mut self.grid_tile_rects);
+            for (&terminal, &(header, tile_body)) in grid.members.iter().zip(&self.grid_tile_rects)
+            {
+                self.panels.push(Panel {
+                    terminal,
+                    body: tile_body,
+                    header: Some(header),
+                    content_hidden: false,
+                });
+            }
+            self.pane_rects.clear();
+            return;
+        }
+        if self.tabs.get(self.active_tab).is_none() {
+            self.pane_rects.clear();
             self.panels.push(Panel {
                 terminal: self.active_terminal,
                 body,
@@ -2603,13 +2740,24 @@ impl App {
                 content_hidden: false,
             });
             return;
-        };
-        grid_tiles(body, grid.members.len(), metrics.scale, &mut self.grid_tile_rects);
-        for (&terminal, &(header, tile_body)) in grid.members.iter().zip(&self.grid_tile_rects) {
+        }
+        let active_tab = self.active_tab;
+        layout_panes(
+            &self.tabs[active_tab].layout,
+            body,
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+            &mut self.pane_rects,
+        );
+        for &(pane, pane_body) in &self.pane_rects {
+            let Some(terminal) = self.terminal_index_of_pane(pane) else {
+                continue;
+            };
             self.panels.push(Panel {
                 terminal,
-                body: tile_body,
-                header: Some(header),
+                body: pane_body,
+                header: None,
                 content_hidden: false,
             });
         }
@@ -2649,11 +2797,13 @@ impl App {
         self.request_frame();
     }
 
-    /// Starts a new panel generation and drops the pointer capture of the
-    /// active terminal, so a press from before the change is not finished in a
-    /// tile whose geometry has moved.
+    /// Starts a new grid composition generation and drops the pointer capture of
+    /// the active terminal, so a press from before the change is not finished in
+    /// a tile whose geometry has moved. A composition change is structural: the
+    /// panels, their layouts and the saved layout all move with it.
     fn bump_grid_generation(&mut self) {
         self.grid_generation = self.grid_generation.wrapping_add(1);
+        self.bump_structure_generation();
         if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
             self.interaction.cancel_pointer_interaction(terminal);
         }
@@ -2931,6 +3081,7 @@ impl App {
         }
         if key_input.state.is_pressed()
             && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
+            && self.shortcut_intercepted(shortcut)
         {
             if self.settings_modal_active() && !global_shortcut_allowed_in_settings(shortcut) {
                 return false;
@@ -3233,7 +3384,7 @@ impl App {
                 return false;
             }
         };
-        if self.panel_layouts_generation != self.grid_generation {
+        if self.panel_layouts_generation != self.layout_generation {
             // The frame's geometry is outdated: a press only chooses the tile under it.
             self.suppressed_release = Some(button);
             self.select_grid_tile(index);
@@ -3313,7 +3464,7 @@ impl App {
         if self.grid_open() {
             // The wheel scrolls the tile under the pointer and never moves focus.
             self.rebuild_panels();
-            if self.panel_layouts_generation != self.grid_generation {
+            if self.panel_layouts_generation != self.layout_generation {
                 return;
             }
             let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
@@ -3392,7 +3543,7 @@ impl App {
         // render, and a stale one is trusted only in the current panel generation:
         // after a membership change the same index names another tile. Outside grid
         // mode `self.panels` is the previous frame's list, so it is not read at all.
-        let layouts_current = self.panel_layouts_generation == self.grid_generation;
+        let layouts_current = self.panel_layouts_generation == self.layout_generation;
         let in_grid = self.grid_open();
         for (index, panel) in self.panels.iter().enumerate() {
             if !in_grid || panel.terminal == active {
@@ -3466,7 +3617,7 @@ impl App {
         };
         match render_result {
             Some(Ok(layout)) => {
-                self.panel_layouts_generation = self.grid_generation;
+                self.panel_layouts_generation = self.layout_generation;
                 self.interaction.update_layout(layout);
                 let active = self.active_terminal;
                 let active_content_hidden = self
@@ -6734,6 +6885,219 @@ mod tests {
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
         assert!(app.terminals[2].input_bytes_for_test().is_empty());
         app.debug_assert_invariants();
+    }
+
+    /// Headless app whose window body is 1000x700 at scale 1.0 with one 8x16
+    /// cell, so a split of the active pane fits the pane minimum.
+    fn headless_split_app(
+        tag: &str,
+        count: usize,
+    ) -> (
+        App,
+        std::sync::mpsc::Receiver<String>,
+        crate::headless::Profile,
+        PathBuf,
+    ) {
+        let (mut app, receiver, profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(tag, count);
+        app.set_grid_metrics(GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        app.rebuild_panels();
+        (app, receiver, profile, root)
+    }
+
+    /// `code` as the window delivers a plain press of it.
+    fn shortcut_key(code: KeyCode) -> KeyInput {
+        KeyInput {
+            state: KeyState::Pressed,
+            physical_key: PhysicalKey::Code(code),
+            keycode: 0,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        }
+    }
+
+    /// Ctrl+Shift+`code` through `App::on_key`; returns the key result.
+    fn press_ctrl_shift(app: &mut App, code: KeyCode) -> bool {
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        app.on_key(shortcut_key(code))
+    }
+
+    #[test]
+    fn ctrl_shift_d_splits_active_pane_into_two() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-right", 1);
+        let first_pane = app.tabs[0].active_pane;
+        let terminals_before = app.terminals.len();
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyD));
+        app.rebuild_panels();
+
+        assert_eq!(app.terminals.len(), terminals_before + 1);
+        assert_eq!(app.panels.len(), 2);
+        let SplitNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = &app.tabs[0].layout
+        else {
+            panic!("the active tab must hold one split");
+        };
+        assert_eq!(*axis, SplitAxis::SideBySide);
+        assert_eq!(*ratio, 0.5);
+        assert!(matches!(**first, SplitNode::Leaf(pane) if pane == first_pane));
+        let new_pane = app.tabs[0].active_pane;
+        assert_ne!(new_pane, first_pane);
+        assert!(matches!(**second, SplitNode::Leaf(pane) if pane == new_pane));
+        assert_eq!(app.active_terminal, terminals_before);
+        assert_eq!(app.terminals[terminals_before].pane_id(), new_pane);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_shift_e_splits_stacked() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-down", 1);
+        let first_pane = app.tabs[0].active_pane;
+
+        press_ctrl_shift(&mut app, KeyCode::KeyE);
+        app.rebuild_panels();
+
+        assert_eq!(app.panels.len(), 2);
+        let SplitNode::Split {
+            axis, ratio, first, ..
+        } = &app.tabs[0].layout
+        else {
+            panic!("the active tab must hold one split");
+        };
+        assert_eq!(*axis, SplitAxis::Stacked);
+        assert_eq!(*ratio, 0.5);
+        assert!(matches!(**first, SplitNode::Leaf(pane) if pane == first_pane));
+        let left = app.panels[0].body;
+        let top = app.panels[1].body;
+        assert_eq!(left.x, top.x);
+        assert_eq!(left.w, top.w);
+        assert!(left.y < top.y);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_in_narrow_pane_shows_hint_and_spawns_nothing() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-too-small", 1);
+        // 994px of two side-by-side panes leaves 497px each; 200px leaves 97px,
+        // below the 100px pane minimum of one 8px cell row of ten columns.
+        app.set_grid_metrics(GridMetrics {
+            width: 200.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        app.rebuild_panels();
+        let terminals_before = app.terminals.len();
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+
+        assert_eq!(app.terminals.len(), terminals_before);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.tabs[0].active_pane, app.terminals[0].pane_id());
+        let hint = app.tab_strip_hint(Instant::now()).expect("a hint is shown");
+        assert!(
+            hint.contains("Панель слишком мала для сплита"),
+            "unexpected hint {hint:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_uses_osc7_directory_of_active_pane() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-osc7", 1);
+        app.shell_override = Some(PathBuf::from("/bin/bash"));
+        let workspace = root.join("workspace");
+        app.terminals[0].osc7_cwd = Some(workspace.clone());
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+
+        assert_eq!(app.terminals.len(), 2);
+        // The split shell runs in the directory the active pane's shell reported.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut cwd = None;
+        while cwd.as_ref() != Some(&workspace) && Instant::now() < deadline {
+            if let Some(pid) = app.terminals[1].process_group_leader()
+                && let Ok(link) = std::fs::read_link(format!("/proc/{pid}/cwd"))
+            {
+                cwd = Some(link);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cwd, Some(workspace));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_panels_lays_out_all_panes_without_overlap() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-layout", 1);
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+        app.rebuild_panels();
+
+        let body = terminal_body_rect(1000.0, 700.0, 1.0);
+        assert_eq!(app.panels.len(), 2);
+        assert_eq!(app.panels[0].terminal, 0);
+        assert_eq!(app.panels[1].terminal, 1);
+        let left = app.panels[0].body;
+        let right = app.panels[1].body;
+        for rect in [left, right] {
+            assert_eq!(rect.x.fract(), 0.0, "x must be whole pixels");
+            assert_eq!(rect.y.fract(), 0.0, "y must be whole pixels");
+            assert_eq!(rect.w.fract(), 0.0, "w must be whole pixels");
+            assert_eq!(rect.h.fract(), 0.0, "h must be whole pixels");
+            assert!(rect.x >= body.x && rect.y >= body.y);
+            assert!(rect.x + rect.w <= body.x + body.w);
+            assert!(rect.y + rect.h <= body.y + body.h);
+            assert!(rect.w >= 100.0 && rect.h >= 48.0, "pane minimum");
+        }
+        assert!(left.x + left.w <= right.x, "panes must not overlap");
+        assert_eq!(left.y, right.y);
+        assert_eq!(left.h, right.h);
+        assert_eq!(right.x, left.x + left.w + 6.0, "one gap between panes");
+        assert_eq!(left.w + right.w + 6.0, body.w);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn layout_generation_grows_on_split_and_metrics_change() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-generations", 1);
+        let before = app.layout_generation;
+        let same = app.grid_metrics;
+        app.set_grid_metrics(same);
+        assert_eq!(
+            app.layout_generation, before,
+            "same metrics keep the generation"
+        );
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+        let after_split = app.layout_generation;
+        assert!(after_split > before, "a split changes the layout");
+
+        app.set_grid_metrics(GridMetrics {
+            width: same.width - 100.0,
+            ..same
+        });
+        assert!(
+            app.layout_generation > after_split,
+            "a metrics change invalidates the layout outside grid mode"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Closing the active terminal drops its tab too, so the strip stays in
