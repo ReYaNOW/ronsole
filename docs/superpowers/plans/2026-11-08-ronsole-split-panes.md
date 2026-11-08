@@ -325,7 +325,7 @@
 
 **Interfaces:**
 - Produces: `GlobalShortcut::FocusPane(PaneDirection)`; `GlobalShortcut::ClosePane`; `fn exact_alt_modifiers(modifiers) -> bool` — Alt без Ctrl, Shift и Super.
-- Consumes: Tasks 2 (`pane_in_direction`), 3 (`activate_pane`), 4 (`close_pane`), 5 (`leaf_count`, предикаты).
+- Consumes: Tasks 2 (`pane_in_direction`, `leaf_count`), 3 (`activate_pane`), 4 (`close_pane`), 5 (предикаты перехвата).
 
 Решения (§6.2, §7):
 - Распознавание: `Alt+←/→/↑/↓` — Alt без Ctrl и Shift (`exact_alt_modifiers`; существующий `exact_global_modifiers` требует Ctrl и для стрелок не годится — не менять его); перехват в `on_key` только при `claude_grid.is_none() && leaf_count(active tab) > 1`, иначе событие идёт обычным маршрутом в терминал.
