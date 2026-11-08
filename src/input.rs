@@ -1086,6 +1086,9 @@ impl TerminalInteraction {
             && tracking
             && !terminal_protocol_pointer_target(self.layout, x, y)
         {
+            // The application never saw this press, so the button is not held
+            // for motion reports or ownership; only its release stays swallowed.
+            self.cancel_pointer_press(button);
             return MouseInputOutcome::Rejected;
         }
         MouseInputOutcome::Ignored

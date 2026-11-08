@@ -10518,7 +10518,8 @@ mod tests {
     #[test]
     fn owner_assigned_after_rejected_press_of_other_button() {
         let (mut app, root) = split_pointer_app("t7-owner-other-button");
-        // Any-motion reporting makes a delivered motion visible in the bytes.
+        // Any-motion reporting makes every delivered motion visible in the bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
         feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
         feed_batch(&app.terminals[1], "\x1b[?1003h");
         assert_eq!(app.on_frame(), Ok(true));
@@ -10531,15 +10532,23 @@ mod tests {
         );
         split_pointer_move(&mut app, over.0, over.1);
         let before = app.terminals[1].input_bytes_for_test().len();
-        // The rejected right press leaves its held bit set; the next delivered
-        // press still claims the owner for the pane that received it.
+        // The rejected right press is not a held button: the terminal never saw
+        // it, so it must not hold the owner and motion must not report it.
         app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
         assert!(app.split_pointer_owner.is_none());
         assert_eq!(app.terminals[1].input_bytes_for_test().len(), before);
+        assert_eq!(app.interaction.pressed_mouse_buttons(), 0);
 
         let body = panel_body_point(&app, 1);
         split_pointer_move(&mut app, body.0, body.1);
         let moved_len = app.terminals[1].input_bytes_for_test().len();
+        // One legacy X10 motion report: ESC [ M and three offset bytes. Button
+        // code 3 plus both offsets is 67 for no held button, while a held right
+        // button would encode 66.
+        let motion = &app.terminals[1].input_bytes_for_test()[before..];
+        assert_eq!(motion.len(), 6, "one X10 motion report");
+        assert_eq!(motion[3], 67, "motion must report no held button");
+
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
         assert_eq!(app.active_terminal, 1);
         assert_eq!(app.split_pointer_owner, Some(1));
@@ -10555,13 +10564,22 @@ mod tests {
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
         assert!(app.terminals[1].input_bytes_for_test().len() > motion_len);
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
-        // The retained right press still holds the owner after the left release.
-        assert_eq!(app.split_pointer_owner, Some(1));
+        // No button is held after the left release: the owner is gone and the
+        // next click belongs to the pane under the pointer.
+        assert!(app.split_pointer_owner.is_none());
+        // The rejected right release stays swallowed.
         let release_len = app.terminals[1].input_bytes_for_test().len();
         app.on_pointer_button(KeyState::Released, PointerButton::Right);
         assert_eq!(app.terminals[1].input_bytes_for_test().len(), release_len);
-        assert!(app.split_pointer_owner.is_none());
         assert_eq!(app.interaction.pressed_mouse_buttons(), 0);
+
+        let neighbour_len = app.terminals[1].input_bytes_for_test().len();
+        split_pointer_move(&mut app, neighbour.0, neighbour.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), neighbour_len);
         let _ = std::fs::remove_dir_all(&root);
     }
 
