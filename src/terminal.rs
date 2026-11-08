@@ -497,6 +497,8 @@ mod tests {
             dev_banner: DevBannerState::default(),
             dev_claude_cache: None,
             dev_channel_verified: None,
+            #[cfg(test)]
+            dev_process_group_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -919,6 +921,8 @@ mod tests {
     fn dev_channel_unknown_group_answer_hides_content_and_keeps_generation_unchecked() {
         let now = Instant::now();
         let mut terminal = test_terminal(120, 8, 1);
+        // A process exists, so an unanswered candidate is "unknown".
+        terminal.set_dev_process_group_for_test(Some(1000));
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         let generation = dev_generation(&terminal);
         let mut scratch = String::new();
@@ -981,6 +985,8 @@ mod tests {
     fn dev_channel_answer_for_stale_generation_is_not_used() {
         let now = Instant::now();
         let mut terminal = test_terminal(120, 8, 1);
+        // A process exists, so the answer comes from the injected lookup.
+        terminal.set_dev_process_group_for_test(Some(1000));
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         let mut scratch = String::new();
         assert!(terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE)).sent);
@@ -996,6 +1002,107 @@ mod tests {
         terminal.observe_dev_channel_cached(now, &mut scratch);
         assert!(!terminal.dev_channel_generation_verified(newer));
         assert!(terminal.dev_channel_content_hidden(now));
+    }
+
+    #[test]
+    fn dev_channel_group_change_without_content_change_unverifies() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        terminal.set_dev_process_group_for_test(Some(1000));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+
+        // The event pass answers for the foreground group 1000: Enter is
+        // written and the generation is verified for that group.
+        assert!(
+            terminal
+                .observe_dev_channel(now, &mut scratch, true, |pgrp| {
+                    assert_eq!(pgrp, Some(1000));
+                    Some(DEV_CLAUDE)
+                })
+                .sent
+        );
+        assert!(terminal.dev_channel_generation_verified(generation));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // The foreground group changes, the content does not. The cached
+        // answer is for the old group, and the frame path may not look up:
+        // the old verification is withdrawn and the content is hidden.
+        let late = now + DEV_WARNING_HIDE_LIMIT;
+        terminal.set_dev_process_group_for_test(Some(2000));
+        terminal.observe_dev_channel_cached(late, &mut scratch);
+        assert!(!terminal.dev_channel_generation_verified(generation));
+        assert!(!terminal.dev_channel_content_verified());
+        assert!(terminal.dev_channel_content_hidden(late));
+
+        // The next event pass answers for the new group and verifies again.
+        terminal.observe_dev_channel(late, &mut scratch, true, |pgrp| {
+            assert_eq!(pgrp, Some(2000));
+            Some(DEV_CLAUDE)
+        });
+        assert!(terminal.dev_channel_generation_verified(generation));
+        assert!(!terminal.dev_channel_content_hidden(late));
+    }
+
+    #[test]
+    fn dev_channel_group_read_failure_with_a_process_is_unknown() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        // A process exists but its foreground group cannot be read.
+        terminal.set_dev_process_group_for_test(None);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+        let mut lookups = 0;
+        terminal.observe_dev_channel(now, &mut scratch, true, |_| {
+            lookups += 1;
+            Some(DEV_CLAUDE)
+        });
+        // No lookup, no Enter, and the content stays unverified and hidden.
+        assert_eq!(lookups, 0);
+        assert!(!terminal.dev_channel_generation_verified(generation));
+        assert!(terminal.dev_channel_content_hidden(now));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // Without a process the same candidate is a verified "no flagged
+        // claude": no lookup, no Enter, and the content is shown.
+        let mut headless = test_terminal(120, 8, 1);
+        feed_dev_screen(&headless, DEV_WARNING_SCREEN);
+        let headless_generation = dev_generation(&headless);
+        let mut headless_scratch = String::new();
+        let mut headless_lookups = 0;
+        headless.observe_dev_channel(now, &mut headless_scratch, true, |_| {
+            headless_lookups += 1;
+            Some(DEV_CLAUDE)
+        });
+        assert_eq!(headless_lookups, 0);
+        assert!(headless.dev_channel_generation_verified(headless_generation));
+        assert!(!headless.dev_channel_content_hidden(now));
+        assert!(headless.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn dev_channel_banner_applies_when_answer_turns_positive_for_same_generation() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(200, 8, 1);
+        terminal.set_dev_process_group_for_test(Some(1000));
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
+        feed_dev_screen(&terminal, &screen);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+
+        // The first answer for this generation is negative: the banner stays.
+        terminal.observe_dev_channel(now, &mut scratch, true, |_| None);
+        assert_banner_rows(&terminal, rows, false);
+        assert_eq!(dev_generation(&terminal), generation);
+
+        // The group changes without a content change; the same generation now
+        // gets a positive answer, and the hiding must be applied.
+        terminal.set_dev_process_group_for_test(Some(2000));
+        terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE));
+        assert_banner_rows(&terminal, rows, true);
+        assert_eq!(dev_generation(&terminal), generation);
     }
 
     /// Word wrap like Claude Code's notice box: rows of at most `width`
@@ -1992,6 +2099,10 @@ impl<'a> BannerRows<'a> {
 struct DevBannerState {
     /// `Term::content_generation` of the last applied scan.
     scanned_generation: Option<u64>,
+    /// The process answer the last applied scan used: whether the foreground
+    /// group holds a flagged `claude`. A changed answer for the same
+    /// generation re-applies the hiding (see `apply_dev_channel_banner`).
+    scanned_answer: Option<bool>,
     /// `Term::scrollback_pushed` and `Term::cols` at the last applied
     /// scan.
     scanned_pushed: u64,
@@ -2139,11 +2250,19 @@ pub struct Terminal {
     /// earlier generation or another foreground group, is "unknown", never
     /// "no"; only the event path writes it, the frame path reads it.
     dev_claude_cache: Option<(u64, Option<u32>, Option<crate::tab_input::ProcGen>)>,
-    /// `Term::content_generation` whose development-channels check finished:
-    /// content may be drawn for exactly this generation. A generation with a
-    /// candidate is recorded only after a verified answer for its foreground
-    /// group; one without a candidate needs no answer.
-    dev_channel_verified: Option<u64>,
+    /// `(Term::content_generation, foreground group)` whose
+    /// development-channels check finished: content may be drawn for exactly
+    /// this pair. The group is `None` when no group answer was needed (no
+    /// candidate) or no process exists. A generation with a candidate and a
+    /// process is recorded only after a verified answer for its group; an
+    /// unknown answer clears the whole entry.
+    dev_channel_verified: Option<(u64, Option<u32>)>,
+    /// Test override of the process and its foreground group for the
+    /// development-channels check: `Some(group)` makes the terminal look like
+    /// it has a process, and a `None` group makes that process's group
+    /// unreadable. Not set means the real `process`/`tcgetpgrp` answer.
+    #[cfg(test)]
+    dev_process_group_for_test: Option<Option<u32>>,
     /// Working directory from the latest OSC 7 report that passed
     /// `accept_osc7_cwd`; a new tab inherits it.
     pub(crate) osc7_cwd: Option<PathBuf>,
@@ -2289,6 +2408,8 @@ impl Terminal {
             dev_banner: DevBannerState::default(),
             dev_claude_cache: None,
             dev_channel_verified: None,
+            #[cfg(test)]
+            dev_process_group_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2399,6 +2520,8 @@ impl Terminal {
             dev_banner: DevBannerState::default(),
             dev_claude_cache: None,
             dev_channel_verified: None,
+            #[cfg(test)]
+            dev_process_group_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2614,7 +2737,7 @@ impl Terminal {
         if !visible || self.dev_warning.enter_at.is_some() {
             return false;
         }
-        let Some(claude) = find_claude(self.process_group_leader()) else {
+        let Some(claude) = find_claude(self.dev_process_group_leader()) else {
             return false;
         };
         self.enter_dev_warning(now, Some(claude))
@@ -2657,17 +2780,23 @@ impl Terminal {
                 self.dev_banner.apply(&mut grid, false);
             }
             self.dev_banner.mark_scanned(&grid);
+            self.dev_banner.scanned_answer = Some(false);
         }
         (generation, drawn)
     }
 
     /// Applies the banner hiding of the last scan of `generation` while it
-    /// still holds; new output is left to the next scan. Only the cell hidden
-    /// flag changes: text, cursor, scrollback and selection stay as the
-    /// program wrote them.
+    /// still holds; a changed process answer for the same generation applies
+    /// again, so a positive answer after a negative one hides the banner. New
+    /// output is left to the next scan. Only the cell hidden flag changes:
+    /// text, cursor, scrollback and selection stay as the program wrote them.
     fn apply_dev_channel_banner(&mut self, generation: u64, flagged: bool) {
         if self.dev_banner.scanned_generation == Some(generation) {
-            return;
+            // Nothing drawn is no banner candidate; otherwise only the same
+            // answer as the last applied scan needs no work.
+            if !self.dev_banner.drawn || self.dev_banner.scanned_answer == Some(flagged) {
+                return;
+            }
         }
         let mut grid = crate::platform::lock_recover(&self.grid);
         if grid.content_generation() != generation {
@@ -2682,6 +2811,7 @@ impl Terminal {
             self.dev_banner.drawn = false;
         }
         self.dev_banner.mark_scanned(&grid);
+        self.dev_banner.scanned_answer = Some(flagged);
     }
 
     /// `observe_dev_channel_banner` with an injected lookup, for tests: hides
@@ -2700,7 +2830,7 @@ impl Terminal {
         if !drawn {
             return;
         }
-        let pgrp = self.process_group_leader();
+        let pgrp = self.dev_process_group_leader();
         let flagged = match self.dev_banner.owner {
             Some((cached, flagged)) if cached == pgrp => flagged,
             _ => {
@@ -2714,15 +2844,18 @@ impl Terminal {
 
     /// One development-channels pass: scans the current content, answers the
     /// warning and banner hiding from `lookup`, and records which generation
-    /// may be shown. `lookup` walks `/proc` only for a generation that has a
-    /// candidate (warning screen or drawn banner) and no cached answer for its
-    /// foreground group; a generation without a candidate needs neither
-    /// `/proc` nor `tcgetpgrp`, so ordinary output stays cheap. Returns whether
-    /// Enter was written.
+    /// and foreground group may be shown. `lookup` walks `/proc` only for a
+    /// generation that has a candidate (warning screen or drawn banner), a
+    /// process, a readable foreground group, and no cached answer for that
+    /// group; a generation without a candidate needs neither `/proc` nor
+    /// `tcgetpgrp`, so ordinary output stays cheap. Returns whether Enter was
+    /// written.
     ///
-    /// "Unknown" is not "no": with `allow_lookup` off (the frame path) and no
-    /// cached answer, the generation stays unverified, so the frame hides its
-    /// content and the next event pass retries the lookup.
+    /// "Unknown" is not "no": with `allow_lookup` off (the frame path), or a
+    /// process whose group cannot be read, the generation stays unverified
+    /// (any earlier verification is withdrawn), so the frame hides its content
+    /// and the next event pass retries the lookup. A terminal without a
+    /// process is a verified "no flagged claude".
     fn observe_dev_channel(
         &mut self,
         now: Instant,
@@ -2734,37 +2867,50 @@ impl Terminal {
         let previous = self.dev_channel_verified;
         let (warning_generation, warning_visible) = self.scan_dev_channel_warning(scratch);
         let (banner_generation, banner_drawn) = self.scan_dev_channel_banner();
-        // Output can land between the two scans: leave this pass to the next
-        // one, which scans the newer generation.
+        // Output can land between the two scans: the verification describes
+        // neither content, so drop it and leave this pass to the next one,
+        // which scans the newer generation.
         if warning_generation != banner_generation {
+            self.dev_channel_verified = None;
             return pass;
         }
         let generation = warning_generation;
         let candidate = warning_visible || banner_drawn;
-        let answer = if candidate {
-            let pgrp = self.process_group_leader();
-            match self.dev_claude_cache {
+        // No candidate: the generation is verified on its own. Without a
+        // process: a verified "no flagged claude" (headless tabs).
+        let (verified_group, answer) = if !candidate || !self.dev_has_process() {
+            (None, None)
+        } else {
+            let Some(pgrp) = self.dev_process_group_leader() else {
+                // A process whose foreground group cannot be read gives no
+                // answer; it is not a verified "no".
+                self.dev_channel_verified = None;
+                return pass;
+            };
+            let answer = match self.dev_claude_cache {
                 Some((cached_generation, cached_pgrp, found))
-                    if cached_generation == generation && cached_pgrp == pgrp =>
+                    if cached_generation == generation && cached_pgrp == Some(pgrp) =>
                 {
                     Some(found)
                 }
                 _ if allow_lookup => {
-                    let found = lookup(pgrp);
-                    self.dev_claude_cache = Some((generation, pgrp, found));
+                    let found = lookup(Some(pgrp));
+                    self.dev_claude_cache = Some((generation, Some(pgrp), found));
                     Some(found)
                 }
                 _ => None,
-            }
-        } else {
-            Some(None)
-        };
-        let Some(answer) = answer else {
-            return pass;
+            };
+            let Some(answer) = answer else {
+                // A frame-path cache miss: nothing may be drawn for this
+                // generation until an event pass answers it.
+                self.dev_channel_verified = None;
+                return pass;
+            };
+            (Some(pgrp), answer)
         };
         pass.sent = warning_visible && self.enter_dev_warning(now, answer);
         self.apply_dev_channel_banner(generation, answer.is_some());
-        self.dev_channel_verified = Some(generation);
+        self.dev_channel_verified = Some((generation, verified_group));
         pass.reverified = self.dev_channel_verified != previous;
         pass
     }
@@ -2791,19 +2937,27 @@ impl Terminal {
         self.observe_dev_channel(now, scratch, false, |_| None)
     }
 
-    /// Whether the development-channels check finished for `generation`:
-    /// content of any other generation must not be drawn.
+    /// Whether the development-channels check finished for `generation` and
+    /// the foreground group it answered for: content of any other generation
+    /// must not be drawn, and a different group has no answer yet. A
+    /// verification without a group (no candidate, or no process) holds for
+    /// the generation alone.
     pub(crate) fn dev_channel_generation_verified(&self, generation: u64) -> bool {
-        self.dev_channel_verified == Some(generation)
+        match self.dev_channel_verified {
+            Some((verified, Some(pgrp))) => {
+                verified == generation && self.dev_process_group_leader() == Some(pgrp)
+            }
+            Some((verified, None)) => verified == generation,
+            None => false,
+        }
     }
 
     /// Whether the grid's current content may be drawn (see
     /// `dev_channel_generation_verified`). Read under the grid lock, since
     /// output can land after the event pass that verified it.
     pub(crate) fn dev_channel_content_verified(&self) -> bool {
-        self.dev_channel_generation_verified(
-            crate::platform::lock_recover(&self.grid).content_generation(),
-        )
+        let generation = crate::platform::lock_recover(&self.grid).content_generation();
+        self.dev_channel_generation_verified(generation)
     }
 
     /// Whether the content must stay hidden: the warning Enter hiding is
@@ -2957,6 +3111,35 @@ impl Terminal {
 
     pub(crate) fn process_group_leader(&self) -> Option<u32> {
         self.process.as_ref()?.process_group_leader()
+    }
+
+    /// Foreground group of the development-channels check: the test override
+    /// when set, otherwise `process_group_leader`. `None` alone cannot tell
+    /// "no process" from "unreadable group"; `dev_has_process` does.
+    fn dev_process_group_leader(&self) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(group) = self.dev_process_group_for_test {
+            return group;
+        }
+        self.process_group_leader()
+    }
+
+    /// Whether a process exists for the development-channels check; a test
+    /// override counts as one.
+    fn dev_has_process(&self) -> bool {
+        #[cfg(test)]
+        if self.dev_process_group_for_test.is_some() {
+            return true;
+        }
+        self.has_process()
+    }
+
+    /// Makes the terminal look like it has a process whose foreground group
+    /// is `group`; a `None` group is a process whose group cannot be read
+    /// (`tcgetpgrp` failure).
+    #[cfg(test)]
+    pub(crate) fn set_dev_process_group_for_test(&mut self, group: Option<u32>) {
+        self.dev_process_group_for_test = Some(group);
     }
 
     /// Foreground job name when a job other than the shell is running in this tab.
