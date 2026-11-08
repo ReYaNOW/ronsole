@@ -499,6 +499,8 @@ mod tests {
             dev_channel_verified: None,
             #[cfg(test)]
             dev_process_group_for_test: None,
+            #[cfg(test)]
+            process_group_leader_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2263,6 +2265,11 @@ pub struct Terminal {
     /// unreadable. Not set means the real `process`/`tcgetpgrp` answer.
     #[cfg(test)]
     dev_process_group_for_test: Option<Option<u32>>,
+    /// Test override of the PTY foreground process group: when set, the
+    /// terminal answers `process_group_leader` with this group even though it
+    /// has no process. Not set means the real `process`/`tcgetpgrp` answer.
+    #[cfg(test)]
+    process_group_leader_for_test: Option<u32>,
     /// Working directory from the latest OSC 7 report that passed
     /// `accept_osc7_cwd`; a new tab inherits it.
     pub(crate) osc7_cwd: Option<PathBuf>,
@@ -2410,6 +2417,8 @@ impl Terminal {
             dev_channel_verified: None,
             #[cfg(test)]
             dev_process_group_for_test: None,
+            #[cfg(test)]
+            process_group_leader_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2522,6 +2531,8 @@ impl Terminal {
             dev_channel_verified: None,
             #[cfg(test)]
             dev_process_group_for_test: None,
+            #[cfg(test)]
+            process_group_leader_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -3110,7 +3121,18 @@ impl Terminal {
     }
 
     pub(crate) fn process_group_leader(&self) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(leader) = self.process_group_leader_for_test {
+            return Some(leader);
+        }
         self.process.as_ref()?.process_group_leader()
+    }
+
+    /// Makes a process-less test terminal answer `process_group_leader` with
+    /// `leader`; `None` restores the real process answer.
+    #[cfg(test)]
+    pub(crate) fn set_process_group_leader_for_test(&mut self, leader: Option<u32>) {
+        self.process_group_leader_for_test = leader;
     }
 
     /// Foreground group of the development-channels check: the test override

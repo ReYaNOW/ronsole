@@ -511,7 +511,6 @@ mod tests {
         attach_test_pane, insert_test_terminal, push_test_terminal,
         started_headless_with_test_terminals,
     };
-    use crate::split::{SplitAxis, split_leaf_at};
     use std::cell::Cell;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -718,40 +717,6 @@ mod tests {
                 expected,
                 "extra bytes reached the PTY"
             );
-        }
-
-        /// Spawns another PTY pane with the fixture screen and splits it into
-        /// tab 0. Returns its token and the file its process writes input to.
-        fn spawn_pane(&mut self, number: u64, screen: &str) -> (String, PathBuf) {
-            let dir = self.root.join(format!("pane-{number}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            let launch = TerminalLaunchSpec {
-                shell: None,
-                working_directory: Some(dir.clone()),
-                inherited_directory: None,
-                command: screen_script(screen),
-                hold: false,
-                bridge_launch_id: None,
-            };
-            let pane = self.app.issue_pane_id();
-            let terminal = Terminal::spawn(
-                None,
-                number,
-                launch,
-                crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
-                pane,
-            );
-            let token = terminal.tab_token().to_owned();
-            let out = dir.join("out");
-            wait_screen_ready(&terminal, &out);
-            let active_pane = self.app.tabs[0].active_pane;
-            assert!(
-                split_leaf_at(&mut self.app.tabs[0].layout, active_pane, SplitAxis::SideBySide, pane),
-                "tab 0 does not own its active pane"
-            );
-            self.app.terminals.push(terminal);
-            self.app.bump_layout_generation();
-            (token, out)
         }
 
         fn held(&self) -> bool {
@@ -1405,86 +1370,199 @@ mod tests {
         assert_eq!(tab_status_call_app(&mut app, &tokens[1], uid), status(true, false));
     }
 
+    /// Feeds one output batch into the visible grid of `terminal`.
+    fn show_screen(terminal: &Terminal, bytes: &str) {
+        let mut grid = crate::platform::lock_recover(&terminal.grid);
+        let mut sink = crate::terminal_process::SessionSink {
+            reply_tx: None,
+            title_cache: None,
+            pending: None,
+            wake: None,
+        };
+        grid.advance(bytes.as_bytes(), Instant::now(), &mut sink);
+    }
+
+    /// Puts the empty Claude input box on the bottom rows of a 24-row screen.
+    fn show_empty_input_box(terminal: &Terminal) {
+        show_screen(terminal, &format!("\x1b[21;1H{EMPTY_BOX}"));
+    }
+
+    /// A tab with two process-less panes, both showing the empty input box and
+    /// carrying distinct test leaders. The fake probes answer for any leader,
+    /// so the bytes a pane records prove routing, not the probe answer.
+    fn split_app_with_empty_boxes() -> (App, String, String) {
+        set_leader(Some(100));
+        ORIGIN_OK.with(|cell| cell.set(true));
+        CLAUDE_PROCESS.with(|cell| cell.set(None));
+        let mut app = App::new();
+        app.tab_input.probe = TabInputProbe {
+            claude_generation: fake_generation,
+            origin_allowed: fake_origin,
+            claude_process_group: fake_claude_process_group,
+        };
+        let first_pane = app.issue_pane_id();
+        let mut first = Terminal::new_for_test(80, 24, 1, first_pane);
+        first.set_process_group_leader_for_test(Some(1001));
+        show_empty_input_box(&first);
+        push_test_terminal(&mut app, first);
+        attach_test_pane(&mut app, 0, 2);
+        app.terminals[1].set_process_group_leader_for_test(Some(1002));
+        show_empty_input_box(&app.terminals[1]);
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        let first_token = app.terminals[0].tab_token().to_owned();
+        let second_token = app.terminals[1].tab_token().to_owned();
+        (app, first_token, second_token)
+    }
+
+    /// Sends one `TAB_INPUT` request at `now`, as the runtime does.
+    fn send_at(
+        app: &mut App,
+        token: &str,
+        kind: TabInputKind,
+        op: [u8; 16],
+        line: &str,
+        now: Instant,
+    ) -> Receiver<TabInputCode> {
+        let (reply, receiver) = channel();
+        app.handle_tab_input_at(
+            TabInputEnvelope {
+                request: TabInputRequest {
+                    token: token.to_owned(),
+                    delay_ms: 100,
+                    kind,
+                    op,
+                    line: line.to_owned(),
+                },
+                peer: PeerCred { uid: 1000, pid: 4242 },
+                reply,
+            },
+            now,
+        );
+        receiver
+    }
+
+    fn after_ms(t0: Instant, ms: u64) -> Instant {
+        t0 + Duration::from_millis(ms)
+    }
+
+    /// A line for each pane's own token is written into that pane and into no
+    /// other pane; the test terminals have no process, so the bytes a pane
+    /// records are exactly what delivery handed to `Terminal::write_input`.
     #[test]
     fn tab_input_goes_to_its_own_pane_by_token() {
-        let mut fx = Fixture::new(EMPTY_BOX);
-        let first_out = fx.root.join("out");
-        let first_token = fx.token.clone();
-        let (second_token, second_out) = fx.spawn_pane(2, EMPTY_BOX);
+        let (mut app, first_token, second_token) = split_app_with_empty_boxes();
+        let t0 = Instant::now();
 
-        let first_reply = fx.send(&first_token, TabInputKind::Line, OP_A, "/effort first-marker", 0);
-        let second_reply = fx.send(&second_token, TabInputKind::Line, OP_B, "/effort second-marker", 0);
-        fx.advance(100);
-        fx.advance(250);
+        let first_reply = send_at(
+            &mut app,
+            &first_token,
+            TabInputKind::Line,
+            OP_A,
+            "/effort first-marker",
+            t0,
+        );
+        let second_reply = send_at(
+            &mut app,
+            &second_token,
+            TabInputKind::Line,
+            OP_B,
+            "/effort second-marker",
+            t0,
+        );
+        app.advance_tab_deliveries(after_ms(t0, 100));
+        app.advance_tab_deliveries(after_ms(t0, 250));
         assert_eq!(first_reply.try_recv(), Ok(TabInputCode::InputDelivered));
         assert_eq!(second_reply.try_recv(), Ok(TabInputCode::InputDelivered));
-        fx.wait_out_at(&first_out, b"/effort first-marker\r");
-        fx.wait_out_at(&second_out, b"/effort second-marker\r");
-        fx.advance(350);
+        assert_eq!(
+            app.terminals[0].input_bytes_for_test(),
+            b"/effort first-marker\r"
+        );
+        assert_eq!(
+            app.terminals[1].input_bytes_for_test(),
+            b"/effort second-marker\r"
+        );
+        app.advance_tab_deliveries(after_ms(t0, 350));
     }
 
     #[test]
     fn clear_input_reaches_pane_of_its_own_session() {
-        let mut fx = Fixture::new(EMPTY_BOX);
-        let (second_token, second_out) = fx.spawn_pane(2, EMPTY_BOX);
+        let (mut app, first_token, second_token) = split_app_with_empty_boxes();
+        let t0 = Instant::now();
 
-        let reply = fx.send(&second_token, TabInputKind::Clear, OP_B, "/clear", 0);
-        fx.advance(100);
-        assert!(fx.app.terminals[1].input_hold_active());
-        assert!(!fx.app.terminals[0].input_hold_active());
-        fx.advance(250);
+        let reply = send_at(&mut app, &second_token, TabInputKind::Clear, OP_B, "/clear", t0);
+        app.advance_tab_deliveries(after_ms(t0, 100));
+        assert!(app.terminals[1].input_hold_active());
+        assert!(!app.terminals[0].input_hold_active());
+        app.advance_tab_deliveries(after_ms(t0, 250));
         assert_eq!(reply.try_recv(), Ok(TabInputCode::InputDelivered));
-        fx.wait_out_at(&second_out, b"/clear\r");
-        assert!(fx.out().is_empty(), "the first pane must see no /clear");
-        fx.advance(350);
-        assert!(!fx.app.terminals[1].input_hold_active());
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"/clear\r");
+        assert!(
+            app.terminals[0].input_bytes_for_test().is_empty(),
+            "the first pane must see no /clear"
+        );
+        app.advance_tab_deliveries(after_ms(t0, 350));
+        assert!(!app.terminals[1].input_hold_active());
         assert_eq!(
-            fx.app.tab_input.records[0]
+            app.tab_input.records[0]
                 .clear_op
                 .as_ref()
                 .map(|clear| clear.op),
             Some(OP_B)
         );
+        // The record belongs to the pane that received the /clear.
+        assert_eq!(app.tab_input.records[0].token, second_token);
+        assert_eq!(app.find_tab_by_token(&first_token), Some(0));
+        assert_eq!(app.find_tab_by_token(&second_token), Some(1));
     }
 
     #[test]
     fn token_addressing_survives_tab_drag_and_other_tab_close() {
-        let mut fx = Fixture::new(EMPTY_BOX);
-        let first_out = fx.root.join("out");
-        let (second_token, second_out) = fx.spawn_pane(2, EMPTY_BOX);
+        let (mut app, first_token, second_token) = split_app_with_empty_boxes();
         // A third tab before the split tab: closing it shifts terminal indices.
-        let third_pane = fx.app.issue_pane_id();
-        insert_test_terminal(&mut fx.app, 0, Terminal::new_for_test(80, 8, 3, third_pane));
-        let first_pane = fx.app.terminals[1].pane_id();
-        fx.app.tabs[0].active_pane = first_pane;
-        fx.app.active_tab = 0;
-        fx.app.active_terminal = 1;
-        fx.app.active_terminal_presented = true;
-        assert_eq!(fx.app.find_tab_by_token(&second_token), Some(2));
+        let third_pane = app.issue_pane_id();
+        insert_test_terminal(&mut app, 0, Terminal::new_for_test(80, 8, 3, third_pane));
+        let first_pane = app.terminals[1].pane_id();
+        app.tabs[0].active_pane = first_pane;
+        app.active_tab = 0;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        assert_eq!(app.find_tab_by_token(&second_token), Some(2));
 
         // Drag the two-pane tab past the third tab, then close the third tab.
-        fx.app.reorder_terminal_tab(0, 1);
-        assert_eq!(fx.app.active_tab, 1);
-        assert!(!fx.app.close_terminal_tab_at(0));
-        assert_eq!(fx.app.active_tab, 0);
-        assert_eq!(fx.app.find_tab_by_token(&second_token), Some(1));
-        assert_eq!(fx.app.find_tab_by_token(&fx.token), Some(0));
+        app.reorder_terminal_tab(0, 1);
+        assert_eq!(app.active_tab, 1);
+        assert!(!app.close_terminal_tab_at(0));
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.find_tab_by_token(&second_token), Some(1));
+        assert_eq!(app.find_tab_by_token(&first_token), Some(0));
 
         let uid = effective_uid();
         let status = TabStatusReply::Status(TabStatus {
             focused: true,
             active: true,
         });
-        assert_eq!(tab_status_call(&mut fx, &second_token, uid), status);
+        assert_eq!(tab_status_call_app(&mut app, &second_token, uid), status);
 
         // The shifted token still routes input into its own pane.
-        let reply = fx.send(&second_token, TabInputKind::Line, OP_B, "/effort after-drag", 0);
-        fx.advance(100);
-        fx.advance(250);
+        let t0 = Instant::now();
+        let reply = send_at(
+            &mut app,
+            &second_token,
+            TabInputKind::Line,
+            OP_B,
+            "/effort after-drag",
+            t0,
+        );
+        app.advance_tab_deliveries(after_ms(t0, 100));
+        app.advance_tab_deliveries(after_ms(t0, 250));
         assert_eq!(reply.try_recv(), Ok(TabInputCode::InputDelivered));
-        fx.wait_out_at(&second_out, b"/effort after-drag\r");
-        assert!(std::fs::read(&first_out).unwrap_or_default().is_empty());
-        fx.advance(350);
+        assert_eq!(
+            app.terminals[1].input_bytes_for_test(),
+            b"/effort after-drag\r"
+        );
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        app.advance_tab_deliveries(after_ms(t0, 350));
     }
 
     #[test]
