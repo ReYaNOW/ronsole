@@ -1173,9 +1173,10 @@ impl App {
             return;
         };
         if tab_index != self.active_tab {
-            // Switching tabs ends a divider drag of the tab being left, before
-            // its tree can move.
+            // Switching tabs ends a divider drag and the split pointer
+            // ownership of the tab being left, before its tree can move.
             self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
             self.active_tab = tab_index;
             self.bump_structure_generation();
         }
@@ -1318,6 +1319,7 @@ impl App {
 
     fn select_terminal_tab_from_user(&mut self, index: usize) {
         self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         self.exit_claude_grid(None);
         let Some(pane) = self.tabs.get(index).map(|tab| tab.active_pane) else {
             return;
@@ -1423,8 +1425,10 @@ impl App {
     /// and the tree does not change then.
     fn split_active_pane(&mut self, axis: SplitAxis) -> bool {
         // A split changes the tree under a live drag; the saved ratio goes back
-        // before the preview is laid out from it.
+        // before the preview is laid out from it. The pressed pointer has no
+        // pane to own once the tree changes.
         self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         let metrics = self.grid_metrics;
         let tab_index = self.active_tab;
         let Some(tab) = self.tabs.get(tab_index) else {
@@ -1884,7 +1888,9 @@ impl App {
     /// window must close.
     fn close_pane(&mut self, pane: PaneId) -> bool {
         // The drag node may be the leaf being closed: restore before the tree moves.
+        // The removed terminal shifts the indices the pointer owner holds.
         self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         let Some(index) = self.terminal_index_of_pane(pane) else {
             return false;
         };
@@ -1935,7 +1941,9 @@ impl App {
     /// stay removed. Returns true when the window must close.
     fn close_tab(&mut self, tab: TabId) -> bool {
         // The drag node may be removed with the tab: restore before the tree moves.
+        // The removed terminals shift the indices the pointer owner holds.
         self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
             return false;
         };
@@ -2229,6 +2237,17 @@ impl App {
         self.bump_structure_generation();
         self.pending_tab_reveal = Some(false);
         self.mark_dirty();
+    }
+
+    /// Ends the split pointer ownership before a structural change or a mode
+    /// switch. The terminal indices behind the owner may shift and the pressed
+    /// pane may disappear, so a later release must not reach another terminal:
+    /// dropping the layout makes the ordinary pointer path reject it.
+    fn reset_split_pointer_owner(&mut self) {
+        if self.split_pointer_owner.take().is_none() {
+            return;
+        }
+        self.interaction.layout = TerminalUiLayout::default();
     }
 
     fn cancel_pointer_interactions(&mut self) {
@@ -2944,6 +2963,9 @@ impl App {
     }
 
     fn remove_closed_terminals(&mut self) -> bool {
+        // Closed terminals leave through `close_pane`, which moves the indices
+        // the split pointer owner holds.
+        self.reset_split_pointer_owner();
         let mut index = self.terminals.len();
         while index > 0 {
             index -= 1;
@@ -3002,7 +3024,9 @@ impl App {
     fn set_grid_metrics(&mut self, metrics: GridMetrics) {
         if metrics != self.grid_metrics {
             // The divider geometry of a live drag belongs to the old metrics.
+            // The pane layouts of a pressed pointer do too.
             self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
             if self.claude_grid.is_some() {
                 self.bump_grid_generation();
             } else {
@@ -3245,8 +3269,10 @@ impl App {
     /// Ctrl+Shift+S. Opens grid mode over the Claude tabs, or leaves it onto the
     /// focused tile.
     fn toggle_claude_grid(&mut self, now: Instant) {
-        // Entering or leaving grid mode ends a divider drag of the split view.
+        // Entering or leaving grid mode ends a divider drag and the split
+        // pointer ownership of the split view.
         self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         if self.claude_grid.is_some() {
             self.exit_claude_grid(Some(self.active_terminal));
             return;
@@ -3282,6 +3308,7 @@ impl App {
     /// is closed.
     fn exit_claude_grid(&mut self, target: Option<usize>) {
         self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         if self.claude_grid.take().is_none() {
             return;
         }
@@ -3641,6 +3668,9 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        // A split pane that received the press owns every button until all of
+        // them are released. Grid mode never reads the split owner.
+        let split_pointer_owned = !self.grid_open() && self.split_pointer_owner.is_some();
         if state == KeyState::Pressed {
             if self
                 .divider_drag
@@ -3720,7 +3750,7 @@ impl App {
             }
             return false;
         }
-        if button == PointerButton::Left && state == KeyState::Pressed {
+        if button == PointerButton::Left && state == KeyState::Pressed && !split_pointer_owned {
             let hit = self
                 .runtime
                 .as_ref()
@@ -3782,9 +3812,11 @@ impl App {
         let active = self.active_terminal;
         // A split-pane press keeps its release: the terminal that received the
         // press gets it with its own layout, even when the pointer has left its
-        // body. A live capture stays with the active terminal.
-        let split_owner = if state == KeyState::Released
+        // body. A live capture stays with the active terminal. Presses that
+        // arrive while the pointer is owned go to the owner the same way.
+        let split_owner = if !self.grid_open()
             && self.interaction.pointer_capture == crate::input::PointerCapture::None
+            && (state == KeyState::Released || split_pointer_owned)
         {
             self.split_pointer_target()
         } else {
@@ -3855,6 +3887,12 @@ impl App {
     /// the bodies), then the pane body, whose terminal receives the event with
     /// the panel's own layout and global pointer coordinates.
     fn route_split_pointer_button(&mut self, button: PointerButton) -> bool {
+        if self.split_pointer_owner.is_some() {
+            // The pressed pointer is owned until every button is released: no
+            // pane hit test, no focus change and no new owner. The claimed path
+            // of the caller delivers the event with the real coordinates.
+            return true;
+        }
         if self.panel_layouts_generation != self.layout_generation {
             // The frame's geometry is outdated: a press only chooses the pane
             // under it and owns its release, like the grid-generation contract.
@@ -3878,7 +3916,10 @@ impl App {
                 // A press a terminal reads as mouse input keeps the pointer
                 // until every button is released, so its app sees the drag.
                 let terminal = self.panels.get(index).map(|panel| panel.terminal);
+                // Only the first press of a gesture claims the pointer: later
+                // presses must not move the owner to another terminal.
                 if let Some(terminal) = terminal
+                    && !self.interaction.mouse_buttons_pressed()
                     && self.terminals.get(terminal).is_some_and(|terminal| {
                         crate::platform::lock_recover(&terminal.grid)
                             .mouse_tracking()
@@ -10152,6 +10193,136 @@ mod tests {
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
         assert!(app.split_pointer_owner.is_none());
         assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_button_press_while_owned_goes_to_owner() {
+        let (mut app, root) = split_pointer_app("t7-second-press-owner");
+        // Press reporting on both panes, so a stray hit test into the other
+        // pane would leave bytes there.
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert_eq!(app.active_terminal, 0);
+
+        // A second button over the other pane stays with the owner: the focus
+        // does not move, the owner does not change and the other pane sees
+        // nothing.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // Both releases go to the owner; the ownership ends with the last one.
+        let second_press_len = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(app.terminals[0].input_bytes_for_test().len() > second_press_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let second_release_len = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.split_pointer_owner.is_none());
+        assert!(app.terminals[0].input_bytes_for_test().len() > second_release_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_cleared_by_split_and_close() {
+        // A split moves the tree under the held pointer.
+        let (mut app, root) = split_pointer_app("t7-owner-split");
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        app.split_active_pane(SplitAxis::SideBySide);
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Closing another pane removes the terminal whose index the owner
+        // held; the release of the lost press must reach nobody.
+        let (mut app, root) = split_pointer_app("t7-owner-close");
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        let other = app.terminals[1].pane_id();
+        assert!(!app.close_pane(other));
+        assert!(app.split_pointer_owner.is_none());
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_cleared_by_grid_and_tab_switch() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-owner-grid-tab",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        app.focused = true;
+        app.terminals[0].set_claude_foreground_for_test(true);
+        grid_pointer_enable_tracking(&app.terminals[0]);
+
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        // Entering grid mode ends the split pointer ownership.
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        assert!(app.split_pointer_owner.is_none());
+        app.toggle_claude_grid(Instant::now());
+        assert!(!app.grid_open());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // A fresh press owns the pointer again; switching tabs ends it.
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        app.select_terminal_tab_from_user(1);
+        assert_eq!(app.active_tab, 1);
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_not_used_for_grid_motion() {
+        let (mut app, root) = split_pointer_app("t7-owner-grid-motion");
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.focused = true;
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        assert_eq!(app.on_frame(), Ok(true));
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        // A stale owner must not take the motion: grid rules route it.
+        app.split_pointer_owner = Some(0);
+
+        let second = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, second);
+        assert_eq!(app.hovered_panel_terminal, Some(1));
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert_eq!(app.split_pointer_owner, Some(0));
         let _ = std::fs::remove_dir_all(&root);
     }
 
