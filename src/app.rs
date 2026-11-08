@@ -7040,6 +7040,9 @@ mod tests {
         let active_terminal_before = app.active_terminal;
         let active_pane_before = app.tabs[0].active_pane;
         let pending_reveal_before = app.pending_tab_reveal;
+        // A refused split must not cancel an activation that was already
+        // pending: seed one so a misplaced cancel in the refusal path shows.
+        app.terminals[0].presentation_intent = TerminalPresentationIntent::ActivateWhenReady;
         let intents_before: Vec<_> = app
             .terminals
             .iter()
