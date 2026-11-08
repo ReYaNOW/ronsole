@@ -263,6 +263,11 @@ impl TerminalInteraction {
         self.cancel_pointer_interaction_state(&mut terminal.scroll_y);
     }
 
+    /// Whether any pointer button is still held for terminal mouse reporting.
+    pub(crate) fn mouse_buttons_pressed(&self) -> bool {
+        self.pressed_mouse_buttons != 0
+    }
+
     fn cancel_pointer_interaction_state(&mut self, scroll: &mut crate::scroll::ScrollState) {
         self.pressed_mouse_buttons = 0;
         let capture = release_pointer_capture(&mut self.pointer_capture);

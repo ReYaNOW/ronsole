@@ -668,6 +668,16 @@ fn dragged_ratio(
     first_extent / available
 }
 
+/// Pointer position clamped into `layout`'s body. A press that leaves its
+/// split pane keeps reporting to that pane's terminal at the border cell.
+fn clamp_pointer_to_panel(layout: TerminalUiLayout, x: f32, y: f32) -> (f32, f32) {
+    let body = layout.body;
+    (
+        x.clamp(body.x, (body.x + body.w).max(body.x)),
+        y.clamp(body.y, (body.y + body.h).max(body.y)),
+    )
+}
+
 pub struct App {
     runtime: Option<WindowRuntime>,
     config: AppConfig,
@@ -773,6 +783,10 @@ pub struct App {
     divider_drag: Option<DividerDrag>,
     last_header_press: Option<(Instant, usize)>,
     hovered_panel_terminal: Option<usize>,
+    /// Terminal that received the press of a pointer drag begun in a split
+    /// pane, while `pointer_capture` is `None`. Motion and the paired release
+    /// go to it with its pane's layout even after the pointer leaves its body.
+    split_pointer_owner: Option<usize>,
     /// Earliest end of the banner hiding among grid tiles that the last grid
     /// frame drew with `content_hidden`; grid mode only.
     withheld_until: Option<Instant>,
@@ -876,6 +890,7 @@ impl App {
             divider_drag: None,
             last_header_press: None,
             hovered_panel_terminal: None,
+            split_pointer_owner: None,
             withheld_until: None,
         }
     }
@@ -1111,6 +1126,18 @@ impl App {
         let terminal = self.panels.get(index)?.terminal;
         let layout = *self.panel_layouts.get(index)?;
         Some((terminal, layout))
+    }
+
+    /// Terminal and layout of the split pane that owns the pressed pointer.
+    /// The press stays with that terminal while any button is held, even after
+    /// the pointer leaves the pane's body.
+    fn split_pointer_target(&self) -> Option<(usize, TerminalUiLayout)> {
+        let owner = self.split_pointer_owner?;
+        let index = self
+            .panels
+            .iter()
+            .position(|panel| panel.terminal == owner)?;
+        Some((owner, *self.panel_layouts.get(index)?))
     }
 
     /// Makes the pane of panel `index` active and points the terminal
@@ -2216,6 +2243,7 @@ impl App {
 
     fn cancel_pointer_interactions(&mut self) {
         self.terminal_tab_drag = None;
+        self.split_pointer_owner = None;
         let active = self.active_terminal;
         if let Some(terminal) = self.terminals.get_mut(active) {
             self.interaction.cancel_pointer_interaction(terminal);
@@ -3534,23 +3562,44 @@ impl App {
             return;
         }
         let active = self.active_terminal;
-        let target = if self.active_tab_split() && !self.grid_open() {
-            // The pane under the pointer takes the motion with its own layout;
-            // focus does not change. A captured pointer keeps its terminal.
-            self.split_panel_under_pointer()
-                .unwrap_or((active, self.interaction.layout))
-        } else {
-            (active, self.interaction.layout)
-        };
-        let (target_terminal, target_layout) = target;
+        let (target_terminal, target_layout, motion_x, motion_y) =
+            if self.active_tab_split() && !self.grid_open() {
+                if self.split_pointer_owner.is_some()
+                    && self.interaction.pointer_capture == crate::input::PointerCapture::None
+                {
+                    // A pressed pane keeps the motion; the pointer is clamped
+                    // into its body so a drag past the border still reports.
+                    let Some((terminal, layout)) = self.split_pointer_target() else {
+                        return;
+                    };
+                    let (x, y) = clamp_pointer_to_panel(layout, self.pointer_x, self.pointer_y);
+                    (terminal, layout, x, y)
+                } else if let Some((terminal, layout)) = self.split_panel_under_pointer() {
+                    // The pane under the pointer takes the motion with its own
+                    // layout; focus does not change. A captured pointer keeps
+                    // its terminal.
+                    (terminal, layout, self.pointer_x, self.pointer_y)
+                } else {
+                    // The rendered geometry is stale or no pane body is under
+                    // the pointer: nothing receives motion for the old layout.
+                    return;
+                }
+            } else {
+                (
+                    active,
+                    self.interaction.layout,
+                    self.pointer_x,
+                    self.pointer_y,
+                )
+            };
         let saved_layout = self.interaction.layout;
         self.interaction.layout = target_layout;
         if let (Some(runtime), Some(terminal)) =
             (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
             let changed = self.interaction.cursor_moved(
-                self.pointer_x,
-                self.pointer_y,
+                motion_x,
+                motion_y,
                 terminal,
                 |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
             );
@@ -3724,8 +3773,22 @@ impl App {
             return false;
         }
         let active = self.active_terminal;
+        // A split-pane press keeps its release: the terminal that received the
+        // press gets it with its own layout, even when the pointer has left its
+        // body. A live capture stays with the active terminal.
+        let split_owner = if state == KeyState::Released
+            && self.interaction.pointer_capture == crate::input::PointerCapture::None
+        {
+            self.split_pointer_target()
+        } else {
+            None
+        };
+        let (target_terminal, target_layout) =
+            split_owner.unwrap_or((active, self.interaction.layout));
+        let saved_layout = self.interaction.layout;
+        self.interaction.layout = target_layout;
         if let (Some(runtime), Some(terminal)) =
-            (self.runtime.as_mut(), self.terminals.get_mut(active))
+            (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
             let handled =
                 self.interaction
@@ -3736,6 +3799,11 @@ impl App {
                 self.sync_animation_state();
                 self.request_frame();
             }
+        }
+        self.interaction.layout = saved_layout;
+        // The owner lives only while some button is still held.
+        if state == KeyState::Released && !self.interaction.mouse_buttons_pressed() {
+            self.split_pointer_owner = None;
         }
         if let Some(uri) = self.interaction.take_link_uri()
             && open_uri_allowed(&uri, crate::terminal::local_host_name())
@@ -3789,6 +3857,18 @@ impl App {
         match panel_hit(&self.panels, self.pointer_x, self.pointer_y) {
             Some(PanelHit::Body(index)) => {
                 self.select_split_panel(index);
+                // A press a terminal reads as mouse input keeps the pointer
+                // until every button is released, so its app sees the drag.
+                let terminal = self.panels.get(index).map(|panel| panel.terminal);
+                if let Some(terminal) = terminal
+                    && self.terminals.get(terminal).is_some_and(|terminal| {
+                        crate::platform::lock_recover(&terminal.grid)
+                            .mouse_tracking()
+                            .enabled()
+                    })
+                {
+                    self.split_pointer_owner = Some(terminal);
+                }
                 true
             }
             Some(PanelHit::Header(_)) | None => {
@@ -9736,6 +9816,73 @@ mod tests {
         app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
         assert_eq!(app.active_terminal, 0);
         assert_ne!(app.terminals[1].scroll_y.target, before_scroll);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mouse_motion_and_release_stay_with_pressed_pane() {
+        let (mut app, root) = split_pointer_app("t7-pressed-pane");
+        // Any-motion reporting on both panes, so a stray motion into the right
+        // pane would show up in its bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 0);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // Motion over the right pane stays with the pane that received the press.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let motion_len = app.terminals[0].input_bytes_for_test().len();
+
+        // The paired release reaches the same pane and focus stays where it was.
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > motion_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn motion_without_press_follows_pane_under_pointer() {
+        let (mut app, root) = split_pointer_app("t7-motion-follow");
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_layout_generation_motion_reaches_no_terminal() {
+        let (mut app, root) = split_pointer_app("t7-stale-motion");
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        app.bump_layout_generation();
+        assert_ne!(app.panel_layouts_generation, app.layout_generation);
+
+        // Neither the pane under the pointer nor the active pane gets motion
+        // encoded against geometry from before the rebuild.
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
