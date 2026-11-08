@@ -126,6 +126,27 @@ Practical notes:
   only a little per frame, because the animation runs on the real frame `dt`
   and bench frames follow each other at once.
 
+## Dump keys
+
+`dump` returns one compact JSON object. Besides the terminal state of the
+active pane (`terminal`, spec §5.1), it describes the tab strip and the split
+layout of the last drawn frame:
+
+| Key | Meaning |
+|---|---|
+| `tabs[]` | One entry per tab (`App.tabs`), not per terminal: `index`, `title` (display title of the tab's active pane), `active`, `rect` (`[x, y, w, h]` tab hitbox, `null` when the tab is outside the strip), `title_number`. |
+| `active_pane` | `PaneId` (`u64`) of the focused pane of the active tab, `null` before the first tab. |
+| `panels[]` | Bodies of the active tab's panes in draw order: `pane_id`, `x`, `y`, `w`, `h` (`f32`, whole pixels), `content_hidden`. |
+
+A split stays inside one tab: `tabs[]` keeps one entry while `panels[]` grows.
+`dump` does not draw a frame, so poll it after a layout change. Sibling pane
+bodies are separated by exactly `GRID_TILE_GAP` (6 px) scaled by `scale` and
+rounded to whole pixels.
+
+Split shortcuts: `key ctrl+shift+d` splits side by side, `key ctrl+shift+e`
+stacks, `key ctrl+shift+w` closes the focused pane, and
+`key alt+left|right|up|down` moves the focus between panes of a split tab.
+
 ## Bench
 
 `bench <frames> [csv=<path>] [action]` draws exactly `frames` forced frames and
