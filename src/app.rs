@@ -23,7 +23,7 @@ use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
-use crate::split::{PaneId, SplitNode};
+use crate::split::{PaneId, SplitNode, leaf_count, remove_leaf, successor};
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
@@ -551,6 +551,18 @@ fn split_leaf_count(node: &SplitNode, pane: Option<PaneId>) -> usize {
         SplitNode::Leaf(id) => usize::from(pane.is_none_or(|pane| pane == *id)),
         SplitNode::Split { first, second, .. } => {
             split_leaf_count(first, pane) + split_leaf_count(second, pane)
+        }
+    }
+}
+
+/// Collects the leaf panes of `node` in tree order. Allocates the caller's
+/// vector; used only by the close path, never in a frame.
+fn collect_split_panes(node: &SplitNode, panes: &mut Vec<PaneId>) {
+    match node {
+        SplitNode::Leaf(pane) => panes.push(*pane),
+        SplitNode::Split { first, second, .. } => {
+            collect_split_panes(first, panes);
+            collect_split_panes(second, panes);
         }
     }
 }
@@ -1310,89 +1322,18 @@ impl App {
         }
     }
 
+    /// Thin adapter over the tab identity: existing callers keep their terminal
+    /// index, the close itself belongs to `close_tab`. Returns true exactly when
+    /// the window must close.
     fn close_terminal_tab_at(&mut self, index: usize) -> bool {
-        if index >= self.terminals.len() {
+        let Some(pane) = self.terminals.get(index).map(Terminal::pane_id) else {
             return false;
-        }
-        let old_active = self.active_terminal;
-        // Grid mode: the tile that takes focus when the focused tile closes,
-        // numbered for the tab list after the removal.
-        let grid_successor = if index == old_active {
-            self.grid_successor_after_removal(index)
-        } else {
-            None
         };
-        let is_final = self.terminals.len() == 1;
-        let active_was_presented = index == old_active && self.active_terminal_presented;
-        if index == old_active {
-            if active_was_presented {
-                self.send_terminal_focus_transition(Some(index), None);
-            }
-        }
-
-        if !is_final {
-            let process = self.terminals[index].take_process_for_cleanup();
-            if let Some(process) = process
-                && let Err(process) = self.try_schedule_terminal_cleanup(process)
-            {
-                self.terminals[index].restore_process_after_cleanup_backpressure(process);
-                if active_was_presented {
-                    self.send_terminal_focus_transition(None, Some(index));
-                }
-                return false;
-            }
-        }
-
-        if index == old_active {
-            self.interaction
-                .reset_for_terminal_switch(&mut self.terminals[index]);
-            self.active_terminal_presented = false;
-        }
-        let mut removed = self.terminals.remove(index);
-        // The closed terminal takes its tab with it: a tab whose pane is gone
-        // would stay in the strip as a phantom entry. The removed tab shifts
-        // the indices the active tab and an open dialog point at.
-        if let Some(tab_index) = self.tab_index_of_pane(removed.pane_id()) {
-            self.tabs.remove(tab_index);
-            self.active_tab =
-                active_index_after_remove(self.active_tab, tab_index, self.tabs.len());
-        }
-        // Removing a tab shifts the indices a `CloseTarget::Tab` points at, so an open
-        // dialog no longer names the tab it was opened for. Cancel it instead.
-        self.cancel_close_dialog();
-        if is_final {
-            removed.shutdown();
-        }
-        self.terminal_tab_drag = None;
-        self.pending_tab_reveal = None;
-
-        if self.terminals.is_empty() {
-            self.active_terminal = 0;
-            self.active_terminal_presented = false;
-            self.cancel_terminal_presentation_intents();
-            return true;
-        }
-
-        self.active_terminal = active_index_after_remove(old_active, index, self.terminals.len());
-        if index == old_active {
-            if let Some(successor) = grid_successor {
-                // Focus stays on a tile; the neighbour outside the grid gets no
-                // deferred activation.
-                self.cancel_terminal_presentation_intents();
-                self.active_terminal = successor;
-                self.activate_ready_terminal(successor, false);
-            } else if self.terminals[self.active_terminal].presentation_ready() {
-                self.activate_ready_terminal(self.active_terminal, false);
-            } else {
-                self.cancel_terminal_presentation_intents();
-                self.terminals[self.active_terminal].presentation_intent =
-                    TerminalPresentationIntent::ActivateWhenReady;
-            }
-        }
-        self.pending_tab_reveal = Some(false);
-        self.request_frame();
-        self.sync_claude_grid(Instant::now());
-        false
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
+            return false;
+        };
+        let tab = self.tabs[tab_index].id;
+        self.close_tab(tab)
     }
 
     fn try_schedule_terminal_cleanup(
@@ -1482,19 +1423,31 @@ impl App {
         }
     }
 
-    /// Reads foreground job names only at the close moment. Returns (tab title, job
-    /// name) for each tab in the target that runs a job; empty when none does, so the
-    /// close proceeds without a dialog.
+    /// Reads foreground job names only at the close moment. Returns (pane title,
+    /// job name) for every pane in the target that runs a job; empty when none
+    /// does, so the close proceeds without a dialog.
     fn busy_close_targets(&self, target: CloseTarget) -> Vec<(String, String)> {
-        let range = match target {
-            CloseTarget::Window => 0..self.terminals.len(),
-            CloseTarget::Tab(index) => index..index.saturating_add(1).min(self.terminals.len()),
+        // A tab target lists every pane of that tab. Its index names one of the
+        // tab's terminals; the tab itself comes from the split tree.
+        let tab_filter = match target {
+            CloseTarget::Window => None,
+            CloseTarget::Tab(index) => {
+                let Some(terminal) = self.terminals.get(index) else {
+                    return Vec::new();
+                };
+                let Some(tab) = self.tab_index_of_pane(terminal.pane_id()) else {
+                    return Vec::new();
+                };
+                Some(tab)
+            }
         };
         let mut busy = Vec::new();
-        for index in range {
-            let Some(terminal) = self.terminals.get(index) else {
+        for terminal in &self.terminals {
+            if let Some(tab) = tab_filter
+                && self.tab_index_of_pane(terminal.pane_id()) != Some(tab)
+            {
                 continue;
-            };
+            }
             let Some(process) = terminal.busy_foreground_name() else {
                 continue;
             };
@@ -1518,6 +1471,280 @@ impl App {
         if self.close_confirm.take().is_some() {
             self.update_link_hover();
             self.request_frame();
+        }
+    }
+
+    /// Closes one pane: the process goes to the cleanup worker first, and only
+    /// an accepted cleanup drops the leaf. A refused cleanup leaves the tree,
+    /// the terminal storage and the focus untouched. Returns true when the
+    /// window must close.
+    fn close_pane(&mut self, pane: PaneId) -> bool {
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return false;
+        };
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
+            return false;
+        };
+        let tab = self.tabs[tab_index].id;
+        let was_active_tab = tab_index == self.active_tab;
+        let last_pane_of_tab = leaf_count(&self.tabs[tab_index].layout) == 1;
+        // The last pane of the last tab is shut down synchronously instead of
+        // waiting for the cleanup worker; that branch cannot refuse.
+        let last_pane_of_window = last_pane_of_tab && self.tabs.len() == 1;
+        let grid_successor = (self.claude_grid.is_some() && index == self.active_terminal)
+            .then(|| self.grid_successor_after_removal(&[index]))
+            .flatten();
+        if !last_pane_of_window {
+            let process = self.terminals[index].take_process_for_cleanup();
+            if let Some(process) = process
+                && let Err(process) = self.try_schedule_terminal_cleanup(process)
+            {
+                self.terminals[index].restore_process_after_cleanup_backpressure(process);
+                return false;
+            }
+        }
+        let tree_successor = if last_pane_of_tab {
+            self.remove_last_pane_of_tab(tab);
+            None
+        } else {
+            self.remove_terminal_at(index)
+        };
+        if let Some(next) = tree_successor
+            && let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab)
+        {
+            self.tabs[tab_index].active_pane = next;
+        }
+        self.terminal_tab_drag = None;
+        self.cancel_close_dialog();
+        self.pending_tab_reveal = Some(false);
+        self.focus_after_removal(tab, was_active_tab, tree_successor, grid_successor);
+        self.request_frame();
+        self.sync_claude_grid(Instant::now());
+        self.terminals.is_empty()
+    }
+
+    /// Closes a whole tab: every pane's process is handed to the cleanup worker
+    /// first, then the panes go through the internal removal path without a
+    /// second dialog. A refused cleanup stops the close; the panes removed so far
+    /// stay removed. Returns true when the window must close.
+    fn close_tab(&mut self, tab: TabId) -> bool {
+        let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+            return false;
+        };
+        let was_active_tab = tab_index == self.active_tab;
+        let mut panes = Vec::new();
+        collect_split_panes(&self.tabs[tab_index].layout, &mut panes);
+        let mut removed_indices: Vec<usize> = panes
+            .iter()
+            .filter_map(|&pane| self.terminal_index_of_pane(pane))
+            .collect();
+        removed_indices.sort_unstable();
+        // The successor is picked before the first mutation, while the tiles
+        // still carry the indices of the current `terminals`.
+        let grid_successor = (self.claude_grid.is_some() && was_active_tab)
+            .then(|| self.grid_successor_after_removal(&removed_indices))
+            .flatten();
+        let mut tree_successor = None;
+        for pane in panes {
+            let Some(index) = self.terminal_index_of_pane(pane) else {
+                continue;
+            };
+            let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+                break;
+            };
+            let last_pane_of_tab = leaf_count(&self.tabs[tab_index].layout) == 1;
+            if !(last_pane_of_tab && self.tabs.len() == 1) {
+                let process = self.terminals[index].take_process_for_cleanup();
+                if let Some(process) = process
+                    && let Err(process) = self.try_schedule_terminal_cleanup(process)
+                {
+                    self.terminals[index].restore_process_after_cleanup_backpressure(process);
+                    break;
+                }
+            }
+            if last_pane_of_tab {
+                self.remove_last_pane_of_tab(tab);
+                break;
+            }
+            if let Some(next) = self.remove_terminal_at(index) {
+                tree_successor = Some(next);
+                if let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) {
+                    self.tabs[tab_index].active_pane = next;
+                }
+            }
+        }
+        self.terminal_tab_drag = None;
+        self.cancel_close_dialog();
+        self.pending_tab_reveal = Some(false);
+        self.focus_after_removal(tab, was_active_tab, tree_successor, grid_successor);
+        self.request_frame();
+        self.sync_claude_grid(Instant::now());
+        self.terminals.is_empty()
+    }
+
+    /// Drops the only pane of `tab` together with the tab. The caller has
+    /// already scheduled the process cleanup; the last terminal of the window is
+    /// shut down here, synchronously within the bounded grace.
+    fn remove_last_pane_of_tab(&mut self, tab: TabId) {
+        let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+            return;
+        };
+        let pane = self.tabs[tab_index].active_pane;
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return;
+        };
+        if self.tabs.len() == 1 {
+            self.terminals[index].shutdown();
+        }
+        self.remove_terminal_at(index);
+        self.tabs.remove(tab_index);
+        self.active_tab = active_index_after_remove(self.active_tab, tab_index, self.tabs.len());
+        self.bump_structure_generation();
+    }
+
+    /// Low-level removal of one pane: drops the terminal, collapses the split
+    /// leaf and grows the structural generations. Returns the tree successor of
+    /// the tab when the removed pane was that tab's active pane. `Tab.active_pane`
+    /// is left to the caller, which sets it in the same close call; no frame or
+    /// event runs in between.
+    fn remove_terminal_at(&mut self, index: usize) -> Option<PaneId> {
+        if index >= self.terminals.len() {
+            return None;
+        }
+        let pane = self.terminals[index].pane_id();
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
+            return None;
+        };
+        // The successor is read before the leaf leaves the tree.
+        let tree_successor = (self.tabs[tab_index].active_pane == pane)
+            .then(|| successor(&self.tabs[tab_index].layout, pane))
+            .flatten();
+        if index == self.active_terminal {
+            // The focused terminal reports the focus loss; the successor reports
+            // the focus gain when the caller activates it.
+            if self.active_terminal_presented {
+                self.send_terminal_focus_transition(Some(index), None);
+            }
+            self.interaction
+                .reset_for_terminal_switch(&mut self.terminals[index]);
+            self.active_terminal_presented = false;
+        }
+        self.terminals.remove(index);
+        if index < self.active_terminal {
+            self.active_terminal -= 1;
+        } else if index == self.active_terminal {
+            self.active_terminal = self
+                .active_terminal
+                .min(self.terminals.len().saturating_sub(1));
+        }
+        // A root leaf cannot collapse; `remove_last_pane_of_tab` drops its tab.
+        remove_leaf(&mut self.tabs[tab_index].layout, pane);
+        self.bump_structure_generation();
+        tree_successor
+    }
+
+    /// §6.4 focus procedure after a close. `removed` names the tab the panes
+    /// left, `tree_successor` is the successor `remove_terminal_at` reported and
+    /// `grid_successor` the tile picked before the first removal. Both
+    /// successors are `None` when the focus does not move.
+    fn focus_after_removal(
+        &mut self,
+        removed: TabId,
+        was_active_tab: bool,
+        tree_successor: Option<PaneId>,
+        grid_successor: Option<usize>,
+    ) {
+        if !self.tabs.iter().any(|tab| tab.id == removed) {
+            // 1. The tab is gone.
+            if was_active_tab {
+                self.focus_after_tab_closed(grid_successor);
+            }
+            // 1b: a background tab leaves the global focus alone; its tiles
+            // leave the grid with the member refresh.
+        } else if self.claude_grid.is_some() {
+            // 2a. The tab survives and the grid is open.
+            if let Some(index) = grid_successor {
+                if let Some(next) = tree_successor {
+                    // Focus moves to another tab's tile: the closed tab only
+                    // keeps its own pane choice, without focus reporting.
+                    self.select_tab_pane_in_background(removed, next);
+                }
+                self.focus_tile_after_removal(index);
+            } else {
+                self.collect_claude_members();
+                if self.grid_members_scratch.is_empty() {
+                    // No tile left: the grid closes and 2b decides the focus.
+                    self.exit_claude_grid(None);
+                    self.focus_after_pane_closed(removed, was_active_tab, tree_successor);
+                } else if let Some(next) = tree_successor {
+                    // The pane was not the focused tile: focus stays.
+                    self.select_tab_pane_in_background(removed, next);
+                }
+            }
+        } else {
+            // 2b. The tab survives and the grid is closed.
+            self.focus_after_pane_closed(removed, was_active_tab, tree_successor);
+        }
+        #[cfg(debug_assertions)]
+        self.debug_assert_invariants();
+    }
+
+    /// 1a. The active tab disappeared: the next tile keeps the grid focus, else
+    /// the grid closes onto the neighbour tab, and a window without tabs closes.
+    fn focus_after_tab_closed(&mut self, grid_successor: Option<usize>) {
+        if self.claude_grid.is_some() {
+            if let Some(index) = grid_successor {
+                self.focus_tile_after_removal(index);
+                return;
+            }
+            self.exit_claude_grid(None);
+        }
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let pane = tab.active_pane;
+        self.focus_pane_after_removal(pane);
+    }
+
+    /// 2b. The pane left a surviving tab: the active tab activates the tree
+    /// successor, a background tab only retargets its active pane.
+    fn focus_after_pane_closed(
+        &mut self,
+        removed: TabId,
+        was_active_tab: bool,
+        tree_successor: Option<PaneId>,
+    ) {
+        let Some(next) = tree_successor else {
+            return;
+        };
+        if was_active_tab {
+            self.focus_pane_after_removal(next);
+        } else {
+            self.select_tab_pane_in_background(removed, next);
+        }
+    }
+
+    /// Focus on a grid tile: the neighbour takes the focus and reports it.
+    fn focus_tile_after_removal(&mut self, index: usize) {
+        if index >= self.terminals.len() {
+            return;
+        }
+        self.cancel_terminal_presentation_intents();
+        self.active_terminal = index;
+        self.activate_ready_terminal(index, false);
+    }
+
+    /// Focus on a pane of the tree: through `activate_pane` when the pane can
+    /// present now, otherwise as a deferred activation.
+    fn focus_pane_after_removal(&mut self, pane: PaneId) {
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return;
+        };
+        if self.terminals[index].presentation_ready() {
+            self.cancel_terminal_presentation_intents();
+            self.activate_pane(pane, false);
+        } else {
+            self.request_terminal_activation(index, false);
         }
     }
 
@@ -2268,8 +2495,11 @@ impl App {
                 }
                 continue;
             }
-            if self.terminals[index].is_closed() && self.close_terminal_tab_at(index) {
-                return true;
+            if self.terminals[index].is_closed() {
+                let pane = self.terminals[index].pane_id();
+                if self.close_pane(pane) {
+                    return true;
+                }
             }
         }
         false
@@ -2437,18 +2667,32 @@ impl App {
         }
     }
 
-    /// Tile that takes focus when the tab at `index` closes: the next member
-    /// in tab order, else the previous one. Returns its index after `index`
-    /// is removed. `None` outside grid mode or when no other tile exists.
-    fn grid_successor_after_removal(&self, index: usize) -> Option<usize> {
+    /// Tile that takes focus after `removed` terminals disappear: the next grid
+    /// member after the focused tile in grid order, skipping every removed
+    /// index, else the previous one. Returns the terminal index after the
+    /// removals, and `None` outside grid mode or when no tile survives.
+    fn grid_successor_after_removal(&self, removed: &[usize]) -> Option<usize> {
         let grid = self.claude_grid.as_ref()?;
+        if removed.is_empty() {
+            return None;
+        }
+        let live = |member: &usize| !removed.contains(member);
+        let pivot = self.active_terminal;
         let target = grid
             .members
             .iter()
             .copied()
-            .find(|&member| member > index)
-            .or_else(|| grid.members.iter().rev().copied().find(|&member| member < index))?;
-        Some(if target > index { target - 1 } else { target })
+            .filter(live)
+            .find(|&member| member > pivot)
+            .or_else(|| {
+                grid.members
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(live)
+                    .find(|&member| member < pivot)
+            })?;
+        Some(target - removed.iter().filter(|&&index| index < target).count())
     }
 
     /// Whether the current members fit the window body at the current metrics (Q9).
@@ -4083,11 +4327,11 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("    fn close_active_terminal").next())
             .expect("shared terminal close lifecycle must remain present");
-        assert!(close.contains("self.terminals.remove(index)"));
-        assert!(close.contains("if self.terminals.is_empty()"));
-        assert!(close.contains("return true;"));
+        // The index adapter routes into the tab close and owns no removal.
+        assert!(close.contains("self.close_tab("));
+        assert!(!close.contains("self.terminals.remove("));
         assert!(!close.contains("add_terminal"));
-        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 2);
+        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 1);
 
         let request = production
             .split("    fn request_terminal_activation")
@@ -6507,6 +6751,262 @@ mod tests {
 
         assert!(app.terminals.is_empty());
         assert!(app.tabs.is_empty());
+        app.debug_assert_invariants();
+    }
+
+    /// One tab with two side-by-side panes built from two terminals; `tabs[0]`
+    /// owns both leaves and the first pane is the tab's active pane.
+    fn two_pane_app(shell: App, first: Terminal, second: Terminal) -> (App, PaneId, PaneId) {
+        let mut app = shell;
+        let first_pane = push_test_terminal(&mut app, first);
+        let second_pane = push_test_terminal(&mut app, second);
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(first_pane)),
+            second: Box::new(SplitNode::Leaf(second_pane)),
+        };
+        app.tabs[0].active_pane = first_pane;
+        app.tabs.remove(1);
+        app.active_tab = 0;
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        (app, first_pane, second_pane)
+    }
+
+    fn presentation_ready_terminal(number: u64, pane: PaneId) -> Terminal {
+        let terminal = Terminal::new_for_test(8, 2, number, pane);
+        crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
+        terminal
+    }
+
+    fn test_shell(number: u64, pane: PaneId) -> Terminal {
+        let terminal = Terminal::spawn(
+            None,
+            number,
+            TerminalLaunchSpec::hermetic_shell_for_test(),
+            terminal_palette(&crate::config::AppConfig::default()),
+            pane,
+        );
+        crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
+        terminal
+    }
+
+    #[test]
+    fn close_pane_gives_place_to_neighbour_and_keeps_processes_alive() {
+        let mut app = App::new();
+        let closed = app.issue_pane_id();
+        let kept = app.issue_pane_id();
+        let (mut app, closed, kept) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, closed),
+            test_shell(2, kept),
+        );
+
+        assert!(!app.close_pane(closed));
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), kept);
+        assert!(
+            app.terminals[0].has_process(),
+            "the neighbour's shell must stay alive"
+        );
+        assert!(!app.terminals[0].is_closed());
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert!(matches!(app.tabs[0].layout, SplitNode::Leaf(pane) if pane == kept));
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn close_pane_refusal_keeps_tree_and_process() {
+        let mut app = App::new();
+        let other = app.issue_pane_id();
+        let kept = app.issue_pane_id();
+        let (mut app, other, kept) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, other),
+            test_shell(2, kept),
+        );
+        // The live shell is the active pane, so the refusal must also keep focus.
+        app.tabs[0].active_pane = kept;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        // A stopped worker drops the sender: every cleanup request is refused.
+        app.terminal_cleanup.shutdown_and_join();
+
+        assert!(!app.close_pane(kept));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.terminals[1].pane_id(), kept);
+        assert!(
+            app.terminals[1].has_process(),
+            "the refused pane keeps its process"
+        );
+        assert_eq!(leaf_count(&app.tabs[0].layout), 2);
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        let _ = other;
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_last_pane_closes_tab_and_focuses_neighbour() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, first));
+        let second = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(2, second));
+        app.active_tab = 0;
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_pane(first));
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].active_pane, second);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_tab_removes_all_panes_and_focuses_next_tab() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        let second = app.issue_pane_id();
+        let (mut app, first, second) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, first),
+            Terminal::new_for_test(8, 2, 2, second),
+        );
+        let third = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(3, third));
+        let tab = app.tabs[0].id;
+
+        assert!(!app.close_tab(tab));
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), third);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].active_pane, third);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        let _ = (first, second);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_tab_refusal_stops_and_keeps_remaining_panes() {
+        let mut app = App::new();
+        let plain = app.issue_pane_id();
+        let kept = app.issue_pane_id();
+        // The processless pane owns no cleanup request, so it is removed before
+        // the live pane is refused and the tab survives with one pane.
+        let (mut app, plain, kept) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, plain),
+            test_shell(2, kept),
+        );
+        app.tabs[0].active_pane = kept;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        app.terminal_cleanup.shutdown_and_join();
+        // A surviving tab keeps the window alive, so the last pane of the target
+        // tab still asks the worker and is refused.
+        let survivor = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(3, survivor));
+        let tab = app.tabs[0].id;
+
+        assert!(!app.close_tab(tab));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.terminals[0].pane_id(), kept);
+        assert!(
+            app.terminals[0].has_process(),
+            "the remaining pane keeps its process"
+        );
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert!(!split_contains_pane(&app.tabs[0].layout, plain));
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn natural_exit_removes_only_its_pane() {
+        let mut app = App::new();
+        let exiting = app.issue_pane_id();
+        let orphan = Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec {
+                shell: None,
+                working_directory: None,
+                inherited_directory: None,
+                command: vec![std::ffi::OsString::from("/bin/true")],
+                hold: false,
+                bridge_launch_id: None,
+            },
+            terminal_palette(&crate::config::AppConfig::default()),
+            exiting,
+        );
+        let kept = app.issue_pane_id();
+        let (mut app, exiting, kept) = two_pane_app(app, orphan, test_shell(2, kept));
+        app.tabs[0].active_pane = kept;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while app.terminals.len() > 1 {
+            assert!(!app.remove_closed_terminals());
+            assert!(
+                Instant::now() < deadline,
+                "the exited pane did not close on its own"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), kept);
+        assert!(
+            app.terminals[0].has_process(),
+            "the neighbour's shell must stay alive"
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert!(matches!(app.tabs[0].layout, SplitNode::Leaf(pane) if pane == kept));
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert_eq!(app.active_terminal, 0);
+        let _ = exiting;
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn closing_active_tile_focuses_next_tile() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        app.active_terminal = 1;
+        app.active_tab = 1;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1, 2]));
+        let closed = app.terminals[1].pane_id();
+
+        assert!(!app.close_pane(closed));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
         app.debug_assert_invariants();
     }
 
