@@ -668,16 +668,6 @@ fn dragged_ratio(
     first_extent / available
 }
 
-/// Pointer position clamped into `layout`'s body. A press that leaves its
-/// split pane keeps reporting to that pane's terminal at the border cell.
-fn clamp_pointer_to_panel(layout: TerminalUiLayout, x: f32, y: f32) -> (f32, f32) {
-    let body = layout.body;
-    (
-        x.clamp(body.x, (body.x + body.w).max(body.x)),
-        y.clamp(body.y, (body.y + body.h).max(body.y)),
-    )
-}
-
 pub struct App {
     runtime: Option<WindowRuntime>,
     config: AppConfig,
@@ -3554,6 +3544,34 @@ impl App {
             self.request_frame();
             return;
         }
+        // The pane that owns the pressed pointer takes the motion with the real
+        // pointer coordinates, before the tab strip and the pane hit tests: a
+        // drag over the scrollbar, past the pane's edge or over the strip keeps
+        // reporting to its terminal.
+        if self.active_tab_split()
+            && !self.grid_open()
+            && self.interaction.pointer_capture == crate::input::PointerCapture::None
+            && let Some((terminal, layout)) = self.split_pointer_target()
+        {
+            let saved_layout = self.interaction.layout;
+            self.interaction.layout = layout;
+            if let (Some(runtime), Some(terminal)) =
+                (self.runtime.as_mut(), self.terminals.get_mut(terminal))
+            {
+                let changed = self.interaction.cursor_moved_claimed(
+                    self.pointer_x,
+                    self.pointer_y,
+                    terminal,
+                    |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
+                );
+                if changed {
+                    self.sync_animation_state();
+                    self.request_frame();
+                }
+            }
+            self.interaction.layout = saved_layout;
+            return;
+        }
         if !self.interaction.terminal_selection_active()
             && self.runtime.as_ref().is_some_and(|runtime| {
                 runtime
@@ -3566,35 +3584,20 @@ impl App {
             return;
         }
         let active = self.active_terminal;
-        let (target_terminal, target_layout, motion_x, motion_y) =
+        let (target_terminal, target_layout) =
             if self.active_tab_split() && !self.grid_open() {
-                if self.split_pointer_owner.is_some()
-                    && self.interaction.pointer_capture == crate::input::PointerCapture::None
-                {
-                    // A pressed pane keeps the motion; the pointer is clamped
-                    // into its body so a drag past the border still reports.
-                    let Some((terminal, layout)) = self.split_pointer_target() else {
-                        return;
-                    };
-                    let (x, y) = clamp_pointer_to_panel(layout, self.pointer_x, self.pointer_y);
-                    (terminal, layout, x, y)
-                } else if let Some((terminal, layout)) = self.split_panel_under_pointer() {
+                if let Some((terminal, layout)) = self.split_panel_under_pointer() {
                     // The pane under the pointer takes the motion with its own
                     // layout; focus does not change. A captured pointer keeps
                     // its terminal.
-                    (terminal, layout, self.pointer_x, self.pointer_y)
+                    (terminal, layout)
                 } else {
                     // The rendered geometry is stale or no pane body is under
                     // the pointer: nothing receives motion for the old layout.
                     return;
                 }
             } else {
-                (
-                    active,
-                    self.interaction.layout,
-                    self.pointer_x,
-                    self.pointer_y,
-                )
+                (active, self.interaction.layout)
             };
         let saved_layout = self.interaction.layout;
         self.interaction.layout = target_layout;
@@ -3602,8 +3605,8 @@ impl App {
             (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
             let changed = self.interaction.cursor_moved(
-                motion_x,
-                motion_y,
+                self.pointer_x,
+                self.pointer_y,
                 terminal,
                 |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
             );
@@ -3794,11 +3797,22 @@ impl App {
         if let (Some(runtime), Some(terminal)) =
             (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
-            let handled =
+            // The owner of the pressed pointer gets the event even over a
+            // protocol area or outside its pane body: its app must see the
+            // release of a button it saw pressed.
+            let handled = if split_owner.is_some() {
+                self.interaction.mouse_input_claimed(
+                    state,
+                    button,
+                    terminal,
+                    |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
+                )
+            } else {
                 self.interaction
                     .mouse_input(state, button, terminal, |text, x, scroll| {
                         runtime.terminal_search_cursor_from_x(text, x, scroll)
-                    });
+                    })
+            };
             if handled {
                 self.sync_animation_state();
                 self.request_frame();
@@ -10002,6 +10016,127 @@ mod tests {
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
         assert_eq!(app.active_terminal, 0);
         assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_over_scrollbar_reaches_pointer_owner() {
+        let (mut app, root) = split_pointer_app("t7-release-scrollbar");
+        // Scrollback makes the pressed pane draw its own scrollbar.
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[0], "\x1b[?1000h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pressed pane draws a scrollbar");
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // The release lands on the pane's own scrollbar. The protocol-area gate
+        // must not drop it, or the terminal app keeps the button held.
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before_release = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert!(bytes.len() > before_release);
+        // X10 release: ESC [ M then the button code 3 (`3 + 32`).
+        assert_eq!(bytes[before_release], 0x1b);
+        assert_eq!(bytes[before_release + 3], 35);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn motion_over_tab_strip_reaches_pointer_owner() {
+        let (mut app, root) = split_pointer_app("t7-motion-tab-strip");
+        // Any-motion reporting, so a delivered motion shows up in the bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let strip = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .terminal_tab_strip_layout()
+            .rect;
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // The tab strip draws over the panes; the pressed pane keeps the motion.
+        split_pointer_move(&mut app, strip.x + strip.w * 0.5, strip.y + strip.h * 0.5);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wheel_over_other_pane_works_while_pointer_owned() {
+        let (mut app, root) = split_pointer_app("t7-wheel-other-pane");
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[0], "\x1b[?1000h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        // The pointer leaves the pressed pane: the wheel goes to the pane under
+        // it, and focus stays with the pressed one.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let before_scroll = app.terminals[1].scroll_y.target;
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+        assert_ne!(app.terminals[1].scroll_y.target, before_scroll);
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pointer_owner_uses_real_coordinates() {
+        let (mut app, root) = split_pointer_app("t7-owner-real-coords");
+        // SGR any-motion reports, so the encoded motion cell is readable.
+        feed_batch(&app.terminals[0], "\x1b[?1003h\x1b[?1006h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let layout = app.panel_layouts[0];
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // Past the pane's right border, over the neighbouring pane: the owner
+        // encodes the real pointer position with its own layout formula.
+        let x = layout.body.x + layout.body.w + 40.0;
+        let y = left.1;
+        split_pointer_move(&mut app, x, y);
+        let col = (((x - layout.text_x).max(0.0) / layout.char_w).floor() as usize + 1)
+            .clamp(1, layout.cols);
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - y
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows - rows_from_bottom;
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes[pressed_len..]),
+            format!("\x1b[<32;{col};{row}M")
+        );
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

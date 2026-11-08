@@ -737,6 +737,30 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
     ) -> bool {
+        self.pointer_moved(x, y, terminal, search_cursor_from_x, false)
+    }
+
+    /// Pointer motion for the terminal that owns the pressed pointer: the real
+    /// pointer coordinates reach it even over a protocol area or outside the
+    /// pane body.
+    pub(crate) fn cursor_moved_claimed(
+        &mut self,
+        x: f32,
+        y: f32,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+    ) -> bool {
+        self.pointer_moved(x, y, terminal, search_cursor_from_x, true)
+    }
+
+    fn pointer_moved(
+        &mut self,
+        x: f32,
+        y: f32,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+        claimed: bool,
+    ) -> bool {
         let was_selection_autoscrolling = self.selection_autoscroll_active(terminal);
         self.mouse_x = x;
         self.mouse_y = y;
@@ -784,14 +808,26 @@ impl TerminalInteraction {
                 let grid = crate::platform::lock_recover(&terminal.grid);
                 (grid.mouse_tracking(), grid.mouse_sgr())
             };
-            if let Some(sequence) = terminal_mouse_motion_sequence(
-                self.layout,
-                mode,
-                sgr,
-                self.pressed_mouse_buttons,
-                x,
-                y,
-            ) {
+            let sequence = if claimed {
+                terminal_mouse_motion_sequence_claimed(
+                    self.layout,
+                    mode,
+                    sgr,
+                    self.pressed_mouse_buttons,
+                    x,
+                    y,
+                )
+            } else {
+                terminal_mouse_motion_sequence(
+                    self.layout,
+                    mode,
+                    sgr,
+                    self.pressed_mouse_buttons,
+                    x,
+                    y,
+                )
+            };
+            if let Some(sequence) = sequence {
                 let _ = terminal.write_input(&sequence);
                 return true;
             }
@@ -805,6 +841,30 @@ impl TerminalInteraction {
         button: PointerButton,
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+    ) -> bool {
+        self.mouse_button_event(state, button, terminal, search_cursor_from_x, false)
+    }
+
+    /// Pointer button event for the terminal that owns the pressed pointer: the
+    /// protocol areas and the pane body never drop it, and it is encoded at the
+    /// real pointer coordinates.
+    pub(crate) fn mouse_input_claimed(
+        &mut self,
+        state: KeyState,
+        button: PointerButton,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+    ) -> bool {
+        self.mouse_button_event(state, button, terminal, search_cursor_from_x, true)
+    }
+
+    fn mouse_button_event(
+        &mut self,
+        state: KeyState,
+        button: PointerButton,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+        claimed: bool,
     ) -> bool {
         let x = self.mouse_x;
         let y = self.mouse_y;
@@ -830,6 +890,7 @@ impl TerminalInteraction {
         }
 
         if let Some(search) = self.layout.search
+            && !claimed
             && state == KeyState::Pressed
             && button == PointerButton::Left
         {
@@ -874,6 +935,7 @@ impl TerminalInteraction {
         }
 
         if let Some(scrollbar) = self.layout.scrollbar
+            && !claimed
             && state == KeyState::Pressed
             && button == PointerButton::Left
             && scrollbar.track.contains(x, y)
@@ -888,7 +950,7 @@ impl TerminalInteraction {
             return true;
         }
 
-        if !self.layout.body.contains(x, y) {
+        if !claimed && !self.layout.body.contains(x, y) {
             return false;
         }
         let left_press = state == KeyState::Pressed && button == PointerButton::Left;
@@ -906,6 +968,7 @@ impl TerminalInteraction {
         // mouse tracking, and never starts a selection. Only a single click opens
         // it; a double or triple click falls through to the selection.
         if left_press
+            && !claimed
             && click_count == 1
             && self.modifiers.control_key()
             && let Some((link, _)) = link_under_pointer(self.layout, terminal, x, y)
@@ -934,16 +997,30 @@ impl TerminalInteraction {
             (grid.mouse_tracking(), grid.mouse_sgr())
         };
         let tracking = tracking_mode.enabled();
-        if let Some(sequence) = terminal_mouse_event_sequence(
-            self.layout,
-            PointerCapture::None,
-            tracking_mode,
-            mouse_sgr,
-            state,
-            button,
-            x,
-            y,
-        ) {
+        let sequence = if claimed {
+            terminal_mouse_event_sequence_claimed(
+                self.layout,
+                PointerCapture::None,
+                tracking_mode,
+                mouse_sgr,
+                state,
+                button,
+                x,
+                y,
+            )
+        } else {
+            terminal_mouse_event_sequence(
+                self.layout,
+                PointerCapture::None,
+                tracking_mode,
+                mouse_sgr,
+                state,
+                button,
+                x,
+                y,
+            )
+        };
+        if let Some(sequence) = sequence {
             let _ = terminal.write_input(&sequence);
             return true;
         }
@@ -1413,11 +1490,25 @@ fn terminal_mouse_protocol_cell(
     x: f32,
     y: f32,
 ) -> Option<(usize, usize)> {
+    if !terminal_protocol_pointer_target(layout, x, y) {
+        return None;
+    }
+    terminal_mouse_protocol_cell_at(layout, x, y)
+}
+
+/// Cell of the pointer at (`x`, `y`) in `layout`, without the body and
+/// protocol-area gate: the owner of the pressed pointer keeps the event where
+/// the pane draws its scrollbar or search bar, or past its edge. The ordinary
+/// formula clamps the cell to the grid.
+fn terminal_mouse_protocol_cell_at(
+    layout: TerminalUiLayout,
+    x: f32,
+    y: f32,
+) -> Option<(usize, usize)> {
     if layout.char_w <= 0.0
         || layout.char_h <= 0.0
         || layout.visible_rows == 0
         || layout.cols == 0
-        || !terminal_protocol_pointer_target(layout, x, y)
     {
         return None;
     }
@@ -1436,10 +1527,36 @@ fn terminal_mouse_event_sequence(
     x: f32,
     y: f32,
 ) -> Option<Vec<u8>> {
+    let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
+    terminal_mouse_event_report(capture, tracking, sgr, state, button, cell_x, cell_y)
+}
+
+fn terminal_mouse_event_sequence_claimed(
+    layout: TerminalUiLayout,
+    capture: PointerCapture,
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    state: KeyState,
+    button: PointerButton,
+    x: f32,
+    y: f32,
+) -> Option<Vec<u8>> {
+    let (cell_x, cell_y) = terminal_mouse_protocol_cell_at(layout, x, y)?;
+    terminal_mouse_event_report(capture, tracking, sgr, state, button, cell_x, cell_y)
+}
+
+fn terminal_mouse_event_report(
+    capture: PointerCapture,
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    state: KeyState,
+    button: PointerButton,
+    cell_x: usize,
+    cell_y: usize,
+) -> Option<Vec<u8>> {
     if capture != PointerCapture::None {
         return None;
     }
-    let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
     let button = terminal_mouse_button(button)?;
     let kind = if state == KeyState::Pressed {
         MouseEventKind::Press(button)
@@ -1459,6 +1576,28 @@ fn terminal_mouse_motion_sequence(
     y: f32,
 ) -> Option<Vec<u8>> {
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
+    terminal_mouse_motion_report(tracking, sgr, pressed_buttons, cell_x, cell_y)
+}
+
+fn terminal_mouse_motion_sequence_claimed(
+    layout: TerminalUiLayout,
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    pressed_buttons: u8,
+    x: f32,
+    y: f32,
+) -> Option<Vec<u8>> {
+    let (cell_x, cell_y) = terminal_mouse_protocol_cell_at(layout, x, y)?;
+    terminal_mouse_motion_report(tracking, sgr, pressed_buttons, cell_x, cell_y)
+}
+
+fn terminal_mouse_motion_report(
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    pressed_buttons: u8,
+    cell_x: usize,
+    cell_y: usize,
+) -> Option<Vec<u8>> {
     let kind = MouseEventKind::Motion {
         held: terminal_first_pressed_button(pressed_buttons),
     };
