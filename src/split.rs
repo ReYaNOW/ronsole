@@ -110,10 +110,14 @@ pub(crate) fn split_child_rects(
     let extent = axis_extent(node, axis);
     let node_gap = if extent < gap { 0.0 } else { gap };
     let available = (extent - node_gap).max(0.0);
+    let first_floor = first_min.ceil();
+    let second_floor = second_min.ceil();
+    let mut clamped = false;
     let clamped_ratio = if available > 0.0 {
-        let lo = first_min.ceil() / available;
-        let hi = 1.0 - second_min.ceil() / available;
+        let lo = first_floor / available;
+        let hi = 1.0 - second_floor / available;
         if lo <= hi {
+            clamped = true;
             ratio.clamp(lo, hi)
         } else {
             ratio
@@ -121,7 +125,12 @@ pub(crate) fn split_child_rects(
     } else {
         ratio
     };
-    let first_extent = (available * clamped_ratio).floor();
+    let mut first_extent = (available * clamped_ratio).floor();
+    // `available * lo` can land just below `first_floor` in `f32`, so the
+    // floor may undershoot a minimum even though both minima fit.
+    if clamped && available >= first_floor + second_floor {
+        first_extent = first_extent.clamp(first_floor, available - second_floor);
+    }
     let second_extent = available - first_extent;
     match axis {
         SplitAxis::SideBySide => (
@@ -412,6 +421,33 @@ mod tests {
         let mut restored = Vec::new();
         layout_panes(&tree, wide, scale, char_w, char_h, &mut restored);
         assert_eq!(restored, wide_out);
+    }
+
+    /// At the clamp boundary `available * (min / available)` can land just
+    /// below `min` in `f32`, so `floor` alone may drop a branch under its
+    /// whole-pixel minimum.
+    #[test]
+    fn clamped_ratio_never_violates_minimum_at_f32_boundary() {
+        let (scale, char_w, char_h) = (1.25_f32, 9.3_f32, 21.7_f32);
+        let min_w = pane_min(char_w, char_h, scale).0.ceil();
+        let tree = split(SplitAxis::SideBySide, 0.1, pane(1), pane(2));
+        let body = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 305.0,
+            h: 400.0,
+        };
+        let mut out = Vec::new();
+        layout_panes(&tree, body, scale, char_w, char_h, &mut out);
+        let first = out[0].1;
+        let second = out[1].1;
+        assert!(first.w >= min_w, "first pane {first:?} below {min_w}");
+        assert!(second.w >= min_w, "second pane {second:?} below {min_w}");
+        assert_eq!(
+            first.w + second.w + gap_for(scale, body.w),
+            body.w,
+            "panes plus gap must cover the node"
+        );
     }
 
     #[test]
