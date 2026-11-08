@@ -495,6 +495,7 @@ mod tests {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            dev_claude_cache: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2031,6 +2032,10 @@ pub struct Terminal {
     bridge_launch: Option<BridgeLaunchState>,
     dev_warning: DevWarningState,
     dev_banner: DevBannerState,
+    /// `(PTY foreground group, flagged claude in it)` for the development-
+    /// channels checks, rebuilt by `refresh_dev_claude_cache` in the event
+    /// paths. The frame path answers from it instead of walking `/proc`.
+    dev_claude_cache: Option<(Option<u32>, Option<crate::tab_input::ProcGen>)>,
     /// Working directory from the latest OSC 7 report that passed
     /// `accept_osc7_cwd`; a new tab inherits it.
     pub(crate) osc7_cwd: Option<PathBuf>,
@@ -2174,6 +2179,7 @@ impl Terminal {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            dev_claude_cache: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2282,6 +2288,7 @@ impl Terminal {
             bridge_launch,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            dev_claude_cache: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2545,6 +2552,50 @@ impl Terminal {
             self.dev_banner.hid_any |= flagged;
         }
         self.dev_banner.mark_scanned(&grid);
+    }
+
+    /// Rebuilds `dev_claude_cache` when the warning or banner scan has output
+    /// it has not scanned yet or the PTY foreground group changed: one `/proc`
+    /// walk per such event-loop pass, nothing for content already scanned by
+    /// the same group. Only the event paths call it; the frame path answers
+    /// from the cache.
+    pub(crate) fn refresh_dev_claude_cache(&mut self) {
+        let pgrp = self.process_group_leader();
+        let generation = crate::platform::lock_recover(&self.grid).content_generation();
+        let scanned = self.dev_warning.scanned_generation == Some(generation)
+            && self.dev_banner.scanned_generation == Some(generation);
+        if scanned && self.dev_claude_cache.is_some_and(|(cached, _)| cached == pgrp) {
+            return;
+        }
+        let found = pgrp.and_then(crate::tab_input::dev_channel_claude_in_group);
+        self.dev_claude_cache = Some((pgrp, found));
+    }
+
+    /// `observe_dev_channel_warning` answered from `dev_claude_cache`: the frame
+    /// path calls this, so it never walks `/proc`. A foreground group other
+    /// than the cached one has no answer.
+    pub(crate) fn observe_dev_channel_warning_cached(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+    ) -> bool {
+        let cache = self.dev_claude_cache;
+        self.observe_dev_channel_warning(now, scratch, |pgrp| {
+            cache
+                .filter(|(cached, _)| *cached == pgrp)
+                .and_then(|(_, found)| found)
+        })
+    }
+
+    /// `observe_dev_channel_banner` answered from `dev_claude_cache`: see
+    /// `observe_dev_channel_warning_cached`.
+    pub(crate) fn observe_dev_channel_banner_cached(&mut self) {
+        let cache = self.dev_claude_cache;
+        self.observe_dev_channel_banner(|pgrp| {
+            cache
+                .filter(|(cached, _)| *cached == pgrp)
+                .and_then(|(_, found)| found)
+        });
     }
 
     /// Keeps a viewport scrolled up into the scrollback on the same lines:

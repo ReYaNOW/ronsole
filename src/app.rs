@@ -1251,12 +1251,11 @@ impl App {
     /// deadline (the next grid frame recomputes it).
     fn advance_dev_channel_warnings(&mut self, now: Instant) {
         for terminal in &mut self.terminals {
-            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
-            terminal.observe_dev_channel_banner(|pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
+            // Event path: refresh the process lookup for the output that
+            // arrived, then answer the checks from it.
+            terminal.refresh_dev_claude_cache();
+            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
+            terminal.observe_dev_channel_banner_cached();
         }
         if self.grid_open() || self.active_tab_split() {
             if self.withheld_until.is_some_and(|until| now >= until) {
@@ -1277,10 +1276,16 @@ impl App {
 
     /// Whether to skip this frame because the active tab shows the warning that
     /// Enter was already sent for: the compositor keeps the last presented
-    /// frame. Only reads the state the event path prepared: see
-    /// `drain_terminal_host_events` for the warning and banner hiding of the
-    /// output that arrived. Input is not affected.
+    /// frame. Rescans the active tab first, since output may have arrived after
+    /// `on_about_to_wait`, answering the process lookup from the cache the
+    /// event paths refreshed (the frame path walks no `/proc`). Input is not
+    /// affected. Also applies the banner hiding
+    /// (`Terminal::observe_dev_channel_banner_cached`) to the new content.
     fn withhold_active_frame(&mut self, now: Instant) -> bool {
+        if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
+            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
+            terminal.observe_dev_channel_banner_cached();
+        }
         if !self.active_dev_warning_hidden(now) {
             return false;
         }
@@ -1289,19 +1294,22 @@ impl App {
         true
     }
 
-    /// Grid counterpart of `withhold_active_frame`: reads the warning state the
-    /// event path prepared (see `drain_terminal_host_events`) for every tile
-    /// terminal and sets `content_hidden` on its panel, so the frame is drawn
-    /// with only the hidden tile body blank. Must run after `rebuild_panels`,
-    /// which resets `content_hidden`. Records the earliest hiding end in
-    /// `withheld_until` for the loop to wake at.
+    /// Grid counterpart of `withhold_active_frame`: applies the warning and
+    /// banner hiding to every tile terminal of the output that arrived after
+    /// `on_about_to_wait` and sets `content_hidden` on its panel, so the frame
+    /// is drawn with only the hidden tile body blank. Answers the process
+    /// lookup from the cache the event paths refreshed. Must run after
+    /// `rebuild_panels`, which resets `content_hidden`. Records the earliest
+    /// hiding end in `withheld_until` for the loop to wake at.
     fn observe_grid_dev_warnings(&mut self, now: Instant) {
         let mut withheld_until: Option<Instant> = None;
         for panel in &mut self.panels {
-            let Some(terminal) = self.terminals.get(panel.terminal) else {
+            let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
                 panel.content_hidden = false;
                 continue;
             };
+            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
+            terminal.observe_dev_channel_banner_cached();
             panel.content_hidden = terminal.dev_warning_frame_hidden(now);
             if panel.content_hidden {
                 if let Some(until) = terminal.dev_warning_hidden_until() {
@@ -3719,7 +3727,8 @@ impl App {
     /// development-channels warning and banner state to the output that
     /// arrived, and, as a fallback for a stalled parser thread, replays
     /// synchronized-output buffers that are overdue by `SYNC_RESERVE_GRACE`,
-    /// when the locks are free. The frame path only reads this prepared state.
+    /// when the locks are free. The frame path rescans output that arrives
+    /// later and answers its process lookup from the cache refreshed here.
     /// Takes its own clock so the about-to-wait body keeps its clock after the
     /// early return.
     fn drain_terminal_host_events(&mut self) {
@@ -3741,13 +3750,11 @@ impl App {
                 }
             }
             // Both methods return early when the content generation did not
-            // change, so a drain without new output does no scanning work.
-            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
-            terminal.observe_dev_channel_banner(|pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
+            // change, so a drain without new output does no scanning work; the
+            // refresh walks `/proc` only for a generation not scanned yet.
+            terminal.refresh_dev_claude_cache();
+            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
+            terminal.observe_dev_channel_banner_cached();
             if terminal
                 .sync_deadline()
                 .is_some_and(|deadline| deadline + SYNC_RESERVE_GRACE <= now)
@@ -4122,36 +4129,42 @@ mod tests {
     }
 
     #[test]
-    fn dev_warning_from_output_arriving_after_about_to_wait_is_still_hidden() {
+    fn dev_warning_from_output_after_about_to_wait_is_hidden_without_drain() {
         let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
-        let mut app = App::new();
-        let pane = app.issue_pane_id();
-        push_test_terminal(
-            &mut app,
-            Terminal::new_bridge_for_test(120, 8, 1, [31; 16], pane),
-        );
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "dev-warning-after-pass",
+                1,
+            );
+        // A bridge terminal keeps the tab's pane id, so the auto-confirm sends
+        // the Enter the frame has to hide.
+        let pane = app.terminals[0].pane_id();
+        let bridge = Terminal::new_bridge_for_test(120, 8, 1, [31; 16], pane);
+        bridge.grid.lock().unwrap().mark_presentation_ready();
+        app.terminals[0] = bridge;
+
         // The pass sees a clean screen: nothing is hidden and no Enter is sent.
         let _ = app.on_about_to_wait();
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
         assert!(!app.terminals[0].dev_warning_frame_hidden(Instant::now()));
 
-        // The warning output lands after the pass. The bridge auto-confirm sends
-        // the Enter; the next drain applies the arrived output, and the frame
-        // reads that prepared state instead of scanning on its own.
+        // The warning output lands after the pass and the auto-confirm sends
+        // the Enter. Without a `drain_terminal_host_events` in between, the
+        // frame itself must rescan the arrived output and hide it, answering
+        // the process lookup from the cache the event paths refreshed.
         feed_batch(&app.terminals[0], warning);
         let sent_at = Instant::now();
         app.advance_bridge_launches(sent_at);
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
-        app.drain_terminal_host_events();
+        app.dirty = true;
+        assert_eq!(app.on_frame(), Ok(false));
+        assert!(app.frame_withheld);
+        assert!(!app.dirty);
         assert_eq!(
             app.terminals[0].dev_warning_hidden_until(),
             Some(sent_at + crate::terminal::DEV_WARNING_HIDE_LIMIT)
         );
-
-        app.dirty = true;
-        assert!(app.withhold_active_frame(sent_at));
-        assert!(app.frame_withheld);
-        assert!(!app.dirty);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
