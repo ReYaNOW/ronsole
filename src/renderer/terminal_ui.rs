@@ -3847,6 +3847,11 @@ impl Renderer {
         let visible_rows = new_rows;
 
         let mut grid = crate::platform::lock_recover(&terminal.grid);
+        // The renderer resizes the grid to the body geometry below, and a resize
+        // bumps the content generation without new output. The development-channels
+        // verdict belongs to the content that was verified, so capture its
+        // generation before that resize.
+        let verified_generation = grid.content_generation();
         let resized =
             prepare_terminal_grid_for_render(&mut grid, search.as_deref_mut(), new_cols, new_rows);
         grid.mark_presentation_layout_ready();
@@ -3897,7 +3902,7 @@ impl Renderer {
         // but output may have landed since. The development-channels check
         // verifies one generation only, so a newer grid draws no body here
         // (the background and the chrome stay).
-        let content_verified = terminal.dev_channel_generation_verified(content_generation);
+        let content_verified = terminal.dev_channel_generation_verified(verified_generation);
         if presentation_visible && content_clip.is_some() && content_verified {
             let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
             for layer in TERMINAL_BODY_LAYERS {
