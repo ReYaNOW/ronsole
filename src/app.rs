@@ -9881,8 +9881,10 @@ mod tests {
         let point = panel_body_point(&app, 0);
         split_pointer_move(&mut app, point.0, point.1);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
-        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
         let _ = std::fs::remove_dir_all(&root);
     }
 
