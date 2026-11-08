@@ -6,6 +6,7 @@ use super::{App, AppLoopControl};
 use crate::config::AppConfig;
 use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
+use crate::panels::Panel;
 use crate::runtime::{PreGlResources, WindowRuntime};
 use crate::terminal::Terminal;
 use std::time::Instant;
@@ -120,14 +121,45 @@ impl App {
         &self.terminals
     }
 
-    /// Index into `terminals` of the active tab.
-    pub(crate) fn active_terminal_index(&self) -> usize {
-        self.active_terminal
-    }
-
     /// The active tab, or `None` when no tab exists.
     pub(crate) fn active_terminal(&self) -> Option<&Terminal> {
         self.terminals.get(self.active_terminal)
+    }
+
+    /// Number of tabs in `App.tabs`, the order the tab strip shows.
+    pub(crate) fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Position of the active tab in `App.tabs`.
+    pub(crate) fn active_tab_index(&self) -> usize {
+        self.active_tab
+    }
+
+    /// Terminal whose display title the tab strip shows for tab `index`: the
+    /// terminal of the tab's active pane, or `None` when `index` is out of range.
+    pub(crate) fn tab_title_terminal(&self, index: usize) -> Option<&Terminal> {
+        let pane = self.tabs.get(index)?.active_pane;
+        self.terminals
+            .iter()
+            .find(|terminal| terminal.pane_id() == pane)
+    }
+
+    /// Display number of tab `index`, or `None` when `index` is out of range.
+    pub(crate) fn tab_title_number(&self, index: usize) -> Option<usize> {
+        self.tabs.get(index).map(|tab| tab.title_number)
+    }
+
+    /// Raw id of the active tab's focused pane, or `None` when no tab exists.
+    pub(crate) fn active_pane_raw(&self) -> Option<u64> {
+        self.tabs
+            .get(self.active_tab)
+            .map(|tab| tab.active_pane.raw())
+    }
+
+    /// Panels drawn in the last frame, in draw order; empty before the first rebuild.
+    pub(crate) fn panels(&self) -> &[Panel] {
+        &self.panels
     }
 
     /// Selection, pointer, and layout state from the last drawn frame.
