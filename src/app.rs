@@ -7893,15 +7893,22 @@ mod tests {
 
     #[test]
     fn alt_arrows_not_intercepted_in_grid() {
-        let mut app = grid_mode_app(&[true, true]);
+        // The active tab is split, so outside grid mode this focus shortcut would
+        // be intercepted; only the open grid keeps the arrow with the tile.
+        let mut app = grid_mode_app(&[true]);
+        let left = app.tabs[0].active_pane;
+        attach_test_pane(&mut app, 0, 2);
+        app.terminals[1].set_claude_foreground_for_test(true);
         app.toggle_claude_grid(Instant::now());
         assert!(app.grid_open());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
 
         let _ = press_alt(&mut app, KeyCode::ArrowLeft);
 
         assert!(app.grid_open());
+        assert_eq!(leaf_count(&app.tabs[0].layout), 2);
         assert_eq!(app.active_terminal, 0);
-        assert_eq!(app.tabs[0].active_pane, app.terminals[0].pane_id());
+        assert_eq!(app.tabs[0].active_pane, left);
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[1;3D");
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
     }
@@ -7923,8 +7930,15 @@ mod tests {
         let (mut app, _receiver, _profile, root) = headless_split_app("close-w-single", 1);
         let single = app.tabs[0].active_pane;
 
-        let _ = press_ctrl_shift(&mut app, KeyCode::KeyW);
+        // A single-pane tab passes the key to its terminal: Ctrl+Shift+W keeps
+        // the legacy Ctrl+W byte, as `ctrl_c_without_selection_sends_etx_flags0`
+        // does for Ctrl+C. A real key carries its unshifted layout character.
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        let mut key = shortcut_key(KeyCode::KeyW);
+        key.unshifted = Some('w');
+        let _ = app.on_key(key);
 
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x17");
         assert_eq!(app.terminals.len(), 1);
         assert_eq!(leaf_count(&app.tabs[0].layout), 1);
         assert_eq!(app.tabs[0].active_pane, single);
