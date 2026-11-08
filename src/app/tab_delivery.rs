@@ -507,6 +507,7 @@ mod tests {
     use std::io::Read;
     use crate::launch::TerminalLaunchSpec;
     use crate::app::AppLoopControl;
+    use crate::app::headless_run::test_support::{insert_test_terminal, push_test_terminal};
     use std::cell::Cell;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -584,11 +585,14 @@ mod tests {
                 hold: false,
                 bridge_launch_id: None,
             };
+            let mut app = App::new();
+            let pane = app.issue_pane_id();
             let terminal = Terminal::spawn(
                 None,
                 1,
                 launch,
                 crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+                pane,
             );
             let token = terminal.tab_token().to_owned();
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -610,13 +614,12 @@ mod tests {
             set_leader(Some(100));
             ORIGIN_OK.with(|cell| cell.set(true));
             CLAUDE_PROCESS.with(|cell| cell.set(None));
-            let mut app = App::new();
             app.tab_input.probe = TabInputProbe {
                 claude_generation: fake_generation,
                 origin_allowed: fake_origin,
                 claude_process_group: fake_claude_process_group,
             };
-            app.terminals.push(terminal);
+            push_test_terminal(&mut app, terminal);
             Self {
                 app,
                 root,
@@ -1096,7 +1099,8 @@ mod tests {
         let mut fx = Fixture::new(EMPTY_BOX);
         let pgrp = fx.app.terminals[0].process_group_leader().unwrap();
         // A second tab without a PTY never matches.
-        fx.app.terminals.insert(0, Terminal::new_for_test(80, 8, 2));
+        let pane = fx.app.issue_pane_id();
+        insert_test_terminal(&mut fx.app, 0, Terminal::new_for_test(80, 8, 2, pane));
         CLAUDE_PROCESS.with(|cell| cell.set(Some((4321, 777, pgrp))));
         let uid = crate::platform::single_instance::effective_uid();
 
@@ -1154,7 +1158,8 @@ mod tests {
         let mut fx = Fixture::new(EMPTY_BOX);
         let token = fx.app.terminals[0].tab_token().to_owned();
         assert_eq!(token.len(), 32);
-        fx.app.terminals.push(Terminal::new_for_test(80, 8, 2));
+        let pane = fx.app.issue_pane_id();
+        push_test_terminal(&mut fx.app, Terminal::new_for_test(80, 8, 2, pane));
         let uid = crate::platform::single_instance::effective_uid();
         let status = |focused: bool, active: bool| TabStatusReply::Status(TabStatus { focused, active });
 
@@ -1190,8 +1195,10 @@ mod tests {
     #[test]
     fn grid_mode_tab_status_reports_active_for_every_tile() {
         let mut fx = Fixture::new(EMPTY_BOX);
-        fx.app.terminals.push(Terminal::new_for_test(80, 8, 2));
-        fx.app.terminals.push(Terminal::new_for_test(80, 8, 3));
+        let second = fx.app.issue_pane_id();
+        push_test_terminal(&mut fx.app, Terminal::new_for_test(80, 8, 2, second));
+        let third = fx.app.issue_pane_id();
+        push_test_terminal(&mut fx.app, Terminal::new_for_test(80, 8, 3, third));
         for (index, is_claude) in [true, false, true].into_iter().enumerate() {
             fx.app.terminals[index].set_claude_foreground_for_test(is_claude);
         }
@@ -1223,7 +1230,8 @@ mod tests {
     #[test]
     fn tab_wait_answers_missing_visible_and_rejected_tabs_immediately() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 8, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 1, pane));
         app.active_terminal_presented = true;
         let token = app.terminals[0].tab_token().to_owned();
         let uid = effective_uid();
@@ -1239,8 +1247,10 @@ mod tests {
     #[test]
     fn tab_wait_resolves_after_focus_tab_change_and_close_handlers() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 8, 1));
-        app.terminals.push(Terminal::new_for_test(80, 8, 2));
+        let first_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 1, first_pane));
+        let second_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 2, second_pane));
         app.active_terminal_presented = true;
         let first = app.terminals[0].tab_token().to_owned();
         let uid = effective_uid();
@@ -1276,8 +1286,10 @@ mod tests {
     #[test]
     fn tab_wait_limit_drops_oldest_connection_without_a_reply() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 8, 1));
-        app.terminals.push(Terminal::new_for_test(80, 8, 2));
+        let first_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 1, first_pane));
+        let second_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 8, 2, second_pane));
         app.active_terminal = 0;
         app.active_terminal_presented = false;
         let token = app.terminals[1].tab_token().to_owned();

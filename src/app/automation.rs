@@ -1635,6 +1635,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::headless_run::test_support::push_test_terminal;
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -1705,11 +1706,13 @@ mod tests {
     #[test]
     fn deferred_tab_activation_blocks_automation_readiness_until_settled() {
         let mut app = App::new();
-        let old = crate::terminal::Terminal::new_for_test(8, 2, 1);
+        let old_pane = app.issue_pane_id();
+        let old = crate::terminal::Terminal::new_for_test(8, 2, 1, old_pane);
         old.grid.lock().unwrap().mark_presentation_ready();
-        let pending = crate::terminal::Terminal::new_for_test(8, 2, 2);
-        app.terminals.push(old);
-        app.terminals.push(pending);
+        let pending_pane = app.issue_pane_id();
+        let pending = crate::terminal::Terminal::new_for_test(8, 2, 2, pending_pane);
+        push_test_terminal(&mut app, old);
+        push_test_terminal(&mut app, pending);
         app.active_terminal = 0;
         app.active_terminal_presented = true;
         app.interaction.layout.cols = 8;
@@ -1945,8 +1948,11 @@ mod tests {
             AutomationController::with_steps(options, Vec::new()).expect("controller");
         let (mut app, _receiver) =
             App::load_headless(None, &profile, None).expect("headless app");
-        app.terminals
-            .push(crate::terminal::Terminal::new_for_test(16, 2, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(
+            &mut app,
+            crate::terminal::Terminal::new_for_test(16, 2, 1, pane),
+        );
         app.active_terminal = 0;
         assert_eq!(app.interaction.clipboard_text(), None);
         {

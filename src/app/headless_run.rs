@@ -160,7 +160,9 @@ impl App {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::app::Tab;
     use crate::headless::Profile;
+    use crate::split::{PaneId, SplitNode};
     use std::path::PathBuf;
     use std::sync::mpsc::Receiver;
 
@@ -188,6 +190,41 @@ pub(crate) mod test_support {
         (app, receiver, profile, root)
     }
 
+    /// Adds `terminal` as one tab at the end of `App`: `terminals` and `tabs`
+    /// grow together and keep the same order. Returns the terminal's pane id.
+    pub(crate) fn push_test_terminal(app: &mut App, terminal: Terminal) -> PaneId {
+        let pane_id = terminal.pane_id();
+        app.terminals.push(terminal);
+        let id = app.issue_tab_id();
+        app.tabs.push(Tab {
+            id,
+            layout: SplitNode::Leaf(pane_id),
+            active_pane: pane_id,
+            title_number: app.tabs.len() + 1,
+        });
+        pane_id
+    }
+
+    /// Inserts `terminal` at `terminal_index` in `terminals`; its tab goes to
+    /// the end of `tabs`, because a terminal index and a tab position are
+    /// independent in the test model. Returns the terminal's pane id.
+    pub(crate) fn insert_test_terminal(
+        app: &mut App,
+        terminal_index: usize,
+        terminal: Terminal,
+    ) -> PaneId {
+        let pane_id = terminal.pane_id();
+        app.terminals.insert(terminal_index, terminal);
+        let id = app.issue_tab_id();
+        app.tabs.push(Tab {
+            id,
+            layout: SplitNode::Leaf(pane_id),
+            active_pane: pane_id,
+            title_number: app.tabs.len() + 1,
+        });
+        pane_id
+    }
+
     /// Like `started_headless`, but the live shell tabs are replaced by `count` test
     /// terminals. Live terminals would let their title poll overwrite the Claude flag
     /// set by a test, and their PTY input is not visible to tests. Terminal 0 is active
@@ -197,13 +234,17 @@ pub(crate) mod test_support {
         count: usize,
     ) -> (App, Receiver<String>, Profile, PathBuf) {
         let (mut app, receiver, profile, root) = started_headless(tag);
-        app.terminals = (0..count)
-            .map(|index| {
-                let terminal = Terminal::new_for_test(80, 24, index as u64 + 1);
-                terminal.grid.lock().unwrap().mark_presentation_ready();
-                terminal
-            })
-            .collect();
+        // The live shell terminals and their tabs are replaced together, so no
+        // tab keeps a leaf of a removed terminal.
+        app.terminals.clear();
+        app.tabs.clear();
+        app.active_tab = 0;
+        for index in 0..count {
+            let pane = app.issue_pane_id();
+            let terminal = Terminal::new_for_test(80, 24, index as u64 + 1, pane);
+            terminal.grid.lock().unwrap().mark_presentation_ready();
+            push_test_terminal(&mut app, terminal);
+        }
         app.active_terminal = 0;
         app.active_terminal_presented = true;
         (app, receiver, profile, root)

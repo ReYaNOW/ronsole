@@ -1656,8 +1656,16 @@ fn terminal_alt_prefixed(bytes: &[u8], alt: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::split::PaneId;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    /// Standalone terminal for input tests: the pane id only has to exist.
+    fn test_terminal(cols: usize, rows: usize, display_number: u64) -> Terminal {
+        static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let pane = PaneId::new(NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        Terminal::new_for_test(cols, rows, display_number, pane)
+    }
 
     #[test]
     fn project_owned_keyboard_contract_separates_physical_keys_from_text() {
@@ -1759,7 +1767,7 @@ mod tests {
 
     #[test]
     fn reset_for_terminal_switch_ends_scrollbar_drag_of_left_terminal() {
-        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        let mut terminal = test_terminal(8, 2, 1);
         let mut interaction = TerminalInteraction::default();
         interaction.pointer_capture = PointerCapture::TerminalScrollbar;
         terminal.scroll_y.is_dragging = true;
@@ -1920,7 +1928,7 @@ mod tests {
     fn ctrl_c_without_selection_sends_etx_flags0() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyC), 46);
         key.unshifted = Some('c');
         assert!(interaction.handle_key_event(&key, &mut terminal));
@@ -1931,7 +1939,7 @@ mod tests {
     fn ctrl_c_with_selection_release_not_sent() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1, 4, 1)));
         let mut release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyC), 46);
         release.unshifted = Some('c');
@@ -1944,7 +1952,7 @@ mod tests {
     fn ctrl_c_with_selection_press_copies_and_sends_nothing() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         // The selection lies past the grid rows, so its copied text is empty and
         // the clipboard write is skipped; only selection state and encoder output are checked.
         crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1000, 4, 1000)));
@@ -1959,7 +1967,7 @@ mod tests {
     fn ctrl_v_release_not_sent() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
         assert!(!interaction.handle_key_event(&release, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
@@ -1969,7 +1977,7 @@ mod tests {
     fn alt_a_flag1_sends_no_separate_text() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::ALT);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -2005,7 +2013,7 @@ mod tests {
         let mut interaction = TerminalInteraction::new_with_memory_clipboard();
         assert!(interaction.set_clipboard_text("pasted".to_string()));
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
         let repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyV), 47);
         let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
@@ -2026,7 +2034,7 @@ mod tests {
         // and the release emits nothing in legacy mode.
         let mut interaction = TerminalInteraction::new_with_memory_clipboard();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
         press.unshifted = Some('v');
         let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
@@ -2039,7 +2047,7 @@ mod tests {
     fn search_target_gets_text_after_key() {
         let mut interaction = TerminalInteraction::default();
         interaction.search.open();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
         key.unshifted = Some('a');
         key.text = Some("a".to_string());
@@ -2051,7 +2059,7 @@ mod tests {
     #[test]
     fn repeated_letter_reaches_pty_as_text() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyA), 30);
         repeat.unshifted = Some('a');
         repeat.text = Some("a".to_string());
@@ -2062,12 +2070,12 @@ mod tests {
     #[test]
     fn ime_preedit_key_not_encoded() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let enter = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::Enter), 28);
         assert!(interaction.handle_key_event(&enter, &mut terminal));
         assert!(!terminal.input_bytes_for_test().is_empty());
 
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut composing = enter.clone();
         composing.ime_preedit = true;
         assert!(!interaction.handle_key_event(&composing, &mut terminal));
@@ -2078,7 +2086,7 @@ mod tests {
     fn ime_preedit_press_text_reaches_pty() {
         // Expected value comes from the I1 ruling: press text still reaches the PTY under preedit.
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
         press.unshifted = Some('a');
         press.text = Some("a".to_string());
@@ -2091,7 +2099,7 @@ mod tests {
     fn ime_preedit_repeat_sends_nothing() {
         // Expected value comes from the I1 ruling: repeat under preedit stays suppressed.
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyA), 30);
         repeat.unshifted = Some('a');
         repeat.text = Some("a".to_string());
@@ -2106,7 +2114,7 @@ mod tests {
         // its key away from the encoder until that key's release.
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         crate::platform::lock_recover(&terminal.grid).set_selection(Some((0, 0, 0, 2)));
         let ctrl_c = |state| {
             let mut key = raw_key(state, PhysicalKey::Code(KeyCode::KeyC), 46);
@@ -2130,7 +2138,7 @@ mod tests {
     #[test]
     fn release_without_flag2_sends_nothing() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let up = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::ArrowUp), 103);
         assert!(!interaction.handle_key_event(&up, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
@@ -2139,7 +2147,7 @@ mod tests {
     #[test]
     fn unidentified_key_without_text_sends_nothing() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
         interaction.handle_key_event(&key, &mut terminal);
         assert!(terminal.input_bytes_for_test().is_empty());
@@ -2150,7 +2158,7 @@ mod tests {
         // Expected bytes are the UTF-8 of the event text, from the task brief: a key with
         // text but no named, physical, or layout identity still types that text.
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut press = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
         press.text = Some("é".to_string());
         let release = KeyInput {
@@ -2169,12 +2177,12 @@ mod tests {
         let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
 
         // Flags 0: an encoded placeholder would arrive as ESC NUL.
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         assert!(!interaction.handle_key_event(&key, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
 
         // Kitty flag 8 (report all keys as escape codes) through the grid parser.
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -2199,7 +2207,7 @@ mod tests {
 
     /// Terminal with Kitty flags 10 (report all keys and report event types) pushed.
     fn modifier_test_terminal() -> Terminal {
-        let terminal = Terminal::new_for_test(80, 30, 1);
+        let terminal = test_terminal(80, 30, 1);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -2511,6 +2519,7 @@ mod tests {
             1,
             launch,
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
         let read_out = || std::fs::read(&out).unwrap_or_default();
 
@@ -2865,7 +2874,7 @@ mod tests {
     }
 
     fn selection_test_terminal() -> Terminal {
-        Terminal::new_for_test(80, 30, 1)
+        test_terminal(80, 30, 1)
     }
 
     fn begin_terminal_selection(

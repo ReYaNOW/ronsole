@@ -23,6 +23,7 @@ use crate::runtime::{TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
+use crate::split::{PaneId, SplitNode};
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
@@ -513,6 +514,47 @@ impl GridHint {
 
 const GRID_HINT_DURATION: Duration = Duration::from_secs(2);
 
+/// Stable identity of one tab in `App.tabs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TabId(u64);
+
+impl TabId {
+    fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// One terminal tab: a split tree over `App.terminals`, the focused pane and
+/// the number the tab strip shows. The layout always contains `active_pane`.
+struct Tab {
+    id: TabId,
+    layout: SplitNode,
+    active_pane: PaneId,
+    /// Display number of the founding terminal (`take_terminal_creation_number`).
+    title_number: usize,
+}
+
+/// Whether `pane` is one of the leaves of this split subtree.
+fn split_contains_pane(node: &SplitNode, pane: PaneId) -> bool {
+    match node {
+        SplitNode::Leaf(id) => *id == pane,
+        SplitNode::Split { first, second, .. } => {
+            split_contains_pane(first, pane) || split_contains_pane(second, pane)
+        }
+    }
+}
+
+/// Number of leaves in the subtree, optionally only those for `pane`.
+#[cfg(any(debug_assertions, test))]
+fn split_leaf_count(node: &SplitNode, pane: Option<PaneId>) -> usize {
+    match node {
+        SplitNode::Leaf(id) => usize::from(pane.is_none_or(|pane| pane == *id)),
+        SplitNode::Split { first, second, .. } => {
+            split_leaf_count(first, pane) + split_leaf_count(second, pane)
+        }
+    }
+}
+
 pub struct App {
     runtime: Option<WindowRuntime>,
     config: AppConfig,
@@ -531,6 +573,16 @@ pub struct App {
     settings_background_dragging: bool,
     terminals: Vec<Terminal>,
     active_terminal: usize,
+    /// Tabs in strip order; `tabs[active_tab]` owns `active_terminal`.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    next_tab_id: u64,
+    /// Source of every `PaneId`; ids are never reused after a pane closes.
+    next_pane_id: u64,
+    /// Grows on structural tab/pane changes; `layout_generation` additionally
+    /// grows when any saved split ratio changes.
+    structure_generation: u64,
+    layout_generation: u64,
     active_terminal_presented: bool,
     next_terminal_creation_number: u64,
     terminal_tab_scroll: ScrollState,
@@ -641,6 +693,12 @@ impl App {
             settings_background_dragging: false,
             terminals: Vec::new(),
             active_terminal: 0,
+            tabs: Vec::new(),
+            active_tab: 0,
+            next_tab_id: 1,
+            next_pane_id: 1,
+            structure_generation: 0,
+            layout_generation: 0,
             active_terminal_presented: false,
             next_terminal_creation_number: 1,
             terminal_tab_scroll: ScrollState::new(7.0),
@@ -772,13 +830,63 @@ impl App {
         }
     }
 
-    fn activate_ready_terminal(&mut self, index: usize, reveal_tail: bool) {
-        if index >= self.terminals.len() {
+    /// Allocates the next stable pane id; the only source of `PaneId`.
+    fn issue_pane_id(&mut self) -> PaneId {
+        let id = PaneId::new(self.next_pane_id);
+        self.next_pane_id = self.next_pane_id.wrapping_add(1);
+        id
+    }
+
+    /// Allocates the next stable tab id; the only source of `TabId`.
+    fn issue_tab_id(&mut self) -> TabId {
+        let id = TabId::new(self.next_tab_id);
+        self.next_tab_id = self.next_tab_id.wrapping_add(1);
+        id
+    }
+
+    fn bump_layout_generation(&mut self) {
+        self.layout_generation = self.layout_generation.wrapping_add(1);
+    }
+
+    /// A structural change (tree shape, tab composition/order or the active
+    /// tab) invalidates both the panels and the saved layout.
+    fn bump_structure_generation(&mut self) {
+        self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.bump_layout_generation();
+    }
+
+    fn tab_index_of_pane(&self, pane: PaneId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| split_contains_pane(&tab.layout, pane))
+    }
+
+    fn terminal_index_of_pane(&self, pane: PaneId) -> Option<usize> {
+        self.terminals
+            .iter()
+            .position(|terminal| terminal.pane_id() == pane)
+    }
+
+    /// The single focus operation: `pane` becomes the active pane of its tab,
+    /// its tab becomes active, and `pane` is presented and reported as focused.
+    /// Everything `activate_ready_terminal` did before lives here now.
+    fn activate_pane(&mut self, pane: PaneId, reveal_tail: bool) {
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
             return;
+        };
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return;
+        };
+        if tab_index != self.active_tab {
+            self.active_tab = tab_index;
+            self.bump_structure_generation();
         }
+        self.tabs[tab_index].active_pane = pane;
         if index == self.active_terminal && self.active_terminal_presented {
             self.pending_tab_reveal = Some(reveal_tail);
             self.mark_dirty();
+            #[cfg(debug_assertions)]
+            self.debug_assert_invariants();
             return;
         }
         let old_presented = self
@@ -797,6 +905,77 @@ impl App {
         self.send_terminal_focus_transition(old_presented, Some(index));
         self.pending_tab_reveal = Some(reveal_tail);
         self.mark_dirty();
+        #[cfg(debug_assertions)]
+        self.debug_assert_invariants();
+    }
+
+    /// Background tab focus change: only `Tab.active_pane` moves, without
+    /// touching `active_tab`, `active_terminal`, `interaction` or focus state.
+    fn select_tab_pane_in_background(&mut self, tab: TabId, pane: PaneId) {
+        let Some(index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+            return;
+        };
+        if split_contains_pane(&self.tabs[index].layout, pane) {
+            self.tabs[index].active_pane = pane;
+        }
+    }
+
+    /// Thin adapter over the pane identity: existing callers keep their index.
+    fn activate_ready_terminal(&mut self, index: usize, reveal_tail: bool) {
+        let Some(pane) = self.terminals.get(index).map(Terminal::pane_id) else {
+            return;
+        };
+        self.activate_pane(pane, reveal_tail);
+    }
+
+    /// Checks the tab model: every terminal owns exactly one split leaf, every
+    /// leaf names a live terminal, and the active tab's pane is the active
+    /// terminal. Production calls it only under `debug_assertions`; tests run
+    /// in a release profile, so its body uses `assert!` and tests call it.
+    #[cfg(any(debug_assertions, test))]
+    fn debug_assert_invariants(&self) {
+        if self.terminals.is_empty() {
+            assert!(self.tabs.is_empty(), "terminals are gone but tabs remain");
+            return;
+        }
+        assert!(!self.tabs.is_empty(), "terminals exist without a tab");
+        assert!(
+            self.active_tab < self.tabs.len(),
+            "active tab index {} is out of range",
+            self.active_tab
+        );
+        assert!(
+            self.active_terminal < self.terminals.len(),
+            "active terminal index {} is out of range",
+            self.active_terminal
+        );
+        assert_eq!(
+            self.tabs[self.active_tab].active_pane,
+            self.terminals[self.active_terminal].pane_id(),
+            "active tab pane and active terminal disagree"
+        );
+        let mut leaves = 0;
+        for tab in &self.tabs {
+            leaves += split_leaf_count(&tab.layout, None);
+            assert!(tab.title_number > 0, "a tab must carry its title number");
+            assert!(
+                split_contains_pane(&tab.layout, tab.active_pane),
+                "a tab's active pane is not one of its leaves"
+            );
+        }
+        assert_eq!(
+            leaves,
+            self.terminals.len(),
+            "split leaves and terminals disagree"
+        );
+        for terminal in &self.terminals {
+            let owned: usize = self
+                .tabs
+                .iter()
+                .map(|tab| split_leaf_count(&tab.layout, Some(terminal.pane_id())))
+                .sum();
+            assert_eq!(owned, 1, "a terminal must own exactly one split leaf");
+        }
     }
 
     fn process_terminal_presentation_intents(&mut self) -> bool {
@@ -883,18 +1062,25 @@ impl App {
         launch.shell.clone_from(&self.shell_override);
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
+        let pane_id = self.issue_pane_id();
         let terminal = Terminal::spawn_sized(
             Some(wake),
             display_number,
             launch,
             self.new_terminal_palette(),
             grid,
+            pane_id,
         );
         let index = self.terminals.len();
         self.terminals.push(terminal);
-        if self.terminals.len() == 1 {
-            self.active_terminal = 0;
-        }
+        let id = self.issue_tab_id();
+        self.tabs.push(Tab {
+            id,
+            layout: SplitNode::Leaf(pane_id),
+            active_pane: pane_id,
+            title_number: display_number as usize,
+        });
+        self.bump_structure_generation();
         self.request_terminal_activation(index, true);
         self.request_frame();
         index
@@ -1355,7 +1541,11 @@ impl App {
         }
         let terminal = self.terminals.remove(from);
         self.terminals.insert(to, terminal);
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
         self.active_terminal = active_index_after_move(self.active_terminal, from, to);
+        self.active_tab = active_index_after_move(self.active_tab, from, to);
+        self.bump_structure_generation();
         self.pending_tab_reveal = Some(false);
         if self.grid_open() {
             // The tile order changed: the panels and layouts of the last frame
@@ -2040,6 +2230,8 @@ impl App {
         shutdown_terminal_processes(&mut processes);
         drop(processes);
         self.terminals.clear();
+        self.tabs.clear();
+        self.active_tab = 0;
         self.terminal_cleanup.shutdown_and_join();
         if let Some(worker) = self.kde_activation_worker.as_mut() {
             worker.shutdown_and_join();
@@ -3113,6 +3305,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::headless_run::test_support::push_test_terminal;
+    use crate::split::SplitAxis;
 
     fn bridge_call(
         app: &mut App,
@@ -3147,7 +3341,9 @@ mod tests {
     #[test]
     fn bridge_snapshot_confirm_forget_and_missing_tab_behave_as_specified() {
         let id = [9; 16];
-        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id, pane);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -3159,8 +3355,7 @@ mod tests {
             Instant::now(),
             &mut sink,
         );
-        let mut app = App::new();
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
 
         assert_eq!(bridge_call_as(&mut app, 0, id, None, u32::MAX).code, 4);
         let snapshot = bridge_call(&mut app, 0, id, None);
@@ -3176,14 +3371,20 @@ mod tests {
         assert_eq!(bridge_call(&mut app, 0, id, None).code, 3);
 
         let mut ordinary = App::new();
-        ordinary.terminals.push(Terminal::new_for_test(80, 24, 2));
+        let ordinary_pane = ordinary.issue_pane_id();
+        push_test_terminal(
+            &mut ordinary,
+            Terminal::new_for_test(80, 24, 2, ordinary_pane),
+        );
         assert_eq!(bridge_call(&mut ordinary, 0, id, None).code, 3);
     }
 
     #[test]
     fn bridge_manual_confirm_after_auto_confirm_returns_already_confirmed() {
         let id = [10; 16];
-        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id, pane);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -3195,8 +3396,7 @@ mod tests {
             Instant::now(),
             &mut sink,
         );
-        let mut app = App::new();
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
         assert!(app.terminals[0].maybe_auto_confirm_bridge(std::time::Instant::now()));
         let screen = app.terminals[0].screen_tail_text(usize::MAX).join("\n");
 
@@ -3348,8 +3548,10 @@ mod tests {
             starttime: 7,
         };
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(120, 8, 1));
-        app.terminals.push(Terminal::new_for_test(120, 8, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(120, 8, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(120, 8, 2, pane));
         app.active_terminal = 0;
         feed_batch(&app.terminals[0], warning);
         let sent_at = Instant::now();
@@ -3386,7 +3588,8 @@ mod tests {
 
         // The first frame without the warning ends hiding and redraws.
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(120, 8, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(120, 8, 1, pane));
         feed_batch(&app.terminals[0], warning);
         assert!(app.terminals[0].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
         assert!(app.withhold_active_frame(sent_at));
@@ -3402,11 +3605,12 @@ mod tests {
     #[test]
     fn bridge_forget_rejects_expired_state() {
         let id = [11; 16];
-        let mut terminal = Terminal::new_bridge_for_test(80, 8, 1, id);
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        let mut terminal = Terminal::new_bridge_for_test(80, 8, 1, id, pane);
         terminal.bridge_launch_state_mut().unwrap().created_at =
             std::time::Instant::now() - crate::terminal::BRIDGE_LAUNCH_TTL;
-        let mut app = App::new();
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
 
         assert_eq!(bridge_call(&mut app, 2, id, None).code, 3);
     }
@@ -3579,11 +3783,13 @@ mod tests {
     #[test]
     fn pending_tab_switch_keeps_old_terminal_committed_until_new_terminal_is_ready() {
         let mut app = App::new();
-        let old = Terminal::new_for_test(8, 2, 1);
+        let old_pane = app.issue_pane_id();
+        let old = Terminal::new_for_test(8, 2, 1, old_pane);
         old.grid.lock().unwrap().mark_presentation_ready();
-        let pending = Terminal::new_for_test(8, 2, 2);
-        app.terminals.push(old);
-        app.terminals.push(pending);
+        let pending_pane = app.issue_pane_id();
+        let pending = Terminal::new_for_test(8, 2, 2, pending_pane);
+        push_test_terminal(&mut app, old);
+        push_test_terminal(&mut app, pending);
         app.active_terminal = 0;
         app.active_terminal_presented = true;
 
@@ -3614,7 +3820,8 @@ mod tests {
     #[test]
     fn background_change_updates_live_and_new_tabs() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
         assert!(app.set_terminal_background(RgbColor::new(0x11, 0x22, 0x33)));
 
         // Live tab: an OSC 11 colour query is answered with the new background.
@@ -3643,8 +3850,10 @@ mod tests {
     #[test]
     fn drain_flushes_only_expired_sync_blocks() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(40, 3, 1));
-        app.terminals.push(Terminal::new_for_test(40, 3, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(40, 3, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(40, 3, 2, pane));
         // Negative: the deadline is an hour ahead, so the held bytes stay.
         let future = Instant::now() + std::time::Duration::from_secs(3600);
         hold_sync_block_at(&app.terminals[0], b"\x1b[?2026hX", future);
@@ -3667,8 +3876,10 @@ mod tests {
     #[test]
     fn background_tab_sync_deadline_sets_loop_timeout() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         let now = Instant::now();
         hold_sync_block_at(&app.terminals[1], b"\x1b[?2026hX", now);
         let deadline = app.terminals[1]
@@ -3686,8 +3897,10 @@ mod tests {
     #[test]
     fn reorder_preserves_presented_active_terminal_identity_without_recommit() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = true;
 
@@ -3705,8 +3918,10 @@ mod tests {
     #[test]
     fn grid_pointer_capture_blocks_tile_switch_until_release() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = true;
         app.grid_metrics = GridMetrics {
@@ -3732,8 +3947,10 @@ mod tests {
     #[test]
     fn grid_tile_switch_ends_left_tile_scrollbar_drag_animation() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = true;
         app.panels = vec![
@@ -3867,13 +4084,10 @@ mod tests {
         assert!(cancel < set);
 
         let switch = production
-            .split("    fn activate_ready_terminal")
+            .split("    fn activate_pane")
             .nth(1)
-            .and_then(|tail| {
-                tail.split("    fn process_terminal_presentation_intents")
-                    .next()
-            })
-            .expect("activation method must remain present");
+            .and_then(|tail| tail.split("    fn activate_ready_terminal").next())
+            .expect("pane activation method must remain present");
         assert!(switch.contains("reset_for_terminal_switch"));
 
         let layout_ready = renderer
@@ -3898,11 +4112,13 @@ mod tests {
             std::process::id()
         ));
         let mut app = App::new();
+        let terminal_pane = app.issue_pane_id();
         let terminal = Terminal::spawn(
             None,
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
             terminal_palette(&crate::config::AppConfig::default()),
+            terminal_pane,
         );
         terminal
             .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
@@ -3915,8 +4131,9 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        app.terminals.push(terminal);
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        push_test_terminal(&mut app, terminal);
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = false;
 
@@ -3939,6 +4156,7 @@ mod tests {
         use std::time::Duration;
 
         let mut app = App::new();
+        let held_pane = app.issue_pane_id();
         let held = Terminal::spawn(
             None,
             1,
@@ -3951,8 +4169,9 @@ mod tests {
                 bridge_launch_id: None,
             },
             terminal_palette(&crate::config::AppConfig::default()),
+            held_pane,
         );
-        app.terminals.push(held);
+        push_test_terminal(&mut app, held);
         app.active_terminal = 0;
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -3977,7 +4196,8 @@ mod tests {
         use std::time::Duration;
 
         let mut app = App::new();
-        app.terminals.push(Terminal::spawn(
+        let orphan_pane = app.issue_pane_id();
+        let orphan = Terminal::spawn(
             None,
             1,
             TerminalLaunchSpec {
@@ -3989,7 +4209,9 @@ mod tests {
                 bridge_launch_id: None,
             },
             terminal_palette(&crate::config::AppConfig::default()),
-        ));
+            orphan_pane,
+        );
+        push_test_terminal(&mut app, orphan);
         app.active_terminal = 0;
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -4022,6 +4244,7 @@ mod tests {
                 bridge_launch_id: None,
             },
             terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
 
         assert!(!terminal.has_process());
@@ -4130,7 +4353,7 @@ mod tests {
 
     /// Starts a hermetic shell tab and waits until it runs a command, so input
     /// written afterwards reaches the shell.
-    fn spawn_shell_tab(label: &str) -> Terminal {
+    fn spawn_shell_tab(label: &str, pane_id: PaneId) -> Terminal {
         let marker = std::env::temp_dir().join(format!(
             "ronsole-close-{label}-{}.ready",
             std::process::id()
@@ -4141,6 +4364,7 @@ mod tests {
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
             terminal_palette(&crate::config::AppConfig::default()),
+            pane_id,
         );
         terminal
             .write_input(format!("printf ready > {}\r", marker.display()).as_bytes())
@@ -4154,7 +4378,8 @@ mod tests {
     /// tab reports that job as busy.
     pub(super) fn busy_shell_app(label: &str) -> App {
         let mut app = App::new();
-        app.terminals.push(spawn_shell_tab(label));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, spawn_shell_tab(label, pane));
         app.terminals[0].write_input(b"sleep 30\r").unwrap();
         wait_for_test_condition("foreground sleep job", || {
             !app.busy_close_targets(CloseTarget::Window).is_empty()
@@ -4187,7 +4412,8 @@ mod tests {
     #[test]
     fn background_job_does_not_make_the_tab_busy() {
         let mut app = App::new();
-        app.terminals.push(spawn_shell_tab("background-job"));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, spawn_shell_tab("background-job", pane));
         let marker = std::env::temp_dir().join(format!(
             "ronsole-close-background-{}.done",
             std::process::id()
@@ -4252,7 +4478,8 @@ mod tests {
             ime_preedit: false,
         };
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 1, pane));
         app.close_confirm = Some(CloseConfirm {
             target: CloseTarget::Tab(0),
             title: "Закрыть вкладку?",
@@ -4270,7 +4497,8 @@ mod tests {
     #[test]
     fn close_request_while_dialog_is_open_is_ignored() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 1, pane));
         app.close_confirm = Some(CloseConfirm {
             target: CloseTarget::Tab(0),
             title: "Закрыть вкладку?",
@@ -4289,8 +4517,10 @@ mod tests {
     #[test]
     fn removing_another_tab_cancels_the_open_tab_dialog() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 24, 1));
-        app.terminals.push(Terminal::new_for_test(80, 24, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 2, pane));
         app.open_close_dialog(CloseConfirm {
             target: CloseTarget::Tab(1),
             title: "Закрыть вкладку?",
@@ -4476,7 +4706,8 @@ mod tests {
             ime_preedit: false,
         };
         let mut app = App::new();
-        let terminal = Terminal::new_for_test(80, 30, 1);
+        let modal_pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(80, 30, 1, modal_pane);
         {
             let mut sink = crate::terminal_process::SessionSink {
                 reply_tx: None,
@@ -4491,7 +4722,7 @@ mod tests {
                 &mut sink,
             );
         }
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
 
         app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
         app.on_key(modifier_key(
@@ -4775,10 +5006,11 @@ mod tests {
     fn grid_mode_app(claude: &[bool]) -> App {
         let mut app = App::new();
         for (index, &is_claude) in claude.iter().enumerate() {
-            let terminal = Terminal::new_for_test(80, 24, index as u64 + 1);
+            let pane = app.issue_pane_id();
+            let terminal = Terminal::new_for_test(80, 24, index as u64 + 1, pane);
             crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
             terminal.set_claude_foreground_for_test(is_claude);
-            app.terminals.push(terminal);
+            push_test_terminal(&mut app, terminal);
         }
         app.active_terminal = 0;
         app.active_terminal_presented = true;
@@ -5154,9 +5386,10 @@ mod tests {
     #[test]
     fn focus_loss_reports_1004() {
         let mut app = App::new();
-        let terminal = Terminal::new_for_test(8, 2, 1);
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(8, 2, 1, pane);
         enable_focus_reporting_for_test(&terminal);
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
         app.active_terminal_presented = true;
         app.on_focus_changed(false);
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
@@ -5165,7 +5398,8 @@ mod tests {
     #[test]
     fn focus_loss_without_1004_sends_nothing() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
         app.active_terminal_presented = true;
         app.on_focus_changed(false);
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
@@ -5176,7 +5410,8 @@ mod tests {
     #[test]
     fn focus_loss_clears_sent_keys_when_terminal_not_presented() {
         let mut app = App::new();
-        let terminal = Terminal::new_for_test(8, 2, 1);
+        let clear_pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(8, 2, 1, clear_pane);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -5203,7 +5438,7 @@ mod tests {
             let mut out = Vec::new();
             assert_eq!(grid.encode_key(&ctrl_press, &mut out), ronsole_term::KeyOutcome::Sent);
         }
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
         app.active_terminal_presented = false;
         app.on_focus_changed(false);
         let mut grid = crate::platform::lock_recover(&app.terminals[0].grid);
@@ -6086,7 +6321,8 @@ mod tests {
     fn background_tab_bell_marks_tab_until_it_is_activated() {
         let mut app = App::new();
         for display_number in [1, 2] {
-            app.terminals.push(Terminal::new_for_test(8, 2, display_number));
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, display_number, pane));
         }
         app.terminals[1].ring_bell_for_test();
 
@@ -6100,10 +6336,105 @@ mod tests {
     }
 
     #[test]
+    fn spawn_creates_one_tab_per_terminal_with_unique_pane_ids() {
+        let (app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "tabs-one-per-terminal",
+                3,
+            );
+        assert_eq!(app.tabs.len(), 3);
+        let mut pane_ids = Vec::new();
+        for (index, tab) in app.tabs.iter().enumerate() {
+            match &tab.layout {
+                SplitNode::Leaf(pane) => {
+                    assert_eq!(*pane, app.terminals[index].pane_id());
+                    pane_ids.push(*pane);
+                }
+                SplitNode::Split { .. } => panic!("tab {index} must start as one leaf"),
+            }
+            assert_eq!(tab.active_pane, app.terminals[index].pane_id());
+        }
+        pane_ids.sort();
+        pane_ids.dedup();
+        assert_eq!(pane_ids.len(), 3, "pane ids must be unique");
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn activate_pane_sets_focus_and_reports_1004() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        let first_terminal = Terminal::new_for_test(8, 2, 1, first);
+        enable_focus_reporting_for_test(&first_terminal);
+        push_test_terminal(&mut app, first_terminal);
+        let second = app.issue_pane_id();
+        let second_terminal = Terminal::new_for_test(8, 2, 2, second);
+        enable_focus_reporting_for_test(&second_terminal);
+        push_test_terminal(&mut app, second_terminal);
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        app.focused = true;
+
+        app.activate_pane(second, true);
+
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.pending_tab_reveal, Some(true));
+        assert_eq!(app.tabs[1].active_pane, second);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn select_tab_pane_in_background_changes_only_tab_pane() {
+        let mut app = App::new();
+        let front = app.issue_pane_id();
+        let front_terminal = Terminal::new_for_test(8, 2, 1, front);
+        enable_focus_reporting_for_test(&front_terminal);
+        push_test_terminal(&mut app, front_terminal);
+        let left = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, left));
+        let right = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 3, right));
+        // A background tab with two panes; the front tab keeps one pane, and
+        // the third terminal moves into that split instead of its own tab.
+        let background = app.tabs[1].id;
+        app.tabs[1].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(left)),
+            second: Box::new(SplitNode::Leaf(right)),
+        };
+        app.tabs[1].active_pane = left;
+        app.tabs.remove(2);
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        app.focused = true;
+        app.interaction.layout.cols = 8;
+
+        app.select_tab_pane_in_background(background, right);
+
+        assert_eq!(app.tabs[1].active_pane, right);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.interaction.layout.cols, 8);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[2].input_bytes_for_test().is_empty());
+        app.debug_assert_invariants();
+    }
+
+    #[test]
     fn active_tab_bell_in_focused_window_sets_nothing() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         assert!(app.focused);
         app.terminals[0].ring_bell_for_test();
 
@@ -6118,7 +6449,8 @@ mod tests {
         // Without a window runtime no compositor request can be sent, so the
         // once-per-period flag must stay clear for the next bell to retry.
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
         app.focused = false;
 
         app.terminals[0].ring_bell_for_test();
@@ -6132,9 +6464,10 @@ mod tests {
     fn tab_focus_transition_reports_out_then_in_only_when_focused() {
         let mut app = App::new();
         for display_number in [1, 2] {
-            let terminal = Terminal::new_for_test(8, 2, display_number);
+            let pane = app.issue_pane_id();
+            let terminal = Terminal::new_for_test(8, 2, display_number, pane);
             enable_focus_reporting_for_test(&terminal);
-            app.terminals.push(terminal);
+            push_test_terminal(&mut app, terminal);
         }
         app.focused = false;
         app.send_terminal_focus_transition(Some(0), Some(1));
@@ -6558,7 +6891,8 @@ mod tests {
         }
 
         let mut app = App::from_config(AppConfig::default());
-        app.terminals.push(Terminal::new_for_test(40, 3, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(40, 3, 1, pane));
 
         app.settings_color_input.set_text("#12ABCF");
         assert!(app.apply_settings_color_draft(SettingsColorField::Foreground));
@@ -6900,7 +7234,11 @@ mod tests {
     #[test]
     fn settings_open_and_focus_loss_clear_tracked_physical_mouse_buttons() {
         let mut settings_app = App::new();
-        settings_app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let settings_pane = settings_app.issue_pane_id();
+        push_test_terminal(
+            &mut settings_app,
+            Terminal::new_for_test(8, 2, 1, settings_pane),
+        );
         settings_app.active_terminal_presented = true;
         settings_app
             .interaction
@@ -6909,7 +7247,8 @@ mod tests {
         assert_eq!(settings_app.interaction.pressed_mouse_buttons_for_test(), 0);
 
         let mut focus_app = App::new();
-        focus_app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let focus_pane = focus_app.issue_pane_id();
+        push_test_terminal(&mut focus_app, Terminal::new_for_test(8, 2, 1, focus_pane));
         focus_app.active_terminal_presented = true;
         focus_app.interaction.set_pressed_mouse_buttons_for_test(1);
         focus_app.on_focus_changed(false);
@@ -6921,7 +7260,8 @@ mod tests {
         use crate::renderer::TerminalUiLayout;
 
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 30, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 30, 1, pane));
         feed_batch(&app.terminals[0], "\x1b[30;1Hsee https://example.com/x");
         app.interaction.update_layout(TerminalUiLayout {
             body: crate::search::Rect {
@@ -7040,7 +7380,8 @@ mod tests {
     #[test]
     fn active_terminal_selection_clear_helper_removes_manual_selection() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 30, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 30, 1, pane));
         crate::platform::lock_recover(&app.terminals[0].grid).set_selection(Some((1, 2, 5, 2)));
 
         assert!(app.clear_active_terminal_text_selection());

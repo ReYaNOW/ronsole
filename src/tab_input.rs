@@ -679,6 +679,7 @@ mod tests {
             1,
             launch,
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            crate::split::PaneId::new(1),
         );
         let wait_until_claude_foreground = |expected: bool| {
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -708,6 +709,7 @@ mod tests {
             1,
             launch,
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            crate::split::PaneId::new(1),
         );
         let wait_until_claude_foreground = |expected: bool| {
             let deadline = Instant::now() + Duration::from_secs(3);

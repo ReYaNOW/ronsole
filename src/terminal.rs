@@ -1,5 +1,6 @@
 use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
+use crate::split::PaneId;
 use crate::terminal_process::{
     HostChannels, PendingHostEvents, SessionSink, flush_expired_sync, notify_main_loop,
     terminal_reply_channel,
@@ -45,6 +46,14 @@ fn new_term(cols: usize, rows: usize, palette: TermPalette) -> Term {
 mod tests {
     use super::*;
 
+    /// Standalone terminal for the terminal-level tests: these never route
+    /// panes through an `App`, so the id only has to be a fresh `PaneId`.
+    fn test_terminal(cols: usize, rows: usize, display_number: u64) -> Terminal {
+        static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let pane = PaneId::new(NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        Terminal::new_for_test(cols, rows, display_number, pane)
+    }
+
     /// Feeds `bytes` into the tab's grid at `now` without a reader, so an
     /// open synchronized-output block holds them until its deadline.
     fn hold_in_sync_block(terminal: &Terminal, bytes: &[u8], now: Instant) {
@@ -61,7 +70,7 @@ mod tests {
 
     #[test]
     fn sync_flush_expired_bumps_content_generation() {
-        let terminal = Terminal::new_for_test(40, 3, 1);
+        let terminal = test_terminal(40, 3, 1);
         let now = Instant::now();
         hold_in_sync_block(&terminal, b"\x1b[?2026hX", now);
         let before = crate::platform::lock_recover(&terminal.grid).content_generation();
@@ -117,7 +126,7 @@ mod tests {
 
     #[test]
     fn scrolled_up_view_keeps_its_lines_while_output_arrives() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -133,7 +142,7 @@ mod tests {
 
     #[test]
     fn view_at_bottom_follows_output() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         anchor_frame(&mut terminal);
 
@@ -149,7 +158,7 @@ mod tests {
 
     #[test]
     fn scrolled_up_view_keeps_its_lines_while_full_scrollback_evicts() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         terminal.grid = Arc::new(Mutex::new(Term::new(TermConfig {
             cols: 20,
             rows: 4,
@@ -184,7 +193,7 @@ mod tests {
 
     #[test]
     fn shrink_then_grow_while_scrolled_up_keeps_offset() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -202,7 +211,7 @@ mod tests {
 
     #[test]
     fn pending_lines_are_drawn_before_the_next_anchor_step() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -230,7 +239,7 @@ mod tests {
 
     #[test]
     fn unusable_char_h_leaves_scrolled_lines_for_the_next_frame() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -245,7 +254,7 @@ mod tests {
 
     #[test]
     fn alternate_screen_round_trip_keeps_scrolled_up_offset() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -264,7 +273,7 @@ mod tests {
 
     #[test]
     fn background_tab_buffer_flushed_at_deadline() {
-        let background = Terminal::new_for_test(40, 3, 2);
+        let background = test_terminal(40, 3, 2);
         let now = Instant::now();
         hold_in_sync_block(&background, b"\x1b[?2026hX", now);
         // The 150 ms hold window comes from the synchronized-output spec (5.4).
@@ -282,7 +291,7 @@ mod tests {
 
     #[test]
     fn reply_from_flush_reaches_writer() {
-        let mut terminal = Terminal::new_for_test(40, 3, 7);
+        let mut terminal = test_terminal(40, 3, 7);
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
         terminal.set_reply_sender_for_test(reply_tx);
         let now = Instant::now();
@@ -334,7 +343,7 @@ mod tests {
 
     #[test]
     fn bell_mark_is_set_and_cleared_by_tab_lifecycle() {
-        let mut terminal = Terminal::new_for_test(40, 3, 8);
+        let mut terminal = test_terminal(40, 3, 8);
         assert!(!terminal.bell_pending());
 
         terminal.mark_bell_pending();
@@ -346,7 +355,7 @@ mod tests {
 
     #[test]
     fn ring_bell_is_taken_once_from_pending_events() {
-        let terminal = Terminal::new_for_test(40, 3, 9);
+        let terminal = test_terminal(40, 3, 9);
         terminal.ring_bell_for_test();
 
         assert!(PendingHostEvents::take(&terminal.pending).bell);
@@ -355,8 +364,8 @@ mod tests {
 
     #[test]
     fn earliest_terminal_deadline_picks_minimum() {
-        let active = Terminal::new_for_test(40, 3, 1);
-        let background = Terminal::new_for_test(40, 3, 2);
+        let active = test_terminal(40, 3, 1);
+        let background = test_terminal(40, 3, 2);
         let now = Instant::now();
         hold_in_sync_block(&active, b"\x1b[?2026hX", now + Duration::from_secs(1));
         hold_in_sync_block(&background, b"\x1b[?2026hX", now);
@@ -366,14 +375,14 @@ mod tests {
             Some(now + Duration::from_millis(150))
         );
         assert_eq!(
-            earliest_terminal_deadline(&[Terminal::new_for_test(40, 3, 3)]),
+            earliest_terminal_deadline(&[test_terminal(40, 3, 3)]),
             None
         );
     }
 
     #[test]
     fn sync_deadline_reads_published_value_without_grid_lock() {
-        let terminal = Terminal::new_for_test(40, 3, 4);
+        let terminal = test_terminal(40, 3, 4);
         let now = Instant::now();
         terminal.hold_sync_block_for_test(b"\x1b[?2026hX", now);
         let pending = terminal.pending.clone();
@@ -392,7 +401,7 @@ mod tests {
 
     #[test]
     fn try_flush_expired_yields_to_busy_grid_lock() {
-        let terminal = Terminal::new_for_test(40, 3, 5);
+        let terminal = test_terminal(40, 3, 5);
         let now = Instant::now();
         terminal.hold_sync_block_for_test(b"\x1b[?2026hX", now);
         let late = now + Duration::from_secs(1);
@@ -471,6 +480,7 @@ mod tests {
         let mut terminal = Terminal {
             grid: grid.clone(),
             bridge_screen_lock: Arc::new(Mutex::new(())),
+            pane_id: PaneId::new(1),
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -578,6 +588,7 @@ mod tests {
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
         terminal.resize_pty(120, 40);
         terminal
@@ -612,15 +623,15 @@ mod tests {
 
     #[test]
     fn tabs_get_distinct_tab_tokens() {
-        let first = Terminal::new_for_test(10, 4, 1);
-        let second = Terminal::new_for_test(10, 4, 2);
+        let first = test_terminal(10, 4, 1);
+        let second = test_terminal(10, 4, 2);
         assert_eq!(first.tab_token().len(), 32);
         assert_ne!(first.tab_token(), second.tab_token());
     }
 
     #[test]
     fn screen_tail_text_reads_current_screen_including_alt_screen() {
-        let terminal = Terminal::new_for_test(10, 4, 1);
+        let terminal = test_terminal(10, 4, 1);
         {
             let mut grid = crate::platform::lock_recover(&terminal.grid);
             feed(&mut grid, b"zero\r\none\r\ntwo  \r\nthree");
@@ -674,7 +685,7 @@ mod tests {
     #[test]
     fn ordinary_tab_does_not_auto_confirm_bridge_warning() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_bridge_warning(&terminal, true);
 
         assert!(!terminal.maybe_auto_confirm_bridge(now));
@@ -684,7 +695,7 @@ mod tests {
     #[test]
     fn bridge_tab_auto_confirms_warning_once_through_input_writer() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([9; 16], now));
         feed_bridge_warning(&terminal, true);
 
@@ -696,7 +707,7 @@ mod tests {
     #[test]
     fn bridge_tab_does_not_auto_confirm_without_warning() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([10; 16], now));
         feed_bridge_warning(&terminal, false);
 
@@ -707,7 +718,7 @@ mod tests {
     #[test]
     fn manual_bridge_confirm_works_without_warning_and_failed_writes_remain_pending() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(80, 8, 1);
+        let mut terminal = test_terminal(80, 8, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([11; 16], now));
         feed(
             &mut crate::platform::lock_recover(&terminal.grid),
@@ -719,7 +730,7 @@ mod tests {
         assert!(!terminal.manually_confirm_bridge(now, screen_hash(&screen)));
         assert_eq!(terminal.input_bytes_for_test(), b"\r");
 
-        let mut failed = Terminal::new_for_test(80, 8, 1);
+        let mut failed = test_terminal(80, 8, 1);
         failed.bridge_launch = Some(BridgeLaunchState::new([12; 16], now));
         feed(
             &mut crate::platform::lock_recover(&failed.grid),
@@ -730,7 +741,7 @@ mod tests {
         assert!(!failed.manually_confirm_bridge(now, screen_hash(&screen)));
         assert!(!failed.bridge_launch_state().unwrap().enter_sent);
 
-        let mut auto = Terminal::new_for_test(120, 8, 1);
+        let mut auto = test_terminal(120, 8, 1);
         auto.bridge_launch = Some(BridgeLaunchState::new([13; 16], now));
         feed_bridge_warning(&auto, true);
         auto.test_input = None;
@@ -751,7 +762,7 @@ mod tests {
     #[test]
     fn manual_enter_marks_bridge_state_as_confirmed() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(10, 4, 1);
+        let mut terminal = test_terminal(10, 4, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([3; 16], now));
         terminal.write_user_input(b"\r");
         assert!(terminal.bridge_launch_state().unwrap().enter_sent);
@@ -782,7 +793,7 @@ mod tests {
     #[test]
     fn dev_warning_sends_one_enter_per_flagged_claude_generation() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         assert!(observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
         assert_eq!(terminal.input_bytes_for_test(), b"\r");
@@ -818,7 +829,7 @@ mod tests {
         let now = Instant::now();
         // No flagged claude in the foreground group (other program, claude
         // without the flag): nothing is sent and nothing is hidden.
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         assert!(!observe_dev(&mut terminal, now, None));
         assert!(!terminal.dev_warning_frame_hidden(now));
@@ -830,7 +841,7 @@ mod tests {
             "\x1b[2J\x1b[HLoading development channels\r\n❯ 1. I am using this for local development",
             "\x1b[2J\x1b[Hordinary claude prompt",
         ] {
-            let mut terminal = Terminal::new_for_test(120, 8, 1);
+            let mut terminal = test_terminal(120, 8, 1);
             feed_dev_screen(&terminal, screen);
             let mut scratch = String::new();
             assert!(!terminal.observe_dev_channel_warning(now, &mut scratch, |_| {
@@ -840,7 +851,7 @@ mod tests {
         }
 
         // A failed write leaves the warning unconfirmed and visible.
-        let mut failed = Terminal::new_for_test(120, 8, 1);
+        let mut failed = test_terminal(120, 8, 1);
         failed.test_input = None;
         feed_dev_screen(&failed, DEV_WARNING_SCREEN);
         assert!(!observe_dev(&mut failed, now, Some(DEV_CLAUDE)));
@@ -850,7 +861,7 @@ mod tests {
     #[test]
     fn dev_warning_frames_stay_hidden_until_screen_changes_or_limit() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ claude");
         assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
         assert!(!terminal.dev_warning_frame_hidden(now));
@@ -868,7 +879,7 @@ mod tests {
         assert!(!terminal.dev_warning_frame_hidden(now + DEV_WARNING_HIDE_LIMIT));
 
         // The first frame without the warning ends hiding.
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         assert!(observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
         feed_dev_screen(&terminal, "\x1b[2J\x1b[H> ready");
@@ -880,7 +891,7 @@ mod tests {
     #[test]
     fn dev_warning_and_bridge_auto_confirm_send_one_enter_together() {
         let now = Instant::now();
-        let mut generic_first = Terminal::new_for_test(120, 8, 1);
+        let mut generic_first = test_terminal(120, 8, 1);
         generic_first.bridge_launch = Some(BridgeLaunchState::new([21; 16], now));
         feed_dev_screen(&generic_first, DEV_WARNING_SCREEN);
         assert!(observe_dev(&mut generic_first, now, Some(DEV_CLAUDE)));
@@ -888,7 +899,7 @@ mod tests {
         assert!(!generic_first.maybe_auto_confirm_bridge(now));
         assert_eq!(generic_first.input_bytes_for_test(), b"\r");
 
-        let mut bridge_first = Terminal::new_for_test(120, 8, 1);
+        let mut bridge_first = test_terminal(120, 8, 1);
         bridge_first.bridge_launch = Some(BridgeLaunchState::new([22; 16], now));
         feed_dev_screen(&bridge_first, DEV_WARNING_SCREEN);
         assert!(bridge_first.maybe_auto_confirm_bridge(now));
@@ -962,7 +973,7 @@ mod tests {
 
     #[test]
     fn dev_banner_rows_are_hidden_for_flagged_claude_only() {
-        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let mut terminal = test_terminal(200, 8, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
         assert_eq!(rows, 2);
         feed_dev_screen(&terminal, &screen);
@@ -982,7 +993,7 @@ mod tests {
         assert_eq!(text[2], format!("\u{258e} {}", DEV_CHANNEL_BANNER_LINES[1]));
 
         // Another process in the tab: the same text stays visible.
-        let mut other = Terminal::new_for_test(200, 8, 1);
+        let mut other = test_terminal(200, 8, 1);
         feed_dev_screen(&other, &screen);
         other.observe_dev_channel_banner(|_| None);
         assert_banner_rows(&other, rows, false);
@@ -1004,7 +1015,7 @@ mod tests {
             // No quote bar.
             ([first, second], Some(format!("\x1b[2J\x1b[Habove\r\n  {first}\r\n  {second}"))),
         ] {
-            let mut terminal = Terminal::new_for_test(200, 8, 1);
+            let mut terminal = test_terminal(200, 8, 1);
             let screen = screen.unwrap_or_else(|| banner_screen(lines, 190).0);
             feed_dev_screen(&terminal, &screen);
             terminal.observe_dev_channel_banner(|_| {
@@ -1018,7 +1029,7 @@ mod tests {
 
     #[test]
     fn dev_banner_wrapped_on_narrow_width_is_hidden() {
-        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let mut terminal = test_terminal(40, 12, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
         // The first line wraps over several rows, the flag word is split.
         assert!(rows >= 6, "{screen:?}");
@@ -1030,7 +1041,7 @@ mod tests {
 
     #[test]
     fn dev_banner_in_chat_pane_is_hidden_without_hiding_side_panel() {
-        let mut terminal = Terminal::new_for_test(143, 8, 1);
+        let mut terminal = test_terminal(143, 8, 1);
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let split = 77;
         let first_head: String = first.chars().take(split).collect();
@@ -1066,7 +1077,7 @@ mod tests {
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
         assert!(head.ends_with("without "));
         for bar in [DEV_CHANNEL_BANNER_BAR, DEV_CHANNEL_PANE_DIVIDER] {
-            let mut terminal = Terminal::new_for_test(160, 8, 1);
+            let mut terminal = test_terminal(160, 8, 1);
             let screen = format!(
                 "\x1b[2J\x1b[H\x1b[2m{bar}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
                  \x1b[2;1H\x1b[2m{bar}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1106,7 +1117,7 @@ mod tests {
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
         assert!(head.ends_with("without "));
         let second = DEV_CHANNEL_BANNER_LINES[1];
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1142,7 +1153,7 @@ mod tests {
     fn dev_banner_card_with_quote_bar_and_bare_second_line_is_not_hidden() {
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1162,7 +1173,7 @@ mod tests {
     /// above it: it is not a banner.
     #[test]
     fn dev_banner_bare_second_line_beside_side_panel_alone_is_not_hidden() {
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H{}\x1b[110G│ panel\x1b[2;1H> prompt\x1b[110G│ more",
             DEV_CHANNEL_BANNER_LINES[1]
@@ -1182,7 +1193,7 @@ mod tests {
     fn dev_banner_quote_bar_first_line_with_bare_second_line_is_not_hidden() {
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1204,7 +1215,7 @@ mod tests {
     fn dev_banner_first_line_followed_by_longer_text_is_not_hidden() {
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1240,7 +1251,7 @@ mod tests {
                 "\x1b[2J\x1b[Hmy output\x1b[2;1H▎ {second}\x1b[110G│ panel\x1b[3;1H│ {second}"
             ),
         ] {
-            let mut terminal = Terminal::new_for_test(200, 8, 1);
+            let mut terminal = test_terminal(200, 8, 1);
             feed_dev_screen(&terminal, &screen);
             terminal.observe_dev_channel_banner(|_| {
                 panic!("process lookup must wait for the exact banner")
@@ -1258,7 +1269,7 @@ mod tests {
             lookups.set(lookups.get() + 1);
             Some(DEV_CLAUDE)
         };
-        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let mut terminal = test_terminal(200, 8, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(find);
@@ -1336,7 +1347,7 @@ mod tests {
 
     #[test]
     fn dev_banner_stays_hidden_while_scrolling_into_scrollback() {
-        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let mut terminal = test_terminal(40, 12, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1354,7 +1365,7 @@ mod tests {
 
     #[test]
     fn dev_banner_pushed_into_scrollback_before_a_scan_is_hidden() {
-        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let mut terminal = test_terminal(40, 12, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
         feed_dev_screen(&terminal, &format!("{screen}{}", "\r\nbelow".repeat(20)));
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1365,7 +1376,7 @@ mod tests {
     fn dev_banner_soft_wrapped_by_the_terminal_or_reflowed_is_hidden() {
         // Notice rows wider than the terminal: autowrap continues each one
         // on rows without the bar.
-        let mut terminal = Terminal::new_for_test(60, 12, 1);
+        let mut terminal = test_terminal(60, 12, 1);
         let (screen, _) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1373,7 +1384,7 @@ mod tests {
 
         // Hidden on a wide screen, scrolled half into the scrollback, then
         // reflowed there and on the screen by resizes.
-        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let mut terminal = test_terminal(200, 8, 1);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
         assert_only_banner_hidden(&terminal, Some(2));
@@ -1428,7 +1439,7 @@ mod tests {
     #[test]
     fn dev_banner_scrolled_out_at_the_top_of_claude_fullscreen_is_hidden() {
         for (cols, notice) in CLAUDE_NOTICE {
-            let mut terminal = Terminal::new_for_test(cols, 30, 1);
+            let mut terminal = test_terminal(cols, 30, 1);
             let notice_rows = notice.join("\r\x1b[1B");
             feed_dev_screen(&terminal, &format!("{CLAUDE_HEADER}{notice_rows}\r\x1b[100C"));
             terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1479,7 +1490,7 @@ mod tests {
                 7,
             ))
         };
-        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        let mut terminal = test_terminal(8, 2, 1);
         assert!(terminal.set_hovered_link(link("https://example.com/x")));
         assert!(!terminal.set_hovered_link(link("https://example.com/x")));
         assert!(terminal.set_hovered_link(link("https://example.com/y")));
@@ -1528,6 +1539,7 @@ mod tests {
             1,
             launch,
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -2001,6 +2013,8 @@ pub(crate) fn screen_hash(screen: &str) -> [u8; 32] {
 pub struct Terminal {
     pub grid: Arc<Mutex<Term>>,
     bridge_screen_lock: Arc<Mutex<()>>,
+    /// Stable identity of this terminal's pane in its tab's split tree.
+    pane_id: PaneId,
     process: Option<crate::terminal_process::TerminalProcess>,
     hold: bool,
     pub scroll_y: crate::scroll::ScrollState,
@@ -2126,7 +2140,12 @@ fn try_lock_recover<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
 
 impl Terminal {
     #[cfg(test)]
-    pub(crate) fn new_for_test(cols: usize, rows: usize, display_number: u64) -> Self {
+    pub(crate) fn new_for_test(
+        cols: usize,
+        rows: usize,
+        display_number: u64,
+        pane_id: PaneId,
+    ) -> Self {
         let title_cache = Arc::new(Mutex::new(
             crate::terminal_process::TerminalTitleState::new_numbered(
                 "terminal".to_string(),
@@ -2140,6 +2159,7 @@ impl Terminal {
                 crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
             ))),
             bridge_screen_lock: Arc::new(Mutex::new(())),
+            pane_id,
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -2172,8 +2192,9 @@ impl Terminal {
         rows: usize,
         display_number: u64,
         bridge_launch_id: [u8; 16],
+        pane_id: PaneId,
     ) -> Self {
-        let mut terminal = Self::new_for_test(cols, rows, display_number);
+        let mut terminal = Self::new_for_test(cols, rows, display_number, pane_id);
         terminal.bridge_launch = Some(BridgeLaunchState::new(bridge_launch_id, Instant::now()));
         terminal
     }
@@ -2185,8 +2206,9 @@ impl Terminal {
         display_number: u64,
         launch: TerminalLaunchSpec,
         palette: TermPalette,
+        pane_id: PaneId,
     ) -> Self {
-        Self::spawn_sized(wake, display_number, launch, palette, DEFAULT_SPAWN_GRID)
+        Self::spawn_sized(wake, display_number, launch, palette, DEFAULT_SPAWN_GRID, pane_id)
     }
 
     /// Starts a tab whose grid and PTY open at `(cols, rows)`; the first frame
@@ -2197,6 +2219,7 @@ impl Terminal {
         launch: TerminalLaunchSpec,
         palette: TermPalette,
         (cols, rows): (u16, u16),
+        pane_id: PaneId,
     ) -> Self {
         let hold = launch.hold;
         let bridge_launch = launch
@@ -2244,6 +2267,7 @@ impl Terminal {
         Self {
             grid,
             bridge_screen_lock,
+            pane_id,
             process,
             hold,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -2597,6 +2621,11 @@ impl Terminal {
 
     pub(crate) fn tab_token(&self) -> &str {
         self.tab_token.as_str()
+    }
+
+    /// Stable identity of this terminal's pane in its tab's split tree.
+    pub(crate) fn pane_id(&self) -> PaneId {
+        self.pane_id
     }
 
     /// Writes keyboard/text/IME/paste input. Marks the time of user input and,
