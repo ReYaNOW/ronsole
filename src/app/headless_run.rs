@@ -162,7 +162,7 @@ pub(crate) mod test_support {
     use super::*;
     use crate::app::Tab;
     use crate::headless::Profile;
-    use crate::split::{PaneId, SplitNode};
+    use crate::split::{PaneId, SplitAxis, SplitNode, split_leaf_at};
     use std::path::PathBuf;
     use std::sync::mpsc::Receiver;
 
@@ -223,6 +223,28 @@ pub(crate) mod test_support {
             title_number: app.tabs.len() + 1,
         });
         pane_id
+    }
+
+    /// Splits the active pane of `tab` side by side with a fresh presentation-ready
+    /// test terminal. No spawn and no runtime wake: the new pane has no process
+    /// and is only visible to tests. Returns the new pane id.
+    pub(crate) fn attach_test_pane(app: &mut App, tab: usize, display_number: u64) -> PaneId {
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(80, 24, display_number, pane);
+        terminal.grid.lock().unwrap().mark_presentation_ready();
+        app.terminals.push(terminal);
+        let active_pane = app.tabs[tab].active_pane;
+        assert!(
+            split_leaf_at(
+                &mut app.tabs[tab].layout,
+                active_pane,
+                SplitAxis::SideBySide,
+                pane
+            ),
+            "tab {tab} does not own its active pane"
+        );
+        app.bump_layout_generation();
+        pane
     }
 
     /// Like `started_headless`, but the live shell tabs are replaced by `count` test

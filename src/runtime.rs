@@ -2723,7 +2723,22 @@ impl Drop for DirectWaylandBackend {
     }
 }
 
+/// One tab-strip entry. The renderer reads the title through the existing
+/// `Terminal` accessor at `title_terminal`; no borrowed strings travel per frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TabLabelIndex {
+    pub id: crate::app::TabId,
+    /// Index in `TerminalRenderParams::terminals` of the tab's active pane.
+    pub title_terminal: usize,
+    /// Number the strip shows for the tab (`Tab::title_number`).
+    pub number: usize,
+    /// Leaves in the tab's split tree; more than one shows the pane focus border.
+    pub leaf_count: usize,
+}
+
 pub(crate) struct TerminalRenderParams<'a> {
+    pub tabs: &'a [TabLabelIndex],
+    pub active_tab: usize,
     pub terminals: &'a [crate::terminal::Terminal],
     pub active_terminal: usize,
     pub panels: &'a [crate::panels::Panel],
@@ -3087,6 +3102,8 @@ impl WindowRuntime {
         self.make_target_current();
         let show_fps = params.show_fps;
         let layout = self.renderer.render_terminal_app(
+            params.tabs,
+            params.active_tab,
             params.terminals,
             params.active_terminal,
             params.panels,
@@ -4012,6 +4029,8 @@ mod tests {
             crate::renderer::SettingsColorView::new(&crate::config::AppConfig::default());
         let mut panel_layouts = Vec::new();
         let result = runtime.render_terminal_and_present(TerminalRenderParams {
+            tabs: &[],
+            active_tab: 0,
             terminals: &[],
             active_terminal: 0,
             panels: &[],

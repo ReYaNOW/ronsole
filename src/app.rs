@@ -19,7 +19,7 @@ use crate::renderer::{
     SettingsTab, TerminalTabHit, TerminalUiLayout, pty_dimension, settings_color_value,
     terminal_body_rect, terminal_palette,
 };
-use crate::runtime::{TerminalRenderParams, WindowRuntime};
+use crate::runtime::{TabLabelIndex, TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
@@ -603,6 +603,8 @@ pub struct App {
     /// Tabs in strip order; `tabs[active_tab]` owns `active_terminal`.
     tabs: Vec<Tab>,
     active_tab: usize,
+    /// One strip label per tab, rebuilt from `tabs` before every render.
+    tab_labels: Vec<TabLabelIndex>,
     next_tab_id: u64,
     /// Source of every `PaneId`; ids are never reused after a pane closes.
     next_pane_id: u64,
@@ -729,6 +731,7 @@ impl App {
             active_terminal: 0,
             tabs: Vec::new(),
             active_tab: 0,
+            tab_labels: Vec::new(),
             next_tab_id: 1,
             next_pane_id: 1,
             structure_generation: 0,
@@ -1056,7 +1059,11 @@ impl App {
 
     fn select_terminal_tab_from_user(&mut self, index: usize) {
         self.exit_claude_grid(None);
-        self.request_terminal_activation(index, false);
+        let Some(pane) = self.tabs.get(index).map(|tab| tab.active_pane) else {
+            return;
+        };
+        self.cancel_terminal_presentation_intents();
+        self.activate_pane(pane, false);
     }
 
     fn add_terminal(&mut self) -> Option<usize> {
@@ -1251,7 +1258,7 @@ impl App {
                 pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
             });
         }
-        if self.grid_open() {
+        if self.grid_open() || self.active_tab_split() {
             if self.withheld_until.is_some_and(|until| now >= until) {
                 self.withheld_until = None;
                 self.request_frame();
@@ -1918,23 +1925,18 @@ impl App {
         }
     }
 
+    /// Moves the tab at `from` to `to`. Panes travel with their tab because a
+    /// tab owns the whole split tree; `terminals` keeps its storage order, so
+    /// `active_terminal` and every pane identity stay valid.
     fn reorder_terminal_tab(&mut self, from: usize, to: usize) {
-        if from >= self.terminals.len() || to >= self.terminals.len() || from == to {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
             return;
         }
-        let terminal = self.terminals.remove(from);
-        self.terminals.insert(to, terminal);
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
-        self.active_terminal = active_index_after_move(self.active_terminal, from, to);
         self.active_tab = active_index_after_move(self.active_tab, from, to);
         self.bump_structure_generation();
         self.pending_tab_reveal = Some(false);
-        if self.grid_open() {
-            // The tile order changed: the panels and layouts of the last frame
-            // name other tiles now.
-            self.bump_grid_generation();
-        }
         self.mark_dirty();
     }
 
@@ -2469,10 +2471,10 @@ impl App {
     }
 
     /// Future instant at which a hidden dev-channels banner must be redrawn:
-    /// the earliest grid tile's hiding end in grid mode, otherwise the active
-    /// tab's.
+    /// the earliest panel's hiding end in grid mode and in a split tab,
+    /// otherwise the active tab's.
     fn dev_warning_wake_deadline(&self, now: Instant) -> Option<Instant> {
-        let deadline = if self.grid_open() {
+        let deadline = if self.grid_open() || self.active_tab_split() {
             self.withheld_until
         } else {
             self.terminals
@@ -2772,6 +2774,32 @@ impl App {
                 body: pane_body,
                 header: None,
                 content_hidden: false,
+            });
+        }
+    }
+
+    /// Whether the active tab owns more than one pane.
+    fn active_tab_split(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| leaf_count(&tab.layout) > 1)
+    }
+
+    /// Rebuilds the tab-strip labels from `tabs`. The buffer is reused every
+    /// frame; the title itself stays in the owning `Terminal`.
+    fn build_tab_labels(&mut self) {
+        self.tab_labels.clear();
+        for tab in &self.tabs {
+            let title_terminal = self
+                .terminals
+                .iter()
+                .position(|terminal| terminal.pane_id() == tab.active_pane)
+                .unwrap_or(usize::MAX);
+            self.tab_labels.push(TabLabelIndex {
+                id: tab.id,
+                title_terminal,
+                number: tab.title_number,
+                leaf_count: leaf_count(&tab.layout),
             });
         }
     }
@@ -3315,7 +3343,16 @@ impl App {
                 });
             match hit {
                 TerminalTabHit::Close(index) => {
-                    return self.request_terminal_close(CloseTarget::Tab(index));
+                    // The strip addresses tabs; the close target still names a
+                    // terminal, so map the tab's active pane to its storage index.
+                    let target = self
+                        .tabs
+                        .get(index)
+                        .and_then(|tab| self.terminal_index_of_pane(tab.active_pane));
+                    let Some(target) = target else {
+                        return false;
+                    };
+                    return self.request_terminal_close(CloseTarget::Tab(target));
                 }
                 TerminalTabHit::Add => {
                     let _ = self.add_terminal();
@@ -3516,7 +3553,9 @@ impl App {
 
         let _ = self.process_terminal_presentation_intents();
         let now = Instant::now();
-        if !self.grid_open() && self.withhold_active_frame(now) {
+        // A split tab draws every visible pane, so its frame is never withheld
+        // as a whole; each pane carries its own `content_hidden` flag instead.
+        if !self.grid_open() && !self.active_tab_split() && self.withhold_active_frame(now) {
             return Ok(false);
         }
         let dt = animation_dt((now - self.last_frame).as_secs_f32());
@@ -3552,14 +3591,13 @@ impl App {
                 terminal.scroll_y.clamp_current(0.0, max);
             }
         }
-        // Grid tiles other than the active tab. Their layouts come from the last
+        // Panels other than the active terminal. Their layouts come from the last
         // render, and a stale one is trusted only in the current grid generation:
-        // after a membership change the same index names another tile. Outside grid
-        // mode `self.panels` is the previous frame's list, so it is not read at all.
+        // after a membership change the same index names another tile. Split
+        // panes need the same animation step outside grid mode.
         let layouts_current = self.panel_layouts_grid_generation == self.grid_generation;
-        let in_grid = self.grid_open();
         for (index, panel) in self.panels.iter().enumerate() {
-            if !in_grid || panel.terminal == active {
+            if panel.terminal == active {
                 continue;
             }
             let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
@@ -3589,12 +3627,15 @@ impl App {
         self.settings_progress = settings_progress;
 
         self.rebuild_panels();
-        if self.grid_open() {
+        if self.grid_open() || self.active_tab_split() {
             self.observe_grid_dev_warnings(now);
         }
+        self.build_tab_labels();
         let tab_strip_hint = self.tab_strip_hint(now);
         let render_result = if let Some(runtime) = self.runtime.as_mut() {
             Some(runtime.render_terminal_and_present(TerminalRenderParams {
+                tabs: &self.tab_labels,
+                active_tab: self.active_tab,
                 terminals: &self.terminals,
                 active_terminal: self.active_terminal,
                 panels: &self.panels,
@@ -3662,7 +3703,7 @@ impl App {
                     self.terminal_tab_scroll.clamp_current(0.0, max);
                     if let Some(reveal_tail) = self.pending_tab_reveal.take() {
                         let target = runtime.terminal_tab_reveal_target(
-                            self.active_terminal,
+                            self.active_tab,
                             reveal_tail,
                             self.terminal_tab_scroll.target,
                         );
@@ -3778,7 +3819,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::headless_run::test_support::push_test_terminal;
+    use crate::app::headless_run::test_support::{attach_test_pane, push_test_terminal};
     use crate::split::SplitAxis;
 
     fn bridge_call(
@@ -3885,9 +3926,12 @@ mod tests {
         let mut background_input = SingleLineInput::default();
         let color_input = SingleLineInput::default();
         let mut panel_layouts = Vec::new();
+        app.build_tab_labels();
         let runtime = app.runtime.as_mut().expect("headless runtime");
         runtime
             .render_terminal_and_present(TerminalRenderParams {
+                tabs: &app.tab_labels,
+                active_tab: app.active_tab,
                 terminals: &app.terminals,
                 active_terminal: app.active_terminal,
                 panels: &app.panels,
@@ -4370,8 +4414,8 @@ mod tests {
     #[test]
     fn reorder_preserves_presented_active_terminal_identity_without_recommit() {
         let mut app = App::new();
-        let pane = app.issue_pane_id();
-        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let first_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, first_pane));
         let pane = app.issue_pane_id();
         push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
@@ -4379,7 +4423,11 @@ mod tests {
 
         app.reorder_terminal_tab(0, 1);
 
-        assert_eq!(app.active_terminal, 1);
+        // A tab owns its panes: the strip order changes, terminal storage does not,
+        // so the presented terminal keeps its index and needs no recommit.
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.active_tab, 1);
+        assert!(split_contains_pane(&app.tabs[1].layout, first_pane));
         assert!(app.active_terminal_presented);
         assert!(
             app.terminals
@@ -6730,7 +6778,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_fix_reorder_bumps_generation_and_skips_stale_layout() {
+    fn grid_reorder_keeps_tile_composition_and_inactive_scroll() {
         let (mut app, _receiver, _profile, root) =
             crate::app::headless_run::test_support::started_headless_with_test_terminals(
                 "grid-fix-reorder-generation",
@@ -6745,16 +6793,19 @@ mod tests {
         assert_eq!(app.panel_layouts[0].max_scroll, 0.0);
         assert!(app.panel_layouts[1].max_scroll >= 10.0);
         let generation = app.grid_generation;
+        let layout_generation = app.layout_generation;
 
-        // After the swap the history tab is at index 0, the inactive one, and
-        // the stale layout of index 0 (short tab) must not clamp it.
+        // Tiles are panes, not tabs: moving a tab in the strip leaves the grid
+        // composition alone, so its generation and its tile order stay put.
         app.reorder_terminal_tab(0, 1);
-        assert_ne!(app.grid_generation, generation);
-        app.terminals[0].scroll_y.target = 20.0;
-        app.terminals[0].scroll_y.current = 20.0;
+        assert_eq!(app.grid_generation, generation);
+        assert!(app.layout_generation > layout_generation);
+        // The inactive history tile keeps its scroll target: index 1 still names it.
+        app.terminals[1].scroll_y.target = 20.0;
+        app.terminals[1].scroll_y.current = 20.0;
 
         assert_eq!(grid_frame_step(&mut app), Ok(true));
-        assert_eq!(app.terminals[0].scroll_y.target, 20.0);
+        assert_eq!(app.terminals[1].scroll_y.target, 20.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8699,6 +8750,83 @@ mod tests {
         let (settled_closed, active) = settings_animation_step(0.0005, false, 0.016);
         assert_eq!(settled_closed, 0.0);
         assert!(!active);
+    }
+
+    #[test]
+    fn tab_strip_shows_one_label_per_tab_with_active_pane_title() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t6-tab-labels",
+                2,
+            );
+        // A second pane in tab 1 must not add a third strip label.
+        let second_pane = attach_test_pane(&mut app, 1, 3);
+        app.activate_pane(second_pane, false);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        assert_eq!(app.tab_labels.len(), 2);
+        assert_eq!(app.tab_labels.len(), app.tabs.len());
+        let tab = &app.tabs[1];
+        let label = &app.tab_labels[1];
+        assert_eq!(label.id, tab.id);
+        assert_eq!(label.number, tab.title_number);
+        assert_eq!(label.leaf_count, 2);
+        // The title comes from the active pane of the tab, not from its founding terminal.
+        assert_eq!(app.terminals[label.title_terminal].pane_id(), second_pane);
+
+        // The renderer keeps one hitbox per tab: the third terminal has none.
+        let renderer = app.runtime.as_ref().expect("headless runtime").renderer();
+        assert!(renderer.terminal_tab_body(0).is_some());
+        assert!(renderer.terminal_tab_body(1).is_some());
+        assert!(renderer.terminal_tab_body(2).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tab_hit_test_and_drag_use_tab_indices() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t6-tab-drag",
+                2,
+            );
+        let moved_tab = app.tabs[1].id;
+        let founding_pane = app.tabs[1].active_pane;
+        let attached_pane = attach_test_pane(&mut app, 1, 3);
+        let terminal_count = app.terminals.len();
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // Two tabs but three terminals: the second tab's hitbox carries tab index 1.
+        let second = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .renderer()
+            .terminal_tab_body(1)
+            .expect("second tab body");
+        let (x, y) = (second[0] + second[2] * 0.5, second[1] + second[3] * 0.5);
+        let hit = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .terminal_tab_hit_test(x, y);
+        assert_eq!(hit, TerminalTabHit::Body(1));
+
+        app.on_pointer_motion(PointerPosition { x, y });
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_tab, 1);
+        // Drag the second tab left of the first tab's centre.
+        app.on_pointer_motion(PointerPosition { x: 0.0, y });
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+
+        assert_eq!(app.tabs[0].id, moved_tab);
+        assert!(split_contains_pane(&app.tabs[0].layout, founding_pane));
+        assert!(split_contains_pane(&app.tabs[0].layout, attached_pane));
+        assert_eq!(leaf_count(&app.tabs[0].layout), 2);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.terminals.len(), terminal_count);
+        assert_eq!(app.on_frame(), Ok(true));
+        assert_eq!(app.panels.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

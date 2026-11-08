@@ -1,5 +1,6 @@
 use super::*;
 use crate::panels::Panel;
+use crate::runtime::TabLabelIndex;
 use crate::scroll::{ScrollbarThumb, scrollbar_drag_target, scrollbar_thumb};
 use ronsole_term::{LinkTarget, UnderlineStyle};
 use crate::single_line_input::SingleLineInput;
@@ -131,6 +132,25 @@ pub(crate) enum TerminalTabHit {
     Add,
 }
 
+/// What surrounds a terminal body, and therefore which chrome it draws.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BodyChrome {
+    /// A tab body: the ordinary top focus separator.
+    #[default]
+    Tab,
+    /// A Claude-grid tile: a header instead of the top separator.
+    GridTile,
+    /// A pane of a multi-pane tab: no top separator; the focus border marks it.
+    SplitPane,
+}
+
+impl BodyChrome {
+    /// The top focus separator belongs to the ordinary single-pane tab only.
+    fn draws_top_separator(self) -> bool {
+        matches!(self, Self::Tab)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct TerminalUiLayout {
     pub body: Rect,
@@ -245,6 +265,28 @@ fn terminal_focus_separator_rect(body: Rect, scale: f32) -> Option<Rect> {
         x: body.x,
         y: body.y,
         w: body.w,
+        h,
+    })
+}
+
+/// Inner rectangle of the pane focus border: `body` inset by the border
+/// thickness, `(2.0 * scale).round()` physical pixels on every side. The caller
+/// fills the four strips between this rect and `body` with the accent colour.
+#[inline]
+pub(crate) fn pane_focus_border(body: Rect, scale: f32) -> Option<Rect> {
+    if ![body.x, body.y, body.w, body.h]
+        .into_iter()
+        .all(f32::is_finite)
+    {
+        return None;
+    }
+    let inset = (2.0 * scale.max(0.0)).round();
+    let w = body.w - inset * 2.0;
+    let h = body.h - inset * 2.0;
+    (inset > 0.0 && w > 0.0 && h > 0.0).then_some(Rect {
+        x: body.x + inset,
+        y: body.y + inset,
+        w,
         h,
     })
 }
@@ -2503,8 +2545,9 @@ impl Renderer {
 
     fn draw_terminal_tabs(
         &mut self,
+        tabs: &[TabLabelIndex],
+        active_tab: usize,
         terminals: &[Terminal],
-        active_terminal: usize,
         scroll_x: f32,
         drag: Option<&crate::tabs::TabDragState>,
         pointer_x: f32,
@@ -2516,14 +2559,17 @@ impl Renderer {
         let add_size = (TERMINAL_ADD_SIZE * s).round().max(1.0);
 
         let mut titles = std::mem::take(&mut self.terminal_tab_display_titles);
-        titles.resize_with(terminals.len(), || String::with_capacity(96));
-        for (terminal, title) in terminals.iter().zip(titles.iter_mut()) {
-            terminal.write_display_title(title);
+        titles.resize_with(tabs.len(), || String::with_capacity(96));
+        for (label, title) in tabs.iter().zip(titles.iter_mut()) {
+            match terminals.get(label.title_terminal) {
+                Some(terminal) => terminal.write_display_title(title),
+                None => title.clear(),
+            }
         }
 
         let mut widths = std::mem::take(&mut self.terminal_tab_widths);
         widths.clear();
-        widths.reserve(terminals.len());
+        widths.reserve(tabs.len());
         for title in &titles {
             widths.push(
                 (self.terminal_ui_text_width(title, 1.0) + TERMINAL_TAB_NATURAL_CHROME * s)
@@ -2555,7 +2601,7 @@ impl Renderer {
 
         let mut hitboxes = std::mem::take(&mut self.terminal_tab_hitboxes);
         hitboxes.clear();
-        hitboxes.resize(terminals.len(), TerminalTabHitbox::default());
+        hitboxes.resize(tabs.len(), TerminalTabHitbox::default());
 
         self.flush();
         self.set_clip(strip.x, strip.y, strip.w, strip.h);
@@ -2568,10 +2614,10 @@ impl Renderer {
             let raw_body = Rect { x: tab_x, y: strip.y, w: tab_w, h: strip.h };
             let visible_body = clipped_rect(raw_body, strip);
             let hovered = visible_body.is_some_and(|rect| rect.contains(pointer_x, pointer_y));
-            let active = idx == active_terminal;
+            let active = idx == active_tab;
             let bg = terminal_tab_surface_color(self.palette.bg, active, hovered);
             self.push_rounded_rect(tab_x, strip.y, tab_w, strip.h, 0.0, bg);
-            if idx + 1 < terminals.len() {
+            if idx + 1 < tabs.len() {
                 self.push_rounded_rect(
                     tab_x + tab_w - 1.0,
                     strip.y + strip.h * 0.25,
@@ -2595,7 +2641,11 @@ impl Renderer {
             let title_max_w = (tab_w - if can_show_close { 56.0 * s } else { 32.0 * s })
                 .max(0.0);
             let title_max_x = title_x + title_max_w;
-            if terminals.get(idx).is_some_and(Terminal::bell_pending) {
+            if tabs
+                .get(idx)
+                .and_then(|label| terminals.get(label.title_terminal))
+                .is_some_and(Terminal::bell_pending)
+            {
                 let dot = (TERMINAL_TAB_BELL_DOT * s).round().max(1.0);
                 let dot_y = (strip.y + (strip.h - dot) * 0.5).round();
                 self.push_rounded_rect(title_x, dot_y, dot, dot, dot * 0.5, self.palette.accent);
@@ -3510,6 +3560,8 @@ impl Renderer {
         Some(self.one_line_cursor_from_input_x(text, x - viewport.x, scroll_x, 0.90))
     }
 
+    /// Hit-tests the tab strip. The returned index addresses `App.tabs`, not
+    /// `App.terminals`, because one tab owns all of its split panes.
     pub(crate) fn terminal_tab_hit_test(&self, x: f32, y: f32) -> TerminalTabHit {
         for (idx, hitbox) in self.terminal_tab_hitboxes.iter().enumerate() {
             if hitbox.close.is_some_and(|rect| rect.contains(x, y)) {
@@ -3577,6 +3629,8 @@ impl Renderer {
 
     pub(crate) fn render_terminal_app(
         &mut self,
+        tabs: &[TabLabelIndex],
+        active_tab: usize,
         terminals: &[Terminal],
         active_terminal: usize,
         panels: &[Panel],
@@ -3612,6 +3666,10 @@ impl Renderer {
         let s = self.scale_factor;
         panel_layouts.clear();
         let mut active_layout = TerminalUiLayout::default();
+        // A multi-pane active tab replaces the top separator with the focus border.
+        let split_tab = tabs
+            .get(active_tab)
+            .is_some_and(|tab| tab.leaf_count > 1);
         // Taken out of `self` so the title cache and the glyph metrics can be used together.
         let mut titles = std::mem::take(&mut self.tile_titles);
         titles.resize_with(panels.len(), TileTitleCache::default);
@@ -3658,12 +3716,19 @@ impl Renderer {
             } else {
                 // Only the active panel gets search, cursor and the ordinary-mode separator.
                 let search_for_panel = if is_active { Some(&mut *search) } else { None };
+                let chrome = if panel.header.is_some() {
+                    BodyChrome::GridTile
+                } else if split_tab {
+                    BodyChrome::SplitPane
+                } else {
+                    BodyChrome::Tab
+                };
                 self.render_terminal_body(
                     terminal,
                     panel.body,
                     search_for_panel,
                     is_active && focused && settings_progress <= 0.0,
-                    panel.header.is_some(),
+                    chrome,
                     focused,
                     pointer_x,
                     pointer_y,
@@ -3685,9 +3750,32 @@ impl Renderer {
         }
         self.tile_titles = titles;
         self.tile_title_scratch = scratch;
+        if split_tab
+            && let Some(inner) = pane_focus_border(active_layout.body, s)
+        {
+            let body = active_layout.body;
+            let color = terminal_focus_separator_color(palette.accent, focused);
+            self.push_rect(body.x, body.y, body.w, inner.y - body.y, color);
+            self.push_rect(
+                body.x,
+                inner.y + inner.h,
+                body.w,
+                body.y + body.h - (inner.y + inner.h),
+                color,
+            );
+            self.push_rect(body.x, inner.y, inner.x - body.x, inner.h, color);
+            self.push_rect(
+                inner.x + inner.w,
+                inner.y,
+                body.x + body.w - (inner.x + inner.w),
+                inner.h,
+                color,
+            );
+        }
         self.draw_terminal_tabs(
+            tabs,
+            active_tab,
             terminals,
-            active_terminal,
             tab_scroll_x,
             drag,
             pointer_x,
@@ -3732,15 +3820,16 @@ impl Renderer {
 
     /// Draws one terminal body into `body`, which is the scissor and the geometry
     /// source for text, cursor and search. `search` is `Some` only for the panel that
-    /// owns the search overlay; `show_cursor` gates the cursor; `tile` marks a grid
-    /// tile, which has no accent separator. The frame is cleared by the caller.
+    /// owns the search overlay; `show_cursor` gates the cursor; `chrome` selects the
+    /// surrounding chrome (single tab, grid tile, or split pane). The frame is
+    /// cleared by the caller.
     pub(crate) fn render_terminal_body(
         &mut self,
         terminal: &Terminal,
         body: Rect,
         mut search: Option<&mut TerminalSearchState>,
         show_cursor: bool,
-        tile: bool,
+        chrome: BodyChrome,
         window_focused: bool,
         pointer_x: f32,
         pointer_y: f32,
@@ -3780,7 +3869,11 @@ impl Renderer {
         );
         let text_x = body.x + 10.0 * s;
         let (_, bottom_pad) = terminal_text_padding(s);
-        let separator = if tile { None } else { terminal_focus_separator_rect(body, s) };
+        let separator = if chrome.draws_top_separator() {
+            terminal_focus_separator_rect(body, s)
+        } else {
+            None
+        };
         let content_clip = terminal_body_content_clip(body, separator);
 
         self.flush();
@@ -6294,6 +6387,40 @@ mod tests {
             assert_eq!(cols, expected_cols, "window scale {scale}");
             assert_eq!(rows, terminal_visible_rows(body.h, char_h, scale), "window scale {scale}");
         }
+    }
+
+    #[test]
+    fn focus_border_is_inside_body_with_two_pixel_inset() {
+        for scale in [1.333_f32, 2.0] {
+            let body = Rect {
+                x: 10.0,
+                y: 20.0,
+                w: 400.0,
+                h: 300.0,
+            };
+            let inset = (2.0 * scale).round();
+            let inner = pane_focus_border(body, scale).expect("positive body has a focus border");
+            assert_eq!(inner.x, body.x + inset, "scale {scale}");
+            assert_eq!(inner.y, body.y + inset, "scale {scale}");
+            assert_eq!(inner.w, body.w - inset * 2.0, "scale {scale}");
+            assert_eq!(inner.h, body.h - inset * 2.0, "scale {scale}");
+            for value in [inner.x, inner.y, inner.w, inner.h] {
+                assert_eq!(value.fract(), 0.0, "scale {scale}: {value} is a whole pixel");
+            }
+            // The four border strips live between the body edge and the inner rect.
+            assert_eq!(inner.x - body.x, inset);
+            assert_eq!(inner.y - body.y, inset);
+            assert_eq!(body.x + body.w - (inner.x + inner.w), inset);
+            assert_eq!(body.y + body.h - (inner.y + inner.h), inset);
+        }
+        assert_eq!(pane_focus_border(Rect { x: 0.0, y: 0.0, w: 0.0, h: 10.0 }, 1.0), None);
+    }
+
+    #[test]
+    fn split_pane_body_has_no_top_separator() {
+        assert!(BodyChrome::Tab.draws_top_separator());
+        assert!(!BodyChrome::GridTile.draws_top_separator());
+        assert!(!BodyChrome::SplitPane.draws_top_separator());
     }
 
     #[test]
