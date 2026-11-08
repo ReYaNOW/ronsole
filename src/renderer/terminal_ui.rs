@@ -3855,6 +3855,9 @@ impl Renderer {
         let resized =
             prepare_terminal_grid_for_render(&mut grid, search.as_deref_mut(), new_cols, new_rows);
         grid.mark_presentation_layout_ready();
+        // Output parsed while the lock is released for `resize_pty` bumps this
+        // generation; that content is unverified for this frame.
+        let resized_generation = grid.content_generation();
         if resized {
             drop(grid);
             terminal.resize_pty(pty_dimension(new_cols), pty_dimension(new_rows));
@@ -3902,7 +3905,8 @@ impl Renderer {
         // but output may have landed since. The development-channels check
         // verifies one generation only, so a newer grid draws no body here
         // (the background and the chrome stay).
-        let content_verified = terminal.dev_channel_generation_verified(verified_generation);
+        let content_verified = terminal.dev_channel_generation_verified(verified_generation)
+            && content_generation == resized_generation;
         if presentation_visible && content_clip.is_some() && content_verified {
             let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
             for layer in TERMINAL_BODY_LAYERS {
