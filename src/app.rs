@@ -1250,14 +1250,33 @@ impl App {
     /// `withhold_active_frame` skipped, in grid mode the `withheld_until`
     /// deadline (the next grid frame recomputes it).
     fn advance_dev_channel_warnings(&mut self, now: Instant) {
-        for terminal in &mut self.terminals {
-            // Event path: refresh the process lookup for the output that
-            // arrived, then answer the checks from it.
-            terminal.refresh_dev_claude_cache();
-            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
-            terminal.observe_dev_channel_banner_cached();
+        let grid_mode = self.grid_open() || self.active_tab_split();
+        let panels = &self.panels;
+        let active = self.active_terminal;
+        let mut redraw = false;
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
+            // Event path: scans the output that arrived and walks `/proc` only
+            // for a candidate generation without a cached answer; a repeated
+            // call in the same loop pass answers from the cache the first one
+            // filled. Verification of content the last frame hid asks for the
+            // redraw that can now show it; background tabs never do.
+            let pass = terminal.observe_dev_channel_event(now, &mut self.dev_warning_scratch);
+            let on_screen = if grid_mode {
+                panels.iter().any(|panel| panel.terminal == index)
+            } else {
+                index == active
+            };
+            // Only a redraw that can show the content is worth asking for; a
+            // frame whose content is now hidden is what withholding draws.
+            // A warning Enter hiding keeps its own deadline wake.
+            let drawable =
+                !terminal.dev_warning_frame_hidden(now) && terminal.dev_channel_content_verified();
+            redraw |= on_screen && (pass.sent || pass.reverified && drawable);
         }
-        if self.grid_open() || self.active_tab_split() {
+        if redraw {
+            self.request_frame();
+        }
+        if grid_mode {
             if self.withheld_until.is_some_and(|until| now >= until) {
                 self.withheld_until = None;
                 self.request_frame();
@@ -1274,19 +1293,24 @@ impl App {
             .is_some_and(|terminal| terminal.dev_warning_frame_hidden(now))
     }
 
-    /// Whether to skip this frame because the active tab shows the warning that
-    /// Enter was already sent for: the compositor keeps the last presented
-    /// frame. Rescans the active tab first, since output may have arrived after
-    /// `on_about_to_wait`, answering the process lookup from the cache the
-    /// event paths refreshed (the frame path walks no `/proc`). Input is not
-    /// affected. Also applies the banner hiding
-    /// (`Terminal::observe_dev_channel_banner_cached`) to the new content.
+    /// Whether to skip this frame: the active tab shows the warning that Enter
+    /// was already sent for (the compositor keeps the last presented frame), or
+    /// its content generation has no verified development-channels answer yet.
+    /// Rescans the active tab first, since output may have arrived after
+    /// `on_about_to_wait`, and answers the process lookup from the cache the
+    /// event paths filled (the frame path walks no `/proc`): an unknown answer
+    /// leaves the generation unverified and the next event pass asks for the
+    /// redraw. Input is not affected.
     fn withhold_active_frame(&mut self, now: Instant) -> bool {
         if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
-            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
-            terminal.observe_dev_channel_banner_cached();
+            terminal.observe_dev_channel_cached(now, &mut self.dev_warning_scratch);
         }
-        if !self.active_dev_warning_hidden(now) {
+        let Some(terminal) = self.terminals.get(self.active_terminal) else {
+            return false;
+        };
+        let warning_hidden = terminal.dev_warning_frame_hidden(now);
+        let verified = terminal.dev_channel_content_verified();
+        if !warning_hidden && verified {
             return false;
         }
         self.frame_withheld = true;
@@ -1294,13 +1318,15 @@ impl App {
         true
     }
 
-    /// Grid counterpart of `withhold_active_frame`: applies the warning and
-    /// banner hiding to every tile terminal of the output that arrived after
-    /// `on_about_to_wait` and sets `content_hidden` on its panel, so the frame
-    /// is drawn with only the hidden tile body blank. Answers the process
-    /// lookup from the cache the event paths refreshed. Must run after
-    /// `rebuild_panels`, which resets `content_hidden`. Records the earliest
-    /// hiding end in `withheld_until` for the loop to wake at.
+    /// Grid and split counterpart of `withhold_active_frame`: scans every tile
+    /// terminal of the output that arrived after `on_about_to_wait` and sets
+    /// `content_hidden` on its panel, so the frame is drawn with only the
+    /// hidden tile body blank. An unknown development-channels answer hides the
+    /// body as well and leaves the generation unverified, so the next event
+    /// pass asks for the redraw. Answers the process lookup from the cache the
+    /// event paths filled. Must run after `rebuild_panels`, which resets
+    /// `content_hidden`. Records the earliest warning-hiding end in
+    /// `withheld_until` for the loop to wake at.
     fn observe_grid_dev_warnings(&mut self, now: Instant) {
         let mut withheld_until: Option<Instant> = None;
         for panel in &mut self.panels {
@@ -1308,9 +1334,8 @@ impl App {
                 panel.content_hidden = false;
                 continue;
             };
-            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
-            terminal.observe_dev_channel_banner_cached();
-            panel.content_hidden = terminal.dev_warning_frame_hidden(now);
+            terminal.observe_dev_channel_cached(now, &mut self.dev_warning_scratch);
+            panel.content_hidden = terminal.dev_channel_content_hidden(now);
             if panel.content_hidden {
                 if let Some(until) = terminal.dev_warning_hidden_until() {
                     withheld_until = Some(withheld_until.map_or(until, |earliest| earliest.min(until)));
@@ -3728,15 +3753,18 @@ impl App {
     /// arrived, and, as a fallback for a stalled parser thread, replays
     /// synchronized-output buffers that are overdue by `SYNC_RESERVE_GRACE`,
     /// when the locks are free. The frame path rescans output that arrives
-    /// later and answers its process lookup from the cache refreshed here.
+    /// later and answers its process lookup from the cache filled here.
     /// Takes its own clock so the about-to-wait body keeps its clock after the
     /// early return.
     fn drain_terminal_host_events(&mut self) {
         let now = Instant::now();
         let active = self.active_terminal;
+        let grid_mode = self.grid_open() || self.active_tab_split();
         // Read before the loop: `tab_visible` cannot be called while `terminals` is borrowed.
         let grid_members = self.claude_grid.as_ref().map(|grid| grid.members.as_slice());
+        let panels = &self.panels;
         let mut bell_rang = false;
+        let mut dev_redraw = false;
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
             // Only the pending-events lock is held while clipboard text is set;
             // the published deadline is read from the same pending state.
@@ -3749,12 +3777,17 @@ impl App {
                     terminal.mark_bell_pending();
                 }
             }
-            // Both methods return early when the content generation did not
-            // change, so a drain without new output does no scanning work; the
-            // refresh walks `/proc` only for a generation not scanned yet.
-            terminal.refresh_dev_claude_cache();
-            terminal.observe_dev_channel_warning_cached(now, &mut self.dev_warning_scratch);
-            terminal.observe_dev_channel_banner_cached();
+            // The scans return at once without new content; the process lookup
+            // runs only for a candidate generation without a cached answer.
+            let pass = terminal.observe_dev_channel_event(now, &mut self.dev_warning_scratch);
+            let on_screen = if grid_mode {
+                panels.iter().any(|panel| panel.terminal == index)
+            } else {
+                index == active
+            };
+            let drawable =
+                !terminal.dev_warning_frame_hidden(now) && terminal.dev_channel_content_verified();
+            dev_redraw |= on_screen && (pass.sent || pass.reverified && drawable);
             if terminal
                 .sync_deadline()
                 .is_some_and(|deadline| deadline + SYNC_RESERVE_GRACE <= now)
@@ -3765,6 +3798,9 @@ impl App {
         if bell_rang {
             self.request_bell_attention();
             self.mark_dirty();
+        }
+        if dev_redraw {
+            self.request_frame();
         }
     }
 
@@ -4103,8 +4139,10 @@ mod tests {
         assert!(!app.withhold_active_frame(sent_at));
         app.active_terminal = 0;
 
-        // Safety limit passed: the screen is shown as is.
+        // Safety limit passed: the event pass answers the development-channels
+        // check for the empty foreground group, then the screen is shown as is.
         let late = sent_at + crate::terminal::DEV_WARNING_HIDE_LIMIT;
+        app.advance_dev_channel_warnings(late);
         assert!(!app.withhold_active_frame(late));
         app.frame_withheld = true;
         app.dirty = false;

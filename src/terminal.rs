@@ -496,6 +496,7 @@ mod tests {
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
             dev_claude_cache: None,
+            dev_channel_verified: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -907,6 +908,94 @@ mod tests {
         assert!(!observe_dev(&mut bridge_first, now, Some(DEV_CLAUDE)));
         assert!(bridge_first.dev_warning_frame_hidden(now));
         assert_eq!(bridge_first.input_bytes_for_test(), b"\r");
+    }
+
+    /// Content generation of the terminal's grid.
+    fn dev_generation(terminal: &Terminal) -> u64 {
+        crate::platform::lock_recover(&terminal.grid).content_generation()
+    }
+
+    #[test]
+    fn dev_channel_unknown_group_answer_hides_content_and_keeps_generation_unchecked() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+
+        // The frame path has no answer for this generation: it hides the
+        // content and must not record the generation as checked, so the next
+        // event pass still asks the process tree.
+        terminal.observe_dev_channel_cached(now, &mut scratch);
+        assert!(terminal.dev_channel_content_hidden(now));
+        assert!(!terminal.dev_channel_generation_verified(generation));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // The following event pass answers for the foreground group and
+        // finishes the check: Enter is written and the generation verified.
+        assert!(terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE)).sent);
+        assert!(terminal.dev_channel_generation_verified(generation));
+        assert!(terminal.dev_warning_frame_hidden(now));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+    }
+
+    #[test]
+    fn ordinary_output_does_not_walk_the_process_tree() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ ordinary output without a warning");
+        let lookups = std::cell::Cell::new(0);
+        let mut scratch = String::new();
+
+        let pass = terminal.observe_dev_channel(now, &mut scratch, true, |_| {
+            lookups.set(lookups.get() + 1);
+            None
+        });
+
+        // No candidate: the process tree and tcgetpgrp are never touched, and
+        // the content is verified on its own.
+        assert_eq!(lookups.get(), 0);
+        assert!(!pass.sent);
+        assert!(terminal.dev_channel_content_verified());
+    }
+
+    #[test]
+    fn dev_channel_change_between_frame_decision_and_render_hides_content() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ ready");
+        let mut scratch = String::new();
+        terminal.observe_dev_channel_cached(now, &mut scratch);
+        let decided = dev_generation(&terminal);
+        assert!(terminal.dev_channel_generation_verified(decided));
+
+        // Output lands after the frame decided: the renderer's final check
+        // under the grid lock, done on the generation it locked, must reject it.
+        feed_dev_screen(&terminal, "more output");
+        let rendered = dev_generation(&terminal);
+        assert_ne!(rendered, decided);
+        assert!(!terminal.dev_channel_generation_verified(rendered));
+    }
+
+    #[test]
+    fn dev_channel_answer_for_stale_generation_is_not_used() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let mut scratch = String::new();
+        assert!(terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE)).sent);
+        let answered = dev_generation(&terminal);
+        assert!(terminal.dev_channel_generation_verified(answered));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // A candidate of a newer generation: the answer keyed to the old
+        // generation is "unknown" here, not a "no claude" for the new one.
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let newer = dev_generation(&terminal);
+        assert_ne!(newer, answered);
+        terminal.observe_dev_channel_cached(now, &mut scratch);
+        assert!(!terminal.dev_channel_generation_verified(newer));
+        assert!(terminal.dev_channel_content_hidden(now));
     }
 
     /// Word wrap like Claude Code's notice box: rows of at most `width`
@@ -1687,6 +1776,16 @@ struct DevWarningState {
     confirmed: Option<crate::tab_input::ProcGen>,
 }
 
+/// Outcome of one development-channels pass (`Terminal::observe_dev_channel`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DevChannelPass {
+    /// Enter was written for the warning.
+    pub(crate) sent: bool,
+    /// The verified generation changed: a frame that hid the previous one
+    /// needs a redraw.
+    pub(crate) reverified: bool,
+}
+
 /// Text of the two Claude Code notice lines shown for the cc-tg development
 /// channel, without the quote-border prefix (`DEV_CHANNEL_BANNER_BAR` and one
 /// space) that Claude Code draws on every row of the notice, wrapped rows
@@ -1899,6 +1998,9 @@ struct DevBannerState {
     scanned_cols: usize,
     /// Some cell of this tab was hidden; until then no clearing pass runs.
     hid_any: bool,
+    /// Of the last scan: whether some block still has a drawn cell, i.e. the
+    /// content needs the process answer before it can be hidden.
+    drawn: bool,
     /// Foreground process group and whether it holds a flagged `claude`,
     /// kept while a banner block stays in the scanned rows.
     owner: Option<(Option<u32>, bool)>,
@@ -2032,10 +2134,16 @@ pub struct Terminal {
     bridge_launch: Option<BridgeLaunchState>,
     dev_warning: DevWarningState,
     dev_banner: DevBannerState,
-    /// `(PTY foreground group, flagged claude in it)` for the development-
-    /// channels checks, rebuilt by `refresh_dev_claude_cache` in the event
-    /// paths. The frame path answers from it instead of walking `/proc`.
-    dev_claude_cache: Option<(Option<u32>, Option<crate::tab_input::ProcGen>)>,
+    /// `(content generation, PTY foreground group, flagged claude in it)` of
+    /// the last development-channels answer. A missing entry, or one for an
+    /// earlier generation or another foreground group, is "unknown", never
+    /// "no"; only the event path writes it, the frame path reads it.
+    dev_claude_cache: Option<(u64, Option<u32>, Option<crate::tab_input::ProcGen>)>,
+    /// `Term::content_generation` whose development-channels check finished:
+    /// content may be drawn for exactly this generation. A generation with a
+    /// candidate is recorded only after a verified answer for its foreground
+    /// group; one without a candidate needs no answer.
+    dev_channel_verified: Option<u64>,
     /// Working directory from the latest OSC 7 report that passed
     /// `accept_osc7_cwd`; a new tab inherits it.
     pub(crate) osc7_cwd: Option<PathBuf>,
@@ -2180,6 +2288,7 @@ impl Terminal {
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
             dev_claude_cache: None,
+            dev_channel_verified: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2289,6 +2398,7 @@ impl Terminal {
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
             dev_claude_cache: None,
+            dev_channel_verified: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2443,34 +2553,37 @@ impl Terminal {
     }
 
     /// Scans the screen for the development-channels warning when its content
-    /// changed. On a matching screen with no Enter sent for it yet, writes one
-    /// Enter if `find_claude` (given the PTY foreground process group) finds a
-    /// `claude --dangerously-load-development-channels` generation that has
-    /// not been confirmed in this tab before. `scratch` is a reusable buffer.
-    /// Returns whether Enter was written.
-    pub(crate) fn observe_dev_channel_warning(
-        &mut self,
-        now: Instant,
-        scratch: &mut String,
-        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
-    ) -> bool {
-        {
-            let grid = crate::platform::lock_recover(&self.grid);
-            if self.dev_warning.scanned_generation == Some(grid.content_generation()) {
-                return false;
-            }
-            self.dev_warning.scanned_generation = Some(grid.content_generation());
-            write_compact_screen(&grid, scratch);
+    /// changed: the cheap half of a check, with no `/proc` and no
+    /// `tcgetpgrp`. Returns the scanned generation and whether the warning is
+    /// on screen.
+    fn scan_dev_channel_warning(&mut self, scratch: &mut String) -> (u64, bool) {
+        let grid = crate::platform::lock_recover(&self.grid);
+        let generation = grid.content_generation();
+        if self.dev_warning.scanned_generation == Some(generation) {
+            return (generation, self.dev_warning.visible);
         }
+        write_compact_screen(&grid, scratch);
+        drop(grid);
+        self.dev_warning.scanned_generation = Some(generation);
         self.dev_warning.visible = compact_bridge_warning_visible(scratch);
         if !self.dev_warning.visible {
             self.dev_warning.enter_at = None;
-            return false;
         }
+        (generation, self.dev_warning.visible)
+    }
+
+    /// Writes the automatic Enter for the warning on screen when `claude` is
+    /// the flagged process generation of the foreground group (`None` is a
+    /// verified "no flagged claude"). Returns whether Enter was written.
+    fn enter_dev_warning(
+        &mut self,
+        now: Instant,
+        claude: Option<crate::tab_input::ProcGen>,
+    ) -> bool {
         if self.dev_warning.enter_at.is_some() {
             return false;
         }
-        let Some(claude) = find_claude(self.process_group_leader()) else {
+        let Some(claude) = claude else {
             return false;
         };
         if self.dev_warning.confirmed == Some(claude) || self.write_input(b"\r").is_err() {
@@ -2482,6 +2595,29 @@ impl Terminal {
             state.enter_sent = true;
         }
         true
+    }
+
+    /// `observe_dev_channel_warning` with an injected lookup, for tests: scans
+    /// the screen and, on a matching screen with no Enter sent for it yet,
+    /// writes one Enter if `find_claude` (given the PTY foreground process
+    /// group) finds a `claude --dangerously-load-development-channels`
+    /// generation not confirmed in this tab before. `scratch` is a reusable
+    /// buffer. The app uses `observe_dev_channel_event`/`_cached` instead.
+    #[cfg(test)]
+    pub(crate) fn observe_dev_channel_warning(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
+    ) -> bool {
+        let (_generation, visible) = self.scan_dev_channel_warning(scratch);
+        if !visible || self.dev_warning.enter_at.is_some() {
+            return false;
+        }
+        let Some(claude) = find_claude(self.process_group_leader()) else {
+            return false;
+        };
+        self.enter_dev_warning(now, Some(claude))
     }
 
     /// End of the frame hiding for this tab: `Some` while the last scanned
@@ -2501,37 +2637,69 @@ impl Terminal {
             .is_some_and(|until| now < until)
     }
 
-    /// When the grid content changed, hides the cells of the exact
-    /// `DEV_CHANNEL_BANNER_LINES` rows (on the screen and in the scrollback,
-    /// see `DevBannerState::scan`) if `find_claude` (given the PTY foreground
-    /// process group) finds a flagged `claude`; the answer is cached per group
-    /// while a banner stays in the scanned rows, and it is asked only for a
-    /// banner with drawn cells. Only the cell hidden flag changes: text,
-    /// cursor, scrollback and selection stay as the program wrote them.
+    /// Finds the banner blocks of the current content and whether one still
+    /// has a drawn cell, without `/proc` and without `tcgetpgrp`. With no drawn
+    /// cell the hidden flags are cleared and the scan is final. Returns the
+    /// scanned generation and the drawn flag (the process-lookup candidate).
+    fn scan_dev_channel_banner(&mut self) -> (u64, bool) {
+        let mut grid = crate::platform::lock_recover(&self.grid);
+        let generation = grid.content_generation();
+        if self.dev_banner.scanned_generation == Some(generation) {
+            return (generation, self.dev_banner.drawn);
+        }
+        let (any, drawn) = self.dev_banner.scan(&grid);
+        if !any {
+            self.dev_banner.owner = None;
+        }
+        self.dev_banner.drawn = drawn;
+        if !drawn {
+            if self.dev_banner.hid_any {
+                self.dev_banner.apply(&mut grid, false);
+            }
+            self.dev_banner.mark_scanned(&grid);
+        }
+        (generation, drawn)
+    }
+
+    /// Applies the banner hiding of the last scan of `generation` while it
+    /// still holds; new output is left to the next scan. Only the cell hidden
+    /// flag changes: text, cursor, scrollback and selection stay as the
+    /// program wrote them.
+    fn apply_dev_channel_banner(&mut self, generation: u64, flagged: bool) {
+        if self.dev_banner.scanned_generation == Some(generation) {
+            return;
+        }
+        let mut grid = crate::platform::lock_recover(&self.grid);
+        if grid.content_generation() != generation {
+            return;
+        }
+        if flagged || self.dev_banner.hid_any {
+            self.dev_banner.scan(&grid);
+            self.dev_banner.apply(&mut grid, flagged);
+            self.dev_banner.hid_any |= flagged;
+        }
+        if flagged {
+            self.dev_banner.drawn = false;
+        }
+        self.dev_banner.mark_scanned(&grid);
+    }
+
+    /// `observe_dev_channel_banner` with an injected lookup, for tests: hides
+    /// the cells of the exact `DEV_CHANNEL_BANNER_LINES` rows (on the screen
+    /// and in the scrollback, see `DevBannerState::scan`) if `find_claude`
+    /// (given the PTY foreground process group) finds a flagged `claude`; the
+    /// answer is cached per group while a banner stays in the scanned rows, and
+    /// it is asked only for a banner with drawn cells. The app uses
+    /// `observe_dev_channel_event`/`_cached` instead.
+    #[cfg(test)]
     pub(crate) fn observe_dev_channel_banner(
         &mut self,
         find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
     ) {
-        let generation = {
-            let mut grid = crate::platform::lock_recover(&self.grid);
-            let generation = grid.content_generation();
-            if self.dev_banner.scanned_generation == Some(generation) {
-                return;
-            }
-            let (any, drawn) = self.dev_banner.scan(&grid);
-            if !any {
-                self.dev_banner.owner = None;
-            }
-            if !drawn {
-                if self.dev_banner.hid_any {
-                    self.dev_banner.apply(&mut grid, false);
-                }
-                self.dev_banner.mark_scanned(&grid);
-                return;
-            }
-            generation
-        };
-        // The process lookup runs without the grid lock.
+        let (generation, drawn) = self.scan_dev_channel_banner();
+        if !drawn {
+            return;
+        }
         let pgrp = self.process_group_leader();
         let flagged = match self.dev_banner.owner {
             Some((cached, flagged)) if cached == pgrp => flagged,
@@ -2541,61 +2709,108 @@ impl Terminal {
                 flagged
             }
         };
-        let mut grid = crate::platform::lock_recover(&self.grid);
-        // New output arrived meanwhile: the next call scans it.
-        if grid.content_generation() != generation {
-            return;
-        }
-        if flagged || self.dev_banner.hid_any {
-            self.dev_banner.scan(&grid);
-            self.dev_banner.apply(&mut grid, flagged);
-            self.dev_banner.hid_any |= flagged;
-        }
-        self.dev_banner.mark_scanned(&grid);
+        self.apply_dev_channel_banner(generation, flagged);
     }
 
-    /// Rebuilds `dev_claude_cache` when the warning or banner scan has output
-    /// it has not scanned yet or the PTY foreground group changed: one `/proc`
-    /// walk per such event-loop pass, nothing for content already scanned by
-    /// the same group. Only the event paths call it; the frame path answers
-    /// from the cache.
-    pub(crate) fn refresh_dev_claude_cache(&mut self) {
-        let pgrp = self.process_group_leader();
-        let generation = crate::platform::lock_recover(&self.grid).content_generation();
-        let scanned = self.dev_warning.scanned_generation == Some(generation)
-            && self.dev_banner.scanned_generation == Some(generation);
-        if scanned && self.dev_claude_cache.is_some_and(|(cached, _)| cached == pgrp) {
-            return;
-        }
-        let found = pgrp.and_then(crate::tab_input::dev_channel_claude_in_group);
-        self.dev_claude_cache = Some((pgrp, found));
-    }
-
-    /// `observe_dev_channel_warning` answered from `dev_claude_cache`: the frame
-    /// path calls this, so it never walks `/proc`. A foreground group other
-    /// than the cached one has no answer.
-    pub(crate) fn observe_dev_channel_warning_cached(
+    /// One development-channels pass: scans the current content, answers the
+    /// warning and banner hiding from `lookup`, and records which generation
+    /// may be shown. `lookup` walks `/proc` only for a generation that has a
+    /// candidate (warning screen or drawn banner) and no cached answer for its
+    /// foreground group; a generation without a candidate needs neither
+    /// `/proc` nor `tcgetpgrp`, so ordinary output stays cheap. Returns whether
+    /// Enter was written.
+    ///
+    /// "Unknown" is not "no": with `allow_lookup` off (the frame path) and no
+    /// cached answer, the generation stays unverified, so the frame hides its
+    /// content and the next event pass retries the lookup.
+    fn observe_dev_channel(
         &mut self,
         now: Instant,
         scratch: &mut String,
-    ) -> bool {
-        let cache = self.dev_claude_cache;
-        self.observe_dev_channel_warning(now, scratch, |pgrp| {
-            cache
-                .filter(|(cached, _)| *cached == pgrp)
-                .and_then(|(_, found)| found)
+        allow_lookup: bool,
+        lookup: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
+    ) -> DevChannelPass {
+        let mut pass = DevChannelPass::default();
+        let previous = self.dev_channel_verified;
+        let (warning_generation, warning_visible) = self.scan_dev_channel_warning(scratch);
+        let (banner_generation, banner_drawn) = self.scan_dev_channel_banner();
+        // Output can land between the two scans: leave this pass to the next
+        // one, which scans the newer generation.
+        if warning_generation != banner_generation {
+            return pass;
+        }
+        let generation = warning_generation;
+        let candidate = warning_visible || banner_drawn;
+        let answer = if candidate {
+            let pgrp = self.process_group_leader();
+            match self.dev_claude_cache {
+                Some((cached_generation, cached_pgrp, found))
+                    if cached_generation == generation && cached_pgrp == pgrp =>
+                {
+                    Some(found)
+                }
+                _ if allow_lookup => {
+                    let found = lookup(pgrp);
+                    self.dev_claude_cache = Some((generation, pgrp, found));
+                    Some(found)
+                }
+                _ => None,
+            }
+        } else {
+            Some(None)
+        };
+        let Some(answer) = answer else {
+            return pass;
+        };
+        pass.sent = warning_visible && self.enter_dev_warning(now, answer);
+        self.apply_dev_channel_banner(generation, answer.is_some());
+        self.dev_channel_verified = Some(generation);
+        pass.reverified = self.dev_channel_verified != previous;
+        pass
+    }
+
+    /// Event-pass entry point: may walk `/proc` for a candidate generation
+    /// without a cached answer for its foreground group.
+    pub(crate) fn observe_dev_channel_event(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+    ) -> DevChannelPass {
+        self.observe_dev_channel(now, scratch, true, |pgrp| {
+            pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
         })
     }
 
-    /// `observe_dev_channel_banner` answered from `dev_claude_cache`: see
-    /// `observe_dev_channel_warning_cached`.
-    pub(crate) fn observe_dev_channel_banner_cached(&mut self) {
-        let cache = self.dev_claude_cache;
-        self.observe_dev_channel_banner(|pgrp| {
-            cache
-                .filter(|(cached, _)| *cached == pgrp)
-                .and_then(|(_, found)| found)
-        });
+    /// Frame-path entry point: never walks `/proc`, so an unknown answer leaves
+    /// the generation unverified and the content hidden.
+    pub(crate) fn observe_dev_channel_cached(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+    ) -> DevChannelPass {
+        self.observe_dev_channel(now, scratch, false, |_| None)
+    }
+
+    /// Whether the development-channels check finished for `generation`:
+    /// content of any other generation must not be drawn.
+    pub(crate) fn dev_channel_generation_verified(&self, generation: u64) -> bool {
+        self.dev_channel_verified == Some(generation)
+    }
+
+    /// Whether the grid's current content may be drawn (see
+    /// `dev_channel_generation_verified`). Read under the grid lock, since
+    /// output can land after the event pass that verified it.
+    pub(crate) fn dev_channel_content_verified(&self) -> bool {
+        self.dev_channel_generation_verified(
+            crate::platform::lock_recover(&self.grid).content_generation(),
+        )
+    }
+
+    /// Whether the content must stay hidden: the warning Enter hiding is
+    /// active, or the content generation has no verified development-channels
+    /// answer.
+    pub(crate) fn dev_channel_content_hidden(&self, now: Instant) -> bool {
+        self.dev_warning_frame_hidden(now) || !self.dev_channel_content_verified()
     }
 
     /// Keeps a viewport scrolled up into the scrollback on the same lines:

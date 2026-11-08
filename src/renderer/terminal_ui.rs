@@ -3893,7 +3893,12 @@ impl Renderer {
         // The hovered link applies only while the grid still has the generation it was built for.
         let hovered_link = terminal.hovered_link();
         let content_generation = grid.content_generation();
-        if presentation_visible && content_clip.is_some() {
+        // The frame decided to draw this panel from the generation it scanned,
+        // but output may have landed since. The development-channels check
+        // verifies one generation only, so a newer grid draws no body here
+        // (the background and the chrome stay).
+        let content_verified = terminal.dev_channel_generation_verified(content_generation);
+        if presentation_visible && content_clip.is_some() && content_verified {
             let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
             for layer in TERMINAL_BODY_LAYERS {
                 for i in visible_range.clone() {
