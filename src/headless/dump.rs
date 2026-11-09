@@ -137,18 +137,42 @@ pub(crate) fn dump_json(session: &mut HeadlessSession) -> Value {
     let wake_pending = app
         .runtime()
         .is_some_and(|runtime| runtime.wake_handle().pending());
-    let active = app.active_terminal_index();
-    let tabs: Vec<Value> = app
-        .terminals()
-        .iter()
-        .enumerate()
-        .map(|(index, terminal)| {
+    let active_tab = app.active_tab_index();
+    let tabs: Vec<Value> = (0..app.tab_count())
+        .map(|index| {
             let mut title = String::new();
-            terminal.write_display_title(&mut title);
+            if let Some(terminal) = app.tab_title_terminal(index) {
+                terminal.write_display_title(&mut title);
+            }
             let rect = renderer
                 .and_then(|renderer| renderer.terminal_tab_body(index))
                 .map_or(Value::Null, |[x, y, w, h]| json!([x, y, w, h]));
-            json!({"index": index, "title": title, "active": index == active, "rect": rect})
+            json!({
+                "index": index,
+                "title": title,
+                "active": index == active_tab,
+                "rect": rect,
+                "title_number": app.tab_title_number(index).unwrap_or_default(),
+            })
+        })
+        .collect();
+    let active_pane = app.active_pane_raw().map_or(Value::Null, |raw| json!(raw));
+    let panels: Vec<Value> = app
+        .panels()
+        .iter()
+        .map(|panel| {
+            let pane_id = app
+                .terminals()
+                .get(panel.terminal)
+                .map_or(Value::Null, |terminal| json!(terminal.pane_id().raw()));
+            json!({
+                "pane_id": pane_id,
+                "x": panel.body.x,
+                "y": panel.body.y,
+                "w": panel.body.w,
+                "h": panel.body.h,
+                "content_hidden": panel.content_hidden,
+            })
         })
         .collect();
     let terminal = app.active_terminal().map_or(Value::Null, |terminal| {
@@ -164,6 +188,8 @@ pub(crate) fn dump_json(session: &mut HeadlessSession) -> Value {
         "scale": scale,
         "cursor_icon": counters.map_or_else(String::new, |counters| format!("{:?}", counters.cursor_kind)),
         "tabs": tabs,
+        "active_pane": active_pane,
+        "panels": panels,
         "terminal": terminal,
         "clipboard": {"mode": "memory", "text": clipboard},
         "external_request": external.map(|arg| json!({"kind": "open_url", "arg": arg})),

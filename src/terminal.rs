@@ -1,5 +1,6 @@
 use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
+use crate::split::PaneId;
 use crate::terminal_process::{
     HostChannels, PendingHostEvents, SessionSink, flush_expired_sync, notify_main_loop,
     terminal_reply_channel,
@@ -45,6 +46,14 @@ fn new_term(cols: usize, rows: usize, palette: TermPalette) -> Term {
 mod tests {
     use super::*;
 
+    /// Standalone terminal for the terminal-level tests: these never route
+    /// panes through an `App`, so the id only has to be a fresh `PaneId`.
+    fn test_terminal(cols: usize, rows: usize, display_number: u64) -> Terminal {
+        static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let pane = PaneId::new(NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        Terminal::new_for_test(cols, rows, display_number, pane)
+    }
+
     /// Feeds `bytes` into the tab's grid at `now` without a reader, so an
     /// open synchronized-output block holds them until its deadline.
     fn hold_in_sync_block(terminal: &Terminal, bytes: &[u8], now: Instant) {
@@ -61,7 +70,7 @@ mod tests {
 
     #[test]
     fn sync_flush_expired_bumps_content_generation() {
-        let terminal = Terminal::new_for_test(40, 3, 1);
+        let terminal = test_terminal(40, 3, 1);
         let now = Instant::now();
         hold_in_sync_block(&terminal, b"\x1b[?2026hX", now);
         let before = crate::platform::lock_recover(&terminal.grid).content_generation();
@@ -117,7 +126,7 @@ mod tests {
 
     #[test]
     fn scrolled_up_view_keeps_its_lines_while_output_arrives() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -133,7 +142,7 @@ mod tests {
 
     #[test]
     fn view_at_bottom_follows_output() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         anchor_frame(&mut terminal);
 
@@ -149,7 +158,7 @@ mod tests {
 
     #[test]
     fn scrolled_up_view_keeps_its_lines_while_full_scrollback_evicts() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         terminal.grid = Arc::new(Mutex::new(Term::new(TermConfig {
             cols: 20,
             rows: 4,
@@ -184,7 +193,7 @@ mod tests {
 
     #[test]
     fn shrink_then_grow_while_scrolled_up_keeps_offset() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -202,7 +211,7 @@ mod tests {
 
     #[test]
     fn pending_lines_are_drawn_before_the_next_anchor_step() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -230,7 +239,7 @@ mod tests {
 
     #[test]
     fn unusable_char_h_leaves_scrolled_lines_for_the_next_frame() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -245,7 +254,7 @@ mod tests {
 
     #[test]
     fn alternate_screen_round_trip_keeps_scrolled_up_offset() {
-        let mut terminal = Terminal::new_for_test(20, 4, 1);
+        let mut terminal = test_terminal(20, 4, 1);
         feed_numbered(&terminal, 0, 40);
         scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
         anchor_frame(&mut terminal);
@@ -264,7 +273,7 @@ mod tests {
 
     #[test]
     fn background_tab_buffer_flushed_at_deadline() {
-        let background = Terminal::new_for_test(40, 3, 2);
+        let background = test_terminal(40, 3, 2);
         let now = Instant::now();
         hold_in_sync_block(&background, b"\x1b[?2026hX", now);
         // The 150 ms hold window comes from the synchronized-output spec (5.4).
@@ -282,7 +291,7 @@ mod tests {
 
     #[test]
     fn reply_from_flush_reaches_writer() {
-        let mut terminal = Terminal::new_for_test(40, 3, 7);
+        let mut terminal = test_terminal(40, 3, 7);
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
         terminal.set_reply_sender_for_test(reply_tx);
         let now = Instant::now();
@@ -334,7 +343,7 @@ mod tests {
 
     #[test]
     fn bell_mark_is_set_and_cleared_by_tab_lifecycle() {
-        let mut terminal = Terminal::new_for_test(40, 3, 8);
+        let mut terminal = test_terminal(40, 3, 8);
         assert!(!terminal.bell_pending());
 
         terminal.mark_bell_pending();
@@ -346,7 +355,7 @@ mod tests {
 
     #[test]
     fn ring_bell_is_taken_once_from_pending_events() {
-        let terminal = Terminal::new_for_test(40, 3, 9);
+        let terminal = test_terminal(40, 3, 9);
         terminal.ring_bell_for_test();
 
         assert!(PendingHostEvents::take(&terminal.pending).bell);
@@ -355,8 +364,8 @@ mod tests {
 
     #[test]
     fn earliest_terminal_deadline_picks_minimum() {
-        let active = Terminal::new_for_test(40, 3, 1);
-        let background = Terminal::new_for_test(40, 3, 2);
+        let active = test_terminal(40, 3, 1);
+        let background = test_terminal(40, 3, 2);
         let now = Instant::now();
         hold_in_sync_block(&active, b"\x1b[?2026hX", now + Duration::from_secs(1));
         hold_in_sync_block(&background, b"\x1b[?2026hX", now);
@@ -366,14 +375,14 @@ mod tests {
             Some(now + Duration::from_millis(150))
         );
         assert_eq!(
-            earliest_terminal_deadline(&[Terminal::new_for_test(40, 3, 3)]),
+            earliest_terminal_deadline(&[test_terminal(40, 3, 3)]),
             None
         );
     }
 
     #[test]
     fn sync_deadline_reads_published_value_without_grid_lock() {
-        let terminal = Terminal::new_for_test(40, 3, 4);
+        let terminal = test_terminal(40, 3, 4);
         let now = Instant::now();
         terminal.hold_sync_block_for_test(b"\x1b[?2026hX", now);
         let pending = terminal.pending.clone();
@@ -392,7 +401,7 @@ mod tests {
 
     #[test]
     fn try_flush_expired_yields_to_busy_grid_lock() {
-        let terminal = Terminal::new_for_test(40, 3, 5);
+        let terminal = test_terminal(40, 3, 5);
         let now = Instant::now();
         terminal.hold_sync_block_for_test(b"\x1b[?2026hX", now);
         let late = now + Duration::from_secs(1);
@@ -471,6 +480,7 @@ mod tests {
         let mut terminal = Terminal {
             grid: grid.clone(),
             bridge_screen_lock: Arc::new(Mutex::new(())),
+            pane_id: PaneId::new(1),
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -485,6 +495,12 @@ mod tests {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            dev_claude_cache: None,
+            dev_channel_verified: None,
+            #[cfg(test)]
+            dev_process_group_for_test: None,
+            #[cfg(test)]
+            process_group_leader_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -578,6 +594,7 @@ mod tests {
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
         terminal.resize_pty(120, 40);
         terminal
@@ -612,15 +629,15 @@ mod tests {
 
     #[test]
     fn tabs_get_distinct_tab_tokens() {
-        let first = Terminal::new_for_test(10, 4, 1);
-        let second = Terminal::new_for_test(10, 4, 2);
+        let first = test_terminal(10, 4, 1);
+        let second = test_terminal(10, 4, 2);
         assert_eq!(first.tab_token().len(), 32);
         assert_ne!(first.tab_token(), second.tab_token());
     }
 
     #[test]
     fn screen_tail_text_reads_current_screen_including_alt_screen() {
-        let terminal = Terminal::new_for_test(10, 4, 1);
+        let terminal = test_terminal(10, 4, 1);
         {
             let mut grid = crate::platform::lock_recover(&terminal.grid);
             feed(&mut grid, b"zero\r\none\r\ntwo  \r\nthree");
@@ -674,7 +691,7 @@ mod tests {
     #[test]
     fn ordinary_tab_does_not_auto_confirm_bridge_warning() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_bridge_warning(&terminal, true);
 
         assert!(!terminal.maybe_auto_confirm_bridge(now));
@@ -684,7 +701,7 @@ mod tests {
     #[test]
     fn bridge_tab_auto_confirms_warning_once_through_input_writer() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([9; 16], now));
         feed_bridge_warning(&terminal, true);
 
@@ -696,7 +713,7 @@ mod tests {
     #[test]
     fn bridge_tab_does_not_auto_confirm_without_warning() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([10; 16], now));
         feed_bridge_warning(&terminal, false);
 
@@ -707,7 +724,7 @@ mod tests {
     #[test]
     fn manual_bridge_confirm_works_without_warning_and_failed_writes_remain_pending() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(80, 8, 1);
+        let mut terminal = test_terminal(80, 8, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([11; 16], now));
         feed(
             &mut crate::platform::lock_recover(&terminal.grid),
@@ -719,7 +736,7 @@ mod tests {
         assert!(!terminal.manually_confirm_bridge(now, screen_hash(&screen)));
         assert_eq!(terminal.input_bytes_for_test(), b"\r");
 
-        let mut failed = Terminal::new_for_test(80, 8, 1);
+        let mut failed = test_terminal(80, 8, 1);
         failed.bridge_launch = Some(BridgeLaunchState::new([12; 16], now));
         feed(
             &mut crate::platform::lock_recover(&failed.grid),
@@ -730,7 +747,7 @@ mod tests {
         assert!(!failed.manually_confirm_bridge(now, screen_hash(&screen)));
         assert!(!failed.bridge_launch_state().unwrap().enter_sent);
 
-        let mut auto = Terminal::new_for_test(120, 8, 1);
+        let mut auto = test_terminal(120, 8, 1);
         auto.bridge_launch = Some(BridgeLaunchState::new([13; 16], now));
         feed_bridge_warning(&auto, true);
         auto.test_input = None;
@@ -751,7 +768,7 @@ mod tests {
     #[test]
     fn manual_enter_marks_bridge_state_as_confirmed() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(10, 4, 1);
+        let mut terminal = test_terminal(10, 4, 1);
         terminal.bridge_launch = Some(BridgeLaunchState::new([3; 16], now));
         terminal.write_user_input(b"\r");
         assert!(terminal.bridge_launch_state().unwrap().enter_sent);
@@ -782,7 +799,7 @@ mod tests {
     #[test]
     fn dev_warning_sends_one_enter_per_flagged_claude_generation() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         assert!(observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
         assert_eq!(terminal.input_bytes_for_test(), b"\r");
@@ -818,7 +835,7 @@ mod tests {
         let now = Instant::now();
         // No flagged claude in the foreground group (other program, claude
         // without the flag): nothing is sent and nothing is hidden.
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         assert!(!observe_dev(&mut terminal, now, None));
         assert!(!terminal.dev_warning_frame_hidden(now));
@@ -830,7 +847,7 @@ mod tests {
             "\x1b[2J\x1b[HLoading development channels\r\n❯ 1. I am using this for local development",
             "\x1b[2J\x1b[Hordinary claude prompt",
         ] {
-            let mut terminal = Terminal::new_for_test(120, 8, 1);
+            let mut terminal = test_terminal(120, 8, 1);
             feed_dev_screen(&terminal, screen);
             let mut scratch = String::new();
             assert!(!terminal.observe_dev_channel_warning(now, &mut scratch, |_| {
@@ -840,7 +857,7 @@ mod tests {
         }
 
         // A failed write leaves the warning unconfirmed and visible.
-        let mut failed = Terminal::new_for_test(120, 8, 1);
+        let mut failed = test_terminal(120, 8, 1);
         failed.test_input = None;
         feed_dev_screen(&failed, DEV_WARNING_SCREEN);
         assert!(!observe_dev(&mut failed, now, Some(DEV_CLAUDE)));
@@ -850,7 +867,7 @@ mod tests {
     #[test]
     fn dev_warning_frames_stay_hidden_until_screen_changes_or_limit() {
         let now = Instant::now();
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ claude");
         assert!(!observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
         assert!(!terminal.dev_warning_frame_hidden(now));
@@ -868,7 +885,7 @@ mod tests {
         assert!(!terminal.dev_warning_frame_hidden(now + DEV_WARNING_HIDE_LIMIT));
 
         // The first frame without the warning ends hiding.
-        let mut terminal = Terminal::new_for_test(120, 8, 1);
+        let mut terminal = test_terminal(120, 8, 1);
         feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
         assert!(observe_dev(&mut terminal, now, Some(DEV_CLAUDE)));
         feed_dev_screen(&terminal, "\x1b[2J\x1b[H> ready");
@@ -880,7 +897,7 @@ mod tests {
     #[test]
     fn dev_warning_and_bridge_auto_confirm_send_one_enter_together() {
         let now = Instant::now();
-        let mut generic_first = Terminal::new_for_test(120, 8, 1);
+        let mut generic_first = test_terminal(120, 8, 1);
         generic_first.bridge_launch = Some(BridgeLaunchState::new([21; 16], now));
         feed_dev_screen(&generic_first, DEV_WARNING_SCREEN);
         assert!(observe_dev(&mut generic_first, now, Some(DEV_CLAUDE)));
@@ -888,13 +905,206 @@ mod tests {
         assert!(!generic_first.maybe_auto_confirm_bridge(now));
         assert_eq!(generic_first.input_bytes_for_test(), b"\r");
 
-        let mut bridge_first = Terminal::new_for_test(120, 8, 1);
+        let mut bridge_first = test_terminal(120, 8, 1);
         bridge_first.bridge_launch = Some(BridgeLaunchState::new([22; 16], now));
         feed_dev_screen(&bridge_first, DEV_WARNING_SCREEN);
         assert!(bridge_first.maybe_auto_confirm_bridge(now));
         assert!(!observe_dev(&mut bridge_first, now, Some(DEV_CLAUDE)));
         assert!(bridge_first.dev_warning_frame_hidden(now));
         assert_eq!(bridge_first.input_bytes_for_test(), b"\r");
+    }
+
+    /// Content generation of the terminal's grid.
+    fn dev_generation(terminal: &Terminal) -> u64 {
+        crate::platform::lock_recover(&terminal.grid).content_generation()
+    }
+
+    #[test]
+    fn dev_channel_unknown_group_answer_hides_content_and_keeps_generation_unchecked() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        // A process exists, so an unanswered candidate is "unknown".
+        terminal.set_dev_process_group_for_test(Some(1000));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+
+        // The frame path has no answer for this generation: it hides the
+        // content and must not record the generation as checked, so the next
+        // event pass still asks the process tree.
+        terminal.observe_dev_channel_cached(now, &mut scratch);
+        assert!(terminal.dev_channel_content_hidden(now));
+        assert!(!terminal.dev_channel_generation_verified(generation));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // The following event pass answers for the foreground group and
+        // finishes the check: Enter is written and the generation verified.
+        assert!(terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE)).sent);
+        assert!(terminal.dev_channel_generation_verified(generation));
+        assert!(terminal.dev_warning_frame_hidden(now));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+    }
+
+    #[test]
+    fn ordinary_output_does_not_walk_the_process_tree() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ ordinary output without a warning");
+        let lookups = std::cell::Cell::new(0);
+        let mut scratch = String::new();
+
+        let pass = terminal.observe_dev_channel(now, &mut scratch, true, |_| {
+            lookups.set(lookups.get() + 1);
+            None
+        });
+
+        // No candidate: the process tree and tcgetpgrp are never touched, and
+        // the content is verified on its own.
+        assert_eq!(lookups.get(), 0);
+        assert!(!pass.sent);
+        assert!(terminal.dev_channel_content_verified());
+    }
+
+    #[test]
+    fn dev_channel_change_between_frame_decision_and_render_hides_content() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ ready");
+        let mut scratch = String::new();
+        terminal.observe_dev_channel_cached(now, &mut scratch);
+        let decided = dev_generation(&terminal);
+        assert!(terminal.dev_channel_generation_verified(decided));
+
+        // Output lands after the frame decided: the renderer's final check
+        // under the grid lock, done on the generation it locked, must reject it.
+        feed_dev_screen(&terminal, "more output");
+        let rendered = dev_generation(&terminal);
+        assert_ne!(rendered, decided);
+        assert!(!terminal.dev_channel_generation_verified(rendered));
+    }
+
+    #[test]
+    fn dev_channel_answer_for_stale_generation_is_not_used() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        // A process exists, so the answer comes from the injected lookup.
+        terminal.set_dev_process_group_for_test(Some(1000));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let mut scratch = String::new();
+        assert!(terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE)).sent);
+        let answered = dev_generation(&terminal);
+        assert!(terminal.dev_channel_generation_verified(answered));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // A candidate of a newer generation: the answer keyed to the old
+        // generation is "unknown" here, not a "no claude" for the new one.
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let newer = dev_generation(&terminal);
+        assert_ne!(newer, answered);
+        terminal.observe_dev_channel_cached(now, &mut scratch);
+        assert!(!terminal.dev_channel_generation_verified(newer));
+        assert!(terminal.dev_channel_content_hidden(now));
+    }
+
+    #[test]
+    fn dev_channel_group_change_without_content_change_unverifies() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        terminal.set_dev_process_group_for_test(Some(1000));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+
+        // The event pass answers for the foreground group 1000: Enter is
+        // written and the generation is verified for that group.
+        assert!(
+            terminal
+                .observe_dev_channel(now, &mut scratch, true, |pgrp| {
+                    assert_eq!(pgrp, Some(1000));
+                    Some(DEV_CLAUDE)
+                })
+                .sent
+        );
+        assert!(terminal.dev_channel_generation_verified(generation));
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // The foreground group changes, the content does not. The cached
+        // answer is for the old group, and the frame path may not look up:
+        // the old verification is withdrawn and the content is hidden.
+        let late = now + DEV_WARNING_HIDE_LIMIT;
+        terminal.set_dev_process_group_for_test(Some(2000));
+        terminal.observe_dev_channel_cached(late, &mut scratch);
+        assert!(!terminal.dev_channel_generation_verified(generation));
+        assert!(!terminal.dev_channel_content_verified());
+        assert!(terminal.dev_channel_content_hidden(late));
+
+        // The next event pass answers for the new group and verifies again.
+        terminal.observe_dev_channel(late, &mut scratch, true, |pgrp| {
+            assert_eq!(pgrp, Some(2000));
+            Some(DEV_CLAUDE)
+        });
+        assert!(terminal.dev_channel_generation_verified(generation));
+        assert!(!terminal.dev_channel_content_hidden(late));
+    }
+
+    #[test]
+    fn dev_channel_group_read_failure_with_a_process_is_unknown() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        // A process exists but its foreground group cannot be read.
+        terminal.set_dev_process_group_for_test(None);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+        let mut lookups = 0;
+        terminal.observe_dev_channel(now, &mut scratch, true, |_| {
+            lookups += 1;
+            Some(DEV_CLAUDE)
+        });
+        // No lookup, no Enter, and the content stays unverified and hidden.
+        assert_eq!(lookups, 0);
+        assert!(!terminal.dev_channel_generation_verified(generation));
+        assert!(terminal.dev_channel_content_hidden(now));
+        assert!(terminal.input_bytes_for_test().is_empty());
+
+        // Without a process the same candidate is a verified "no flagged
+        // claude": no lookup, no Enter, and the content is shown.
+        let mut headless = test_terminal(120, 8, 1);
+        feed_dev_screen(&headless, DEV_WARNING_SCREEN);
+        let headless_generation = dev_generation(&headless);
+        let mut headless_scratch = String::new();
+        let mut headless_lookups = 0;
+        headless.observe_dev_channel(now, &mut headless_scratch, true, |_| {
+            headless_lookups += 1;
+            Some(DEV_CLAUDE)
+        });
+        assert_eq!(headless_lookups, 0);
+        assert!(headless.dev_channel_generation_verified(headless_generation));
+        assert!(!headless.dev_channel_content_hidden(now));
+        assert!(headless.input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn dev_channel_banner_applies_when_answer_turns_positive_for_same_generation() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(200, 8, 1);
+        terminal.set_dev_process_group_for_test(Some(1000));
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
+        feed_dev_screen(&terminal, &screen);
+        let generation = dev_generation(&terminal);
+        let mut scratch = String::new();
+
+        // The first answer for this generation is negative: the banner stays.
+        terminal.observe_dev_channel(now, &mut scratch, true, |_| None);
+        assert_banner_rows(&terminal, rows, false);
+        assert_eq!(dev_generation(&terminal), generation);
+
+        // The group changes without a content change; the same generation now
+        // gets a positive answer, and the hiding must be applied.
+        terminal.set_dev_process_group_for_test(Some(2000));
+        terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE));
+        assert_banner_rows(&terminal, rows, true);
+        assert_eq!(dev_generation(&terminal), generation);
     }
 
     /// Word wrap like Claude Code's notice box: rows of at most `width`
@@ -962,7 +1172,7 @@ mod tests {
 
     #[test]
     fn dev_banner_rows_are_hidden_for_flagged_claude_only() {
-        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let mut terminal = test_terminal(200, 8, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
         assert_eq!(rows, 2);
         feed_dev_screen(&terminal, &screen);
@@ -982,7 +1192,7 @@ mod tests {
         assert_eq!(text[2], format!("\u{258e} {}", DEV_CHANNEL_BANNER_LINES[1]));
 
         // Another process in the tab: the same text stays visible.
-        let mut other = Terminal::new_for_test(200, 8, 1);
+        let mut other = test_terminal(200, 8, 1);
         feed_dev_screen(&other, &screen);
         other.observe_dev_channel_banner(|_| None);
         assert_banner_rows(&other, rows, false);
@@ -1004,7 +1214,7 @@ mod tests {
             // No quote bar.
             ([first, second], Some(format!("\x1b[2J\x1b[Habove\r\n  {first}\r\n  {second}"))),
         ] {
-            let mut terminal = Terminal::new_for_test(200, 8, 1);
+            let mut terminal = test_terminal(200, 8, 1);
             let screen = screen.unwrap_or_else(|| banner_screen(lines, 190).0);
             feed_dev_screen(&terminal, &screen);
             terminal.observe_dev_channel_banner(|_| {
@@ -1018,7 +1228,7 @@ mod tests {
 
     #[test]
     fn dev_banner_wrapped_on_narrow_width_is_hidden() {
-        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let mut terminal = test_terminal(40, 12, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
         // The first line wraps over several rows, the flag word is split.
         assert!(rows >= 6, "{screen:?}");
@@ -1030,7 +1240,7 @@ mod tests {
 
     #[test]
     fn dev_banner_in_chat_pane_is_hidden_without_hiding_side_panel() {
-        let mut terminal = Terminal::new_for_test(143, 8, 1);
+        let mut terminal = test_terminal(143, 8, 1);
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let split = 77;
         let first_head: String = first.chars().take(split).collect();
@@ -1066,7 +1276,7 @@ mod tests {
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
         assert!(head.ends_with("without "));
         for bar in [DEV_CHANNEL_BANNER_BAR, DEV_CHANNEL_PANE_DIVIDER] {
-            let mut terminal = Terminal::new_for_test(160, 8, 1);
+            let mut terminal = test_terminal(160, 8, 1);
             let screen = format!(
                 "\x1b[2J\x1b[H\x1b[2m{bar}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
                  \x1b[2;1H\x1b[2m{bar}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1106,7 +1316,7 @@ mod tests {
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
         assert!(head.ends_with("without "));
         let second = DEV_CHANNEL_BANNER_LINES[1];
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1142,7 +1352,7 @@ mod tests {
     fn dev_banner_card_with_quote_bar_and_bare_second_line_is_not_hidden() {
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1162,7 +1372,7 @@ mod tests {
     /// above it: it is not a banner.
     #[test]
     fn dev_banner_bare_second_line_beside_side_panel_alone_is_not_hidden() {
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H{}\x1b[110G│ panel\x1b[2;1H> prompt\x1b[110G│ more",
             DEV_CHANNEL_BANNER_LINES[1]
@@ -1182,7 +1392,7 @@ mod tests {
     fn dev_banner_quote_bar_first_line_with_bare_second_line_is_not_hidden() {
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_BANNER_BAR}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1204,7 +1414,7 @@ mod tests {
     fn dev_banner_first_line_followed_by_longer_text_is_not_hidden() {
         let first = DEV_CHANNEL_BANNER_LINES[0];
         let (head, tail) = first.split_at(first.find("--dangerously").expect("flag in banner"));
-        let mut terminal = Terminal::new_for_test(160, 8, 1);
+        let mut terminal = test_terminal(160, 8, 1);
         let screen = format!(
             "\x1b[2J\x1b[H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{head}\x1b[110G│ Ты: hello\
              \x1b[2;1H\x1b[2m{DEV_CHANNEL_PANE_DIVIDER}\x1b[3G\x1b[22m{tail}\x1b[110G│ Claude: hi\
@@ -1240,7 +1450,7 @@ mod tests {
                 "\x1b[2J\x1b[Hmy output\x1b[2;1H▎ {second}\x1b[110G│ panel\x1b[3;1H│ {second}"
             ),
         ] {
-            let mut terminal = Terminal::new_for_test(200, 8, 1);
+            let mut terminal = test_terminal(200, 8, 1);
             feed_dev_screen(&terminal, &screen);
             terminal.observe_dev_channel_banner(|_| {
                 panic!("process lookup must wait for the exact banner")
@@ -1258,7 +1468,7 @@ mod tests {
             lookups.set(lookups.get() + 1);
             Some(DEV_CLAUDE)
         };
-        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let mut terminal = test_terminal(200, 8, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(find);
@@ -1336,7 +1546,7 @@ mod tests {
 
     #[test]
     fn dev_banner_stays_hidden_while_scrolling_into_scrollback() {
-        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let mut terminal = test_terminal(40, 12, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1354,7 +1564,7 @@ mod tests {
 
     #[test]
     fn dev_banner_pushed_into_scrollback_before_a_scan_is_hidden() {
-        let mut terminal = Terminal::new_for_test(40, 12, 1);
+        let mut terminal = test_terminal(40, 12, 1);
         let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 38);
         feed_dev_screen(&terminal, &format!("{screen}{}", "\r\nbelow".repeat(20)));
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1365,7 +1575,7 @@ mod tests {
     fn dev_banner_soft_wrapped_by_the_terminal_or_reflowed_is_hidden() {
         // Notice rows wider than the terminal: autowrap continues each one
         // on rows without the bar.
-        let mut terminal = Terminal::new_for_test(60, 12, 1);
+        let mut terminal = test_terminal(60, 12, 1);
         let (screen, _) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1373,7 +1583,7 @@ mod tests {
 
         // Hidden on a wide screen, scrolled half into the scrollback, then
         // reflowed there and on the screen by resizes.
-        let mut terminal = Terminal::new_for_test(200, 8, 1);
+        let mut terminal = test_terminal(200, 8, 1);
         feed_dev_screen(&terminal, &screen);
         terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
         assert_only_banner_hidden(&terminal, Some(2));
@@ -1428,7 +1638,7 @@ mod tests {
     #[test]
     fn dev_banner_scrolled_out_at_the_top_of_claude_fullscreen_is_hidden() {
         for (cols, notice) in CLAUDE_NOTICE {
-            let mut terminal = Terminal::new_for_test(cols, 30, 1);
+            let mut terminal = test_terminal(cols, 30, 1);
             let notice_rows = notice.join("\r\x1b[1B");
             feed_dev_screen(&terminal, &format!("{CLAUDE_HEADER}{notice_rows}\r\x1b[100C"));
             terminal.observe_dev_channel_banner(|_| Some(DEV_CLAUDE));
@@ -1479,7 +1689,7 @@ mod tests {
                 7,
             ))
         };
-        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        let mut terminal = test_terminal(8, 2, 1);
         assert!(terminal.set_hovered_link(link("https://example.com/x")));
         assert!(!terminal.set_hovered_link(link("https://example.com/x")));
         assert!(terminal.set_hovered_link(link("https://example.com/y")));
@@ -1528,6 +1738,7 @@ mod tests {
             1,
             launch,
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1672,6 +1883,16 @@ struct DevWarningState {
     enter_at: Option<Instant>,
     /// The `claude` process generation that got the automatic Enter.
     confirmed: Option<crate::tab_input::ProcGen>,
+}
+
+/// Outcome of one development-channels pass (`Terminal::observe_dev_channel`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DevChannelPass {
+    /// Enter was written for the warning.
+    pub(crate) sent: bool,
+    /// The verified generation changed: a frame that hid the previous one
+    /// needs a redraw.
+    pub(crate) reverified: bool,
 }
 
 /// Text of the two Claude Code notice lines shown for the cc-tg development
@@ -1880,12 +2101,19 @@ impl<'a> BannerRows<'a> {
 struct DevBannerState {
     /// `Term::content_generation` of the last applied scan.
     scanned_generation: Option<u64>,
+    /// The process answer the last applied scan used: whether the foreground
+    /// group holds a flagged `claude`. A changed answer for the same
+    /// generation re-applies the hiding (see `apply_dev_channel_banner`).
+    scanned_answer: Option<bool>,
     /// `Term::scrollback_pushed` and `Term::cols` at the last applied
     /// scan.
     scanned_pushed: u64,
     scanned_cols: usize,
     /// Some cell of this tab was hidden; until then no clearing pass runs.
     hid_any: bool,
+    /// Of the last scan: whether some block still has a drawn cell, i.e. the
+    /// content needs the process answer before it can be hidden.
+    drawn: bool,
     /// Foreground process group and whether it holds a flagged `claude`,
     /// kept while a banner block stays in the scanned rows.
     owner: Option<(Option<u32>, bool)>,
@@ -2001,6 +2229,8 @@ pub(crate) fn screen_hash(screen: &str) -> [u8; 32] {
 pub struct Terminal {
     pub grid: Arc<Mutex<Term>>,
     bridge_screen_lock: Arc<Mutex<()>>,
+    /// Stable identity of this terminal's pane in its tab's split tree.
+    pane_id: PaneId,
     process: Option<crate::terminal_process::TerminalProcess>,
     hold: bool,
     pub scroll_y: crate::scroll::ScrollState,
@@ -2017,6 +2247,29 @@ pub struct Terminal {
     bridge_launch: Option<BridgeLaunchState>,
     dev_warning: DevWarningState,
     dev_banner: DevBannerState,
+    /// `(content generation, PTY foreground group, flagged claude in it)` of
+    /// the last development-channels answer. A missing entry, or one for an
+    /// earlier generation or another foreground group, is "unknown", never
+    /// "no"; only the event path writes it, the frame path reads it.
+    dev_claude_cache: Option<(u64, Option<u32>, Option<crate::tab_input::ProcGen>)>,
+    /// `(Term::content_generation, foreground group)` whose
+    /// development-channels check finished: content may be drawn for exactly
+    /// this pair. The group is `None` when no group answer was needed (no
+    /// candidate) or no process exists. A generation with a candidate and a
+    /// process is recorded only after a verified answer for its group; an
+    /// unknown answer clears the whole entry.
+    dev_channel_verified: Option<(u64, Option<u32>)>,
+    /// Test override of the process and its foreground group for the
+    /// development-channels check: `Some(group)` makes the terminal look like
+    /// it has a process, and a `None` group makes that process's group
+    /// unreadable. Not set means the real `process`/`tcgetpgrp` answer.
+    #[cfg(test)]
+    dev_process_group_for_test: Option<Option<u32>>,
+    /// Test override of the PTY foreground process group: when set, the
+    /// terminal answers `process_group_leader` with this group even though it
+    /// has no process. Not set means the real `process`/`tcgetpgrp` answer.
+    #[cfg(test)]
+    process_group_leader_for_test: Option<u32>,
     /// Working directory from the latest OSC 7 report that passed
     /// `accept_osc7_cwd`; a new tab inherits it.
     pub(crate) osc7_cwd: Option<PathBuf>,
@@ -2126,7 +2379,12 @@ fn try_lock_recover<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
 
 impl Terminal {
     #[cfg(test)]
-    pub(crate) fn new_for_test(cols: usize, rows: usize, display_number: u64) -> Self {
+    pub(crate) fn new_for_test(
+        cols: usize,
+        rows: usize,
+        display_number: u64,
+        pane_id: PaneId,
+    ) -> Self {
         let title_cache = Arc::new(Mutex::new(
             crate::terminal_process::TerminalTitleState::new_numbered(
                 "terminal".to_string(),
@@ -2140,6 +2398,7 @@ impl Terminal {
                 crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
             ))),
             bridge_screen_lock: Arc::new(Mutex::new(())),
+            pane_id,
             process: None,
             hold: false,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -2154,6 +2413,12 @@ impl Terminal {
             bridge_launch: None,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            dev_claude_cache: None,
+            dev_channel_verified: None,
+            #[cfg(test)]
+            dev_process_group_for_test: None,
+            #[cfg(test)]
+            process_group_leader_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2172,8 +2437,9 @@ impl Terminal {
         rows: usize,
         display_number: u64,
         bridge_launch_id: [u8; 16],
+        pane_id: PaneId,
     ) -> Self {
-        let mut terminal = Self::new_for_test(cols, rows, display_number);
+        let mut terminal = Self::new_for_test(cols, rows, display_number, pane_id);
         terminal.bridge_launch = Some(BridgeLaunchState::new(bridge_launch_id, Instant::now()));
         terminal
     }
@@ -2185,8 +2451,9 @@ impl Terminal {
         display_number: u64,
         launch: TerminalLaunchSpec,
         palette: TermPalette,
+        pane_id: PaneId,
     ) -> Self {
-        Self::spawn_sized(wake, display_number, launch, palette, DEFAULT_SPAWN_GRID)
+        Self::spawn_sized(wake, display_number, launch, palette, DEFAULT_SPAWN_GRID, pane_id)
     }
 
     /// Starts a tab whose grid and PTY open at `(cols, rows)`; the first frame
@@ -2197,6 +2464,7 @@ impl Terminal {
         launch: TerminalLaunchSpec,
         palette: TermPalette,
         (cols, rows): (u16, u16),
+        pane_id: PaneId,
     ) -> Self {
         let hold = launch.hold;
         let bridge_launch = launch
@@ -2244,6 +2512,7 @@ impl Terminal {
         Self {
             grid,
             bridge_screen_lock,
+            pane_id,
             process,
             hold,
             scroll_y: crate::scroll::ScrollState::new(7.0),
@@ -2258,6 +2527,12 @@ impl Terminal {
             bridge_launch,
             dev_warning: DevWarningState::default(),
             dev_banner: DevBannerState::default(),
+            dev_claude_cache: None,
+            dev_channel_verified: None,
+            #[cfg(test)]
+            dev_process_group_for_test: None,
+            #[cfg(test)]
+            process_group_leader_for_test: None,
             osc7_cwd: None,
             hovered_link: None,
             bell_pending: false,
@@ -2412,34 +2687,37 @@ impl Terminal {
     }
 
     /// Scans the screen for the development-channels warning when its content
-    /// changed. On a matching screen with no Enter sent for it yet, writes one
-    /// Enter if `find_claude` (given the PTY foreground process group) finds a
-    /// `claude --dangerously-load-development-channels` generation that has
-    /// not been confirmed in this tab before. `scratch` is a reusable buffer.
-    /// Returns whether Enter was written.
-    pub(crate) fn observe_dev_channel_warning(
-        &mut self,
-        now: Instant,
-        scratch: &mut String,
-        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
-    ) -> bool {
-        {
-            let grid = crate::platform::lock_recover(&self.grid);
-            if self.dev_warning.scanned_generation == Some(grid.content_generation()) {
-                return false;
-            }
-            self.dev_warning.scanned_generation = Some(grid.content_generation());
-            write_compact_screen(&grid, scratch);
+    /// changed: the cheap half of a check, with no `/proc` and no
+    /// `tcgetpgrp`. Returns the scanned generation and whether the warning is
+    /// on screen.
+    fn scan_dev_channel_warning(&mut self, scratch: &mut String) -> (u64, bool) {
+        let grid = crate::platform::lock_recover(&self.grid);
+        let generation = grid.content_generation();
+        if self.dev_warning.scanned_generation == Some(generation) {
+            return (generation, self.dev_warning.visible);
         }
+        write_compact_screen(&grid, scratch);
+        drop(grid);
+        self.dev_warning.scanned_generation = Some(generation);
         self.dev_warning.visible = compact_bridge_warning_visible(scratch);
         if !self.dev_warning.visible {
             self.dev_warning.enter_at = None;
-            return false;
         }
+        (generation, self.dev_warning.visible)
+    }
+
+    /// Writes the automatic Enter for the warning on screen when `claude` is
+    /// the flagged process generation of the foreground group (`None` is a
+    /// verified "no flagged claude"). Returns whether Enter was written.
+    fn enter_dev_warning(
+        &mut self,
+        now: Instant,
+        claude: Option<crate::tab_input::ProcGen>,
+    ) -> bool {
         if self.dev_warning.enter_at.is_some() {
             return false;
         }
-        let Some(claude) = find_claude(self.process_group_leader()) else {
+        let Some(claude) = claude else {
             return false;
         };
         if self.dev_warning.confirmed == Some(claude) || self.write_input(b"\r").is_err() {
@@ -2451,6 +2729,29 @@ impl Terminal {
             state.enter_sent = true;
         }
         true
+    }
+
+    /// `observe_dev_channel_warning` with an injected lookup, for tests: scans
+    /// the screen and, on a matching screen with no Enter sent for it yet,
+    /// writes one Enter if `find_claude` (given the PTY foreground process
+    /// group) finds a `claude --dangerously-load-development-channels`
+    /// generation not confirmed in this tab before. `scratch` is a reusable
+    /// buffer. The app uses `observe_dev_channel_event`/`_cached` instead.
+    #[cfg(test)]
+    pub(crate) fn observe_dev_channel_warning(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
+    ) -> bool {
+        let (_generation, visible) = self.scan_dev_channel_warning(scratch);
+        if !visible || self.dev_warning.enter_at.is_some() {
+            return false;
+        }
+        let Some(claude) = find_claude(self.dev_process_group_leader()) else {
+            return false;
+        };
+        self.enter_dev_warning(now, Some(claude))
     }
 
     /// End of the frame hiding for this tab: `Some` while the last scanned
@@ -2470,48 +2771,45 @@ impl Terminal {
             .is_some_and(|until| now < until)
     }
 
-    /// When the grid content changed, hides the cells of the exact
-    /// `DEV_CHANNEL_BANNER_LINES` rows (on the screen and in the scrollback,
-    /// see `DevBannerState::scan`) if `find_claude` (given the PTY foreground
-    /// process group) finds a flagged `claude`; the answer is cached per group
-    /// while a banner stays in the scanned rows, and it is asked only for a
-    /// banner with drawn cells. Only the cell hidden flag changes: text,
-    /// cursor, scrollback and selection stay as the program wrote them.
-    pub(crate) fn observe_dev_channel_banner(
-        &mut self,
-        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
-    ) {
-        let generation = {
-            let mut grid = crate::platform::lock_recover(&self.grid);
-            let generation = grid.content_generation();
-            if self.dev_banner.scanned_generation == Some(generation) {
-                return;
-            }
-            let (any, drawn) = self.dev_banner.scan(&grid);
-            if !any {
-                self.dev_banner.owner = None;
-            }
-            if !drawn {
-                if self.dev_banner.hid_any {
-                    self.dev_banner.apply(&mut grid, false);
-                }
-                self.dev_banner.mark_scanned(&grid);
-                return;
-            }
-            generation
-        };
-        // The process lookup runs without the grid lock.
-        let pgrp = self.process_group_leader();
-        let flagged = match self.dev_banner.owner {
-            Some((cached, flagged)) if cached == pgrp => flagged,
-            _ => {
-                let flagged = find_claude(pgrp).is_some();
-                self.dev_banner.owner = Some((pgrp, flagged));
-                flagged
-            }
-        };
+    /// Finds the banner blocks of the current content and whether one still
+    /// has a drawn cell, without `/proc` and without `tcgetpgrp`. With no drawn
+    /// cell the hidden flags are cleared and the scan is final. Returns the
+    /// scanned generation and the drawn flag (the process-lookup candidate).
+    fn scan_dev_channel_banner(&mut self) -> (u64, bool) {
         let mut grid = crate::platform::lock_recover(&self.grid);
-        // New output arrived meanwhile: the next call scans it.
+        let generation = grid.content_generation();
+        if self.dev_banner.scanned_generation == Some(generation) {
+            return (generation, self.dev_banner.drawn);
+        }
+        let (any, drawn) = self.dev_banner.scan(&grid);
+        if !any {
+            self.dev_banner.owner = None;
+        }
+        self.dev_banner.drawn = drawn;
+        if !drawn {
+            if self.dev_banner.hid_any {
+                self.dev_banner.apply(&mut grid, false);
+            }
+            self.dev_banner.mark_scanned(&grid);
+            self.dev_banner.scanned_answer = Some(false);
+        }
+        (generation, drawn)
+    }
+
+    /// Applies the banner hiding of the last scan of `generation` while it
+    /// still holds; a changed process answer for the same generation applies
+    /// again, so a positive answer after a negative one hides the banner. New
+    /// output is left to the next scan. Only the cell hidden flag changes:
+    /// text, cursor, scrollback and selection stay as the program wrote them.
+    fn apply_dev_channel_banner(&mut self, generation: u64, flagged: bool) {
+        if self.dev_banner.scanned_generation == Some(generation) {
+            // Nothing drawn is no banner candidate; otherwise only the same
+            // answer as the last applied scan needs no work.
+            if !self.dev_banner.drawn || self.dev_banner.scanned_answer == Some(flagged) {
+                return;
+            }
+        }
+        let mut grid = crate::platform::lock_recover(&self.grid);
         if grid.content_generation() != generation {
             return;
         }
@@ -2520,7 +2818,164 @@ impl Terminal {
             self.dev_banner.apply(&mut grid, flagged);
             self.dev_banner.hid_any |= flagged;
         }
+        if flagged {
+            self.dev_banner.drawn = false;
+        }
         self.dev_banner.mark_scanned(&grid);
+        self.dev_banner.scanned_answer = Some(flagged);
+    }
+
+    /// `observe_dev_channel_banner` with an injected lookup, for tests: hides
+    /// the cells of the exact `DEV_CHANNEL_BANNER_LINES` rows (on the screen
+    /// and in the scrollback, see `DevBannerState::scan`) if `find_claude`
+    /// (given the PTY foreground process group) finds a flagged `claude`; the
+    /// answer is cached per group while a banner stays in the scanned rows, and
+    /// it is asked only for a banner with drawn cells. The app uses
+    /// `observe_dev_channel_event`/`_cached` instead.
+    #[cfg(test)]
+    pub(crate) fn observe_dev_channel_banner(
+        &mut self,
+        find_claude: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
+    ) {
+        let (generation, drawn) = self.scan_dev_channel_banner();
+        if !drawn {
+            return;
+        }
+        let pgrp = self.dev_process_group_leader();
+        let flagged = match self.dev_banner.owner {
+            Some((cached, flagged)) if cached == pgrp => flagged,
+            _ => {
+                let flagged = find_claude(pgrp).is_some();
+                self.dev_banner.owner = Some((pgrp, flagged));
+                flagged
+            }
+        };
+        self.apply_dev_channel_banner(generation, flagged);
+    }
+
+    /// One development-channels pass: scans the current content, answers the
+    /// warning and banner hiding from `lookup`, and records which generation
+    /// and foreground group may be shown. `lookup` walks `/proc` only for a
+    /// generation that has a candidate (warning screen or drawn banner), a
+    /// process, a readable foreground group, and no cached answer for that
+    /// group; a generation without a candidate needs neither `/proc` nor
+    /// `tcgetpgrp`, so ordinary output stays cheap. Returns whether Enter was
+    /// written.
+    ///
+    /// "Unknown" is not "no": with `allow_lookup` off (the frame path), or a
+    /// process whose group cannot be read, the generation stays unverified
+    /// (any earlier verification is withdrawn), so the frame hides its content
+    /// and the next event pass retries the lookup. A terminal without a
+    /// process is a verified "no flagged claude".
+    fn observe_dev_channel(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+        allow_lookup: bool,
+        lookup: impl FnOnce(Option<u32>) -> Option<crate::tab_input::ProcGen>,
+    ) -> DevChannelPass {
+        let mut pass = DevChannelPass::default();
+        let previous = self.dev_channel_verified;
+        let (warning_generation, warning_visible) = self.scan_dev_channel_warning(scratch);
+        let (banner_generation, banner_drawn) = self.scan_dev_channel_banner();
+        // Output can land between the two scans: the verification describes
+        // neither content, so drop it and leave this pass to the next one,
+        // which scans the newer generation.
+        if warning_generation != banner_generation {
+            self.dev_channel_verified = None;
+            return pass;
+        }
+        let generation = warning_generation;
+        let candidate = warning_visible || banner_drawn;
+        // No candidate: the generation is verified on its own. Without a
+        // process: a verified "no flagged claude" (headless tabs).
+        let (verified_group, answer) = if !candidate || !self.dev_has_process() {
+            (None, None)
+        } else {
+            let Some(pgrp) = self.dev_process_group_leader() else {
+                // A process whose foreground group cannot be read gives no
+                // answer; it is not a verified "no".
+                self.dev_channel_verified = None;
+                return pass;
+            };
+            let answer = match self.dev_claude_cache {
+                Some((cached_generation, cached_pgrp, found))
+                    if cached_generation == generation && cached_pgrp == Some(pgrp) =>
+                {
+                    Some(found)
+                }
+                _ if allow_lookup => {
+                    let found = lookup(Some(pgrp));
+                    self.dev_claude_cache = Some((generation, Some(pgrp), found));
+                    Some(found)
+                }
+                _ => None,
+            };
+            let Some(answer) = answer else {
+                // A frame-path cache miss: nothing may be drawn for this
+                // generation until an event pass answers it.
+                self.dev_channel_verified = None;
+                return pass;
+            };
+            (Some(pgrp), answer)
+        };
+        pass.sent = warning_visible && self.enter_dev_warning(now, answer);
+        self.apply_dev_channel_banner(generation, answer.is_some());
+        self.dev_channel_verified = Some((generation, verified_group));
+        pass.reverified = self.dev_channel_verified != previous;
+        pass
+    }
+
+    /// Event-pass entry point: may walk `/proc` for a candidate generation
+    /// without a cached answer for its foreground group.
+    pub(crate) fn observe_dev_channel_event(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+    ) -> DevChannelPass {
+        self.observe_dev_channel(now, scratch, true, |pgrp| {
+            pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
+        })
+    }
+
+    /// Frame-path entry point: never walks `/proc`, so an unknown answer leaves
+    /// the generation unverified and the content hidden.
+    pub(crate) fn observe_dev_channel_cached(
+        &mut self,
+        now: Instant,
+        scratch: &mut String,
+    ) -> DevChannelPass {
+        self.observe_dev_channel(now, scratch, false, |_| None)
+    }
+
+    /// Whether the development-channels check finished for `generation` and
+    /// the foreground group it answered for: content of any other generation
+    /// must not be drawn, and a different group has no answer yet. A
+    /// verification without a group (no candidate, or no process) holds for
+    /// the generation alone.
+    pub(crate) fn dev_channel_generation_verified(&self, generation: u64) -> bool {
+        match self.dev_channel_verified {
+            Some((verified, Some(pgrp))) => {
+                verified == generation && self.dev_process_group_leader() == Some(pgrp)
+            }
+            Some((verified, None)) => verified == generation,
+            None => false,
+        }
+    }
+
+    /// Whether the grid's current content may be drawn (see
+    /// `dev_channel_generation_verified`). Read under the grid lock, since
+    /// output can land after the event pass that verified it.
+    pub(crate) fn dev_channel_content_verified(&self) -> bool {
+        let generation = crate::platform::lock_recover(&self.grid).content_generation();
+        self.dev_channel_generation_verified(generation)
+    }
+
+    /// Whether the content must stay hidden: the warning Enter hiding is
+    /// active, or the content generation has no verified development-channels
+    /// answer.
+    pub(crate) fn dev_channel_content_hidden(&self, now: Instant) -> bool {
+        self.dev_warning_frame_hidden(now) || !self.dev_channel_content_verified()
     }
 
     /// Keeps a viewport scrolled up into the scrollback on the same lines:
@@ -2599,6 +3054,11 @@ impl Terminal {
         self.tab_token.as_str()
     }
 
+    /// Stable identity of this terminal's pane in its tab's split tree.
+    pub(crate) fn pane_id(&self) -> PaneId {
+        self.pane_id
+    }
+
     /// Writes keyboard/text/IME/paste input. Marks the time of user input and,
     /// while `begin_input_hold` is active, buffers the bytes in arrival order.
     pub(crate) fn write_user_input(&mut self, bytes: &[u8]) {
@@ -2661,7 +3121,47 @@ impl Terminal {
     }
 
     pub(crate) fn process_group_leader(&self) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(leader) = self.process_group_leader_for_test {
+            return Some(leader);
+        }
         self.process.as_ref()?.process_group_leader()
+    }
+
+    /// Makes a process-less test terminal answer `process_group_leader` with
+    /// `leader`; `None` restores the real process answer.
+    #[cfg(test)]
+    pub(crate) fn set_process_group_leader_for_test(&mut self, leader: Option<u32>) {
+        self.process_group_leader_for_test = leader;
+    }
+
+    /// Foreground group of the development-channels check: the test override
+    /// when set, otherwise `process_group_leader`. `None` alone cannot tell
+    /// "no process" from "unreadable group"; `dev_has_process` does.
+    fn dev_process_group_leader(&self) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(group) = self.dev_process_group_for_test {
+            return group;
+        }
+        self.process_group_leader()
+    }
+
+    /// Whether a process exists for the development-channels check; a test
+    /// override counts as one.
+    fn dev_has_process(&self) -> bool {
+        #[cfg(test)]
+        if self.dev_process_group_for_test.is_some() {
+            return true;
+        }
+        self.has_process()
+    }
+
+    /// Makes the terminal look like it has a process whose foreground group
+    /// is `group`; a `None` group is a process whose group cannot be read
+    /// (`tcgetpgrp` failure).
+    #[cfg(test)]
+    pub(crate) fn set_dev_process_group_for_test(&mut self, group: Option<u32>) {
+        self.dev_process_group_for_test = Some(group);
     }
 
     /// Foreground job name when a job other than the shell is running in this tab.
@@ -2689,6 +3189,16 @@ impl Terminal {
 
     pub fn write_display_title(&self, output: &mut String) {
         crate::platform::lock_recover(&self.title_cache).write_resolved(output);
+    }
+
+    /// The resolved title without this terminal's display number suffix.
+    pub(crate) fn write_title(&self, output: &mut String) {
+        crate::platform::lock_recover(&self.title_cache).write_title(output);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_programmed_title_for_test(&self, text: String) {
+        crate::platform::lock_recover(&self.title_cache).set_programmed(text);
     }
 
     /// Whether this tab's foreground process group leader is a `claude` process.
@@ -2753,7 +3263,6 @@ impl Terminal {
         if finished { self.process.take() } else { None }
     }
 
-    #[cfg(test)]
     pub(crate) fn has_process(&self) -> bool {
         self.process.is_some()
     }

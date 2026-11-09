@@ -140,6 +140,37 @@ impl Default for TerminalInteraction {
     }
 }
 
+/// What one pointer-button event did with its terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MouseInputOutcome {
+    /// The event did not target this terminal.
+    Ignored,
+    /// An interaction consumed the event without forwarding it to the terminal
+    /// application: a pointer capture, a selection, a protocol control or a
+    /// link.
+    Consumed,
+    /// A mouse-reporting sequence was written to the terminal application.
+    Delivered,
+    /// A press that never reached the terminal application: a protocol area of
+    /// the pane withheld it, or the terminal took no mouse input at all. Its
+    /// release must not reach the application alone.
+    Rejected,
+}
+
+impl MouseInputOutcome {
+    pub(crate) fn handled(self) -> bool {
+        matches!(self, Self::Consumed | Self::Delivered)
+    }
+
+    pub(crate) fn delivered(self) -> bool {
+        self == Self::Delivered
+    }
+
+    pub(crate) fn rejected(self) -> bool {
+        self == Self::Rejected
+    }
+}
+
 impl TerminalInteraction {
     pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {
         // No host modifier means no modifier key is down, so a release that never
@@ -263,6 +294,24 @@ impl TerminalInteraction {
         self.cancel_pointer_interaction_state(&mut terminal.scroll_y);
     }
 
+    /// Clears the held flag of `button` without forwarding a release: the
+    /// terminal application must not see a release whose press it never saw,
+    /// yet the button is physically up again for motion reporting.
+    pub(crate) fn cancel_pointer_press(&mut self, button: PointerButton) {
+        update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, KeyState::Released);
+    }
+
+    /// Whether any pointer button is still held for terminal mouse reporting.
+    pub(crate) fn mouse_buttons_pressed(&self) -> bool {
+        self.pressed_mouse_buttons != 0
+    }
+
+    /// Buttons still held for terminal mouse reporting, as a mask of
+    /// `mouse_button_bit`.
+    pub(crate) fn pressed_mouse_buttons(&self) -> u8 {
+        self.pressed_mouse_buttons
+    }
+
     fn cancel_pointer_interaction_state(&mut self, scroll: &mut crate::scroll::ScrollState) {
         self.pressed_mouse_buttons = 0;
         let capture = release_pointer_capture(&mut self.pointer_capture);
@@ -282,6 +331,8 @@ impl TerminalInteraction {
         had_selection
     }
 
+    /// Test-only: production routes by the whole capture state, not by one kind.
+    #[cfg(test)]
     pub(crate) fn terminal_selection_active(&self) -> bool {
         self.pointer_capture == PointerCapture::TerminalSelection
     }
@@ -437,7 +488,7 @@ impl TerminalInteraction {
 
     #[cfg(test)]
     pub(crate) fn pressed_mouse_buttons_for_test(&self) -> u8 {
-        self.pressed_mouse_buttons
+        self.pressed_mouse_buttons()
     }
 
     /// Clipboard backed by an in-process buffer instead of the Wayland clipboard.
@@ -732,6 +783,30 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
     ) -> bool {
+        self.pointer_moved(x, y, terminal, search_cursor_from_x, false)
+    }
+
+    /// Pointer motion for the terminal that owns the pressed pointer: the real
+    /// pointer coordinates reach it even over a protocol area or outside the
+    /// pane body.
+    pub(crate) fn cursor_moved_claimed(
+        &mut self,
+        x: f32,
+        y: f32,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+    ) -> bool {
+        self.pointer_moved(x, y, terminal, search_cursor_from_x, true)
+    }
+
+    fn pointer_moved(
+        &mut self,
+        x: f32,
+        y: f32,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+        claimed: bool,
+    ) -> bool {
         let was_selection_autoscrolling = self.selection_autoscroll_active(terminal);
         self.mouse_x = x;
         self.mouse_y = y;
@@ -779,14 +854,26 @@ impl TerminalInteraction {
                 let grid = crate::platform::lock_recover(&terminal.grid);
                 (grid.mouse_tracking(), grid.mouse_sgr())
             };
-            if let Some(sequence) = terminal_mouse_motion_sequence(
-                self.layout,
-                mode,
-                sgr,
-                self.pressed_mouse_buttons,
-                x,
-                y,
-            ) {
+            let sequence = if claimed {
+                terminal_mouse_motion_sequence_claimed(
+                    self.layout,
+                    mode,
+                    sgr,
+                    self.pressed_mouse_buttons,
+                    x,
+                    y,
+                )
+            } else {
+                terminal_mouse_motion_sequence(
+                    self.layout,
+                    mode,
+                    sgr,
+                    self.pressed_mouse_buttons,
+                    x,
+                    y,
+                )
+            };
+            if let Some(sequence) = sequence {
                 let _ = terminal.write_input(&sequence);
                 return true;
             }
@@ -801,6 +888,41 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
     ) -> bool {
+        self.mouse_input_outcome(state, button, terminal, search_cursor_from_x, false)
+            .handled()
+    }
+
+    /// Pointer button event with its outcome. `claimed` means the terminal owns
+    /// the pressed pointer: its protocol areas and its body never drop the
+    /// event, and it is encoded at the real pointer coordinates.
+    pub(crate) fn mouse_input_outcome(
+        &mut self,
+        state: KeyState,
+        button: PointerButton,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+        claimed: bool,
+    ) -> MouseInputOutcome {
+        let outcome =
+            self.mouse_button_event(state, button, terminal, search_cursor_from_x, claimed);
+        if outcome == MouseInputOutcome::Ignored && state == KeyState::Pressed {
+            // The terminal did not take this press, so it must not stay held
+            // for the motion reports of another pane, and its release must not
+            // reach an application that never saw the press.
+            self.cancel_pointer_press(button);
+            return MouseInputOutcome::Rejected;
+        }
+        outcome
+    }
+
+    fn mouse_button_event(
+        &mut self,
+        state: KeyState,
+        button: PointerButton,
+        terminal: &mut Terminal,
+        search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
+        claimed: bool,
+    ) -> MouseInputOutcome {
         let x = self.mouse_x;
         let y = self.mouse_y;
         update_pressed_mouse_buttons(&mut self.pressed_mouse_buttons, button, state);
@@ -816,15 +938,16 @@ impl TerminalInteraction {
             if capture == PointerCapture::TerminalScrollbar {
                 terminal.scroll_y.end_drag();
             }
-            return true;
+            return MouseInputOutcome::Consumed;
         }
 
         if state == KeyState::Released && button == PointerButton::Left && self.link_press_pending {
             self.link_press_pending = false;
-            return true;
+            return MouseInputOutcome::Consumed;
         }
 
         if let Some(search) = self.layout.search
+            && !claimed
             && state == KeyState::Pressed
             && button == PointerButton::Left
         {
@@ -832,25 +955,25 @@ impl TerminalInteraction {
                 TerminalSearchHit::Close => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.close_search(terminal);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Next => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.search.next();
                     self.jump_to_search_match(terminal);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Previous => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.search.previous();
                     self.jump_to_search_match(terminal);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::CaseToggle => {
                     self.pointer_capture = PointerCapture::SearchControl;
                     self.search.toggle_case();
                     self.refresh_search(terminal, SearchRefreshCause::User);
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Input => {
                     let local_x = x - search.input.x - 5.0 * self.layout.scale;
@@ -858,17 +981,18 @@ impl TerminalInteraction {
                         search_cursor_from_x(&self.search.text, local_x, self.search.scroll_x);
                     begin_search_pointer_selection(&mut self.search, cursor);
                     self.pointer_capture = PointerCapture::SearchInput;
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::Chrome => {
                     self.pointer_capture = PointerCapture::SearchControl;
-                    return true;
+                    return MouseInputOutcome::Consumed;
                 }
                 TerminalSearchHit::None => {}
             }
         }
 
         if let Some(scrollbar) = self.layout.scrollbar
+            && !claimed
             && state == KeyState::Pressed
             && button == PointerButton::Left
             && scrollbar.track.contains(x, y)
@@ -880,11 +1004,11 @@ impl TerminalInteraction {
             terminal.scroll_y.velocity = 0.0;
             terminal.scroll_y.is_dragging = true;
             self.pointer_capture = PointerCapture::TerminalScrollbar;
-            return true;
+            return MouseInputOutcome::Consumed;
         }
 
-        if !self.layout.body.contains(x, y) {
-            return false;
+        if !claimed && !self.layout.body.contains(x, y) {
+            return MouseInputOutcome::Ignored;
         }
         let left_press = state == KeyState::Pressed && button == PointerButton::Left;
         let press_cell = if left_press {
@@ -901,6 +1025,7 @@ impl TerminalInteraction {
         // mouse tracking, and never starts a selection. Only a single click opens
         // it; a double or triple click falls through to the selection.
         if left_press
+            && !claimed
             && click_count == 1
             && self.modifiers.control_key()
             && let Some((link, _)) = link_under_pointer(self.layout, terminal, x, y)
@@ -914,7 +1039,7 @@ impl TerminalInteraction {
                 PointerButton::Left,
                 KeyState::Released,
             );
-            return true;
+            return MouseInputOutcome::Consumed;
         }
         if state == KeyState::Pressed {
             let search_owned_selection = self.search.owns_grid_selection();
@@ -929,18 +1054,32 @@ impl TerminalInteraction {
             (grid.mouse_tracking(), grid.mouse_sgr())
         };
         let tracking = tracking_mode.enabled();
-        if let Some(sequence) = terminal_mouse_event_sequence(
-            self.layout,
-            PointerCapture::None,
-            tracking_mode,
-            mouse_sgr,
-            state,
-            button,
-            x,
-            y,
-        ) {
+        let sequence = if claimed {
+            terminal_mouse_event_sequence_claimed(
+                self.layout,
+                PointerCapture::None,
+                tracking_mode,
+                mouse_sgr,
+                state,
+                button,
+                x,
+                y,
+            )
+        } else {
+            terminal_mouse_event_sequence(
+                self.layout,
+                PointerCapture::None,
+                tracking_mode,
+                mouse_sgr,
+                state,
+                button,
+                x,
+                y,
+            )
+        };
+        if let Some(sequence) = sequence {
             let _ = terminal.write_input(&sequence);
-            return true;
+            return MouseInputOutcome::Delivered;
         }
 
         if !tracking
@@ -948,9 +1087,22 @@ impl TerminalInteraction {
             && let Some(pos) = press_cell
         {
             self.begin_terminal_selection_at(terminal, pos, click_count);
-            return true;
+            return MouseInputOutcome::Consumed;
         }
-        false
+        // The press is inside the body but over a protocol area of this pane:
+        // mouse tracking would report it, except that the area owns the event.
+        // The release of such a press must never reach the application alone.
+        if !claimed
+            && state == KeyState::Pressed
+            && tracking
+            && !terminal_protocol_pointer_target(self.layout, x, y)
+        {
+            // The application never saw this press, so the button is not held
+            // for motion reports or ownership; only its release stays swallowed.
+            self.cancel_pointer_press(button);
+            return MouseInputOutcome::Rejected;
+        }
+        MouseInputOutcome::Ignored
     }
 
     pub(crate) fn mouse_wheel(
@@ -959,7 +1111,11 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         layout: TerminalUiLayout,
     ) -> bool {
-        if !layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
+        // A live UI capture owns the wheel past the captured terminal's body:
+        // the drag keeps scrolling its terminal. Without one, the wheel belongs
+        // only to the body under the pointer.
+        let claimed = self.pointer_capture != PointerCapture::None;
+        if !claimed && !layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
         let dy = terminal_wheel_delta(delta, layout.char_h, self.scroll_sensitivity);
         let grid = crate::platform::lock_recover(&terminal.grid);
         let is_alt = grid.is_alt_screen();
@@ -975,6 +1131,7 @@ impl TerminalInteraction {
                 self.mouse_x,
                 self.mouse_y,
                 dy,
+                claimed,
             ) {
                 let _ = terminal.write_input(&input);
             }
@@ -1408,11 +1565,25 @@ fn terminal_mouse_protocol_cell(
     x: f32,
     y: f32,
 ) -> Option<(usize, usize)> {
+    if !terminal_protocol_pointer_target(layout, x, y) {
+        return None;
+    }
+    terminal_mouse_protocol_cell_at(layout, x, y)
+}
+
+/// Cell of the pointer at (`x`, `y`) in `layout`, without the body and
+/// protocol-area gate: the owner of the pressed pointer keeps the event where
+/// the pane draws its scrollbar or search bar, or past its edge. The ordinary
+/// formula clamps the cell to the grid.
+fn terminal_mouse_protocol_cell_at(
+    layout: TerminalUiLayout,
+    x: f32,
+    y: f32,
+) -> Option<(usize, usize)> {
     if layout.char_w <= 0.0
         || layout.char_h <= 0.0
         || layout.visible_rows == 0
         || layout.cols == 0
-        || !terminal_protocol_pointer_target(layout, x, y)
     {
         return None;
     }
@@ -1431,10 +1602,36 @@ fn terminal_mouse_event_sequence(
     x: f32,
     y: f32,
 ) -> Option<Vec<u8>> {
+    let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
+    terminal_mouse_event_report(capture, tracking, sgr, state, button, cell_x, cell_y)
+}
+
+fn terminal_mouse_event_sequence_claimed(
+    layout: TerminalUiLayout,
+    capture: PointerCapture,
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    state: KeyState,
+    button: PointerButton,
+    x: f32,
+    y: f32,
+) -> Option<Vec<u8>> {
+    let (cell_x, cell_y) = terminal_mouse_protocol_cell_at(layout, x, y)?;
+    terminal_mouse_event_report(capture, tracking, sgr, state, button, cell_x, cell_y)
+}
+
+fn terminal_mouse_event_report(
+    capture: PointerCapture,
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    state: KeyState,
+    button: PointerButton,
+    cell_x: usize,
+    cell_y: usize,
+) -> Option<Vec<u8>> {
     if capture != PointerCapture::None {
         return None;
     }
-    let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
     let button = terminal_mouse_button(button)?;
     let kind = if state == KeyState::Pressed {
         MouseEventKind::Press(button)
@@ -1454,12 +1651,37 @@ fn terminal_mouse_motion_sequence(
     y: f32,
 ) -> Option<Vec<u8>> {
     let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
+    terminal_mouse_motion_report(tracking, sgr, pressed_buttons, cell_x, cell_y)
+}
+
+fn terminal_mouse_motion_sequence_claimed(
+    layout: TerminalUiLayout,
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    pressed_buttons: u8,
+    x: f32,
+    y: f32,
+) -> Option<Vec<u8>> {
+    let (cell_x, cell_y) = terminal_mouse_protocol_cell_at(layout, x, y)?;
+    terminal_mouse_motion_report(tracking, sgr, pressed_buttons, cell_x, cell_y)
+}
+
+fn terminal_mouse_motion_report(
+    tracking: MouseTrackingMode,
+    sgr: bool,
+    pressed_buttons: u8,
+    cell_x: usize,
+    cell_y: usize,
+) -> Option<Vec<u8>> {
     let kind = MouseEventKind::Motion {
         held: terminal_first_pressed_button(pressed_buttons),
     };
     mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)
 }
 
+/// `claimed` means a UI capture owns the pressed pointer: the wheel is encoded
+/// at the real pointer position, clamped to the grid, even past the pane body
+/// or over its protocol areas.
 fn terminal_mouse_wheel_sequence(
     layout: TerminalUiLayout,
     tracking: MouseTrackingMode,
@@ -1467,8 +1689,13 @@ fn terminal_mouse_wheel_sequence(
     x: f32,
     y: f32,
     dy: f32,
+    claimed: bool,
 ) -> Option<Vec<u8>> {
-    let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
+    let (cell_x, cell_y) = if claimed {
+        terminal_mouse_protocol_cell_at(layout, x, y)?
+    } else {
+        terminal_mouse_protocol_cell(layout, x, y)?
+    };
     let steps = (dy.abs() / 20.0).max(1.0) as usize;
     let kind = if dy > 0.0 {
         MouseEventKind::WheelUp
@@ -1492,14 +1719,21 @@ fn terminal_mouse_button(button: PointerButton) -> Option<MouseButton> {
     }
 }
 
-fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: KeyState) {
-    // Bit per button: left 1, middle 2, right 4.
-    let bit = match button {
+/// Bit of `button` in `pressed_mouse_buttons`: left 1, middle 2, right 4.
+pub(crate) fn mouse_button_bit(button: PointerButton) -> u8 {
+    match button {
         PointerButton::Left => 1u8,
         PointerButton::Middle => 2,
         PointerButton::Right => 4,
-        PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => return,
-    };
+        PointerButton::Back | PointerButton::Forward | PointerButton::Other(_) => 0,
+    }
+}
+
+fn update_pressed_mouse_buttons(buttons: &mut u8, button: PointerButton, state: KeyState) {
+    let bit = mouse_button_bit(button);
+    if bit == 0 {
+        return;
+    }
     if state == KeyState::Pressed {
         *buttons |= bit;
     } else {
@@ -1656,8 +1890,16 @@ fn terminal_alt_prefixed(bytes: &[u8], alt: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::split::PaneId;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    /// Standalone terminal for input tests: the pane id only has to exist.
+    fn test_terminal(cols: usize, rows: usize, display_number: u64) -> Terminal {
+        static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let pane = PaneId::new(NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        Terminal::new_for_test(cols, rows, display_number, pane)
+    }
 
     #[test]
     fn project_owned_keyboard_contract_separates_physical_keys_from_text() {
@@ -1759,7 +2001,7 @@ mod tests {
 
     #[test]
     fn reset_for_terminal_switch_ends_scrollbar_drag_of_left_terminal() {
-        let mut terminal = Terminal::new_for_test(8, 2, 1);
+        let mut terminal = test_terminal(8, 2, 1);
         let mut interaction = TerminalInteraction::default();
         interaction.pointer_capture = PointerCapture::TerminalScrollbar;
         terminal.scroll_y.is_dragging = true;
@@ -1920,7 +2162,7 @@ mod tests {
     fn ctrl_c_without_selection_sends_etx_flags0() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyC), 46);
         key.unshifted = Some('c');
         assert!(interaction.handle_key_event(&key, &mut terminal));
@@ -1931,7 +2173,7 @@ mod tests {
     fn ctrl_c_with_selection_release_not_sent() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1, 4, 1)));
         let mut release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyC), 46);
         release.unshifted = Some('c');
@@ -1944,7 +2186,7 @@ mod tests {
     fn ctrl_c_with_selection_press_copies_and_sends_nothing() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         // The selection lies past the grid rows, so its copied text is empty and
         // the clipboard write is skipped; only selection state and encoder output are checked.
         crate::platform::lock_recover(&terminal.grid).set_selection(Some((1, 1000, 4, 1000)));
@@ -1959,7 +2201,7 @@ mod tests {
     fn ctrl_v_release_not_sent() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
         assert!(!interaction.handle_key_event(&release, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
@@ -1969,7 +2211,7 @@ mod tests {
     fn alt_a_flag1_sends_no_separate_text() {
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::ALT);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -2005,7 +2247,7 @@ mod tests {
         let mut interaction = TerminalInteraction::new_with_memory_clipboard();
         assert!(interaction.set_clipboard_text("pasted".to_string()));
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
         let repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyV), 47);
         let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
@@ -2026,7 +2268,7 @@ mod tests {
         // and the release emits nothing in legacy mode.
         let mut interaction = TerminalInteraction::new_with_memory_clipboard();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyV), 47);
         press.unshifted = Some('v');
         let release = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::KeyV), 47);
@@ -2039,7 +2281,7 @@ mod tests {
     fn search_target_gets_text_after_key() {
         let mut interaction = TerminalInteraction::default();
         interaction.search.open();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut key = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
         key.unshifted = Some('a');
         key.text = Some("a".to_string());
@@ -2051,7 +2293,7 @@ mod tests {
     #[test]
     fn repeated_letter_reaches_pty_as_text() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyA), 30);
         repeat.unshifted = Some('a');
         repeat.text = Some("a".to_string());
@@ -2062,12 +2304,12 @@ mod tests {
     #[test]
     fn ime_preedit_key_not_encoded() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let enter = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::Enter), 28);
         assert!(interaction.handle_key_event(&enter, &mut terminal));
         assert!(!terminal.input_bytes_for_test().is_empty());
 
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut composing = enter.clone();
         composing.ime_preedit = true;
         assert!(!interaction.handle_key_event(&composing, &mut terminal));
@@ -2078,7 +2320,7 @@ mod tests {
     fn ime_preedit_press_text_reaches_pty() {
         // Expected value comes from the I1 ruling: press text still reaches the PTY under preedit.
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut press = raw_key(KeyState::Pressed, PhysicalKey::Code(KeyCode::KeyA), 30);
         press.unshifted = Some('a');
         press.text = Some("a".to_string());
@@ -2091,7 +2333,7 @@ mod tests {
     fn ime_preedit_repeat_sends_nothing() {
         // Expected value comes from the I1 ruling: repeat under preedit stays suppressed.
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut repeat = raw_key(KeyState::Repeat, PhysicalKey::Code(KeyCode::KeyA), 30);
         repeat.unshifted = Some('a');
         repeat.text = Some("a".to_string());
@@ -2106,7 +2348,7 @@ mod tests {
         // its key away from the encoder until that key's release.
         let mut interaction = TerminalInteraction::default();
         interaction.set_modifiers(Modifiers::CONTROL);
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         crate::platform::lock_recover(&terminal.grid).set_selection(Some((0, 0, 0, 2)));
         let ctrl_c = |state| {
             let mut key = raw_key(state, PhysicalKey::Code(KeyCode::KeyC), 46);
@@ -2130,7 +2372,7 @@ mod tests {
     #[test]
     fn release_without_flag2_sends_nothing() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let up = raw_key(KeyState::Released, PhysicalKey::Code(KeyCode::ArrowUp), 103);
         assert!(!interaction.handle_key_event(&up, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
@@ -2139,7 +2381,7 @@ mod tests {
     #[test]
     fn unidentified_key_without_text_sends_nothing() {
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
         interaction.handle_key_event(&key, &mut terminal);
         assert!(terminal.input_bytes_for_test().is_empty());
@@ -2150,7 +2392,7 @@ mod tests {
         // Expected bytes are the UTF-8 of the event text, from the task brief: a key with
         // text but no named, physical, or layout identity still types that text.
         let mut interaction = TerminalInteraction::default();
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut press = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
         press.text = Some("é".to_string());
         let release = KeyInput {
@@ -2169,12 +2411,12 @@ mod tests {
         let key = raw_key(KeyState::Pressed, PhysicalKey::Unidentified, 0);
 
         // Flags 0: an encoded placeholder would arrive as ESC NUL.
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         assert!(!interaction.handle_key_event(&key, &mut terminal));
         assert!(terminal.input_bytes_for_test().is_empty());
 
         // Kitty flag 8 (report all keys as escape codes) through the grid parser.
-        let mut terminal = Terminal::new_for_test(80, 30, 1);
+        let mut terminal = test_terminal(80, 30, 1);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -2199,7 +2441,7 @@ mod tests {
 
     /// Terminal with Kitty flags 10 (report all keys and report event types) pushed.
     fn modifier_test_terminal() -> Terminal {
-        let terminal = Terminal::new_for_test(80, 30, 1);
+        let terminal = test_terminal(80, 30, 1);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -2511,6 +2753,7 @@ mod tests {
             1,
             launch,
             crate::renderer::terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
         let read_out = || std::fs::read(&out).unwrap_or_default();
 
@@ -2865,7 +3108,7 @@ mod tests {
     }
 
     fn selection_test_terminal() -> Terminal {
-        Terminal::new_for_test(80, 30, 1)
+        test_terminal(80, 30, 1)
     }
 
     fn begin_terminal_selection(
@@ -3579,6 +3822,7 @@ mod tests {
                 x,
                 y,
                 40.0,
+                false,
             )
             .is_none());
         }
@@ -3601,6 +3845,7 @@ mod tests {
             body_x,
             body_y,
             40.0,
+            false,
         )
         .is_some());
 
@@ -3615,6 +3860,26 @@ mod tests {
             formerly_covered.1,
         )
         .is_some());
+    }
+
+    #[test]
+    fn captured_wheel_scrolls_its_terminal_outside_the_body() {
+        let mut interaction = TerminalInteraction::default();
+        // A scrollbar drag owns the pointer past the pane's body.
+        interaction.pointer_capture = PointerCapture::TerminalScrollbar;
+        interaction.mouse_x = 900.0;
+        interaction.mouse_y = 400.0;
+        let mut terminal = selection_test_terminal();
+        let mut layout = mouse_test_layout(0.0);
+        layout.max_scroll = 100.0;
+        assert!(!layout.body.contains(interaction.mouse_x, interaction.mouse_y));
+
+        assert!(interaction.mouse_wheel(
+            ScrollDelta::Pixel { x: 0.0, y: 1.0 },
+            &mut terminal,
+            layout,
+        ));
+        assert!(terminal.scroll_y.target > 0.0);
     }
 
     #[test]

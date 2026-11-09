@@ -6,6 +6,7 @@ use super::{App, AppLoopControl};
 use crate::config::AppConfig;
 use crate::input::TerminalInteraction;
 use crate::launch::TerminalLaunchSpec;
+use crate::panels::Panel;
 use crate::runtime::{PreGlResources, WindowRuntime};
 use crate::terminal::Terminal;
 use std::time::Instant;
@@ -120,14 +121,45 @@ impl App {
         &self.terminals
     }
 
-    /// Index into `terminals` of the active tab.
-    pub(crate) fn active_terminal_index(&self) -> usize {
-        self.active_terminal
-    }
-
     /// The active tab, or `None` when no tab exists.
     pub(crate) fn active_terminal(&self) -> Option<&Terminal> {
         self.terminals.get(self.active_terminal)
+    }
+
+    /// Number of tabs in `App.tabs`, the order the tab strip shows.
+    pub(crate) fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Position of the active tab in `App.tabs`.
+    pub(crate) fn active_tab_index(&self) -> usize {
+        self.active_tab
+    }
+
+    /// Terminal whose display title the tab strip shows for tab `index`: the
+    /// terminal of the tab's active pane, or `None` when `index` is out of range.
+    pub(crate) fn tab_title_terminal(&self, index: usize) -> Option<&Terminal> {
+        let pane = self.tabs.get(index)?.active_pane;
+        self.terminals
+            .iter()
+            .find(|terminal| terminal.pane_id() == pane)
+    }
+
+    /// Display number of tab `index`, or `None` when `index` is out of range.
+    pub(crate) fn tab_title_number(&self, index: usize) -> Option<usize> {
+        self.tabs.get(index).map(|tab| tab.title_number)
+    }
+
+    /// Raw id of the active tab's focused pane, or `None` when no tab exists.
+    pub(crate) fn active_pane_raw(&self) -> Option<u64> {
+        self.tabs
+            .get(self.active_tab)
+            .map(|tab| tab.active_pane.raw())
+    }
+
+    /// Panels drawn in the last frame, in draw order; empty before the first rebuild.
+    pub(crate) fn panels(&self) -> &[Panel] {
+        &self.panels
     }
 
     /// Selection, pointer, and layout state from the last drawn frame.
@@ -160,7 +192,9 @@ impl App {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::app::Tab;
     use crate::headless::Profile;
+    use crate::split::{PaneId, SplitAxis, SplitNode, split_leaf_at};
     use std::path::PathBuf;
     use std::sync::mpsc::Receiver;
 
@@ -188,6 +222,63 @@ pub(crate) mod test_support {
         (app, receiver, profile, root)
     }
 
+    /// Adds `terminal` as one tab at the end of `App`: `terminals` and `tabs`
+    /// grow together and keep the same order. Returns the terminal's pane id.
+    pub(crate) fn push_test_terminal(app: &mut App, terminal: Terminal) -> PaneId {
+        let pane_id = terminal.pane_id();
+        app.terminals.push(terminal);
+        let id = app.issue_tab_id();
+        app.tabs.push(Tab {
+            id,
+            layout: SplitNode::Leaf(pane_id),
+            active_pane: pane_id,
+            title_number: app.tabs.len() + 1,
+        });
+        pane_id
+    }
+
+    /// Inserts `terminal` at `terminal_index` in `terminals`; its tab goes to
+    /// the end of `tabs`, because a terminal index and a tab position are
+    /// independent in the test model. Returns the terminal's pane id.
+    pub(crate) fn insert_test_terminal(
+        app: &mut App,
+        terminal_index: usize,
+        terminal: Terminal,
+    ) -> PaneId {
+        let pane_id = terminal.pane_id();
+        app.terminals.insert(terminal_index, terminal);
+        let id = app.issue_tab_id();
+        app.tabs.push(Tab {
+            id,
+            layout: SplitNode::Leaf(pane_id),
+            active_pane: pane_id,
+            title_number: app.tabs.len() + 1,
+        });
+        pane_id
+    }
+
+    /// Splits the active pane of `tab` side by side with a fresh presentation-ready
+    /// test terminal. No spawn and no runtime wake: the new pane has no process
+    /// and is only visible to tests. Returns the new pane id.
+    pub(crate) fn attach_test_pane(app: &mut App, tab: usize, display_number: u64) -> PaneId {
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(80, 24, display_number, pane);
+        terminal.grid.lock().unwrap().mark_presentation_ready();
+        app.terminals.push(terminal);
+        let active_pane = app.tabs[tab].active_pane;
+        assert!(
+            split_leaf_at(
+                &mut app.tabs[tab].layout,
+                active_pane,
+                SplitAxis::SideBySide,
+                pane
+            ),
+            "tab {tab} does not own its active pane"
+        );
+        app.bump_layout_generation();
+        pane
+    }
+
     /// Like `started_headless`, but the live shell tabs are replaced by `count` test
     /// terminals. Live terminals would let their title poll overwrite the Claude flag
     /// set by a test, and their PTY input is not visible to tests. Terminal 0 is active
@@ -197,13 +288,17 @@ pub(crate) mod test_support {
         count: usize,
     ) -> (App, Receiver<String>, Profile, PathBuf) {
         let (mut app, receiver, profile, root) = started_headless(tag);
-        app.terminals = (0..count)
-            .map(|index| {
-                let terminal = Terminal::new_for_test(80, 24, index as u64 + 1);
-                terminal.grid.lock().unwrap().mark_presentation_ready();
-                terminal
-            })
-            .collect();
+        // The live shell terminals and their tabs are replaced together, so no
+        // tab keeps a leaf of a removed terminal.
+        app.terminals.clear();
+        app.tabs.clear();
+        app.active_tab = 0;
+        for index in 0..count {
+            let pane = app.issue_pane_id();
+            let terminal = Terminal::new_for_test(80, 24, index as u64 + 1, pane);
+            terminal.grid.lock().unwrap().mark_presentation_ready();
+            push_test_terminal(&mut app, terminal);
+        }
         app.active_terminal = 0;
         app.active_terminal_presented = true;
         (app, receiver, profile, root)

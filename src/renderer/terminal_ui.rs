@@ -1,5 +1,6 @@
 use super::*;
 use crate::panels::Panel;
+use crate::runtime::TabLabelIndex;
 use crate::scroll::{ScrollbarThumb, scrollbar_drag_target, scrollbar_thumb};
 use ronsole_term::{LinkTarget, UnderlineStyle};
 use crate::single_line_input::SingleLineInput;
@@ -82,6 +83,19 @@ const TERMINAL_TAB_BELL_DOT: f32 = 6.0;
 /// Space between the bell dot and the tab title.
 const TERMINAL_TAB_BELL_GAP: f32 = 6.0;
 const TERMINAL_ADD_SIZE: f32 = 20.0;
+
+/// Tab width from its title: the natural chrome, plus the bell dot and its
+/// gap so the dot does not push the title out of the tab.
+fn terminal_tab_width(text_width: f32, bell_pending: bool, s: f32) -> f32 {
+    let bell = if bell_pending {
+        (TERMINAL_TAB_BELL_DOT * s).round().max(1.0) + TERMINAL_TAB_BELL_GAP * s
+    } else {
+        0.0
+    };
+    (text_width + TERMINAL_TAB_NATURAL_CHROME * s + bell)
+        .round()
+        .max(72.0 * s)
+}
 const TAB_STRIP_EDGE_FADE_ALPHA: f32 = 0.4;
 const TAB_STRIP_EDGE_FADE_WIDTH: f32 = 40.0;
 const SEARCH_MATCH: [f32; 4] = [0.60, 0.60, 0.60, 0.35];
@@ -129,6 +143,25 @@ pub(crate) enum TerminalTabHit {
     Body(usize),
     Close(usize),
     Add,
+}
+
+/// What surrounds a terminal body, and therefore which chrome it draws.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BodyChrome {
+    /// A tab body: the ordinary top focus separator.
+    #[default]
+    Tab,
+    /// A Claude-grid tile: a header instead of the top separator.
+    GridTile,
+    /// A pane of a multi-pane tab: no top separator; the focus border marks it.
+    SplitPane,
+}
+
+impl BodyChrome {
+    /// The top focus separator belongs to the ordinary single-pane tab only.
+    fn draws_top_separator(self) -> bool {
+        matches!(self, Self::Tab)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -245,6 +278,28 @@ fn terminal_focus_separator_rect(body: Rect, scale: f32) -> Option<Rect> {
         x: body.x,
         y: body.y,
         w: body.w,
+        h,
+    })
+}
+
+/// Inner rectangle of the pane focus border: `body` inset by the border
+/// thickness, `(2.0 * scale).round()` physical pixels on every side. The caller
+/// fills the four strips between this rect and `body` with the accent colour.
+#[inline]
+pub(crate) fn pane_focus_border(body: Rect, scale: f32) -> Option<Rect> {
+    if ![body.x, body.y, body.w, body.h]
+        .into_iter()
+        .all(f32::is_finite)
+    {
+        return None;
+    }
+    let inset = (2.0 * scale.max(0.0)).round();
+    let w = body.w - inset * 2.0;
+    let h = body.h - inset * 2.0;
+    (inset > 0.0 && w > 0.0 && h > 0.0).then_some(Rect {
+        x: body.x + inset,
+        y: body.y + inset,
+        w,
         h,
     })
 }
@@ -1617,6 +1672,16 @@ pub(crate) fn terminal_scrollbar_layout(
         w: 8.0 * s,
         h: (body.h - 8.0 * s).max(1.0),
     };
+    // The scrollbar is drawn after the body scissor is lifted, so a track that
+    // does not fit wholly inside `body` would spill into the gap and the
+    // neighbouring pane of a narrow split.
+    if track.x < body.x
+        || track.y < body.y
+        || track.x + track.w > body.x + body.w
+        || track.y + track.h > body.y + body.h
+    {
+        return None;
+    }
     let max_scroll = terminal_max_scroll(total_lines, char_h, body.h, s);
     if max_scroll <= 0.0 {
         return None;
@@ -2503,8 +2568,9 @@ impl Renderer {
 
     fn draw_terminal_tabs(
         &mut self,
+        tabs: &[TabLabelIndex],
+        active_tab: usize,
         terminals: &[Terminal],
-        active_terminal: usize,
         scroll_x: f32,
         drag: Option<&crate::tabs::TabDragState>,
         pointer_x: f32,
@@ -2516,20 +2582,23 @@ impl Renderer {
         let add_size = (TERMINAL_ADD_SIZE * s).round().max(1.0);
 
         let mut titles = std::mem::take(&mut self.terminal_tab_display_titles);
-        titles.resize_with(terminals.len(), || String::with_capacity(96));
-        for (terminal, title) in terminals.iter().zip(titles.iter_mut()) {
-            terminal.write_display_title(title);
+        titles.resize_with(tabs.len(), || String::with_capacity(96));
+        for (label, title) in tabs.iter().zip(titles.iter_mut()) {
+            match terminals.get(label.title_terminal) {
+                Some(terminal) => write_tab_label(terminal, label.number, title),
+                None => title.clear(),
+            }
         }
 
         let mut widths = std::mem::take(&mut self.terminal_tab_widths);
         widths.clear();
-        widths.reserve(terminals.len());
-        for title in &titles {
-            widths.push(
-                (self.terminal_ui_text_width(title, 1.0) + TERMINAL_TAB_NATURAL_CHROME * s)
-                    .round()
-                    .max(72.0 * s),
-            );
+        widths.reserve(tabs.len());
+        for (label, title) in tabs.iter().zip(titles.iter()) {
+            widths.push(terminal_tab_width(
+                self.terminal_ui_text_width(title, 1.0),
+                label.bell_pending,
+                s,
+            ));
         }
         let max_scroll = terminal_tab_max_scroll(&widths, strip.w, s);
         let scroll_x = scroll_x.clamp(0.0, max_scroll);
@@ -2555,7 +2624,7 @@ impl Renderer {
 
         let mut hitboxes = std::mem::take(&mut self.terminal_tab_hitboxes);
         hitboxes.clear();
-        hitboxes.resize(terminals.len(), TerminalTabHitbox::default());
+        hitboxes.resize(tabs.len(), TerminalTabHitbox::default());
 
         self.flush();
         self.set_clip(strip.x, strip.y, strip.w, strip.h);
@@ -2568,10 +2637,10 @@ impl Renderer {
             let raw_body = Rect { x: tab_x, y: strip.y, w: tab_w, h: strip.h };
             let visible_body = clipped_rect(raw_body, strip);
             let hovered = visible_body.is_some_and(|rect| rect.contains(pointer_x, pointer_y));
-            let active = idx == active_terminal;
+            let active = idx == active_tab;
             let bg = terminal_tab_surface_color(self.palette.bg, active, hovered);
             self.push_rounded_rect(tab_x, strip.y, tab_w, strip.h, 0.0, bg);
-            if idx + 1 < terminals.len() {
+            if idx + 1 < tabs.len() {
                 self.push_rounded_rect(
                     tab_x + tab_w - 1.0,
                     strip.y + strip.h * 0.25,
@@ -2595,7 +2664,7 @@ impl Renderer {
             let title_max_w = (tab_w - if can_show_close { 56.0 * s } else { 32.0 * s })
                 .max(0.0);
             let title_max_x = title_x + title_max_w;
-            if terminals.get(idx).is_some_and(Terminal::bell_pending) {
+            if tabs.get(idx).is_some_and(|label| label.bell_pending) {
                 let dot = (TERMINAL_TAB_BELL_DOT * s).round().max(1.0);
                 let dot_y = (strip.y + (strip.h - dot) * 0.5).round();
                 self.push_rounded_rect(title_x, dot_y, dot, dot, dot * 0.5, self.palette.accent);
@@ -3510,6 +3579,8 @@ impl Renderer {
         Some(self.one_line_cursor_from_input_x(text, x - viewport.x, scroll_x, 0.90))
     }
 
+    /// Hit-tests the tab strip. The returned index addresses `App.tabs`, not
+    /// `App.terminals`, because one tab owns all of its split panes.
     pub(crate) fn terminal_tab_hit_test(&self, x: f32, y: f32) -> TerminalTabHit {
         for (idx, hitbox) in self.terminal_tab_hitboxes.iter().enumerate() {
             if hitbox.close.is_some_and(|rect| rect.contains(x, y)) {
@@ -3577,6 +3648,8 @@ impl Renderer {
 
     pub(crate) fn render_terminal_app(
         &mut self,
+        tabs: &[TabLabelIndex],
+        active_tab: usize,
         terminals: &[Terminal],
         active_terminal: usize,
         panels: &[Panel],
@@ -3612,16 +3685,25 @@ impl Renderer {
         let s = self.scale_factor;
         panel_layouts.clear();
         let mut active_layout = TerminalUiLayout::default();
+        // A multi-pane active tab replaces the top separator with the focus border.
+        let split_tab = tabs
+            .get(active_tab)
+            .is_some_and(|tab| tab.leaf_count > 1);
         // Taken out of `self` so the title cache and the glyph metrics can be used together.
         let mut titles = std::mem::take(&mut self.tile_titles);
         titles.resize_with(panels.len(), TileTitleCache::default);
         let mut scratch = std::mem::take(&mut self.tile_title_scratch);
+        // Whether the focused panel is a grid tile, which draws its own frame.
+        let mut active_is_tile = false;
         for (index, panel) in panels.iter().enumerate() {
             let Some(terminal) = terminals.get(panel.terminal) else {
                 panel_layouts.push(TerminalUiLayout::default());
                 continue;
             };
             let is_active = panel.terminal == active_terminal;
+            if is_active {
+                active_is_tile = panel.header.is_some();
+            }
             if let Some(header) = panel.header {
                 let pad = (TILE_TITLE_PAD * s).round();
                 let text_w = (header.w - 2.0 * pad).max(0.0);
@@ -3658,12 +3740,19 @@ impl Renderer {
             } else {
                 // Only the active panel gets search, cursor and the ordinary-mode separator.
                 let search_for_panel = if is_active { Some(&mut *search) } else { None };
+                let chrome = if panel.header.is_some() {
+                    BodyChrome::GridTile
+                } else if split_tab {
+                    BodyChrome::SplitPane
+                } else {
+                    BodyChrome::Tab
+                };
                 self.render_terminal_body(
                     terminal,
                     panel.body,
                     search_for_panel,
                     is_active && focused && settings_progress <= 0.0,
-                    panel.header.is_some(),
+                    chrome,
                     focused,
                     pointer_x,
                     pointer_y,
@@ -3685,9 +3774,32 @@ impl Renderer {
         }
         self.tile_titles = titles;
         self.tile_title_scratch = scratch;
+        if split_focus_border_visible(split_tab, active_is_tile)
+            && let Some(inner) = pane_focus_border(active_layout.body, s)
+        {
+            let body = active_layout.body;
+            let color = terminal_focus_separator_color(palette.accent, focused);
+            self.push_rect(body.x, body.y, body.w, inner.y - body.y, color);
+            self.push_rect(
+                body.x,
+                inner.y + inner.h,
+                body.w,
+                body.y + body.h - (inner.y + inner.h),
+                color,
+            );
+            self.push_rect(body.x, inner.y, inner.x - body.x, inner.h, color);
+            self.push_rect(
+                inner.x + inner.w,
+                inner.y,
+                body.x + body.w - (inner.x + inner.w),
+                inner.h,
+                color,
+            );
+        }
         self.draw_terminal_tabs(
+            tabs,
+            active_tab,
             terminals,
-            active_terminal,
             tab_scroll_x,
             drag,
             pointer_x,
@@ -3732,15 +3844,16 @@ impl Renderer {
 
     /// Draws one terminal body into `body`, which is the scissor and the geometry
     /// source for text, cursor and search. `search` is `Some` only for the panel that
-    /// owns the search overlay; `show_cursor` gates the cursor; `tile` marks a grid
-    /// tile, which has no accent separator. The frame is cleared by the caller.
+    /// owns the search overlay; `show_cursor` gates the cursor; `chrome` selects the
+    /// surrounding chrome (single tab, grid tile, or split pane). The frame is
+    /// cleared by the caller.
     pub(crate) fn render_terminal_body(
         &mut self,
         terminal: &Terminal,
         body: Rect,
         mut search: Option<&mut TerminalSearchState>,
         show_cursor: bool,
-        tile: bool,
+        chrome: BodyChrome,
         window_focused: bool,
         pointer_x: f32,
         pointer_y: f32,
@@ -3753,9 +3866,17 @@ impl Renderer {
         let visible_rows = new_rows;
 
         let mut grid = crate::platform::lock_recover(&terminal.grid);
+        // The renderer resizes the grid to the body geometry below, and a resize
+        // bumps the content generation without new output. The development-channels
+        // verdict belongs to the content that was verified, so capture its
+        // generation before that resize.
+        let verified_generation = grid.content_generation();
         let resized =
             prepare_terminal_grid_for_render(&mut grid, search.as_deref_mut(), new_cols, new_rows);
         grid.mark_presentation_layout_ready();
+        // Output parsed while the lock is released for `resize_pty` bumps this
+        // generation; that content is unverified for this frame.
+        let resized_generation = grid.content_generation();
         if resized {
             drop(grid);
             terminal.resize_pty(pty_dimension(new_cols), pty_dimension(new_rows));
@@ -3780,7 +3901,11 @@ impl Renderer {
         );
         let text_x = body.x + 10.0 * s;
         let (_, bottom_pad) = terminal_text_padding(s);
-        let separator = if tile { None } else { terminal_focus_separator_rect(body, s) };
+        let separator = if chrome.draws_top_separator() {
+            terminal_focus_separator_rect(body, s)
+        } else {
+            None
+        };
         let content_clip = terminal_body_content_clip(body, separator);
 
         self.flush();
@@ -3795,7 +3920,13 @@ impl Renderer {
         // The hovered link applies only while the grid still has the generation it was built for.
         let hovered_link = terminal.hovered_link();
         let content_generation = grid.content_generation();
-        if presentation_visible && content_clip.is_some() {
+        // The frame decided to draw this panel from the generation it scanned,
+        // but output may have landed since. The development-channels check
+        // verifies one generation only, so a newer grid draws no body here
+        // (the background and the chrome stay).
+        let content_verified = terminal.dev_channel_generation_verified(verified_generation)
+            && content_generation == resized_generation;
+        if presentation_visible && content_clip.is_some() && content_verified {
             let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
             for layer in TERMINAL_BODY_LAYERS {
                 for i in visible_range.clone() {
@@ -4057,10 +4188,46 @@ impl Renderer {
     }
 }
 
+/// Writes one tab-strip label: the title of the tab's active pane without the
+/// terminal's own display suffix, followed by the tab's number. A title that
+/// already ends with a number keeps it.
+pub(crate) fn write_tab_label(terminal: &Terminal, number: usize, out: &mut String) {
+    use std::fmt::Write as _;
+    terminal.write_title(out);
+    let _ = write!(out, " ({number})");
+}
+
+/// The pane focus border belongs to the split panes of a tab; a grid tile draws
+/// its own frame through the panel header.
+pub(crate) fn split_focus_border_visible(split_tab: bool, active_is_tile: bool) -> bool {
+    split_tab && !active_is_tile
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ronsole_term::{TermConfig, TermIdentity, UnderlineStyle};
+
+    #[test]
+    fn tab_label_uses_tab_number_not_terminal_number() {
+        // The terminal's own display suffix is ` (7)`; the strip shows tab 1.
+        let terminal = Terminal::new_for_test(80, 24, 7, crate::split::PaneId::new(1));
+        let mut label = String::new();
+        write_tab_label(&terminal, 1, &mut label);
+        assert_eq!(label, "terminal (1)");
+
+        // A title that already ends with its own number keeps it.
+        terminal.set_programmed_title_for_test("build (2)".to_string());
+        write_tab_label(&terminal, 1, &mut label);
+        assert_eq!(label, "build (2) (1)");
+    }
+
+    #[test]
+    fn split_focus_border_hidden_for_grid_tile() {
+        assert!(!split_focus_border_visible(true, true));
+        assert!(split_focus_border_visible(true, false));
+        assert!(!split_focus_border_visible(false, false));
+    }
 
     #[test]
     fn terminal_cell_face_from_flags_selects_bundled_face() {
@@ -4281,6 +4448,55 @@ mod tests {
         assert_eq!(terminal_anchored_scroll_offset(3.4, 0, 20.0, 100.0, false), 3.0);
         // The alternate screen draws no scrollback offset.
         assert_eq!(terminal_anchored_scroll_offset(10.0, 2, 20.0, 0.0, true), 0.0);
+    }
+
+    #[test]
+    fn scrollbar_layout_is_absent_when_the_track_does_not_fit_inside_the_body() {
+        // A split pane can shrink below the fixed scrollbar inset; the scrollbar
+        // draws outside the body scissor, so an overflowing track is skipped.
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for (w, h) in [(4.0_f32, 40.0_f32), (11.0, 40.0), (800.0, 2.0), (0.0, 0.0)] {
+                let body = Rect { x: 10.0, y: 20.0, w, h };
+                assert!(
+                    terminal_scrollbar_layout(body, scale, 20.0, 100, 0.0).is_none(),
+                    "w {w} h {h} scale {scale}"
+                );
+            }
+            for w in [12.0_f32, 13.0, 40.0, 800.0] {
+                for h in [4.0 * scale + 1.0, 8.0 * scale, 40.0 * scale, 600.0] {
+                    let body = Rect { x: 10.0, y: 20.0, w, h };
+                    let layout = terminal_scrollbar_layout(body, scale, 20.0, 100, 0.0);
+                    if let Some(layout) = layout {
+                        for rect in [layout.track, layout.thumb] {
+                            assert!(rect.x >= body.x, "w {w} h {h} scale {scale}");
+                            assert!(rect.y >= body.y, "w {w} h {h} scale {scale}");
+                            assert!(
+                                rect.x + rect.w <= body.x + body.w,
+                                "w {w} h {h} scale {scale}"
+                            );
+                            assert!(
+                                rect.y + rect.h <= body.y + body.h,
+                                "w {w} h {h} scale {scale}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // An ordinary body keeps its scrollbar.
+        let body = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+        assert!(terminal_scrollbar_layout(body, 1.0, 20.0, 100, 0.0).is_some());
+    }
+
+    #[test]
+    fn tab_width_leaves_room_for_the_bell_dot() {
+        for s in [1.0_f32, 1.25, 1.333, 2.0] {
+            let plain = terminal_tab_width(100.0, false, s);
+            let bell = terminal_tab_width(100.0, true, s);
+            let extra = (TERMINAL_TAB_BELL_DOT * s).round().max(1.0) + TERMINAL_TAB_BELL_GAP * s;
+            assert!((bell - plain - extra).abs() <= 1.0, "scale {s}");
+            assert_eq!(terminal_tab_width(0.0, false, s), 72.0 * s);
+        }
     }
 
     #[test]
@@ -6294,6 +6510,40 @@ mod tests {
             assert_eq!(cols, expected_cols, "window scale {scale}");
             assert_eq!(rows, terminal_visible_rows(body.h, char_h, scale), "window scale {scale}");
         }
+    }
+
+    #[test]
+    fn focus_border_is_inside_body_with_two_pixel_inset() {
+        for scale in [1.333_f32, 2.0] {
+            let body = Rect {
+                x: 10.0,
+                y: 20.0,
+                w: 400.0,
+                h: 300.0,
+            };
+            let inset = (2.0 * scale).round();
+            let inner = pane_focus_border(body, scale).expect("positive body has a focus border");
+            assert_eq!(inner.x, body.x + inset, "scale {scale}");
+            assert_eq!(inner.y, body.y + inset, "scale {scale}");
+            assert_eq!(inner.w, body.w - inset * 2.0, "scale {scale}");
+            assert_eq!(inner.h, body.h - inset * 2.0, "scale {scale}");
+            for value in [inner.x, inner.y, inner.w, inner.h] {
+                assert_eq!(value.fract(), 0.0, "scale {scale}: {value} is a whole pixel");
+            }
+            // The four border strips live between the body edge and the inner rect.
+            assert_eq!(inner.x - body.x, inset);
+            assert_eq!(inner.y - body.y, inset);
+            assert_eq!(body.x + body.w - (inner.x + inner.w), inset);
+            assert_eq!(body.y + body.h - (inner.y + inner.h), inset);
+        }
+        assert_eq!(pane_focus_border(Rect { x: 0.0, y: 0.0, w: 0.0, h: 10.0 }, 1.0), None);
+    }
+
+    #[test]
+    fn split_pane_body_has_no_top_separator() {
+        assert!(BodyChrome::Tab.draws_top_separator());
+        assert!(!BodyChrome::GridTile.draws_top_separator());
+        assert!(!BodyChrome::SplitPane.draws_top_separator());
     }
 
     #[test]

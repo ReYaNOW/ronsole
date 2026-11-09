@@ -3,13 +3,15 @@ use crate::config::{
     DEFAULT_TERMINAL_BOLD_FOREGROUND, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FOREGROUND,
     DEFAULT_TERMINAL_PALETTE, RgbColor, SCROLL_SENSITIVITY_STEP, TERMINAL_FONT_SIZE_STEP,
 };
-use crate::input::{MULTI_CLICK_WINDOW, TerminalInteraction, terminal_scroll_animating};
+use crate::input::{
+    MULTI_CLICK_WINDOW, TerminalInteraction, mouse_button_bit, terminal_scroll_animating,
+};
 use crate::input_types::{
     CursorKind, KeyCode, KeyInput, KeyState, Modifiers, PhysicalKey, PointerButton,
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::panels::{Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
+use crate::panels::{GRID_TILE_GAP, Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
 use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
@@ -19,10 +21,15 @@ use crate::renderer::{
     SettingsTab, TerminalTabHit, TerminalUiLayout, pty_dimension, settings_color_value,
     terminal_body_rect, terminal_palette,
 };
-use crate::runtime::{TerminalRenderParams, WindowRuntime};
+use crate::runtime::{TabLabelIndex, TerminalRenderParams, WindowRuntime};
 use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
+use crate::split::{
+    PaneDirection, PaneId, SplitAxis, SplitNode, divider_at, layout_panes, leaf_count, min_extent,
+    node_at_path, node_at_path_mut, pane_in_direction, pane_min, remove_leaf, split_child_rects,
+    split_leaf_at, successor,
+};
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
     drag_autoscroll_delta, drag_autoscroll_speed, take_terminal_creation_number,
@@ -80,6 +87,10 @@ enum GlobalShortcut {
     CloseTab,
     Search,
     ToggleClaudeGrid,
+    SplitRight,
+    SplitDown,
+    FocusPane(PaneDirection),
+    ClosePane,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,6 +148,15 @@ fn exact_global_modifiers(modifiers: Modifiers, shift: bool) -> bool {
         && !modifiers.super_key()
 }
 
+/// Alt without Ctrl, Shift and Super: the modifier set of the pane focus keys.
+#[inline]
+fn exact_alt_modifiers(modifiers: Modifiers) -> bool {
+    modifiers.alt_key()
+        && !modifiers.control_key()
+        && !modifiers.shift_key()
+        && !modifiers.super_key()
+}
+
 fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShortcut> {
     match key {
         PhysicalKey::Code(KeyCode::F1) if modifiers.is_empty() => {
@@ -156,6 +176,27 @@ fn global_shortcut(key: PhysicalKey, modifiers: Modifiers) -> Option<GlobalShort
         }
         PhysicalKey::Code(KeyCode::KeyS) if exact_global_modifiers(modifiers, true) => {
             Some(GlobalShortcut::ToggleClaudeGrid)
+        }
+        PhysicalKey::Code(KeyCode::KeyD) if exact_global_modifiers(modifiers, true) => {
+            Some(GlobalShortcut::SplitRight)
+        }
+        PhysicalKey::Code(KeyCode::KeyE) if exact_global_modifiers(modifiers, true) => {
+            Some(GlobalShortcut::SplitDown)
+        }
+        PhysicalKey::Code(KeyCode::KeyW) if exact_global_modifiers(modifiers, true) => {
+            Some(GlobalShortcut::ClosePane)
+        }
+        PhysicalKey::Code(KeyCode::ArrowLeft) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Left))
+        }
+        PhysicalKey::Code(KeyCode::ArrowRight) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Right))
+        }
+        PhysicalKey::Code(KeyCode::ArrowUp) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Up))
+        }
+        PhysicalKey::Code(KeyCode::ArrowDown) if exact_alt_modifiers(modifiers) => {
+            Some(GlobalShortcut::FocusPane(PaneDirection::Down))
         }
         _ => None,
     }
@@ -500,6 +541,8 @@ struct ClaudeGrid {
 enum GridHint {
     NoClaudeTabs,
     TooManyTabs,
+    SplitTooSmall,
+    SpawnFailed,
 }
 
 impl GridHint {
@@ -507,11 +550,154 @@ impl GridHint {
         match self {
             Self::NoClaudeTabs => "Нет вкладок с Claude",
             Self::TooManyTabs => "Слишком много вкладок с Claude для окна",
+            Self::SplitTooSmall => "Панель слишком мала для сплита",
+            Self::SpawnFailed => "Не удалось запустить панель",
         }
     }
 }
 
 const GRID_HINT_DURATION: Duration = Duration::from_secs(2);
+
+/// Stable identity of one tab in `App.tabs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TabId(u64);
+
+impl TabId {
+    fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// One terminal tab: a split tree over `App.terminals`, the focused pane and
+/// the number the tab strip shows. The layout always contains `active_pane`.
+struct Tab {
+    id: TabId,
+    layout: SplitNode,
+    active_pane: PaneId,
+    /// Display number of the founding terminal (`take_terminal_creation_number`).
+    title_number: usize,
+}
+
+/// A divider drag in flight: the tab and the split node addressed from its
+/// root, the button that owns the drag, the structure generation the geometry
+/// belongs to, the saved ratio to restore when the drag is cancelled and the
+/// pointer distance to the first branch edge the press grabbed.
+struct DividerDrag {
+    tab: TabId,
+    path: Vec<u8>,
+    axis: SplitAxis,
+    button: PointerButton,
+    structure_generation: u64,
+    ratio_at_start: f32,
+    grab_offset: f32,
+}
+
+/// Whether `pane` is one of the leaves of this split subtree.
+fn split_contains_pane(node: &SplitNode, pane: PaneId) -> bool {
+    match node {
+        SplitNode::Leaf(id) => *id == pane,
+        SplitNode::Split { first, second, .. } => {
+            split_contains_pane(first, pane) || split_contains_pane(second, pane)
+        }
+    }
+}
+
+/// Number of leaves in the subtree, optionally only those for `pane`.
+#[cfg(any(debug_assertions, test))]
+fn split_leaf_count(node: &SplitNode, pane: Option<PaneId>) -> usize {
+    match node {
+        SplitNode::Leaf(id) => usize::from(pane.is_none_or(|pane| pane == *id)),
+        SplitNode::Split { first, second, .. } => {
+            split_leaf_count(first, pane) + split_leaf_count(second, pane)
+        }
+    }
+}
+
+/// Collects the leaf panes of `node` in tree order. Allocates the caller's
+/// vector; used only by the close path, never in a frame.
+fn collect_split_panes(node: &SplitNode, panes: &mut Vec<PaneId>) {
+    match node {
+        SplitNode::Leaf(pane) => panes.push(*pane),
+        SplitNode::Split { first, second, .. } => {
+            collect_split_panes(first, panes);
+            collect_split_panes(second, panes);
+        }
+    }
+}
+
+/// Absolute rect of the split node addressed by `path` in a tab body, walked
+/// through the same `split_child_rects` call the layout uses. `None` when the
+/// path leaves the tree or ends on a leaf.
+fn split_node_rect(
+    root: &SplitNode,
+    body: Rect,
+    path: &[u8],
+    scale: f32,
+    char_w: f32,
+    char_h: f32,
+) -> Option<Rect> {
+    let gap = (GRID_TILE_GAP * scale).round();
+    let mut node = root;
+    let mut rect = body;
+    for step in path {
+        let SplitNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return None;
+        };
+        let first_min = min_extent(first, *axis, char_w, char_h, scale);
+        let second_min = min_extent(second, *axis, char_w, char_h, scale);
+        let (first_rect, second_rect) =
+            split_child_rects(rect, *axis, *ratio, gap, first_min, second_min);
+        match step {
+            0 => {
+                node = first;
+                rect = first_rect;
+            }
+            1 => {
+                node = second;
+                rect = second_rect;
+            }
+            _ => return None,
+        }
+    }
+    matches!(node, SplitNode::Split { .. }).then_some(rect)
+}
+
+/// Ratio that puts the divider of `node_rect` at `coord` along `axis`. The
+/// first branch keeps its minimum and the second keeps its own, judged on the
+/// same `available` span [`split_child_rects`] uses; a node too small for both
+/// minimums follows the pointer unclamped.
+fn dragged_ratio(
+    node_rect: Rect,
+    axis: SplitAxis,
+    saved_ratio: f32,
+    gap: f32,
+    first_min: f32,
+    second_min: f32,
+    coord: f32,
+) -> f32 {
+    let (extent, start) = match axis {
+        SplitAxis::SideBySide => (node_rect.w, node_rect.x),
+        SplitAxis::Stacked => (node_rect.h, node_rect.y),
+    };
+    let node_gap = if extent < gap { 0.0 } else { gap };
+    let available = (extent - node_gap).max(0.0);
+    if available <= 0.0 {
+        return saved_ratio;
+    }
+    let first_floor = first_min.ceil();
+    let second_floor = second_min.ceil();
+    let mut first_extent = (coord - start).clamp(0.0, available);
+    if available >= first_floor + second_floor {
+        first_extent = first_extent.clamp(first_floor, available - second_floor);
+    }
+    first_extent / available
+}
 
 pub struct App {
     runtime: Option<WindowRuntime>,
@@ -531,6 +717,18 @@ pub struct App {
     settings_background_dragging: bool,
     terminals: Vec<Terminal>,
     active_terminal: usize,
+    /// Tabs in strip order; `tabs[active_tab]` owns `active_terminal`.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// One strip label per tab, rebuilt from `tabs` before every render.
+    tab_labels: Vec<TabLabelIndex>,
+    next_tab_id: u64,
+    /// Source of every `PaneId`; ids are never reused after a pane closes.
+    next_pane_id: u64,
+    /// Grows on structural tab/pane changes; `layout_generation` additionally
+    /// grows when any saved split ratio changes.
+    structure_generation: u64,
+    layout_generation: u64,
     active_terminal_presented: bool,
     next_terminal_creation_number: u64,
     terminal_tab_scroll: ScrollState,
@@ -576,24 +774,41 @@ pub struct App {
     grid_metrics: GridMetrics,
     /// Panels drawn in the current frame; rebuilt by `rebuild_panels` before each render.
     panels: Vec<Panel>,
+    /// Outside grid mode, the body of every pane of the active tab, in tree
+    /// order, as laid out for the current frame. Reused by every rebuild.
+    pane_rects: Vec<(PaneId, Rect)>,
     /// Layouts of `panels` from the last render, in `panels` order.
     panel_layouts: Vec<TerminalUiLayout>,
     /// `None` while the ordinary single-panel view is shown.
     claude_grid: Option<ClaudeGrid>,
-    /// Grows whenever the panel composition, order, metrics or mode change.
+    /// Grows whenever the grid composition changes: its members, their order,
+    /// or grid mode opening and closing.
     grid_generation: u64,
-    /// `grid_generation` at the time `panel_layouts` were rendered.
+    /// `layout_generation` at the time `panel_layouts` were rendered.
     panel_layouts_generation: u64,
+    /// `grid_generation` at the time `panel_layouts` were rendered. Grid input
+    /// matches against tile geometry only, so a focus change never stales it.
+    panel_layouts_grid_generation: u64,
     /// Hint shown on the tab strip until its deadline.
     grid_hint: Option<(GridHint, Instant)>,
     /// Scratch for the tab indices of the current composition; swapped with `ClaudeGrid::members`.
     grid_members_scratch: Vec<usize>,
     /// Scratch for the tile rectangles `rebuild_panels` gets from `grid_tiles`.
     grid_tile_rects: Vec<(Rect, Rect)>,
-    /// Pointer state reserved for grid tile handling.
-    suppressed_release: Option<PointerButton>,
+    /// Pointer state reserved for grid tile handling. Buttons whose press never
+    /// reached the terminal and whose release must be swallowed even when the
+    /// mode that owned the press has ended. `Vec`, not a bitmask:
+    /// `PointerButton::Other` carries an arbitrary identity.
+    suppressed_release: Vec<PointerButton>,
+    /// The divider drag in flight, if any. Only the button that started it ends it.
+    divider_drag: Option<DividerDrag>,
     last_header_press: Option<(Instant, usize)>,
     hovered_panel_terminal: Option<usize>,
+    /// Terminal that received the press of a pointer drag begun in a split
+    /// pane or a grid tile, while `pointer_capture` is `None`. Motion and the
+    /// paired release go to it with its own layout even after the pointer
+    /// leaves its body. Ownership lasts only while a button is still held.
+    split_pointer_owner: Option<usize>,
     /// Earliest end of the banner hiding among grid tiles that the last grid
     /// frame drew with `content_hidden`; grid mode only.
     withheld_until: Option<Instant>,
@@ -641,6 +856,13 @@ impl App {
             settings_background_dragging: false,
             terminals: Vec::new(),
             active_terminal: 0,
+            tabs: Vec::new(),
+            active_tab: 0,
+            tab_labels: Vec::new(),
+            next_tab_id: 1,
+            next_pane_id: 1,
+            structure_generation: 0,
+            layout_generation: 0,
             active_terminal_presented: false,
             next_terminal_creation_number: 1,
             terminal_tab_scroll: ScrollState::new(7.0),
@@ -677,16 +899,20 @@ impl App {
             automation: None,
             grid_metrics: GridMetrics::default(),
             panels: Vec::new(),
+            pane_rects: Vec::new(),
             panel_layouts: Vec::new(),
             claude_grid: None,
             grid_generation: 0,
             panel_layouts_generation: 0,
+            panel_layouts_grid_generation: 0,
             grid_hint: None,
             grid_members_scratch: Vec::new(),
             grid_tile_rects: Vec::new(),
-            suppressed_release: None,
+            suppressed_release: Vec::new(),
+            divider_drag: None,
             last_header_press: None,
             hovered_panel_terminal: None,
+            split_pointer_owner: None,
             withheld_until: None,
         }
     }
@@ -772,13 +998,254 @@ impl App {
         }
     }
 
-    fn activate_ready_terminal(&mut self, index: usize, reveal_tail: bool) {
-        if index >= self.terminals.len() {
+    /// Allocates the next stable pane id; the only source of `PaneId`.
+    fn issue_pane_id(&mut self) -> PaneId {
+        let id = PaneId::new(self.next_pane_id);
+        self.next_pane_id = self.next_pane_id.wrapping_add(1);
+        id
+    }
+
+    /// Allocates the next stable tab id; the only source of `TabId`.
+    fn issue_tab_id(&mut self) -> TabId {
+        let id = TabId::new(self.next_tab_id);
+        self.next_tab_id = self.next_tab_id.wrapping_add(1);
+        id
+    }
+
+    fn bump_layout_generation(&mut self) {
+        self.layout_generation = self.layout_generation.wrapping_add(1);
+    }
+
+    /// A structural change (tree shape, tab composition/order or the active
+    /// tab) invalidates both the panels and the saved layout.
+    fn bump_structure_generation(&mut self) {
+        self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.bump_layout_generation();
+    }
+
+    /// Marks the next release of `button` as swallowed. Idempotent: one press
+    /// owns one release.
+    fn suppress_release(&mut self, button: PointerButton) {
+        if !self.suppressed_release.contains(&button) {
+            self.suppressed_release.push(button);
+        }
+    }
+
+    /// Takes exactly one suppression mark of `button`; `true` when the release
+    /// must not reach the terminal.
+    fn take_suppressed_release(&mut self, button: PointerButton) -> bool {
+        let Some(index) = self
+            .suppressed_release
+            .iter()
+            .position(|entry| *entry == button)
+        else {
+            return false;
+        };
+        self.suppressed_release.remove(index);
+        true
+    }
+
+    /// Ends the live drag, if any, restoring the saved ratio of its node while
+    /// the node still exists. Called before every structural mutation that can
+    /// move or delete the node, and on every mode change that ends the drag.
+    fn cancel_divider_drag(&mut self) {
+        let Some(drag) = self.divider_drag.take() else {
+            return;
+        };
+        let mut restored = false;
+        if let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == drag.tab)
+            && let Some(SplitNode::Split { ratio, .. }) =
+                node_at_path_mut(&mut self.tabs[tab_index].layout, &drag.path)
+            && *ratio != drag.ratio_at_start
+        {
+            *ratio = drag.ratio_at_start;
+            restored = true;
+        }
+        if restored {
+            self.bump_layout_generation();
+        }
+        self.suppress_release(drag.button);
+    }
+
+    /// Moves the divider of the live drag to the pointer, keeping the distance
+    /// the press grabbed to the first branch edge so the divider does not jump.
+    /// The saved ratio comes from the node geometry of the current frame,
+    /// clamped to the minimums of both branches. A structure change since the
+    /// press ends the drag without a rollback: the node may no longer exist and
+    /// its current ratio stands.
+    fn update_divider_drag(&mut self, x: f32, y: f32) {
+        let Some(drag) = self.divider_drag.take() else {
+            return;
+        };
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == drag.tab) else {
+            self.suppress_release(drag.button);
+            return;
+        };
+        if self.structure_generation != drag.structure_generation {
+            self.suppress_release(drag.button);
             return;
         }
+        let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let axis = drag.axis;
+        let gap = (GRID_TILE_GAP * metrics.scale).round();
+        let coord = match axis {
+            SplitAxis::SideBySide => x - drag.grab_offset,
+            SplitAxis::Stacked => y - drag.grab_offset,
+        };
+        let ratio = {
+            let layout = &self.tabs[tab_index].layout;
+            let rect = split_node_rect(
+                layout,
+                body,
+                &drag.path,
+                metrics.scale,
+                metrics.char_w,
+                metrics.char_h,
+            );
+            let node = node_at_path(layout, &drag.path);
+            match (rect, node) {
+                (Some(rect), Some(SplitNode::Split { ratio: saved, first, second, .. })) => {
+                    let first_min =
+                        min_extent(first, axis, metrics.char_w, metrics.char_h, metrics.scale);
+                    let second_min =
+                        min_extent(second, axis, metrics.char_w, metrics.char_h, metrics.scale);
+                    let ratio =
+                        dragged_ratio(rect, axis, *saved, gap, first_min, second_min, coord);
+                    // A motion that leaves the cut on the same pixel keeps the
+                    // saved ratio instead of rewriting its float representation.
+                    let (before, _) =
+                        split_child_rects(rect, axis, *saved, gap, first_min, second_min);
+                    let (after, _) =
+                        split_child_rects(rect, axis, ratio, gap, first_min, second_min);
+                    Some((ratio, before != after))
+                }
+                _ => None,
+            }
+        };
+        let Some((ratio, pixel_changed)) = ratio else {
+            self.suppress_release(drag.button);
+            return;
+        };
+        if pixel_changed
+            && let Some(SplitNode::Split { ratio: saved, .. }) =
+                node_at_path_mut(&mut self.tabs[tab_index].layout, &drag.path)
+        {
+            *saved = ratio;
+            self.bump_layout_generation();
+            self.request_frame();
+        }
+        self.divider_drag = Some(drag);
+    }
+
+    /// Terminal and layout of the split pane under the pointer, with global
+    /// coordinates. A live pointer capture keeps its terminal, so the wheel and
+    /// the motion follow it. `None` when the rendered geometry is stale or no
+    /// body is under the pointer: both callers then keep the active pane.
+    fn split_panel_under_pointer(&self) -> Option<(usize, TerminalUiLayout)> {
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            return Some((self.active_terminal, self.interaction.layout));
+        }
+        if self.panel_layouts_generation != self.layout_generation {
+            return None;
+        }
+        let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
+        else {
+            return None;
+        };
+        let terminal = self.panels.get(index)?.terminal;
+        let layout = *self.panel_layouts.get(index)?;
+        Some((terminal, layout))
+    }
+
+    /// Terminal and layout of the grid tile under the pointer. A live pointer
+    /// capture keeps its terminal, so the motion follows it. `None` when the
+    /// rendered geometry is stale or no tile body is under the pointer: nothing
+    /// receives motion for an old layout.
+    fn grid_tile_under_pointer(&self) -> Option<(usize, TerminalUiLayout)> {
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            return Some((self.active_terminal, self.interaction.layout));
+        }
+        if self.panel_layouts_grid_generation != self.grid_generation {
+            return None;
+        }
+        let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
+        else {
+            return None;
+        };
+        let terminal = self.panels.get(index)?.terminal;
+        let layout = *self.panel_layouts.get(index)?;
+        Some((terminal, layout))
+    }
+
+    /// Terminal and layout of the split pane or grid tile that owns the
+    /// pressed pointer. The press stays with that terminal while any button is
+    /// held, even after the pointer leaves the pane's body.
+    fn split_pointer_target(&self) -> Option<(usize, TerminalUiLayout)> {
+        let owner = self.split_pointer_owner?;
+        let index = self
+            .panels
+            .iter()
+            .position(|panel| panel.terminal == owner)?;
+        Some((owner, *self.panel_layouts.get(index)?))
+    }
+
+    /// Makes the pane of panel `index` active and points the terminal
+    /// interaction at that panel's layout, with global pointer coordinates.
+    /// The split-tab counterpart of `select_grid_tile`.
+    fn select_split_panel(&mut self, index: usize) {
+        let Some(pane) = self
+            .panels
+            .get(index)
+            .and_then(|panel| self.terminals.get(panel.terminal))
+            .map(Terminal::pane_id)
+        else {
+            return;
+        };
+        self.cancel_terminal_presentation_intents();
+        self.activate_pane(pane, false);
+        if let Some(layout) = self.panel_layouts.get(index) {
+            self.interaction.layout = *layout;
+        }
+        self.request_frame();
+    }
+
+    fn tab_index_of_pane(&self, pane: PaneId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| split_contains_pane(&tab.layout, pane))
+    }
+
+    fn terminal_index_of_pane(&self, pane: PaneId) -> Option<usize> {
+        self.terminals
+            .iter()
+            .position(|terminal| terminal.pane_id() == pane)
+    }
+
+    /// The single focus operation: `pane` becomes the active pane of its tab,
+    /// its tab becomes active, and `pane` is presented and reported as focused.
+    /// Everything `activate_ready_terminal` did before lives here now.
+    fn activate_pane(&mut self, pane: PaneId, reveal_tail: bool) {
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
+            return;
+        };
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return;
+        };
+        if tab_index != self.active_tab {
+            // Switching tabs ends a divider drag and the split pointer
+            // ownership of the tab being left, before its tree can move.
+            self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
+            self.active_tab = tab_index;
+            self.bump_structure_generation();
+        }
+        self.tabs[tab_index].active_pane = pane;
         if index == self.active_terminal && self.active_terminal_presented {
             self.pending_tab_reveal = Some(reveal_tail);
             self.mark_dirty();
+            #[cfg(debug_assertions)]
+            self.debug_assert_invariants();
             return;
         }
         let old_presented = self
@@ -797,6 +1264,88 @@ impl App {
         self.send_terminal_focus_transition(old_presented, Some(index));
         self.pending_tab_reveal = Some(reveal_tail);
         self.mark_dirty();
+        #[cfg(debug_assertions)]
+        self.debug_assert_invariants();
+    }
+
+    /// Background tab focus change: only `Tab.active_pane` moves, without
+    /// touching `active_tab`, `active_terminal`, `interaction` or focus state.
+    fn select_tab_pane_in_background(&mut self, tab: TabId, pane: PaneId) {
+        let Some(index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+            return;
+        };
+        if split_contains_pane(&self.tabs[index].layout, pane) {
+            self.tabs[index].active_pane = pane;
+        }
+    }
+
+    /// Thin adapter over the pane identity: existing callers keep their index.
+    fn activate_ready_terminal(&mut self, index: usize, reveal_tail: bool) {
+        let Some(pane) = self.terminals.get(index).map(Terminal::pane_id) else {
+            return;
+        };
+        self.activate_pane(pane, reveal_tail);
+    }
+
+    /// Checks the tab model: every terminal owns exactly one split leaf, every
+    /// leaf names a live terminal, and the active tab's pane is the active
+    /// terminal. Production calls it only under `debug_assertions`; tests run
+    /// in a release profile, so its body uses `assert!` and tests call it.
+    #[cfg(any(debug_assertions, test))]
+    fn debug_assert_invariants(&self) {
+        if self.terminals.is_empty() {
+            assert!(self.tabs.is_empty(), "terminals are gone but tabs remain");
+            return;
+        }
+        assert!(!self.tabs.is_empty(), "terminals exist without a tab");
+        assert!(
+            self.active_tab < self.tabs.len(),
+            "active tab index {} is out of range",
+            self.active_tab
+        );
+        assert!(
+            self.active_terminal < self.terminals.len(),
+            "active terminal index {} is out of range",
+            self.active_terminal
+        );
+        assert_eq!(
+            self.tabs[self.active_tab].active_pane,
+            self.terminals[self.active_terminal].pane_id(),
+            "active tab pane and active terminal disagree"
+        );
+        let mut leaves = 0;
+        for tab in &self.tabs {
+            leaves += split_leaf_count(&tab.layout, None);
+            assert!(tab.title_number > 0, "a tab must carry its title number");
+            assert!(
+                split_contains_pane(&tab.layout, tab.active_pane),
+                "a tab's active pane is not one of its leaves"
+            );
+        }
+        assert_eq!(
+            leaves,
+            self.terminals.len(),
+            "split leaves and terminals disagree"
+        );
+        for (position, terminal) in self.terminals.iter().enumerate() {
+            let pane = terminal.pane_id();
+            // Two terminals with one pane id would each claim the same leaf, so
+            // the per-terminal count below cannot see a leaf that no terminal
+            // owns. Reject duplicates before comparing the two multisets.
+            assert!(
+                self.terminals[position + 1..]
+                    .iter()
+                    .all(|other| other.pane_id() != pane),
+                "two terminals share pane id {}",
+                pane.raw()
+            );
+            let owned: usize = self
+                .tabs
+                .iter()
+                .map(|tab| split_leaf_count(&tab.layout, Some(pane)))
+                .sum();
+            assert_eq!(owned, 1, "a terminal must own exactly one split leaf");
+        }
     }
 
     fn process_terminal_presentation_intents(&mut self) -> bool {
@@ -829,8 +1378,14 @@ impl App {
     }
 
     fn select_terminal_tab_from_user(&mut self, index: usize) {
+        self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         self.exit_claude_grid(None);
-        self.request_terminal_activation(index, false);
+        let Some(pane) = self.tabs.get(index).map(|tab| tab.active_pane) else {
+            return;
+        };
+        self.cancel_terminal_presentation_intents();
+        self.activate_pane(pane, false);
     }
 
     fn add_terminal(&mut self) -> Option<usize> {
@@ -877,27 +1432,129 @@ impl App {
     fn spawn_terminal_tab(
         &mut self,
         wake: WakeHandle,
-        mut launch: TerminalLaunchSpec,
+        launch: TerminalLaunchSpec,
         grid: (u16, u16),
     ) -> usize {
-        launch.shell.clone_from(&self.shell_override);
+        // A new tab is a structural change: a live drag ends before it.
+        self.cancel_divider_drag();
         self.cancel_terminal_presentation_intents();
         let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
+        let pane_id = self.issue_pane_id();
+        let index = self.spawn_terminal(wake, display_number, launch, grid, pane_id);
+        let id = self.issue_tab_id();
+        self.tabs.push(Tab {
+            id,
+            layout: SplitNode::Leaf(pane_id),
+            active_pane: pane_id,
+            title_number: display_number as usize,
+        });
+        self.bump_structure_generation();
+        self.request_terminal_activation(index, true);
+        self.request_frame();
+        index
+    }
+
+    /// Spawns one shell at `grid` under the caller's pane id and display
+    /// number and returns its index in `terminals`. The caller owns the tab and
+    /// the split tree.
+    fn spawn_terminal(
+        &mut self,
+        wake: WakeHandle,
+        display_number: u64,
+        mut launch: TerminalLaunchSpec,
+        grid: (u16, u16),
+        pane_id: PaneId,
+    ) -> usize {
+        launch.shell.clone_from(&self.shell_override);
         let terminal = Terminal::spawn_sized(
             Some(wake),
             display_number,
             launch,
             self.new_terminal_palette(),
             grid,
+            pane_id,
         );
         let index = self.terminals.len();
         self.terminals.push(terminal);
-        if self.terminals.len() == 1 {
-            self.active_terminal = 0;
-        }
-        self.request_terminal_activation(index, true);
-        self.request_frame();
         index
+    }
+
+    /// Splits the active pane of the active tab along `axis`: the new pane gets
+    /// its own shell in the active pane's directory. Refuses, showing a hint,
+    /// when a pane of the split would fall below `pane_min`; nothing is spawned
+    /// and the tree does not change then.
+    fn split_active_pane(&mut self, axis: SplitAxis) -> bool {
+        // A split changes the tree under a live drag; the saved ratio goes back
+        // before the preview is laid out from it. The pressed pointer has no
+        // pane to own once the tree changes.
+        self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
+        let metrics = self.grid_metrics;
+        let tab_index = self.active_tab;
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return false;
+        };
+        let active_pane = tab.active_pane;
+        // The split is laid out on a copy first: a pane below the minimum must
+        // not spawn a shell and must not reach the real tree.
+        let mut preview = tab.layout.clone();
+        let pane_id = self.issue_pane_id();
+        if !split_leaf_at(&mut preview, active_pane, axis, pane_id) {
+            return false;
+        }
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let (min_w, min_h) = pane_min(metrics.char_w, metrics.char_h, metrics.scale);
+        let mut scratch: Vec<(PaneId, Rect)> = Vec::with_capacity(leaf_count(&preview));
+        layout_panes(
+            &preview,
+            body,
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+            &mut scratch,
+        );
+        if scratch
+            .iter()
+            .any(|&(_, rect)| rect.w < min_w || rect.h < min_h)
+        {
+            self.set_grid_hint(GridHint::SplitTooSmall, Instant::now());
+            return false;
+        }
+        let Some(wake) = self.runtime.as_ref().map(|runtime| runtime.wake_handle()) else {
+            return false;
+        };
+        let inherited_directory = self
+            .terminals
+            .get(self.active_terminal)
+            .and_then(|terminal| terminal.osc7_cwd.clone());
+        let display_number = take_terminal_creation_number(&mut self.next_terminal_creation_number);
+        let index = self.spawn_terminal(
+            wake,
+            display_number,
+            TerminalLaunchSpec {
+                inherited_directory,
+                ..TerminalLaunchSpec::default()
+            },
+            crate::terminal::DEFAULT_SPAWN_GRID,
+            pane_id,
+        );
+        // A failed spawn leaves a process-less error terminal: drop it and keep
+        // the tree, the focus and the pending activation untouched.
+        if !self.terminals[index].has_process() {
+            self.terminals.pop();
+            self.set_grid_hint(GridHint::SpawnFailed, Instant::now());
+            return false;
+        }
+        self.cancel_terminal_presentation_intents();
+        let applied = split_leaf_at(&mut self.tabs[tab_index].layout, active_pane, axis, pane_id);
+        debug_assert!(applied, "the preview split already succeeded");
+        if !applied {
+            return false;
+        }
+        self.activate_pane(pane_id, false);
+        self.bump_structure_generation();
+        self.request_frame();
+        true
     }
 
     /// Palette a tab created now starts with: the configured background, with
@@ -922,15 +1579,33 @@ impl App {
     /// `withhold_active_frame` skipped, in grid mode the `withheld_until`
     /// deadline (the next grid frame recomputes it).
     fn advance_dev_channel_warnings(&mut self, now: Instant) {
-        for terminal in &mut self.terminals {
-            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
-            terminal.observe_dev_channel_banner(|pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
+        let grid_mode = self.grid_open() || self.active_tab_split();
+        let panels = &self.panels;
+        let active = self.active_terminal;
+        let mut redraw = false;
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
+            // Event path: scans the output that arrived and walks `/proc` only
+            // for a candidate generation without a cached answer; a repeated
+            // call in the same loop pass answers from the cache the first one
+            // filled. Verification of content the last frame hid asks for the
+            // redraw that can now show it; background tabs never do.
+            let pass = terminal.observe_dev_channel_event(now, &mut self.dev_warning_scratch);
+            let on_screen = if grid_mode {
+                panels.iter().any(|panel| panel.terminal == index)
+            } else {
+                index == active
+            };
+            // Only a redraw that can show the content is worth asking for; a
+            // frame whose content is now hidden is what withholding draws.
+            // A warning Enter hiding keeps its own deadline wake.
+            let drawable =
+                !terminal.dev_warning_frame_hidden(now) && terminal.dev_channel_content_verified();
+            redraw |= on_screen && (pass.sent || pass.reverified && drawable);
         }
-        if self.grid_open() {
+        if redraw {
+            self.request_frame();
+        }
+        if grid_mode {
             if self.withheld_until.is_some_and(|until| now >= until) {
                 self.withheld_until = None;
                 self.request_frame();
@@ -947,21 +1622,24 @@ impl App {
             .is_some_and(|terminal| terminal.dev_warning_frame_hidden(now))
     }
 
-    /// Whether to skip this frame because the active tab shows the warning that
-    /// Enter was already sent for: the compositor keeps the last presented
-    /// frame. Rescans the active tab first, since output may have arrived after
-    /// `on_about_to_wait`. Input is not affected. Also applies the banner
-    /// hiding (`Terminal::observe_dev_channel_banner`) to the new content.
+    /// Whether to skip this frame: the active tab shows the warning that Enter
+    /// was already sent for (the compositor keeps the last presented frame), or
+    /// its content generation has no verified development-channels answer yet.
+    /// Rescans the active tab first, since output may have arrived after
+    /// `on_about_to_wait`, and answers the process lookup from the cache the
+    /// event paths filled (the frame path walks no `/proc`): an unknown answer
+    /// leaves the generation unverified and the next event pass asks for the
+    /// redraw. Input is not affected.
     fn withhold_active_frame(&mut self, now: Instant) -> bool {
         if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
-            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
-            terminal.observe_dev_channel_banner(|pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
+            terminal.observe_dev_channel_cached(now, &mut self.dev_warning_scratch);
         }
-        if !self.active_dev_warning_hidden(now) {
+        let Some(terminal) = self.terminals.get(self.active_terminal) else {
+            return false;
+        };
+        let warning_hidden = terminal.dev_warning_frame_hidden(now);
+        let verified = terminal.dev_channel_content_verified();
+        if !warning_hidden && verified {
             return false;
         }
         self.frame_withheld = true;
@@ -969,11 +1647,15 @@ impl App {
         true
     }
 
-    /// Grid counterpart of `withhold_active_frame`: applies the warning and
-    /// banner hiding to every tile terminal and sets `content_hidden` on its
-    /// panel, so the frame is drawn with only the hidden tile body blank. Must
-    /// run after `rebuild_panels`, which resets `content_hidden`. Records the
-    /// earliest hiding end in `withheld_until` for the loop to wake at.
+    /// Grid and split counterpart of `withhold_active_frame`: scans every tile
+    /// terminal of the output that arrived after `on_about_to_wait` and sets
+    /// `content_hidden` on its panel, so the frame is drawn with only the
+    /// hidden tile body blank. An unknown development-channels answer hides the
+    /// body as well and leaves the generation unverified, so the next event
+    /// pass asks for the redraw. Answers the process lookup from the cache the
+    /// event paths filled. Must run after `rebuild_panels`, which resets
+    /// `content_hidden`. Records the earliest warning-hiding end in
+    /// `withheld_until` for the loop to wake at.
     fn observe_grid_dev_warnings(&mut self, now: Instant) {
         let mut withheld_until: Option<Instant> = None;
         for panel in &mut self.panels {
@@ -981,13 +1663,8 @@ impl App {
                 panel.content_hidden = false;
                 continue;
             };
-            terminal.observe_dev_channel_warning(now, &mut self.dev_warning_scratch, |pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
-            terminal.observe_dev_channel_banner(|pgrp| {
-                pgrp.and_then(crate::tab_input::dev_channel_claude_in_group)
-            });
-            panel.content_hidden = terminal.dev_warning_frame_hidden(now);
+            terminal.observe_dev_channel_cached(now, &mut self.dev_warning_scratch);
+            panel.content_hidden = terminal.dev_channel_content_hidden(now);
             if panel.content_hidden {
                 if let Some(until) = terminal.dev_warning_hidden_until() {
                     withheld_until = Some(withheld_until.map_or(until, |earliest| earliest.min(until)));
@@ -1113,81 +1790,18 @@ impl App {
         }
     }
 
+    /// Thin adapter over the tab identity: existing callers keep their terminal
+    /// index, the close itself belongs to `close_tab`. Returns true exactly when
+    /// the window must close.
     fn close_terminal_tab_at(&mut self, index: usize) -> bool {
-        if index >= self.terminals.len() {
+        let Some(pane) = self.terminals.get(index).map(Terminal::pane_id) else {
             return false;
-        }
-        let old_active = self.active_terminal;
-        // Grid mode: the tile that takes focus when the focused tile closes,
-        // numbered for the tab list after the removal.
-        let grid_successor = if index == old_active {
-            self.grid_successor_after_removal(index)
-        } else {
-            None
         };
-        let is_final = self.terminals.len() == 1;
-        let active_was_presented = index == old_active && self.active_terminal_presented;
-        if index == old_active {
-            if active_was_presented {
-                self.send_terminal_focus_transition(Some(index), None);
-            }
-        }
-
-        if !is_final {
-            let process = self.terminals[index].take_process_for_cleanup();
-            if let Some(process) = process
-                && let Err(process) = self.try_schedule_terminal_cleanup(process)
-            {
-                self.terminals[index].restore_process_after_cleanup_backpressure(process);
-                if active_was_presented {
-                    self.send_terminal_focus_transition(None, Some(index));
-                }
-                return false;
-            }
-        }
-
-        if index == old_active {
-            self.interaction
-                .reset_for_terminal_switch(&mut self.terminals[index]);
-            self.active_terminal_presented = false;
-        }
-        let mut removed = self.terminals.remove(index);
-        // Removing a tab shifts the indices a `CloseTarget::Tab` points at, so an open
-        // dialog no longer names the tab it was opened for. Cancel it instead.
-        self.cancel_close_dialog();
-        if is_final {
-            removed.shutdown();
-        }
-        self.terminal_tab_drag = None;
-        self.pending_tab_reveal = None;
-
-        if self.terminals.is_empty() {
-            self.active_terminal = 0;
-            self.active_terminal_presented = false;
-            self.cancel_terminal_presentation_intents();
-            return true;
-        }
-
-        self.active_terminal = active_index_after_remove(old_active, index, self.terminals.len());
-        if index == old_active {
-            if let Some(successor) = grid_successor {
-                // Focus stays on a tile; the neighbour outside the grid gets no
-                // deferred activation.
-                self.cancel_terminal_presentation_intents();
-                self.active_terminal = successor;
-                self.activate_ready_terminal(successor, false);
-            } else if self.terminals[self.active_terminal].presentation_ready() {
-                self.activate_ready_terminal(self.active_terminal, false);
-            } else {
-                self.cancel_terminal_presentation_intents();
-                self.terminals[self.active_terminal].presentation_intent =
-                    TerminalPresentationIntent::ActivateWhenReady;
-            }
-        }
-        self.pending_tab_reveal = Some(false);
-        self.request_frame();
-        self.sync_claude_grid(Instant::now());
-        false
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
+            return false;
+        };
+        let tab = self.tabs[tab_index].id;
+        self.close_tab(tab)
     }
 
     fn try_schedule_terminal_cleanup(
@@ -1277,19 +1891,31 @@ impl App {
         }
     }
 
-    /// Reads foreground job names only at the close moment. Returns (tab title, job
-    /// name) for each tab in the target that runs a job; empty when none does, so the
-    /// close proceeds without a dialog.
+    /// Reads foreground job names only at the close moment. Returns (pane title,
+    /// job name) for every pane in the target that runs a job; empty when none
+    /// does, so the close proceeds without a dialog.
     fn busy_close_targets(&self, target: CloseTarget) -> Vec<(String, String)> {
-        let range = match target {
-            CloseTarget::Window => 0..self.terminals.len(),
-            CloseTarget::Tab(index) => index..index.saturating_add(1).min(self.terminals.len()),
+        // A tab target lists every pane of that tab. Its index names one of the
+        // tab's terminals; the tab itself comes from the split tree.
+        let tab_filter = match target {
+            CloseTarget::Window => None,
+            CloseTarget::Tab(index) => {
+                let Some(terminal) = self.terminals.get(index) else {
+                    return Vec::new();
+                };
+                let Some(tab) = self.tab_index_of_pane(terminal.pane_id()) else {
+                    return Vec::new();
+                };
+                Some(tab)
+            }
         };
         let mut busy = Vec::new();
-        for index in range {
-            let Some(terminal) = self.terminals.get(index) else {
+        for terminal in &self.terminals {
+            if let Some(tab) = tab_filter
+                && self.tab_index_of_pane(terminal.pane_id()) != Some(tab)
+            {
                 continue;
-            };
+            }
             let Some(process) = terminal.busy_foreground_name() else {
                 continue;
             };
@@ -1314,6 +1940,319 @@ impl App {
             self.update_link_hover();
             self.request_frame();
         }
+    }
+
+    /// Closes one pane: the process goes to the cleanup worker first, and only
+    /// an accepted cleanup drops the leaf. A refused cleanup leaves the tree,
+    /// the terminal storage and the focus untouched. Returns true when the
+    /// window must close.
+    fn close_pane(&mut self, pane: PaneId) -> bool {
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return false;
+        };
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
+            return false;
+        };
+        let tab = self.tabs[tab_index].id;
+        let was_active_tab = tab_index == self.active_tab;
+        let last_pane_of_tab = leaf_count(&self.tabs[tab_index].layout) == 1;
+        // The last pane of the last tab is shut down synchronously instead of
+        // waiting for the cleanup worker; that branch cannot refuse.
+        let last_pane_of_window = last_pane_of_tab && self.tabs.len() == 1;
+        let grid_successor = (self.claude_grid.is_some() && index == self.active_terminal)
+            .then(|| self.grid_successor_after_removal(&[index]))
+            .flatten();
+        if !last_pane_of_window {
+            let process = self.terminals[index].take_process_for_cleanup();
+            if let Some(process) = process
+                && let Err(process) = self.try_schedule_terminal_cleanup(process)
+            {
+                self.terminals[index].restore_process_after_cleanup_backpressure(process);
+                return false;
+            }
+        }
+        // The cleanup is accepted (or no process needs it): the terminal really
+        // leaves storage. Only now end the live pointer gesture, because a
+        // refused cleanup keeps both the pane and its owner.
+        // The drag node may be the leaf being closed: restore before the tree moves.
+        // The removed terminal shifts the indices the pointer owner holds.
+        self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
+        let tree_successor = if last_pane_of_tab {
+            self.remove_last_pane_of_tab(tab);
+            None
+        } else {
+            self.remove_terminal_at(index)
+        };
+        if let Some(next) = tree_successor
+            && let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab)
+        {
+            self.tabs[tab_index].active_pane = next;
+        }
+        self.terminal_tab_drag = None;
+        self.cancel_close_dialog();
+        self.pending_tab_reveal = Some(false);
+        self.focus_after_removal(tab, was_active_tab, tree_successor, grid_successor);
+        self.request_frame();
+        self.sync_claude_grid(Instant::now());
+        self.terminals.is_empty()
+    }
+
+    /// Closes a whole tab: every pane's process is handed to the cleanup worker
+    /// first, then the panes go through the internal removal path without a
+    /// second dialog. A refused cleanup stops the close; the panes removed so far
+    /// stay removed. Returns true when the window must close.
+    fn close_tab(&mut self, tab: TabId) -> bool {
+        let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+            return false;
+        };
+        let was_active_tab = tab_index == self.active_tab;
+        let mut panes = Vec::new();
+        collect_split_panes(&self.tabs[tab_index].layout, &mut panes);
+        // The tile that holds the focus now: §6.4 keeps the focus on it when a
+        // refused cleanup stops the close before its own pane leaves.
+        let focused_pane = self
+            .terminals
+            .get(self.active_terminal)
+            .map(Terminal::pane_id);
+        let mut tree_successor = None;
+        for pane in panes {
+            let Some(index) = self.terminal_index_of_pane(pane) else {
+                continue;
+            };
+            let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+                break;
+            };
+            let last_pane_of_tab = leaf_count(&self.tabs[tab_index].layout) == 1;
+            if !(last_pane_of_tab && self.tabs.len() == 1) {
+                let process = self.terminals[index].take_process_for_cleanup();
+                if let Some(process) = process
+                    && let Err(process) = self.try_schedule_terminal_cleanup(process)
+                {
+                    self.terminals[index].restore_process_after_cleanup_backpressure(process);
+                    break;
+                }
+            }
+            // The hand-off is accepted: this pane really leaves storage. End
+            // the live pointer gesture only now; a refused cleanup leaves the
+            // pane alive and its owner untouched.
+            // The drag node may be removed with the tab: restore before the
+            // tree moves, and before the removed terminal shifts its index.
+            self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
+            if last_pane_of_tab {
+                self.remove_last_pane_of_tab(tab);
+                break;
+            }
+            if let Some(next) = self.remove_terminal_at(index) {
+                tree_successor = Some(next);
+                if let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) {
+                    self.tabs[tab_index].active_pane = next;
+                }
+            }
+        }
+        // The successor is picked over the tiles that actually survived: a
+        // refusal leaves the focused tile alive and the focus alone, and only a
+        // vanished tile hands the focus to its grid neighbour.
+        let grid_successor = if self.claude_grid.is_some()
+            && was_active_tab
+            && focused_pane.is_none_or(|pane| self.terminal_index_of_pane(pane).is_none())
+        {
+            self.grid_successor_after_focused_removal()
+        } else {
+            None
+        };
+        self.terminal_tab_drag = None;
+        self.cancel_close_dialog();
+        self.pending_tab_reveal = Some(false);
+        self.focus_after_removal(tab, was_active_tab, tree_successor, grid_successor);
+        self.request_frame();
+        self.sync_claude_grid(Instant::now());
+        self.terminals.is_empty()
+    }
+
+    /// Drops the only pane of `tab` together with the tab. The caller has
+    /// already scheduled the process cleanup; the last terminal of the window is
+    /// shut down here, synchronously within the bounded grace.
+    fn remove_last_pane_of_tab(&mut self, tab: TabId) {
+        let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) else {
+            return;
+        };
+        let pane = self.tabs[tab_index].active_pane;
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return;
+        };
+        if self.tabs.len() == 1 {
+            self.terminals[index].shutdown();
+        }
+        self.remove_terminal_at(index);
+        self.tabs.remove(tab_index);
+        self.active_tab = active_index_after_remove(self.active_tab, tab_index, self.tabs.len());
+        self.bump_structure_generation();
+    }
+
+    /// Low-level removal of one pane: drops the terminal, collapses the split
+    /// leaf and grows the structural generations. Returns the tree successor of
+    /// the tab when the removed pane was that tab's active pane. `Tab.active_pane`
+    /// is left to the caller, which sets it in the same close call; no frame or
+    /// event runs in between.
+    fn remove_terminal_at(&mut self, index: usize) -> Option<PaneId> {
+        if index >= self.terminals.len() {
+            return None;
+        }
+        let pane = self.terminals[index].pane_id();
+        let Some(tab_index) = self.tab_index_of_pane(pane) else {
+            return None;
+        };
+        // The successor is read before the leaf leaves the tree.
+        let tree_successor = (self.tabs[tab_index].active_pane == pane)
+            .then(|| successor(&self.tabs[tab_index].layout, pane))
+            .flatten();
+        if index == self.active_terminal {
+            // The focused terminal reports the focus loss; the successor reports
+            // the focus gain when the caller activates it.
+            if self.active_terminal_presented {
+                self.send_terminal_focus_transition(Some(index), None);
+            }
+            self.interaction
+                .reset_for_terminal_switch(&mut self.terminals[index]);
+            self.active_terminal_presented = false;
+        }
+        self.terminals.remove(index);
+        if index < self.active_terminal {
+            self.active_terminal -= 1;
+        } else if index == self.active_terminal {
+            self.active_terminal = self
+                .active_terminal
+                .min(self.terminals.len().saturating_sub(1));
+        }
+        // A root leaf cannot collapse; `remove_last_pane_of_tab` drops its tab.
+        remove_leaf(&mut self.tabs[tab_index].layout, pane);
+        self.bump_structure_generation();
+        tree_successor
+    }
+
+    /// §6.4 focus procedure after a close. `removed` names the tab the panes
+    /// left, `tree_successor` is the successor `remove_terminal_at` reported and
+    /// `grid_successor` the tile picked before the first removal. Both
+    /// successors are `None` when the focus does not move.
+    fn focus_after_removal(
+        &mut self,
+        removed: TabId,
+        was_active_tab: bool,
+        tree_successor: Option<PaneId>,
+        grid_successor: Option<usize>,
+    ) {
+        if !self.tabs.iter().any(|tab| tab.id == removed) {
+            // 1. The tab is gone.
+            if was_active_tab {
+                self.focus_after_tab_closed(grid_successor);
+            }
+            // 1b: a background tab leaves the global focus alone; its tiles
+            // leave the grid with the member refresh.
+        } else if self.claude_grid.is_some() {
+            // 2a. The tab survives and the grid is open.
+            if let Some(index) = grid_successor {
+                if let Some(next) = tree_successor {
+                    // Focus moves to another tab's tile: the closed tab only
+                    // keeps its own pane choice, without focus reporting.
+                    self.select_tab_pane_in_background(removed, next);
+                }
+                self.focus_tile_after_removal(index);
+            } else {
+                self.collect_claude_members();
+                if self.grid_members_scratch.is_empty() {
+                    // No tile left: the grid closes and 2b decides the focus.
+                    self.exit_claude_grid(None);
+                    self.focus_after_pane_closed(removed, was_active_tab, tree_successor);
+                } else if let Some(next) = tree_successor {
+                    // The pane was not the focused tile: focus stays.
+                    self.select_tab_pane_in_background(removed, next);
+                }
+            }
+        } else {
+            // 2b. The tab survives and the grid is closed.
+            self.focus_after_pane_closed(removed, was_active_tab, tree_successor);
+        }
+        #[cfg(debug_assertions)]
+        self.debug_assert_invariants();
+    }
+
+    /// 1a. The active tab disappeared: the next tile keeps the grid focus, else
+    /// the grid closes onto the neighbour tab, and a window without tabs closes.
+    fn focus_after_tab_closed(&mut self, grid_successor: Option<usize>) {
+        if self.claude_grid.is_some() {
+            if let Some(index) = grid_successor {
+                self.focus_tile_after_removal(index);
+                return;
+            }
+            self.exit_claude_grid(None);
+        }
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let pane = tab.active_pane;
+        self.focus_pane_after_removal(pane);
+    }
+
+    /// 2b. The pane left a surviving tab: the active tab activates the tree
+    /// successor, a background tab only retargets its active pane.
+    fn focus_after_pane_closed(
+        &mut self,
+        removed: TabId,
+        was_active_tab: bool,
+        tree_successor: Option<PaneId>,
+    ) {
+        let Some(next) = tree_successor else {
+            return;
+        };
+        if was_active_tab {
+            self.focus_pane_after_removal(next);
+        } else {
+            self.select_tab_pane_in_background(removed, next);
+        }
+    }
+
+    /// Focus on a grid tile: the neighbour takes the focus and reports it.
+    fn focus_tile_after_removal(&mut self, index: usize) {
+        if index >= self.terminals.len() {
+            return;
+        }
+        self.cancel_terminal_presentation_intents();
+        self.active_terminal = index;
+        self.activate_ready_terminal(index, false);
+    }
+
+    /// Focus on a pane of the tree: through `activate_pane` when the pane can
+    /// present now, otherwise as a deferred activation. The deferred path moves
+    /// the logical focus at once — the tab, its active pane and the active
+    /// terminal name the choice — while the presentation waits.
+    fn focus_pane_after_removal(&mut self, pane: PaneId) {
+        let Some(index) = self.terminal_index_of_pane(pane) else {
+            return;
+        };
+        if self.terminals[index].presentation_ready() {
+            self.cancel_terminal_presentation_intents();
+            self.activate_pane(pane, false);
+        } else {
+            self.select_pane_for_deferred_activation(pane, index);
+            self.request_terminal_activation(index, false);
+        }
+    }
+
+    /// Points the focus at `pane` without presenting it. `active_terminal_presented`
+    /// stays false and no focus report is written, so the `activate_pane` that
+    /// runs when the pane is ready still presents it and reports the focus gain.
+    fn select_pane_for_deferred_activation(&mut self, pane: PaneId, index: usize) {
+        if let Some(tab_index) = self.tab_index_of_pane(pane) {
+            if tab_index != self.active_tab {
+                self.active_tab = tab_index;
+                self.bump_structure_generation();
+            }
+            self.tabs[tab_index].active_pane = pane;
+        }
+        self.active_terminal = index;
+        self.active_terminal_presented = false;
     }
 
     fn close_confirm_hit_test(&self, x: f32, y: f32) -> CloseConfirmHit {
@@ -1349,24 +2288,81 @@ impl App {
         }
     }
 
+    /// Moves the tab at `from` to `to`. Panes travel with their tab because a
+    /// tab owns the whole split tree; `terminals` keeps its storage order, so
+    /// `active_terminal` and every pane identity stay valid.
     fn reorder_terminal_tab(&mut self, from: usize, to: usize) {
-        if from >= self.terminals.len() || to >= self.terminals.len() || from == to {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
             return;
         }
-        let terminal = self.terminals.remove(from);
-        self.terminals.insert(to, terminal);
-        self.active_terminal = active_index_after_move(self.active_terminal, from, to);
+        // The tab order is structural: a live drag across it must not keep pulling.
+        self.cancel_divider_drag();
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = active_index_after_move(self.active_tab, from, to);
+        self.bump_structure_generation();
         self.pending_tab_reveal = Some(false);
-        if self.grid_open() {
-            // The tile order changed: the panels and layouts of the last frame
-            // name other tiles now.
-            self.bump_grid_generation();
-        }
         self.mark_dirty();
     }
 
+    /// Ends the pressed-pointer ownership of a split pane or grid tile before
+    /// a structural change or a mode switch. The terminal indices behind the
+    /// owner may shift and the pressed pane may disappear, so a later physical
+    /// release must not reach another terminal: every button the owner still
+    /// holds gets its release swallowed and its press state cancelled. The
+    /// owner's application did see those presses, so the gesture ends for it
+    /// first with a protocol release on the claimed path; otherwise a change in
+    /// a neighbouring pane leaves it dragging. The layout stays actual for
+    /// ordinary input.
+    fn reset_split_pointer_owner(&mut self) {
+        let owner_target = self.split_pointer_target();
+        let Some(owner) = self.split_pointer_owner.take() else {
+            return;
+        };
+        let pressed = self.interaction.pressed_mouse_buttons();
+        if let Some((target, layout)) = owner_target {
+            let saved_layout = self.interaction.layout;
+            self.interaction.layout = layout;
+            if let Some(terminal) = self.terminals.get_mut(target) {
+                for button in [
+                    PointerButton::Left,
+                    PointerButton::Middle,
+                    PointerButton::Right,
+                ] {
+                    if pressed & mouse_button_bit(button) != 0 {
+                        let _ = self.interaction.mouse_input_outcome(
+                            KeyState::Released,
+                            button,
+                            terminal,
+                            |_, _, _| 0,
+                            true,
+                        );
+                    }
+                }
+            }
+            self.interaction.layout = saved_layout;
+        }
+        for button in [
+            PointerButton::Left,
+            PointerButton::Middle,
+            PointerButton::Right,
+        ] {
+            if pressed & mouse_button_bit(button) != 0 {
+                self.suppress_release(button);
+            }
+        }
+        if let Some(terminal) = self.terminals.get_mut(owner) {
+            self.interaction.cancel_pointer_interaction(terminal);
+        }
+    }
+
     fn cancel_pointer_interactions(&mut self) {
+        // A live divider drag is a pointer interaction too: cancel it before the
+        // pointer state is dropped, so the node keeps its pre-drag ratio and the
+        // lost release stays swallowed instead of resuming as a plain click.
+        self.cancel_divider_drag();
         self.terminal_tab_drag = None;
+        self.split_pointer_owner = None;
         let active = self.active_terminal;
         if let Some(terminal) = self.terminals.get_mut(active) {
             self.interaction.cancel_pointer_interaction(terminal);
@@ -1795,7 +2791,7 @@ impl App {
     fn update_link_hover(&mut self) {
         let modal_active = self.settings_modal_active() || self.close_confirm.is_some();
         let (x, y) = (self.pointer_x, self.pointer_y);
-        let changed = if self.grid_open() {
+        let changed = if self.grid_open() || self.active_tab_split() {
             self.update_grid_link_hover(modal_active, x, y)
         } else {
             // Grid mode is closed: a link still hovered in a tile is dropped first.
@@ -1817,10 +2813,16 @@ impl App {
         self.refresh_cursor_icon();
     }
 
-    /// Grid-mode hover: only the tile under the pointer, with its own layout,
-    /// may hold a link. Outdated layouts skip the hover entirely.
+    /// Panel-mode hover: only the panel under the pointer, with its own layout,
+    /// may hold a link. Outdated layouts skip the hover entirely. Grid tiles
+    /// track the grid generation, split panes the layout generation.
     fn update_grid_link_hover(&mut self, modal_active: bool, x: f32, y: f32) -> bool {
-        if self.panel_layouts_generation != self.grid_generation {
+        let current = if self.grid_open() {
+            self.panel_layouts_grid_generation == self.grid_generation
+        } else {
+            self.panel_layouts_generation == self.layout_generation
+        };
+        if !current {
             return false;
         }
         let target = match panel_hit(&self.panels, x, y) {
@@ -1896,10 +2898,10 @@ impl App {
     }
 
     /// Future instant at which a hidden dev-channels banner must be redrawn:
-    /// the earliest grid tile's hiding end in grid mode, otherwise the active
-    /// tab's.
+    /// the earliest panel's hiding end in grid mode and in a split tab,
+    /// otherwise the active tab's.
     fn dev_warning_wake_deadline(&self, now: Instant) -> Option<Instant> {
-        let deadline = if self.grid_open() {
+        let deadline = if self.grid_open() || self.active_tab_split() {
             self.withheld_until
         } else {
             self.terminals
@@ -2002,6 +3004,35 @@ impl App {
         true
     }
 
+    /// Whether the window handles `shortcut` now. Pane commands are not
+    /// intercepted while grid mode shows tiles: there every pane key belongs to
+    /// the focused tile's terminal. Focus and close commands also need a split
+    /// tab, so a single-pane tab keeps sending those keys to its shell.
+    #[inline]
+    fn shortcut_intercepted(&self, shortcut: GlobalShortcut) -> bool {
+        match shortcut {
+            GlobalShortcut::SplitRight | GlobalShortcut::SplitDown => self.claude_grid.is_none(),
+            GlobalShortcut::FocusPane(_) | GlobalShortcut::ClosePane => {
+                self.claude_grid.is_none() && self.active_tab_split()
+            }
+            _ => true,
+        }
+    }
+
+    /// Moves the focus to the pane next to the active one along `direction`.
+    /// Input can arrive before the next frame, so the pane rects of the last
+    /// frame may predate the current tree: rebuild before hit-testing. Without
+    /// a candidate the focus stays.
+    fn focus_pane_in_direction(&mut self, direction: PaneDirection) {
+        self.rebuild_panels();
+        let Some(active_pane) = self.tabs.get(self.active_tab).map(|tab| tab.active_pane) else {
+            return;
+        };
+        if let Some(pane) = pane_in_direction(&self.pane_rects, active_pane, direction) {
+            self.activate_pane(pane, false);
+        }
+    }
+
     fn handle_global_key(&mut self, shortcut: GlobalShortcut) -> bool {
         match shortcut {
             GlobalShortcut::ToggleSettings => self.toggle_settings(),
@@ -2021,6 +3052,20 @@ impl App {
                 }
             }
             GlobalShortcut::ToggleClaudeGrid => self.toggle_claude_grid(Instant::now()),
+            GlobalShortcut::SplitRight => {
+                self.split_active_pane(SplitAxis::SideBySide);
+            }
+            GlobalShortcut::SplitDown => {
+                self.split_active_pane(SplitAxis::Stacked);
+            }
+            GlobalShortcut::FocusPane(direction) => self.focus_pane_in_direction(direction),
+            GlobalShortcut::ClosePane => {
+                if let Some(pane) = self.tabs.get(self.active_tab).map(|tab| tab.active_pane)
+                    && self.close_pane(pane)
+                {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -2040,6 +3085,8 @@ impl App {
         shutdown_terminal_processes(&mut processes);
         drop(processes);
         self.terminals.clear();
+        self.tabs.clear();
+        self.active_tab = 0;
         self.terminal_cleanup.shutdown_and_join();
         if let Some(worker) = self.kde_activation_worker.as_mut() {
             worker.shutdown_and_join();
@@ -2057,8 +3104,15 @@ impl App {
                 }
                 continue;
             }
-            if self.terminals[index].is_closed() && self.close_terminal_tab_at(index) {
-                return true;
+            if self.terminals[index].is_closed() {
+                // A removal shifts the indices the split pointer owner holds;
+                // `close_pane` resets the owner only right before it removes
+                // the terminal. An idle pass must leave the pressed pointer
+                // with its owner.
+                let pane = self.terminals[index].pane_id();
+                if self.close_pane(pane) {
+                    return true;
+                }
             }
         }
         false
@@ -2095,12 +3149,22 @@ impl App {
         self.shutdown_all();
     }
 
-    /// The only writer of `grid_metrics`. A change while grid mode is open
-    /// starts a new generation at once, so input that arrives before the next
-    /// frame is not matched against the old tile geometry.
+    /// The only writer of `grid_metrics`. Any change starts new generations at
+    /// once: the panels and their layouts of the last frame were computed from
+    /// the old metrics, so input that arrives before the next frame must not be
+    /// matched against that geometry. Grid mode also starts a new composition
+    /// generation.
     fn set_grid_metrics(&mut self, metrics: GridMetrics) {
-        if self.claude_grid.is_some() && metrics != self.grid_metrics {
-            self.bump_grid_generation();
+        if metrics != self.grid_metrics {
+            // The divider geometry of a live drag belongs to the old metrics.
+            // The pane layouts of a pressed pointer do too.
+            self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
+            if self.claude_grid.is_some() {
+                self.bump_grid_generation();
+            } else {
+                self.bump_structure_generation();
+            }
         }
         self.grid_metrics = metrics;
     }
@@ -2123,13 +3187,28 @@ impl App {
         self.set_grid_metrics(metrics);
     }
 
-    /// Ordinary mode: one panel, the active terminal filling the window body.
-    /// Grid mode: one tile per member, in tab order.
+    /// Ordinary mode: one panel per pane of the active tab, laid out from its
+    /// split tree. Grid mode: one tile per member, in tab order.
     fn rebuild_panels(&mut self) {
         let metrics = self.grid_metrics;
         let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
         self.panels.clear();
-        let Some(grid) = self.claude_grid.as_ref() else {
+        if let Some(grid) = self.claude_grid.as_ref() {
+            grid_tiles(body, grid.members.len(), metrics.scale, &mut self.grid_tile_rects);
+            for (&terminal, &(header, tile_body)) in grid.members.iter().zip(&self.grid_tile_rects)
+            {
+                self.panels.push(Panel {
+                    terminal,
+                    body: tile_body,
+                    header: Some(header),
+                    content_hidden: false,
+                });
+            }
+            self.pane_rects.clear();
+            return;
+        }
+        if self.tabs.get(self.active_tab).is_none() {
+            self.pane_rects.clear();
             self.panels.push(Panel {
                 terminal: self.active_terminal,
                 body,
@@ -2137,14 +3216,58 @@ impl App {
                 content_hidden: false,
             });
             return;
-        };
-        grid_tiles(body, grid.members.len(), metrics.scale, &mut self.grid_tile_rects);
-        for (&terminal, &(header, tile_body)) in grid.members.iter().zip(&self.grid_tile_rects) {
+        }
+        let active_tab = self.active_tab;
+        layout_panes(
+            &self.tabs[active_tab].layout,
+            body,
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+            &mut self.pane_rects,
+        );
+        for &(pane, pane_body) in &self.pane_rects {
+            let Some(terminal) = self.terminal_index_of_pane(pane) else {
+                continue;
+            };
             self.panels.push(Panel {
                 terminal,
-                body: tile_body,
-                header: Some(header),
+                body: pane_body,
+                header: None,
                 content_hidden: false,
+            });
+        }
+    }
+
+    /// Whether the active tab owns more than one pane.
+    fn active_tab_split(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| leaf_count(&tab.layout) > 1)
+    }
+
+    /// Rebuilds the tab-strip labels from `tabs`. The buffer is reused every
+    /// frame; the title itself stays in the owning `Terminal`.
+    fn build_tab_labels(&mut self) {
+        self.tab_labels.clear();
+        for tab in &self.tabs {
+            let mut title_terminal = usize::MAX;
+            let mut bell_pending = false;
+            for (index, terminal) in self.terminals.iter().enumerate() {
+                if !split_contains_pane(&tab.layout, terminal.pane_id()) {
+                    continue;
+                }
+                if terminal.pane_id() == tab.active_pane {
+                    title_terminal = index;
+                }
+                bell_pending |= terminal.bell_pending();
+            }
+            self.tab_labels.push(TabLabelIndex {
+                id: tab.id,
+                title_terminal,
+                number: tab.title_number,
+                leaf_count: leaf_count(&tab.layout),
+                bell_pending,
             });
         }
     }
@@ -2183,11 +3306,16 @@ impl App {
         self.request_frame();
     }
 
-    /// Starts a new panel generation and drops the pointer capture of the
-    /// active terminal, so a press from before the change is not finished in a
-    /// tile whose geometry has moved.
+    /// Starts a new grid composition generation and drops the pointer capture of
+    /// the active terminal, so a press from before the change is not finished in
+    /// a tile whose geometry has moved. A composition change is structural: the
+    /// panels, their layouts and the saved layout all move with it.
     fn bump_grid_generation(&mut self) {
+        // The owner's tile belongs to geometry the new generation replaces: end
+        // its gesture on the claimed path before the held bits are reset.
+        self.reset_split_pointer_owner();
         self.grid_generation = self.grid_generation.wrapping_add(1);
+        self.bump_structure_generation();
         if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
             self.interaction.cancel_pointer_interaction(terminal);
         }
@@ -2216,28 +3344,66 @@ impl App {
             .is_some_and(|grid| grid.members.contains(&index))
     }
 
-    /// Whether the tab at `index` is on screen: a tile while grid mode is open,
-    /// otherwise the presented active tab.
+    /// Whether the panel of the terminal at `index` is on screen: a tile while
+    /// grid mode is open, otherwise any pane of the presented active tab. A pane
+    /// without the keyboard focus is still visible, so `tab-status` reports it
+    /// active (§9).
     fn tab_visible(&self, index: usize) -> bool {
         if self.claude_grid.is_some() {
-            self.grid_contains(index)
-        } else {
-            index == self.active_terminal && self.active_terminal_presented
+            return self.grid_contains(index);
         }
+        self.active_terminal_presented
+            && self.terminals.get(index).is_some_and(|terminal| {
+                self.tab_index_of_pane(terminal.pane_id()) == Some(self.active_tab)
+            })
     }
 
-    /// Tile that takes focus when the tab at `index` closes: the next member
-    /// in tab order, else the previous one. Returns its index after `index`
-    /// is removed. `None` outside grid mode or when no other tile exists.
-    fn grid_successor_after_removal(&self, index: usize) -> Option<usize> {
+    /// Tile that takes focus after `removed` terminals disappear: the next grid
+    /// member after the focused tile in grid order, skipping every removed
+    /// index, else the previous one. Returns the terminal index after the
+    /// removals, and `None` outside grid mode or when no tile survives.
+    fn grid_successor_after_removal(&self, removed: &[usize]) -> Option<usize> {
         let grid = self.claude_grid.as_ref()?;
+        if removed.is_empty() {
+            return None;
+        }
+        let live = |member: &usize| !removed.contains(member);
+        let pivot = self.active_terminal;
         let target = grid
             .members
             .iter()
             .copied()
-            .find(|&member| member > index)
-            .or_else(|| grid.members.iter().rev().copied().find(|&member| member < index))?;
-        Some(if target > index { target - 1 } else { target })
+            .filter(live)
+            .find(|&member| member > pivot)
+            .or_else(|| {
+                grid.members
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(live)
+                    .find(|&member| member < pivot)
+            })?;
+        Some(target - removed.iter().filter(|&&index| index < target).count())
+    }
+
+    /// Tile that takes the focus once the focused tile has left while the grid
+    /// is open: the first surviving member at or after the slot the tile
+    /// occupied, else the last member before it (§6.4). `remove_terminal_at`
+    /// leaves `active_terminal` on that slot, so it is the pivot of the search.
+    fn grid_successor_after_focused_removal(&mut self) -> Option<usize> {
+        self.collect_claude_members();
+        let slot = self.active_terminal;
+        self.grid_members_scratch
+            .iter()
+            .copied()
+            .find(|&member| member >= slot)
+            .or_else(|| {
+                self.grid_members_scratch
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&member| member < slot)
+            })
     }
 
     /// Whether the current members fit the window body at the current metrics (Q9).
@@ -2250,6 +3416,10 @@ impl App {
     /// Ctrl+Shift+S. Opens grid mode over the Claude tabs, or leaves it onto the
     /// focused tile.
     fn toggle_claude_grid(&mut self, now: Instant) {
+        // Entering or leaving grid mode ends a divider drag and the split
+        // pointer ownership of the split view.
+        self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         if self.claude_grid.is_some() {
             self.exit_claude_grid(Some(self.active_terminal));
             return;
@@ -2284,6 +3454,8 @@ impl App {
     /// as a tab click); `None` keeps the active tab. Does nothing when grid mode
     /// is closed.
     fn exit_claude_grid(&mut self, target: Option<usize>) {
+        self.cancel_divider_drag();
+        self.reset_split_pointer_owner();
         if self.claude_grid.take().is_none() {
             return;
         }
@@ -2431,6 +3603,7 @@ impl App {
         }
         if key_input.state.is_pressed()
             && let Some(shortcut) = global_shortcut(key_input.physical_key, self.modifiers)
+            && self.shortcut_intercepted(shortcut)
         {
             if self.settings_modal_active() && !global_shortcut_allowed_in_settings(shortcut) {
                 return false;
@@ -2493,8 +3666,13 @@ impl App {
         let previous_y = self.pointer_y;
         self.pointer_x = position.x;
         self.pointer_y = position.y;
-        if self.grid_open() {
-            // Hit-tests of this event use the tile list as it is now.
+        if self.divider_drag.is_some() {
+            // A live drag owns the pointer: motion moves the divider only.
+            self.update_divider_drag(self.pointer_x, self.pointer_y);
+            return;
+        }
+        if self.grid_open() || self.active_tab_split() {
+            // Hit-tests of this event use the panel list as it is now.
             self.rebuild_panels();
         }
         self.update_link_hover();
@@ -2540,7 +3718,39 @@ impl App {
             self.request_frame();
             return;
         }
-        if !self.interaction.terminal_selection_active()
+        // The pane or tile that owns the pressed pointer takes the motion with
+        // the real pointer coordinates, before the tab strip and the pane hit
+        // tests: a drag over the scrollbar, past the pane's edge or over the
+        // strip keeps reporting to its terminal. Without a held button the
+        // gesture is over and motion follows the hit test again.
+        if (self.active_tab_split() || self.grid_open())
+            && self.interaction.pointer_capture == crate::input::PointerCapture::None
+            && self.interaction.mouse_buttons_pressed()
+            && let Some((terminal, layout)) = self.split_pointer_target()
+        {
+            let saved_layout = self.interaction.layout;
+            self.interaction.layout = layout;
+            if let (Some(runtime), Some(terminal)) =
+                (self.runtime.as_mut(), self.terminals.get_mut(terminal))
+            {
+                let changed = self.interaction.cursor_moved_claimed(
+                    self.pointer_x,
+                    self.pointer_y,
+                    terminal,
+                    |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
+                );
+                if changed {
+                    self.sync_animation_state();
+                    self.request_frame();
+                }
+            }
+            self.interaction.layout = saved_layout;
+            return;
+        }
+        // The tab strip swallows hover only while no UI capture owns the
+        // pointer: a scrollbar drag or a search-input selection that crosses
+        // the strip keeps its motion, as the capture path below delivers it.
+        if self.interaction.pointer_capture == crate::input::PointerCapture::None
             && self.runtime.as_ref().is_some_and(|runtime| {
                 runtime
                     .terminal_tab_strip_layout()
@@ -2552,8 +3762,35 @@ impl App {
             return;
         }
         let active = self.active_terminal;
+        let (target_terminal, target_layout) = if self.grid_open() {
+            if let Some((terminal, layout)) = self.grid_tile_under_pointer() {
+                // The tile under the pointer takes the motion with its own
+                // layout; focus does not change. A captured pointer keeps its
+                // terminal.
+                (terminal, layout)
+            } else {
+                // The rendered geometry is stale or no tile body is under the
+                // pointer: nothing receives motion for the old layout.
+                return;
+            }
+        } else if self.active_tab_split() {
+            if let Some((terminal, layout)) = self.split_panel_under_pointer() {
+                // The pane under the pointer takes the motion with its own
+                // layout; focus does not change. A captured pointer keeps
+                // its terminal.
+                (terminal, layout)
+            } else {
+                // The rendered geometry is stale or no pane body is under
+                // the pointer: nothing receives motion for the old layout.
+                return;
+            }
+        } else {
+            (active, self.interaction.layout)
+        };
+        let saved_layout = self.interaction.layout;
+        self.interaction.layout = target_layout;
         if let (Some(runtime), Some(terminal)) =
-            (self.runtime.as_mut(), self.terminals.get_mut(active))
+            (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
         {
             let changed = self.interaction.cursor_moved(
                 self.pointer_x,
@@ -2566,6 +3803,7 @@ impl App {
                 self.request_frame();
             }
         }
+        self.interaction.layout = saved_layout;
     }
 
     pub(crate) fn on_pointer_leave(&mut self, width: u32, height: u32) {
@@ -2591,15 +3829,52 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
-        // A new press of the same button means the release owed by an earlier
-        // suppressed press was lost; that stale mark must not swallow this press's release.
-        if state == KeyState::Pressed && self.suppressed_release == Some(button) {
-            self.suppressed_release = None;
+        // A split pane or grid tile that received the press owns every button
+        // until all of them are released.
+        let pointer_owned = self.split_pointer_owner.is_some();
+        if state == KeyState::Pressed {
+            if self
+                .divider_drag
+                .as_ref()
+                .is_some_and(|drag| drag.button == button)
+            {
+                // The owner pressed again while its release is still missing: the
+                // old drag ends with its last recorded ratio and this press is
+                // routed as a new one.
+                self.divider_drag = None;
+                self.take_suppressed_release(button);
+            } else if self.divider_drag.is_some() {
+                // Another button never takes over a live drag; its press and
+                // its release are both swallowed.
+                self.suppress_release(button);
+                return false;
+            } else {
+                // A new press of the same button means the release owed by an
+                // earlier suppressed press was lost; that stale mark must not
+                // swallow this press's release.
+                self.take_suppressed_release(button);
+            }
+        }
+        if state == KeyState::Released
+            && self
+                .divider_drag
+                .as_ref()
+                .is_some_and(|drag| drag.button == button)
+        {
+            // The release that ends a drag belongs to the press that started it.
+            self.divider_drag = None;
+            self.take_suppressed_release(button);
+            return false;
         }
         // A press that never reached the terminal (grid header, gap, stale
-        // generation) owns its release, even when grid mode has closed since.
-        if state == KeyState::Released && self.suppressed_release == Some(button) {
-            self.suppressed_release = None;
+        // generation, protocol area) owns its release, even when that mode has
+        // ended since. The button is physically up again, so its held flag
+        // must clear even though no event reaches the terminal.
+        if state == KeyState::Released && self.take_suppressed_release(button) {
+            self.interaction.cancel_pointer_press(button);
+            if !self.interaction.mouse_buttons_pressed() {
+                self.split_pointer_owner = None;
+            }
             return false;
         }
         if self.close_confirm.is_some() {
@@ -2642,7 +3917,7 @@ impl App {
             }
             return false;
         }
-        if button == PointerButton::Left && state == KeyState::Pressed {
+        if button == PointerButton::Left && state == KeyState::Pressed && !pointer_owned {
             let hit = self
                 .runtime
                 .as_ref()
@@ -2651,7 +3926,16 @@ impl App {
                 });
             match hit {
                 TerminalTabHit::Close(index) => {
-                    return self.request_terminal_close(CloseTarget::Tab(index));
+                    // The strip addresses tabs; the close target still names a
+                    // terminal, so map the tab's active pane to its storage index.
+                    let target = self
+                        .tabs
+                        .get(index)
+                        .and_then(|tab| self.terminal_index_of_pane(tab.active_pane));
+                    let Some(target) = target else {
+                        return false;
+                    };
+                    return self.request_terminal_close(CloseTarget::Tab(target));
                 }
                 TerminalTabHit::Add => {
                     let _ = self.add_terminal();
@@ -2687,22 +3971,71 @@ impl App {
             self.request_frame();
             return false;
         }
-        if self.grid_open() && !self.route_grid_pointer_button(state, button) {
+        if (self.grid_open() || self.active_tab_split())
+            && !self.route_pointer_button(state, button)
+        {
             return false;
         }
         let active = self.active_terminal;
-        if let (Some(runtime), Some(terminal)) =
-            (self.runtime.as_mut(), self.terminals.get_mut(active))
+        // A press claims the pointer when it is the first one the terminal
+        // actually receives as mouse input: a press swallowed by a protocol
+        // area (search, scrollbar, link) claims nothing and needs no paired
+        // release. Bits of other buttons, including ones the terminal never
+        // received, must not block the claim.
+        let claims_pointer = (self.grid_open() || self.active_tab_split())
+            && !pointer_owned
+            && state == KeyState::Pressed
+            && self.interaction.pointer_capture == crate::input::PointerCapture::None;
+        // The press keeps its release: the terminal that received it gets it
+        // with its own pane or tile layout, even when the pointer has left its
+        // body. A live capture stays with the active terminal. Presses that
+        // arrive while the pointer is owned go to the owner the same way.
+        let pointer_target = if (self.grid_open() || self.active_tab_split())
+            && self.interaction.pointer_capture == crate::input::PointerCapture::None
+            && (state == KeyState::Released || pointer_owned)
         {
-            let handled =
-                self.interaction
-                    .mouse_input(state, button, terminal, |text, x, scroll| {
-                        runtime.terminal_search_cursor_from_x(text, x, scroll)
-                    });
-            if handled {
+            self.split_pointer_target()
+        } else {
+            None
+        };
+        let (target_terminal, target_layout) =
+            pointer_target.unwrap_or((active, self.interaction.layout));
+        let saved_layout = self.interaction.layout;
+        self.interaction.layout = target_layout;
+        let mut press_delivered = false;
+        let mut press_rejected = false;
+        if let (Some(runtime), Some(terminal)) =
+            (self.runtime.as_mut(), self.terminals.get_mut(target_terminal))
+        {
+            // The owner of the pressed pointer gets the event even over a
+            // protocol area or outside its pane body: its app must see the
+            // release of a button it saw pressed.
+            let outcome = self.interaction.mouse_input_outcome(
+                state,
+                button,
+                terminal,
+                |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
+                pointer_target.is_some(),
+            );
+            press_delivered = outcome.delivered();
+            press_rejected = outcome.rejected();
+            if outcome.handled() {
                 self.sync_animation_state();
                 self.request_frame();
             }
+        }
+        self.interaction.layout = saved_layout;
+        if press_rejected {
+            // The terminal application never saw the press: its release must
+            // not reach the application as an unpaired report.
+            self.suppress_release(button);
+        }
+        if claims_pointer && press_delivered {
+            self.split_pointer_owner = Some(target_terminal);
+        }
+        // The owner lives only while some button is still held.
+        if state == KeyState::Released && !self.interaction.mouse_buttons_pressed() {
+            self.split_pointer_owner = None;
         }
         if let Some(uri) = self.interaction.take_link_uri()
             && open_uri_allowed(&uri, crate::terminal::local_host_name())
@@ -2712,12 +4045,115 @@ impl App {
         false
     }
 
-    /// Grid-mode routing of one pointer button event. Returns `false` when the
-    /// event is handled here and must not reach the active terminal, `true` when
-    /// it goes on to the terminal's mouse handling.
-    fn route_grid_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+    /// Pointer-button routing for a tab that draws more than one panel: grid
+    /// mode over its tiles, or the split layout of the active tab. Returns
+    /// `false` when the event is handled here and must not reach a terminal,
+    /// `true` when it goes on to the terminal's mouse handling.
+    fn route_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        // Hit-tests of this event use the panel list as it is now.
         self.rebuild_panels();
         if state == KeyState::Released {
+            return true;
+        }
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            // A captured pointer belongs to its terminal until its release.
+            return true;
+        }
+        if self.grid_open() {
+            return self.route_grid_pointer_button(state, button);
+        }
+        self.route_split_pointer_button(button)
+    }
+
+    /// Split-tab routing of one press: the divider first (its band lies over
+    /// the bodies), then the pane body, whose terminal receives the event with
+    /// the panel's own layout and global pointer coordinates.
+    fn route_split_pointer_button(&mut self, button: PointerButton) -> bool {
+        if self.split_pointer_owner.is_some() {
+            // The pressed pointer is owned until every button is released: no
+            // pane hit test, no focus change and no new owner. The claimed path
+            // of the caller delivers the event with the real coordinates.
+            return true;
+        }
+        if self.panel_layouts_generation != self.layout_generation {
+            // The frame's geometry is outdated: a press only chooses the pane
+            // under it and owns its release, like the grid-generation contract.
+            self.suppress_release(button);
+            if let Some(PanelHit::Body(index) | PanelHit::Header(index)) =
+                panel_hit(&self.panels, self.pointer_x, self.pointer_y)
+            {
+                self.select_split_panel(index);
+            }
+            return false;
+        }
+        if let Some(drag) = self.divider_drag_at(button) {
+            // The drag never changes focus and its release is swallowed.
+            self.divider_drag = Some(drag);
+            self.suppress_release(button);
+            return false;
+        }
+        match panel_hit(&self.panels, self.pointer_x, self.pointer_y) {
+            Some(PanelHit::Body(index)) => {
+                // The pane becomes active here; the caller claims the pointer
+                // only after the terminal actually received the press.
+                self.select_split_panel(index);
+                true
+            }
+            Some(PanelHit::Header(_)) | None => {
+                // Split panels draw no headers; a gap routes nothing.
+                self.suppress_release(button);
+                false
+            }
+        }
+    }
+
+    /// Drag that a press at the pointer starts when it lands on a split
+    /// divider: the node path, its axis, its saved ratio and the pointer
+    /// distance to the first branch edge.
+    fn divider_drag_at(&self, button: PointerButton) -> Option<DividerDrag> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let hit = divider_at(
+            &tab.layout,
+            body,
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+            self.pointer_x,
+            self.pointer_y,
+        )?;
+        let ratio_at_start = match node_at_path(&tab.layout, &hit.path) {
+            Some(SplitNode::Split { ratio, .. }) => *ratio,
+            _ => return None,
+        };
+        let coord = match hit.axis {
+            SplitAxis::SideBySide => self.pointer_x,
+            SplitAxis::Stacked => self.pointer_y,
+        };
+        Some(DividerDrag {
+            tab: tab.id,
+            path: hit.path,
+            axis: hit.axis,
+            button,
+            structure_generation: self.structure_generation,
+            ratio_at_start,
+            grab_offset: coord - hit.first_edge,
+        })
+    }
+
+    /// Grid-mode routing of one pointer button event. Returns `false` when the
+    /// event is handled here and must not reach the active terminal, `true` when
+    /// it goes on to the terminal's mouse handling. The caller rebuilds the
+    /// panels first.
+    fn route_grid_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
+        if state == KeyState::Released {
+            return true;
+        }
+        if self.split_pointer_owner.is_some() {
+            // The pressed pointer is owned until every button is released: no
+            // tile hit test, no focus change and no new owner. The claimed path
+            // of the caller delivers the event with the real coordinates.
             return true;
         }
         if self.interaction.pointer_capture != crate::input::PointerCapture::None {
@@ -2729,13 +4165,13 @@ impl App {
             Some(PanelHit::Body(index)) => (index, false),
             None => {
                 // A gap between tiles routes nothing; its release is swallowed.
-                self.suppressed_release = Some(button);
+                self.suppress_release(button);
                 return false;
             }
         };
-        if self.panel_layouts_generation != self.grid_generation {
+        if self.panel_layouts_grid_generation != self.grid_generation {
             // The frame's geometry is outdated: a press only chooses the tile under it.
-            self.suppressed_release = Some(button);
+            self.suppress_release(button);
             self.select_grid_tile(index);
             self.request_frame();
             return false;
@@ -2744,7 +4180,7 @@ impl App {
             self.select_grid_tile(index);
             return true;
         }
-        self.suppressed_release = Some(button);
+        self.suppress_release(button);
         if button == PointerButton::Left {
             let terminal = self.panels[index].terminal;
             let now = Instant::now();
@@ -2772,7 +4208,9 @@ impl App {
             return;
         }
         self.cancel_terminal_presentation_intents();
-        self.activate_ready_terminal(terminal, false);
+        if let Some(pane) = self.terminals.get(terminal).map(Terminal::pane_id) {
+            self.activate_pane(pane, false);
+        }
         if let Some(layout) = self.panel_layouts.get(index) {
             self.interaction.layout = *layout;
         }
@@ -2799,6 +4237,20 @@ impl App {
             }
             return;
         }
+        // A captured pointer keeps the wheel: neither the tab strip nor the
+        // tile under the pointer may take it from the capturing terminal.
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            let active = self.active_terminal;
+            if let Some(terminal) = self.terminals.get_mut(active)
+                && self
+                    .interaction
+                    .mouse_wheel(delta, terminal, self.interaction.layout)
+            {
+                self.sync_animation_state();
+                self.request_frame();
+            }
+            return;
+        }
         if let Some(runtime) = self.runtime.as_ref() {
             let strip = runtime.terminal_tab_strip_layout();
             if strip.rect.contains(self.pointer_x, self.pointer_y) {
@@ -2813,18 +4265,26 @@ impl App {
         if self.grid_open() {
             // The wheel scrolls the tile under the pointer and never moves focus.
             self.rebuild_panels();
-            if self.panel_layouts_generation != self.grid_generation {
+            let Some((target, layout)) = self.grid_tile_under_pointer() else {
                 return;
+            };
+            let Some(terminal) = self.terminals.get_mut(target) else {
+                return;
+            };
+            if self.interaction.mouse_wheel(delta, terminal, layout) {
+                self.sync_animation_state();
+                self.request_frame();
             }
-            let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
-            else {
+            return;
+        }
+        if self.active_tab_split() {
+            // The wheel scrolls the pane under the pointer (or the captured one)
+            // and never moves focus.
+            self.rebuild_panels();
+            let Some((index, layout)) = self.split_panel_under_pointer() else {
                 return;
             };
-            let (Some(panel), Some(layout)) = (self.panels.get(index), self.panel_layouts.get(index).copied())
-            else {
-                return;
-            };
-            let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
+            let Some(terminal) = self.terminals.get_mut(index) else {
                 return;
             };
             if self.interaction.mouse_wheel(delta, terminal, layout) {
@@ -2852,7 +4312,9 @@ impl App {
 
         let _ = self.process_terminal_presentation_intents();
         let now = Instant::now();
-        if !self.grid_open() && self.withhold_active_frame(now) {
+        // A split tab draws every visible pane, so its frame is never withheld
+        // as a whole; each pane carries its own `content_hidden` flag instead.
+        if !self.grid_open() && !self.active_tab_split() && self.withhold_active_frame(now) {
             return Ok(false);
         }
         let dt = animation_dt((now - self.last_frame).as_secs_f32());
@@ -2888,14 +4350,18 @@ impl App {
                 terminal.scroll_y.clamp_current(0.0, max);
             }
         }
-        // Grid tiles other than the active tab. Their layouts come from the last
-        // render, and a stale one is trusted only in the current panel generation:
-        // after a membership change the same index names another tile. Outside grid
-        // mode `self.panels` is the previous frame's list, so it is not read at all.
-        let layouts_current = self.panel_layouts_generation == self.grid_generation;
-        let in_grid = self.grid_open();
+        // Panels other than the active terminal. Their layouts come from the last
+        // render, and a stale one is trusted only in the current generation: after
+        // a membership change the same index names another terminal. Grid input
+        // matches tile geometry, so grid mode tracks its own generation; split
+        // panes outside it are invalidated by every layout change.
+        let layouts_current = if self.grid_open() {
+            self.panel_layouts_grid_generation == self.grid_generation
+        } else {
+            self.panel_layouts_generation == self.layout_generation
+        };
         for (index, panel) in self.panels.iter().enumerate() {
-            if !in_grid || panel.terminal == active {
+            if panel.terminal == active {
                 continue;
             }
             let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
@@ -2925,12 +4391,15 @@ impl App {
         self.settings_progress = settings_progress;
 
         self.rebuild_panels();
-        if self.grid_open() {
+        if self.grid_open() || self.active_tab_split() {
             self.observe_grid_dev_warnings(now);
         }
+        self.build_tab_labels();
         let tab_strip_hint = self.tab_strip_hint(now);
         let render_result = if let Some(runtime) = self.runtime.as_mut() {
             Some(runtime.render_terminal_and_present(TerminalRenderParams {
+                tabs: &self.tab_labels,
+                active_tab: self.active_tab,
                 terminals: &self.terminals,
                 active_terminal: self.active_terminal,
                 panels: &self.panels,
@@ -2966,7 +4435,8 @@ impl App {
         };
         match render_result {
             Some(Ok(layout)) => {
-                self.panel_layouts_generation = self.grid_generation;
+                self.panel_layouts_generation = self.layout_generation;
+                self.panel_layouts_grid_generation = self.grid_generation;
                 self.interaction.update_layout(layout);
                 let active = self.active_terminal;
                 let active_content_hidden = self
@@ -2997,7 +4467,7 @@ impl App {
                     self.terminal_tab_scroll.clamp_current(0.0, max);
                     if let Some(reveal_tail) = self.pending_tab_reveal.take() {
                         let target = runtime.terminal_tab_reveal_target(
-                            self.active_terminal,
+                            self.active_tab,
                             reveal_tail,
                             self.terminal_tab_scroll.target,
                         );
@@ -3017,17 +4487,23 @@ impl App {
         Ok(true)
     }
 
-    /// Applies host events parked by each tab's parser thread and, as a
-    /// fallback for a stalled parser thread, replays synchronized-output
-    /// buffers that are overdue by `SYNC_RESERVE_GRACE`, when the locks are
-    /// free. Takes its own clock so the about-to-wait body keeps its clock
-    /// after the early return.
+    /// Applies host events parked by each tab's parser thread, applies the
+    /// development-channels warning and banner state to the output that
+    /// arrived, and, as a fallback for a stalled parser thread, replays
+    /// synchronized-output buffers that are overdue by `SYNC_RESERVE_GRACE`,
+    /// when the locks are free. The frame path rescans output that arrives
+    /// later and answers its process lookup from the cache filled here.
+    /// Takes its own clock so the about-to-wait body keeps its clock after the
+    /// early return.
     fn drain_terminal_host_events(&mut self) {
         let now = Instant::now();
         let active = self.active_terminal;
+        let grid_mode = self.grid_open() || self.active_tab_split();
         // Read before the loop: `tab_visible` cannot be called while `terminals` is borrowed.
         let grid_members = self.claude_grid.as_ref().map(|grid| grid.members.as_slice());
+        let panels = &self.panels;
         let mut bell_rang = false;
+        let mut dev_redraw = false;
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
             // Only the pending-events lock is held while clipboard text is set;
             // the published deadline is read from the same pending state.
@@ -3040,6 +4516,17 @@ impl App {
                     terminal.mark_bell_pending();
                 }
             }
+            // The scans return at once without new content; the process lookup
+            // runs only for a candidate generation without a cached answer.
+            let pass = terminal.observe_dev_channel_event(now, &mut self.dev_warning_scratch);
+            let on_screen = if grid_mode {
+                panels.iter().any(|panel| panel.terminal == index)
+            } else {
+                index == active
+            };
+            let drawable =
+                !terminal.dev_warning_frame_hidden(now) && terminal.dev_channel_content_verified();
+            dev_redraw |= on_screen && (pass.sent || pass.reverified && drawable);
             if terminal
                 .sync_deadline()
                 .is_some_and(|deadline| deadline + SYNC_RESERVE_GRACE <= now)
@@ -3050,6 +4537,9 @@ impl App {
         if bell_rang {
             self.request_bell_attention();
             self.mark_dirty();
+        }
+        if dev_redraw {
+            self.request_frame();
         }
     }
 
@@ -3113,6 +4603,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::headless_run::test_support::{attach_test_pane, push_test_terminal};
+    use crate::split::SplitAxis;
 
     fn bridge_call(
         app: &mut App,
@@ -3147,7 +4639,9 @@ mod tests {
     #[test]
     fn bridge_snapshot_confirm_forget_and_missing_tab_behave_as_specified() {
         let id = [9; 16];
-        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id, pane);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -3159,8 +4653,7 @@ mod tests {
             Instant::now(),
             &mut sink,
         );
-        let mut app = App::new();
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
 
         assert_eq!(bridge_call_as(&mut app, 0, id, None, u32::MAX).code, 4);
         let snapshot = bridge_call(&mut app, 0, id, None);
@@ -3176,14 +4669,20 @@ mod tests {
         assert_eq!(bridge_call(&mut app, 0, id, None).code, 3);
 
         let mut ordinary = App::new();
-        ordinary.terminals.push(Terminal::new_for_test(80, 24, 2));
+        let ordinary_pane = ordinary.issue_pane_id();
+        push_test_terminal(
+            &mut ordinary,
+            Terminal::new_for_test(80, 24, 2, ordinary_pane),
+        );
         assert_eq!(bridge_call(&mut ordinary, 0, id, None).code, 3);
     }
 
     #[test]
     fn bridge_manual_confirm_after_auto_confirm_returns_already_confirmed() {
         let id = [10; 16];
-        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id);
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_bridge_for_test(120, 8, 1, id, pane);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -3195,8 +4694,7 @@ mod tests {
             Instant::now(),
             &mut sink,
         );
-        let mut app = App::new();
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
         assert!(app.terminals[0].maybe_auto_confirm_bridge(std::time::Instant::now()));
         let screen = app.terminals[0].screen_tail_text(usize::MAX).join("\n");
 
@@ -3212,9 +4710,12 @@ mod tests {
         let mut background_input = SingleLineInput::default();
         let color_input = SingleLineInput::default();
         let mut panel_layouts = Vec::new();
+        app.build_tab_labels();
         let runtime = app.runtime.as_mut().expect("headless runtime");
         runtime
             .render_terminal_and_present(TerminalRenderParams {
+                tabs: &app.tab_labels,
+                active_tab: app.active_tab,
                 terminals: &app.terminals,
                 active_terminal: app.active_terminal,
                 panels: &app.panels,
@@ -3348,8 +4849,10 @@ mod tests {
             starttime: 7,
         };
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(120, 8, 1));
-        app.terminals.push(Terminal::new_for_test(120, 8, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(120, 8, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(120, 8, 2, pane));
         app.active_terminal = 0;
         feed_batch(&app.terminals[0], warning);
         let sent_at = Instant::now();
@@ -3375,8 +4878,10 @@ mod tests {
         assert!(!app.withhold_active_frame(sent_at));
         app.active_terminal = 0;
 
-        // Safety limit passed: the screen is shown as is.
+        // Safety limit passed: the event pass answers the development-channels
+        // check for the empty foreground group, then the screen is shown as is.
         let late = sent_at + crate::terminal::DEV_WARNING_HIDE_LIMIT;
+        app.advance_dev_channel_warnings(late);
         assert!(!app.withhold_active_frame(late));
         app.frame_withheld = true;
         app.dirty = false;
@@ -3386,7 +4891,8 @@ mod tests {
 
         // The first frame without the warning ends hiding and redraws.
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(120, 8, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(120, 8, 1, pane));
         feed_batch(&app.terminals[0], warning);
         assert!(app.terminals[0].observe_dev_channel_warning(sent_at, &mut scratch, |_| Some(claude)));
         assert!(app.withhold_active_frame(sent_at));
@@ -3400,13 +4906,53 @@ mod tests {
     }
 
     #[test]
+    fn dev_warning_from_output_after_about_to_wait_is_hidden_without_drain() {
+        let warning = "\x1b[2J\x1b[HWARNING: Loading development channels\r\n--dangerously-load-development-channels\r\n❯ 1. I am using this for local development";
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "dev-warning-after-pass",
+                1,
+            );
+        // A bridge terminal keeps the tab's pane id, so the auto-confirm sends
+        // the Enter the frame has to hide.
+        let pane = app.terminals[0].pane_id();
+        let bridge = Terminal::new_bridge_for_test(120, 8, 1, [31; 16], pane);
+        bridge.grid.lock().unwrap().mark_presentation_ready();
+        app.terminals[0] = bridge;
+
+        // The pass sees a clean screen: nothing is hidden and no Enter is sent.
+        let _ = app.on_about_to_wait();
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(!app.terminals[0].dev_warning_frame_hidden(Instant::now()));
+
+        // The warning output lands after the pass and the auto-confirm sends
+        // the Enter. Without a `drain_terminal_host_events` in between, the
+        // frame itself must rescan the arrived output and hide it, answering
+        // the process lookup from the cache the event paths refreshed.
+        feed_batch(&app.terminals[0], warning);
+        let sent_at = Instant::now();
+        app.advance_bridge_launches(sent_at);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\r");
+        app.dirty = true;
+        assert_eq!(app.on_frame(), Ok(false));
+        assert!(app.frame_withheld);
+        assert!(!app.dirty);
+        assert_eq!(
+            app.terminals[0].dev_warning_hidden_until(),
+            Some(sent_at + crate::terminal::DEV_WARNING_HIDE_LIMIT)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn bridge_forget_rejects_expired_state() {
         let id = [11; 16];
-        let mut terminal = Terminal::new_bridge_for_test(80, 8, 1, id);
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        let mut terminal = Terminal::new_bridge_for_test(80, 8, 1, id, pane);
         terminal.bridge_launch_state_mut().unwrap().created_at =
             std::time::Instant::now() - crate::terminal::BRIDGE_LAUNCH_TTL;
-        let mut app = App::new();
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
 
         assert_eq!(bridge_call(&mut app, 2, id, None).code, 3);
     }
@@ -3579,11 +5125,13 @@ mod tests {
     #[test]
     fn pending_tab_switch_keeps_old_terminal_committed_until_new_terminal_is_ready() {
         let mut app = App::new();
-        let old = Terminal::new_for_test(8, 2, 1);
+        let old_pane = app.issue_pane_id();
+        let old = Terminal::new_for_test(8, 2, 1, old_pane);
         old.grid.lock().unwrap().mark_presentation_ready();
-        let pending = Terminal::new_for_test(8, 2, 2);
-        app.terminals.push(old);
-        app.terminals.push(pending);
+        let pending_pane = app.issue_pane_id();
+        let pending = Terminal::new_for_test(8, 2, 2, pending_pane);
+        push_test_terminal(&mut app, old);
+        push_test_terminal(&mut app, pending);
         app.active_terminal = 0;
         app.active_terminal_presented = true;
 
@@ -3614,7 +5162,8 @@ mod tests {
     #[test]
     fn background_change_updates_live_and_new_tabs() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
         assert!(app.set_terminal_background(RgbColor::new(0x11, 0x22, 0x33)));
 
         // Live tab: an OSC 11 colour query is answered with the new background.
@@ -3643,8 +5192,10 @@ mod tests {
     #[test]
     fn drain_flushes_only_expired_sync_blocks() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(40, 3, 1));
-        app.terminals.push(Terminal::new_for_test(40, 3, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(40, 3, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(40, 3, 2, pane));
         // Negative: the deadline is an hour ahead, so the held bytes stay.
         let future = Instant::now() + std::time::Duration::from_secs(3600);
         hold_sync_block_at(&app.terminals[0], b"\x1b[?2026hX", future);
@@ -3667,8 +5218,10 @@ mod tests {
     #[test]
     fn background_tab_sync_deadline_sets_loop_timeout() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         let now = Instant::now();
         hold_sync_block_at(&app.terminals[1], b"\x1b[?2026hX", now);
         let deadline = app.terminals[1]
@@ -3686,14 +5239,20 @@ mod tests {
     #[test]
     fn reorder_preserves_presented_active_terminal_identity_without_recommit() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let first_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, first_pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = true;
 
         app.reorder_terminal_tab(0, 1);
 
-        assert_eq!(app.active_terminal, 1);
+        // A tab owns its panes: the strip order changes, terminal storage does not,
+        // so the presented terminal keeps its index and needs no recommit.
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.active_tab, 1);
+        assert!(split_contains_pane(&app.tabs[1].layout, first_pane));
         assert!(app.active_terminal_presented);
         assert!(
             app.terminals
@@ -3705,8 +5264,10 @@ mod tests {
     #[test]
     fn grid_pointer_capture_blocks_tile_switch_until_release() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = true;
         app.grid_metrics = GridMetrics {
@@ -3732,8 +5293,10 @@ mod tests {
     #[test]
     fn grid_tile_switch_ends_left_tile_scrollbar_drag_animation() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = true;
         app.panels = vec![
@@ -3847,11 +5410,11 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("    fn close_active_terminal").next())
             .expect("shared terminal close lifecycle must remain present");
-        assert!(close.contains("self.terminals.remove(index)"));
-        assert!(close.contains("if self.terminals.is_empty()"));
-        assert!(close.contains("return true;"));
+        // The index adapter routes into the tab close and owns no removal.
+        assert!(close.contains("self.close_tab("));
+        assert!(!close.contains("self.terminals.remove("));
         assert!(!close.contains("add_terminal"));
-        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 2);
+        assert_eq!(production.matches("self.close_terminal_tab_at(").count(), 1);
 
         let request = production
             .split("    fn request_terminal_activation")
@@ -3867,13 +5430,10 @@ mod tests {
         assert!(cancel < set);
 
         let switch = production
-            .split("    fn activate_ready_terminal")
+            .split("    fn activate_pane")
             .nth(1)
-            .and_then(|tail| {
-                tail.split("    fn process_terminal_presentation_intents")
-                    .next()
-            })
-            .expect("activation method must remain present");
+            .and_then(|tail| tail.split("    fn activate_ready_terminal").next())
+            .expect("pane activation method must remain present");
         assert!(switch.contains("reset_for_terminal_switch"));
 
         let layout_ready = renderer
@@ -3898,11 +5458,13 @@ mod tests {
             std::process::id()
         ));
         let mut app = App::new();
+        let terminal_pane = app.issue_pane_id();
         let terminal = Terminal::spawn(
             None,
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
             terminal_palette(&crate::config::AppConfig::default()),
+            terminal_pane,
         );
         terminal
             .write_input(format!("trap '' TERM; printf ready > {}\r", marker.display()).as_bytes())
@@ -3915,8 +5477,9 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        app.terminals.push(terminal);
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        push_test_terminal(&mut app, terminal);
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         app.active_terminal = 0;
         app.active_terminal_presented = false;
 
@@ -3939,6 +5502,7 @@ mod tests {
         use std::time::Duration;
 
         let mut app = App::new();
+        let held_pane = app.issue_pane_id();
         let held = Terminal::spawn(
             None,
             1,
@@ -3951,8 +5515,9 @@ mod tests {
                 bridge_launch_id: None,
             },
             terminal_palette(&crate::config::AppConfig::default()),
+            held_pane,
         );
-        app.terminals.push(held);
+        push_test_terminal(&mut app, held);
         app.active_terminal = 0;
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -3977,7 +5542,8 @@ mod tests {
         use std::time::Duration;
 
         let mut app = App::new();
-        app.terminals.push(Terminal::spawn(
+        let orphan_pane = app.issue_pane_id();
+        let orphan = Terminal::spawn(
             None,
             1,
             TerminalLaunchSpec {
@@ -3989,7 +5555,9 @@ mod tests {
                 bridge_launch_id: None,
             },
             terminal_palette(&crate::config::AppConfig::default()),
-        ));
+            orphan_pane,
+        );
+        push_test_terminal(&mut app, orphan);
         app.active_terminal = 0;
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -4022,6 +5590,7 @@ mod tests {
                 bridge_launch_id: None,
             },
             terminal_palette(&crate::config::AppConfig::default()),
+            PaneId::new(1),
         );
 
         assert!(!terminal.has_process());
@@ -4130,7 +5699,7 @@ mod tests {
 
     /// Starts a hermetic shell tab and waits until it runs a command, so input
     /// written afterwards reaches the shell.
-    fn spawn_shell_tab(label: &str) -> Terminal {
+    fn spawn_shell_tab(label: &str, pane_id: PaneId) -> Terminal {
         let marker = std::env::temp_dir().join(format!(
             "ronsole-close-{label}-{}.ready",
             std::process::id()
@@ -4141,6 +5710,7 @@ mod tests {
             1,
             TerminalLaunchSpec::hermetic_shell_for_test(),
             terminal_palette(&crate::config::AppConfig::default()),
+            pane_id,
         );
         terminal
             .write_input(format!("printf ready > {}\r", marker.display()).as_bytes())
@@ -4154,7 +5724,8 @@ mod tests {
     /// tab reports that job as busy.
     pub(super) fn busy_shell_app(label: &str) -> App {
         let mut app = App::new();
-        app.terminals.push(spawn_shell_tab(label));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, spawn_shell_tab(label, pane));
         app.terminals[0].write_input(b"sleep 30\r").unwrap();
         wait_for_test_condition("foreground sleep job", || {
             !app.busy_close_targets(CloseTarget::Window).is_empty()
@@ -4187,7 +5758,8 @@ mod tests {
     #[test]
     fn background_job_does_not_make_the_tab_busy() {
         let mut app = App::new();
-        app.terminals.push(spawn_shell_tab("background-job"));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, spawn_shell_tab("background-job", pane));
         let marker = std::env::temp_dir().join(format!(
             "ronsole-close-background-{}.done",
             std::process::id()
@@ -4252,7 +5824,8 @@ mod tests {
             ime_preedit: false,
         };
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 1, pane));
         app.close_confirm = Some(CloseConfirm {
             target: CloseTarget::Tab(0),
             title: "Закрыть вкладку?",
@@ -4270,7 +5843,8 @@ mod tests {
     #[test]
     fn close_request_while_dialog_is_open_is_ignored() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 24, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 1, pane));
         app.close_confirm = Some(CloseConfirm {
             target: CloseTarget::Tab(0),
             title: "Закрыть вкладку?",
@@ -4289,8 +5863,10 @@ mod tests {
     #[test]
     fn removing_another_tab_cancels_the_open_tab_dialog() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 24, 1));
-        app.terminals.push(Terminal::new_for_test(80, 24, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 24, 2, pane));
         app.open_close_dialog(CloseConfirm {
             target: CloseTarget::Tab(1),
             title: "Закрыть вкладку?",
@@ -4476,7 +6052,8 @@ mod tests {
             ime_preedit: false,
         };
         let mut app = App::new();
-        let terminal = Terminal::new_for_test(80, 30, 1);
+        let modal_pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(80, 30, 1, modal_pane);
         {
             let mut sink = crate::terminal_process::SessionSink {
                 reply_tx: None,
@@ -4491,7 +6068,7 @@ mod tests {
                 &mut sink,
             );
         }
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
 
         app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
         app.on_key(modifier_key(
@@ -4775,10 +6352,11 @@ mod tests {
     fn grid_mode_app(claude: &[bool]) -> App {
         let mut app = App::new();
         for (index, &is_claude) in claude.iter().enumerate() {
-            let terminal = Terminal::new_for_test(80, 24, index as u64 + 1);
+            let pane = app.issue_pane_id();
+            let terminal = Terminal::new_for_test(80, 24, index as u64 + 1, pane);
             crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
             terminal.set_claude_foreground_for_test(is_claude);
-            app.terminals.push(terminal);
+            push_test_terminal(&mut app, terminal);
         }
         app.active_terminal = 0;
         app.active_terminal_presented = true;
@@ -5154,9 +6732,10 @@ mod tests {
     #[test]
     fn focus_loss_reports_1004() {
         let mut app = App::new();
-        let terminal = Terminal::new_for_test(8, 2, 1);
+        let pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(8, 2, 1, pane);
         enable_focus_reporting_for_test(&terminal);
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
         app.active_terminal_presented = true;
         app.on_focus_changed(false);
         assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
@@ -5165,7 +6744,8 @@ mod tests {
     #[test]
     fn focus_loss_without_1004_sends_nothing() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
         app.active_terminal_presented = true;
         app.on_focus_changed(false);
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
@@ -5176,7 +6756,8 @@ mod tests {
     #[test]
     fn focus_loss_clears_sent_keys_when_terminal_not_presented() {
         let mut app = App::new();
-        let terminal = Terminal::new_for_test(8, 2, 1);
+        let clear_pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(8, 2, 1, clear_pane);
         let mut sink = crate::terminal_process::SessionSink {
             reply_tx: None,
             title_cache: None,
@@ -5203,7 +6784,7 @@ mod tests {
             let mut out = Vec::new();
             assert_eq!(grid.encode_key(&ctrl_press, &mut out), ronsole_term::KeyOutcome::Sent);
         }
-        app.terminals.push(terminal);
+        push_test_terminal(&mut app, terminal);
         app.active_terminal_presented = false;
         app.on_focus_changed(false);
         let mut grid = crate::platform::lock_recover(&app.terminals[0].grid);
@@ -5314,6 +6895,17 @@ mod tests {
         feed_batch(terminal, "\x1b[?1000h");
     }
 
+    /// Centre of the tab strip drawn by the headless runtime, above every body.
+    fn tab_strip_point(app: &App) -> (f32, f32) {
+        let strip = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .terminal_tab_strip_layout()
+            .rect;
+        (strip.x + strip.w * 0.5, strip.y + strip.h * 0.5)
+    }
+
     #[test]
     fn grid_pointer_click_in_inactive_tile_focuses_it_and_routes_press() {
         let (mut app, _receiver, _profile, root) =
@@ -5413,7 +7005,7 @@ mod tests {
         // The release arrives after the exit and must not reach the PTY.
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5435,7 +7027,7 @@ mod tests {
         let generation = app.grid_generation;
         app.on_resize_with_logical_size(800, 400, None);
         assert_ne!(app.grid_generation, generation);
-        assert_ne!(app.panel_layouts_generation, app.grid_generation);
+        assert_ne!(app.panel_layouts_grid_generation, app.grid_generation);
 
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
@@ -5454,7 +7046,7 @@ mod tests {
         grid_pointer_enable_tracking(&app.terminals[0]);
         app.toggle_claude_grid(Instant::now());
         assert_eq!(app.on_frame(), Ok(true));
-        app.suppressed_release = Some(PointerButton::Left);
+        app.suppressed_release = vec![PointerButton::Left];
         (app, root)
     }
 
@@ -5464,7 +7056,7 @@ mod tests {
         let point = grid_pointer_point(&app, 0, false);
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         // The press is routed as usual, so the body of the active tile gets bytes.
         assert!(!app.terminals[0].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -5476,7 +7068,7 @@ mod tests {
         let point = grid_pointer_point(&app, 0, false);
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5489,7 +7081,7 @@ mod tests {
             );
         grid_pointer_enable_tracking(&app.terminals[0]);
         assert_eq!(app.on_frame(), Ok(true));
-        app.panel_layouts_generation = app.grid_generation.wrapping_add(1);
+        app.panel_layouts_grid_generation = app.grid_generation.wrapping_add(1);
         assert!(!app.grid_open());
 
         let point = grid_pointer_point(&app, 0, false);
@@ -5541,11 +7133,11 @@ mod tests {
         grid_pointer_move(&mut app, point);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
         assert_eq!(app.active_terminal, 1);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
 
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5566,12 +7158,12 @@ mod tests {
         let header = grid_pointer_point(&app, 0, true);
         grid_pointer_move(&mut app, header);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
 
         let body = grid_pointer_point(&app, 0, false);
         grid_pointer_move(&mut app, body);
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5592,9 +7184,9 @@ mod tests {
         grid_pointer_move(&mut app, header);
         app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
         app.on_pointer_button(KeyState::Released, PointerButton::Right);
-        assert_eq!(app.suppressed_release, Some(PointerButton::Left));
+        assert_eq!(app.suppressed_release, vec![PointerButton::Left]);
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
-        assert_eq!(app.suppressed_release, None);
+        assert!(app.suppressed_release.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5701,6 +7293,167 @@ mod tests {
 
         assert_eq!(app.active_terminal, 0);
         assert_eq!(app.terminals[1].scroll_y.target, before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_motion_follows_the_tile_under_the_pointer() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-motion",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+        // Any-motion reporting makes the receiving tile visible in its bytes.
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+
+        // The inactive tile under the pointer receives the motion; the active
+        // tile next to it and the focus stay untouched.
+        let point = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, point);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert_eq!(app.active_terminal, 0);
+
+        // The frame's tile geometry is stale: it must not encode the motion.
+        app.bump_grid_generation();
+        let stale = app.terminals[1].input_bytes_for_test().len();
+        grid_pointer_move(&mut app, point);
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), stale);
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pressed_tile_keeps_motion_and_release_over_another_tile() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-owner",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Button-motion reporting with SGR coordinates on both tiles: a held bit
+        // left behind by one tile would surface in the other as a drag report.
+        for terminal in &app.terminals {
+            feed_batch(terminal, "\x1b[?1002h\x1b[?1006h");
+        }
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // A press in tile 0 claims the pointer for its terminal.
+        let first = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, first);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // Motion over tile 1 stays with the pressed tile, encoded with its own
+        // layout at the real pointer position.
+        let layout = app.panel_layouts[0];
+        let second = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, second);
+        let col = (((second.0 - layout.text_x).max(0.0) / layout.char_w).floor() as usize + 1)
+            .clamp(1, layout.cols);
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - second.1
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows - rows_from_bottom;
+        let motion = app.terminals[0].input_bytes_for_test();
+        assert_eq!(
+            String::from_utf8_lossy(&motion[pressed_len..]),
+            format!("\x1b[<32;{col};{row}M")
+        );
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.active_terminal, 0);
+
+        // Exactly one release over tile 1 reaches the owner; tile 1 sees none.
+        let motion_len = motion.len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes[motion_len..]),
+            format!("\x1b[<0;{col};{row}m")
+        );
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.split_pointer_owner.is_none());
+
+        // Without the owner, motion follows the hit test again: tile 1 reports
+        // it as any motion and the pressed tile stays silent.
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        let after_release = app.terminals[0].input_bytes_for_test().len();
+        grid_pointer_move(&mut app, second);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), after_release);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_wheel_with_pointer_capture_ignores_the_tile_under_the_pointer() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-wheel-capture",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Both tiles need scrollback: the captured tile draws the scrollbar that
+        // starts the capture, and the tile under the pointer must stay still.
+        // Button-motion SGR reports make the captured tile's protocol wheel
+        // visible in its bytes.
+        for terminal in &app.terminals {
+            feed_batch(terminal, &"history line\r\n".repeat(200));
+            feed_batch(terminal, "\x1b[?1002h\x1b[?1006h");
+        }
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // A real capture: the press lands on tile 0's own scrollbar.
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("tile 0 draws a scrollbar");
+        let grab = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        grid_pointer_move(&mut app, grab);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(
+            app.interaction.pointer_capture,
+            crate::input::PointerCapture::TerminalScrollbar
+        );
+        let captured_len = app.terminals[0].input_bytes_for_test().len();
+
+        // The pointer leaves the captured tile for tile 1: the wheel stays with
+        // tile 0 and is encoded with tile 0's layout at the real pointer
+        // position, while tile 1 and the focus are untouched.
+        let second = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, second);
+        let before = app.terminals[1].scroll_y.target;
+        app.on_scroll(ScrollDelta::Pixel { x: 0.0, y: 1.0 });
+
+        assert_eq!(app.terminals[1].scroll_y.target, before);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let layout = app.panel_layouts[0];
+        let col = (((second.0 - layout.text_x).max(0.0) / layout.char_w).floor() as usize + 1)
+            .clamp(1, layout.cols);
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - second.1
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows.saturating_sub(rows_from_bottom);
+        assert_eq!(
+            String::from_utf8_lossy(&app.terminals[0].input_bytes_for_test()[captured_len..]),
+            format!("\x1b[<64;{col};{row}M")
+        );
+        assert_eq!(app.active_terminal, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6022,7 +7775,58 @@ mod tests {
     }
 
     #[test]
-    fn grid_fix_reorder_bumps_generation_and_skips_stale_layout() {
+    fn inactive_pane_scroll_ignores_stale_layout_after_close() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "split-inactive-stale-layout",
+                2,
+            );
+        // Tab 0 holds two panes; tab 1 holds one terminal at terminal index 2.
+        let first_pane = app.terminals[0].pane_id();
+        let second_pane = app.terminals[1].pane_id();
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(first_pane)),
+            second: Box::new(SplitNode::Leaf(second_pane)),
+        };
+        app.tabs[0].active_pane = second_pane;
+        app.tabs.remove(1);
+        let other_pane = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(3, other_pane));
+        app.active_tab = 0;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        app.set_grid_metrics(GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        feed_batch(&app.terminals[2], &"history line\r\n".repeat(200));
+        // The frame records layouts for both panes of tab 0.
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+
+        app.terminals[2].scroll_y.target = 20.0;
+        app.terminals[2].scroll_y.current = 20.0;
+        // A stale layout whose body swallows every scrollable line: trusting it
+        // would clamp the terminal that now sits at its index.
+        app.panel_layouts[1].body.h = 1_000_000.0;
+
+        // Closing pane 0 shifts the other tab's terminal from index 2 to 1.
+        assert!(!app.close_pane(first_pane));
+        assert!(app.layout_generation > app.panel_layouts_generation);
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.terminals[1].pane_id(), other_pane);
+
+        assert_eq!(grid_frame_step(&mut app), Ok(true));
+        assert_eq!(app.terminals[1].scroll_y.target, 20.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_reorder_keeps_tile_composition_and_inactive_scroll() {
         let (mut app, _receiver, _profile, root) =
             crate::app::headless_run::test_support::started_headless_with_test_terminals(
                 "grid-fix-reorder-generation",
@@ -6037,16 +7841,19 @@ mod tests {
         assert_eq!(app.panel_layouts[0].max_scroll, 0.0);
         assert!(app.panel_layouts[1].max_scroll >= 10.0);
         let generation = app.grid_generation;
+        let layout_generation = app.layout_generation;
 
-        // After the swap the history tab is at index 0, the inactive one, and
-        // the stale layout of index 0 (short tab) must not clamp it.
+        // Tiles are panes, not tabs: moving a tab in the strip leaves the grid
+        // composition alone, so its generation and its tile order stay put.
         app.reorder_terminal_tab(0, 1);
-        assert_ne!(app.grid_generation, generation);
-        app.terminals[0].scroll_y.target = 20.0;
-        app.terminals[0].scroll_y.current = 20.0;
+        assert_eq!(app.grid_generation, generation);
+        assert!(app.layout_generation > layout_generation);
+        // The inactive history tile keeps its scroll target: index 1 still names it.
+        app.terminals[1].scroll_y.target = 20.0;
+        app.terminals[1].scroll_y.current = 20.0;
 
         assert_eq!(grid_frame_step(&mut app), Ok(true));
-        assert_eq!(app.terminals[0].scroll_y.target, 20.0);
+        assert_eq!(app.terminals[1].scroll_y.target, 20.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6086,7 +7893,8 @@ mod tests {
     fn background_tab_bell_marks_tab_until_it_is_activated() {
         let mut app = App::new();
         for display_number in [1, 2] {
-            app.terminals.push(Terminal::new_for_test(8, 2, display_number));
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, display_number, pane));
         }
         app.terminals[1].ring_bell_for_test();
 
@@ -6100,10 +7908,1053 @@ mod tests {
     }
 
     #[test]
+    fn split_tab_bell_from_inactive_pane_marks_the_tab() {
+        let mut app = App::new();
+        for display_number in [1, 2] {
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, display_number, pane));
+        }
+        // Tab 1 stays in the background; its active pane keeps the founding terminal.
+        let bell_pane = attach_test_pane(&mut app, 1, 3);
+        let bell_terminal = app
+            .terminal_index_of_pane(bell_pane)
+            .expect("the new pane has a terminal");
+        assert_ne!(app.tabs[1].active_pane, bell_pane);
+
+        app.terminals[bell_terminal].ring_bell_for_test();
+        app.drain_terminal_host_events();
+        assert!(app.terminals[bell_terminal].bell_pending());
+        app.build_tab_labels();
+        assert!(
+            app.tab_labels[1].bell_pending,
+            "an inactive pane of a background tab must mark its tab"
+        );
+        assert!(!app.tab_labels[0].bell_pending, "the other tab stays unmarked");
+
+        // Activating the source pane clears its own mark; the other tab is untouched.
+        app.activate_pane(bell_pane, false);
+        assert!(!app.terminals[bell_terminal].bell_pending());
+        app.build_tab_labels();
+        assert!(!app.tab_labels[1].bell_pending);
+        assert!(!app.tab_labels[0].bell_pending);
+    }
+
+    #[test]
+    fn spawn_creates_one_tab_per_terminal_with_unique_pane_ids() {
+        let (app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "tabs-one-per-terminal",
+                3,
+            );
+        assert_eq!(app.tabs.len(), 3);
+        let mut pane_ids = Vec::new();
+        for (index, tab) in app.tabs.iter().enumerate() {
+            match &tab.layout {
+                SplitNode::Leaf(pane) => {
+                    assert_eq!(*pane, app.terminals[index].pane_id());
+                    pane_ids.push(*pane);
+                }
+                SplitNode::Split { .. } => panic!("tab {index} must start as one leaf"),
+            }
+            assert_eq!(tab.active_pane, app.terminals[index].pane_id());
+        }
+        pane_ids.sort();
+        pane_ids.dedup();
+        assert_eq!(pane_ids.len(), 3, "pane ids must be unique");
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn activate_pane_sets_focus_and_reports_1004() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        let first_terminal = Terminal::new_for_test(8, 2, 1, first);
+        enable_focus_reporting_for_test(&first_terminal);
+        push_test_terminal(&mut app, first_terminal);
+        let second = app.issue_pane_id();
+        let second_terminal = Terminal::new_for_test(8, 2, 2, second);
+        enable_focus_reporting_for_test(&second_terminal);
+        push_test_terminal(&mut app, second_terminal);
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        app.focused = true;
+
+        app.activate_pane(second, true);
+
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.pending_tab_reveal, Some(true));
+        assert_eq!(app.tabs[1].active_pane, second);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[O");
+        assert_eq!(app.terminals[1].input_bytes_for_test(), b"\x1b[I");
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn select_tab_pane_in_background_changes_only_tab_pane() {
+        let mut app = App::new();
+        let front = app.issue_pane_id();
+        let front_terminal = Terminal::new_for_test(8, 2, 1, front);
+        enable_focus_reporting_for_test(&front_terminal);
+        push_test_terminal(&mut app, front_terminal);
+        let left = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, left));
+        let right = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 3, right));
+        // A background tab with two panes; the front tab keeps one pane, and
+        // the third terminal moves into that split instead of its own tab.
+        let background = app.tabs[1].id;
+        app.tabs[1].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(left)),
+            second: Box::new(SplitNode::Leaf(right)),
+        };
+        app.tabs[1].active_pane = left;
+        app.tabs.remove(2);
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        app.focused = true;
+        app.interaction.layout.cols = 8;
+
+        app.select_tab_pane_in_background(background, right);
+
+        assert_eq!(app.tabs[1].active_pane, right);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.interaction.layout.cols, 8);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[2].input_bytes_for_test().is_empty());
+        app.debug_assert_invariants();
+    }
+
+    /// Headless app whose window body is 1000x700 at scale 1.0 with one 8x16
+    /// cell, so a split of the active pane fits the pane minimum.
+    fn headless_split_app(
+        tag: &str,
+        count: usize,
+    ) -> (
+        App,
+        std::sync::mpsc::Receiver<String>,
+        crate::headless::Profile,
+        PathBuf,
+    ) {
+        let (mut app, receiver, profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(tag, count);
+        app.set_grid_metrics(GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        app.rebuild_panels();
+        (app, receiver, profile, root)
+    }
+
+    /// `code` as the window delivers a plain press of it.
+    fn shortcut_key(code: KeyCode) -> KeyInput {
+        KeyInput {
+            state: KeyState::Pressed,
+            physical_key: PhysicalKey::Code(code),
+            keycode: 0,
+            text: None,
+            unshifted: None,
+            named: None,
+            ime_preedit: false,
+        }
+    }
+
+    /// Ctrl+Shift+`code` through `App::on_key`; returns the key result.
+    fn press_ctrl_shift(app: &mut App, code: KeyCode) -> bool {
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        app.on_key(shortcut_key(code))
+    }
+
+    /// Alt+`code` through `App::on_key`; returns the key result.
+    fn press_alt(app: &mut App, code: KeyCode) -> bool {
+        app.on_modifiers(Modifiers::ALT);
+        app.on_key(shortcut_key(code))
+    }
+
+    /// Two-pane side-by-side tab with the right pane focused. Returns the left
+    /// and right pane ids.
+    fn focused_right_split_app(tag: &str) -> (App, PaneId, PaneId, PathBuf) {
+        let (mut app, _receiver, _profile, root) = headless_split_app(tag, 1);
+        let left = app.tabs[0].active_pane;
+        let right = attach_test_pane(&mut app, 0, 2);
+        app.tabs[0].active_pane = right;
+        app.active_terminal = app
+            .terminal_index_of_pane(right)
+            .expect("the right pane has a terminal");
+        app.rebuild_panels();
+        (app, left, right, root)
+    }
+
+    #[test]
+    fn ctrl_shift_d_splits_active_pane_into_two() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-right", 1);
+        let first_pane = app.tabs[0].active_pane;
+        let terminals_before = app.terminals.len();
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyD));
+        app.rebuild_panels();
+
+        assert_eq!(app.terminals.len(), terminals_before + 1);
+        assert_eq!(app.panels.len(), 2);
+        let SplitNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = &app.tabs[0].layout
+        else {
+            panic!("the active tab must hold one split");
+        };
+        assert_eq!(*axis, SplitAxis::SideBySide);
+        assert_eq!(*ratio, 0.5);
+        assert!(matches!(**first, SplitNode::Leaf(pane) if pane == first_pane));
+        let new_pane = app.tabs[0].active_pane;
+        assert_ne!(new_pane, first_pane);
+        assert!(matches!(**second, SplitNode::Leaf(pane) if pane == new_pane));
+        assert_eq!(app.active_terminal, terminals_before);
+        assert_eq!(app.terminals[terminals_before].pane_id(), new_pane);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_shift_e_splits_stacked() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-down", 1);
+        let first_pane = app.tabs[0].active_pane;
+
+        press_ctrl_shift(&mut app, KeyCode::KeyE);
+        app.rebuild_panels();
+
+        assert_eq!(app.panels.len(), 2);
+        let SplitNode::Split {
+            axis, ratio, first, ..
+        } = &app.tabs[0].layout
+        else {
+            panic!("the active tab must hold one split");
+        };
+        assert_eq!(*axis, SplitAxis::Stacked);
+        assert_eq!(*ratio, 0.5);
+        assert!(matches!(**first, SplitNode::Leaf(pane) if pane == first_pane));
+        let left = app.panels[0].body;
+        let top = app.panels[1].body;
+        assert_eq!(left.x, top.x);
+        assert_eq!(left.w, top.w);
+        assert!(left.y < top.y);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_left_moves_focus_to_left_pane() {
+        let (mut app, left, _right, root) = focused_right_split_app("alt-left");
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_down_moves_focus_to_lower_pane() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("alt-down", 1);
+        let top = app.tabs[0].active_pane;
+        let bottom = attach_test_pane_at(&mut app, top, SplitAxis::Stacked, 2);
+        app.rebuild_panels();
+
+        let _ = press_alt(&mut app, KeyCode::ArrowDown);
+
+        assert_eq!(app.tabs[0].active_pane, bottom);
+        assert_eq!(
+            app.active_terminal,
+            app.terminal_index_of_pane(bottom)
+                .expect("the lower pane has a terminal")
+        );
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_arrows_go_to_terminal_when_single_pane() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("alt-single", 1);
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+        let _ = press_alt(&mut app, KeyCode::ArrowDown);
+
+        // Legacy cursor-key encoding with the Alt modifier, as the terminal
+        // encoder defines it.
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[1;3D\x1b[1;3B");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alt_arrows_not_intercepted_in_grid() {
+        // The active tab is split, so outside grid mode this focus shortcut would
+        // be intercepted; only the open grid keeps the arrow with the tile.
+        let mut app = grid_mode_app(&[true]);
+        let left = app.tabs[0].active_pane;
+        attach_test_pane(&mut app, 0, 2);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+
+        assert!(app.grid_open());
+        assert_eq!(leaf_count(&app.tabs[0].layout), 2);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x1b[1;3D");
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+    }
+
+    #[test]
+    fn alt_arrows_with_two_panes_do_not_reach_shell() {
+        let (mut app, left, _right, root) = focused_right_split_app("alt-two-panes");
+
+        let _ = press_alt(&mut app, KeyCode::ArrowLeft);
+
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_shift_w_closes_active_pane_only_with_two_panes() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("close-w-single", 1);
+        let single = app.tabs[0].active_pane;
+
+        // A single-pane tab passes the key to its terminal: Ctrl+Shift+W keeps
+        // the legacy Ctrl+W byte, as `ctrl_c_without_selection_sends_etx_flags0`
+        // does for Ctrl+C. A real key carries its unshifted layout character.
+        app.on_modifiers(Modifiers::CONTROL | Modifiers::SHIFT);
+        let mut key = shortcut_key(KeyCode::KeyW);
+        key.unshifted = Some('w');
+        let _ = app.on_key(key);
+
+        assert_eq!(app.terminals[0].input_bytes_for_test(), b"\x17");
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.tabs[0].active_pane, single);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (mut app, left, right, root) = focused_right_split_app("close-w-split");
+        app.active_terminal_presented = true;
+
+        let _ = press_ctrl_shift(&mut app, KeyCode::KeyW);
+
+        assert!(app.terminal_index_of_pane(right).is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), left);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert_eq!(app.active_terminal, 0);
+        app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_in_narrow_pane_shows_hint_and_spawns_nothing() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-too-small", 1);
+        // 994px of two side-by-side panes leaves 497px each; 200px leaves 97px,
+        // below the 100px pane minimum of one 8px cell row of ten columns.
+        app.set_grid_metrics(GridMetrics {
+            width: 200.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        app.rebuild_panels();
+        let terminals_before = app.terminals.len();
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+
+        assert_eq!(app.terminals.len(), terminals_before);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.tabs[0].active_pane, app.terminals[0].pane_id());
+        let hint = app.tab_strip_hint(Instant::now()).expect("a hint is shown");
+        assert!(
+            hint.contains("Панель слишком мала для сплита"),
+            "unexpected hint {hint:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_spawn_failure_keeps_tree_and_shows_hint() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-spawn-failure", 1);
+        app.shell_override = Some(PathBuf::from("/definitely/missing/ronsole-test-shell"));
+        let terminals_before = app.terminals.len();
+        let active_terminal_before = app.active_terminal;
+        let active_pane_before = app.tabs[0].active_pane;
+        let pending_reveal_before = app.pending_tab_reveal;
+        // A refused split must not cancel an activation that was already
+        // pending: seed one so a misplaced cancel in the refusal path shows.
+        app.terminals[0].presentation_intent = TerminalPresentationIntent::ActivateWhenReady;
+        let intents_before: Vec<_> = app
+            .terminals
+            .iter()
+            .map(|terminal| {
+                (
+                    terminal.presentation_intent,
+                    terminal.reveal_right_tail_when_presented,
+                )
+            })
+            .collect();
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+
+        assert_eq!(app.terminals.len(), terminals_before);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert_eq!(app.active_terminal, active_terminal_before);
+        assert_eq!(app.tabs[0].active_pane, active_pane_before);
+        assert_eq!(app.pending_tab_reveal, pending_reveal_before);
+        let intents_after: Vec<_> = app
+            .terminals
+            .iter()
+            .map(|terminal| {
+                (
+                    terminal.presentation_intent,
+                    terminal.reveal_right_tail_when_presented,
+                )
+            })
+            .collect();
+        assert_eq!(intents_after, intents_before);
+        let hint = app.tab_strip_hint(Instant::now()).expect("a hint is shown");
+        assert!(
+            hint.contains("Не удалось запустить панель"),
+            "unexpected hint {hint:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_uses_osc7_directory_of_active_pane() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-osc7", 1);
+        app.shell_override = Some(PathBuf::from("/bin/bash"));
+        let workspace = root.join("workspace");
+        app.terminals[0].osc7_cwd = Some(workspace.clone());
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+
+        assert_eq!(app.terminals.len(), 2);
+        // The split shell runs in the directory the active pane's shell reported.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut cwd = None;
+        while cwd.as_ref() != Some(&workspace) && Instant::now() < deadline {
+            if let Some(pid) = app.terminals[1].process_group_leader()
+                && let Ok(link) = std::fs::read_link(format!("/proc/{pid}/cwd"))
+            {
+                cwd = Some(link);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cwd, Some(workspace));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_panels_lays_out_all_panes_without_overlap() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-layout", 1);
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+        app.rebuild_panels();
+
+        let body = terminal_body_rect(1000.0, 700.0, 1.0);
+        assert_eq!(app.panels.len(), 2);
+        assert_eq!(app.panels[0].terminal, 0);
+        assert_eq!(app.panels[1].terminal, 1);
+        let left = app.panels[0].body;
+        let right = app.panels[1].body;
+        for rect in [left, right] {
+            assert_eq!(rect.x.fract(), 0.0, "x must be whole pixels");
+            assert_eq!(rect.y.fract(), 0.0, "y must be whole pixels");
+            assert_eq!(rect.w.fract(), 0.0, "w must be whole pixels");
+            assert_eq!(rect.h.fract(), 0.0, "h must be whole pixels");
+            assert!(rect.x >= body.x && rect.y >= body.y);
+            assert!(rect.x + rect.w <= body.x + body.w);
+            assert!(rect.y + rect.h <= body.y + body.h);
+            assert!(rect.w >= 100.0 && rect.h >= 48.0, "pane minimum");
+        }
+        assert!(left.x + left.w <= right.x, "panes must not overlap");
+        assert_eq!(left.y, right.y);
+        assert_eq!(left.h, right.h);
+        assert_eq!(right.x, left.x + left.w + 6.0, "one gap between panes");
+        assert_eq!(left.w + right.w + 6.0, body.w);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn layout_generation_grows_on_split_and_metrics_change() {
+        let (mut app, _receiver, _profile, root) = headless_split_app("split-generations", 1);
+        let before = app.layout_generation;
+        let same = app.grid_metrics;
+        app.set_grid_metrics(same);
+        assert_eq!(
+            app.layout_generation, before,
+            "same metrics keep the generation"
+        );
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+        let after_split = app.layout_generation;
+        assert!(after_split > before, "a split changes the layout");
+
+        app.set_grid_metrics(GridMetrics {
+            width: same.width - 100.0,
+            ..same
+        });
+        assert!(
+            app.layout_generation > after_split,
+            "a metrics change invalidates the layout outside grid mode"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Closing the active terminal drops its tab too, so the strip stays in
+    /// step with `terminals` and the successor is still activatable.
+    #[test]
+    fn close_active_terminal_keeps_tabs_in_sync() {
+        let mut app = App::new();
+        for number in 1..=3 {
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, number, pane));
+        }
+        app.active_terminal = 1;
+        app.active_tab = 1;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_terminal_tab_at(1));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.tabs.len(), app.terminals.len());
+        app.debug_assert_invariants();
+        app.activate_ready_terminal(1, false);
+        assert_eq!(app.active_terminal, 1);
+        app.debug_assert_invariants();
+    }
+
+    /// Closing a background terminal removes only its own tab; the active
+    /// terminal and tab follow the index shift.
+    #[test]
+    fn close_background_terminal_keeps_tabs_in_sync() {
+        let mut app = App::new();
+        for number in 1..=3 {
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, number, pane));
+        }
+        app.active_terminal = 2;
+        app.active_tab = 2;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_terminal_tab_at(0));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.tabs.len(), app.terminals.len());
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    /// The last terminal takes the last tab with it: nothing is left to draw.
+    #[test]
+    fn closing_only_terminal_clears_tabs() {
+        let mut app = App::new();
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        app.active_terminal = 0;
+        app.active_tab = 0;
+        app.active_terminal_presented = true;
+
+        assert!(app.close_terminal_tab_at(0));
+
+        assert!(app.terminals.is_empty());
+        assert!(app.tabs.is_empty());
+        app.debug_assert_invariants();
+    }
+
+    /// One tab with two side-by-side panes built from two terminals; `tabs[0]`
+    /// owns both leaves and the first pane is the tab's active pane.
+    fn two_pane_app(shell: App, first: Terminal, second: Terminal) -> (App, PaneId, PaneId) {
+        let mut app = shell;
+        let first_pane = push_test_terminal(&mut app, first);
+        let second_pane = push_test_terminal(&mut app, second);
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(first_pane)),
+            second: Box::new(SplitNode::Leaf(second_pane)),
+        };
+        app.tabs[0].active_pane = first_pane;
+        app.tabs.remove(1);
+        app.active_tab = 0;
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        (app, first_pane, second_pane)
+    }
+
+    fn presentation_ready_terminal(number: u64, pane: PaneId) -> Terminal {
+        let terminal = Terminal::new_for_test(8, 2, number, pane);
+        crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
+        terminal
+    }
+
+    fn test_shell(number: u64, pane: PaneId) -> Terminal {
+        let terminal = Terminal::spawn(
+            None,
+            number,
+            TerminalLaunchSpec::hermetic_shell_for_test(),
+            terminal_palette(&crate::config::AppConfig::default()),
+            pane,
+        );
+        crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
+        terminal
+    }
+
+    #[test]
+    fn close_pane_gives_place_to_neighbour_and_keeps_processes_alive() {
+        let mut app = App::new();
+        let closed = app.issue_pane_id();
+        let kept = app.issue_pane_id();
+        let (mut app, closed, kept) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, closed),
+            test_shell(2, kept),
+        );
+
+        assert!(!app.close_pane(closed));
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), kept);
+        assert!(
+            app.terminals[0].has_process(),
+            "the neighbour's shell must stay alive"
+        );
+        assert!(!app.terminals[0].is_closed());
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert!(matches!(app.tabs[0].layout, SplitNode::Leaf(pane) if pane == kept));
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn close_pane_refusal_keeps_tree_and_process() {
+        let mut app = App::new();
+        let other = app.issue_pane_id();
+        let kept = app.issue_pane_id();
+        let (mut app, other, kept) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, other),
+            test_shell(2, kept),
+        );
+        // The live shell is the active pane, so the refusal must also keep focus.
+        app.tabs[0].active_pane = kept;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        // A stopped worker drops the sender: every cleanup request is refused.
+        app.terminal_cleanup.shutdown_and_join();
+
+        assert!(!app.close_pane(kept));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.terminals[1].pane_id(), kept);
+        assert!(
+            app.terminals[1].has_process(),
+            "the refused pane keeps its process"
+        );
+        assert_eq!(leaf_count(&app.tabs[0].layout), 2);
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        let _ = other;
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_last_pane_closes_tab_and_focuses_neighbour() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, first));
+        let second = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(2, second));
+        app.active_tab = 0;
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_pane(first));
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].active_pane, second);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_tab_removes_all_panes_and_focuses_next_tab() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        let second = app.issue_pane_id();
+        let (mut app, first, second) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, first),
+            Terminal::new_for_test(8, 2, 2, second),
+        );
+        let third = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(3, third));
+        let tab = app.tabs[0].id;
+
+        assert!(!app.close_tab(tab));
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), third);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].active_pane, third);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        let _ = (first, second);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_tab_refusal_stops_and_keeps_remaining_panes() {
+        let mut app = App::new();
+        let plain = app.issue_pane_id();
+        let kept = app.issue_pane_id();
+        // The processless pane owns no cleanup request, so it is removed before
+        // the live pane is refused and the tab survives with one pane.
+        let (mut app, plain, kept) = two_pane_app(
+            app,
+            Terminal::new_for_test(8, 2, 1, plain),
+            test_shell(2, kept),
+        );
+        app.tabs[0].active_pane = kept;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        app.terminal_cleanup.shutdown_and_join();
+        // A surviving tab keeps the window alive, so the last pane of the target
+        // tab still asks the worker and is refused.
+        let survivor = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(3, survivor));
+        let tab = app.tabs[0].id;
+
+        assert!(!app.close_tab(tab));
+
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.terminals[0].pane_id(), kept);
+        assert!(
+            app.terminals[0].has_process(),
+            "the remaining pane keeps its process"
+        );
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(leaf_count(&app.tabs[0].layout), 1);
+        assert!(!split_contains_pane(&app.tabs[0].layout, plain));
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn close_tab_refusal_in_grid_keeps_focus_on_live_tile() {
+        let mut app = App::new();
+        let shell = app.issue_pane_id();
+        let other = app.issue_pane_id();
+        let focused = app.issue_pane_id();
+        push_test_terminal(&mut app, test_shell(1, shell));
+        push_test_terminal(&mut app, presentation_ready_terminal(2, other));
+        push_test_terminal(&mut app, presentation_ready_terminal(3, focused));
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.terminals[2].set_claude_foreground_for_test(true);
+        // The focused tile moves into the shell's tab, in tree order after the
+        // shell, so the refused cleanup arrives on the first pane of the close.
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(shell)),
+            second: Box::new(SplitNode::Leaf(focused)),
+        };
+        app.tabs[0].active_pane = focused;
+        app.tabs.remove(2);
+        app.active_tab = 0;
+        app.active_terminal = 2;
+        app.active_terminal_presented = true;
+        app.grid_metrics = GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        assert_eq!(app.active_terminal, 2);
+        app.terminal_cleanup.shutdown_and_join();
+        let tab = app.tabs[0].id;
+
+        assert!(!app.close_tab(tab));
+
+        // Nothing left, so the live focused tile keeps the focus (§6.4).
+        assert_eq!(app.terminals.len(), 3);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 2);
+        assert_eq!(app.terminals[2].pane_id(), focused);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.tabs[0].active_pane, focused);
+        assert!(
+            app.terminals[0].has_process(),
+            "the refused shell keeps its process"
+        );
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn close_tab_partial_refusal_focuses_actual_surviving_tile() {
+        let mut app = App::new();
+        let outside = app.issue_pane_id();
+        let focused = app.issue_pane_id();
+        let shell = app.issue_pane_id();
+        let plain = app.issue_pane_id();
+        let next_tile = app.issue_pane_id();
+        let last_tile = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(1, outside));
+        push_test_terminal(&mut app, presentation_ready_terminal(2, focused));
+        push_test_terminal(&mut app, test_shell(3, shell));
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 4, plain));
+        push_test_terminal(&mut app, presentation_ready_terminal(5, next_tile));
+        push_test_terminal(&mut app, presentation_ready_terminal(6, last_tile));
+        for index in [0, 1, 4, 5] {
+            app.terminals[index].set_claude_foreground_for_test(true);
+        }
+        // The closed tab owns panes 1..4 in tree order [focused, shell, plain,
+        // next]: the focused tile leaves first, then the live shell refuses.
+        app.tabs[1].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(focused)),
+            second: Box::new(SplitNode::Split {
+                axis: SplitAxis::Stacked,
+                ratio: 0.5,
+                first: Box::new(SplitNode::Leaf(shell)),
+                second: Box::new(SplitNode::Split {
+                    axis: SplitAxis::Stacked,
+                    ratio: 0.5,
+                    first: Box::new(SplitNode::Leaf(plain)),
+                    second: Box::new(SplitNode::Leaf(next_tile)),
+                }),
+            }),
+        };
+        app.tabs[1].active_pane = focused;
+        app.tabs.remove(4);
+        app.tabs.remove(3);
+        app.tabs.remove(2);
+        app.active_tab = 1;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+        app.grid_metrics = GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1, 4, 5]));
+        app.terminal_cleanup.shutdown_and_join();
+        let tab = app.tabs[1].id;
+
+        assert!(!app.close_tab(tab));
+
+        // The focused tile left before the refusal: the next live tile in grid
+        // order is `next_tile` alone, not the shell's neighbour `plain`.
+        assert_eq!(app.terminals.len(), 5);
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 3);
+        assert_eq!(app.terminals[3].pane_id(), next_tile);
+        assert!(app.active_terminal_presented);
+        assert_eq!(app.tabs[1].active_pane, next_tile);
+        assert!(
+            app.terminals[1].has_process(),
+            "the refused shell keeps its process"
+        );
+        assert!(app.grid_open());
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn close_active_pane_with_unready_successor_keeps_invariant() {
+        let mut app = App::new();
+        let outside = app.issue_pane_id();
+        let pending = app.issue_pane_id();
+        let other = app.issue_pane_id();
+        let closed = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(1, outside));
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pending));
+        push_test_terminal(&mut app, presentation_ready_terminal(3, other));
+        push_test_terminal(&mut app, presentation_ready_terminal(4, closed));
+        // The closed tab owns the ready focused pane and the unready successor;
+        // the closed pane sits last in `terminals`, so its removal leaves
+        // `active_terminal` on the pane of the neighbour tab.
+        app.tabs[1].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Leaf(pending)),
+            second: Box::new(SplitNode::Leaf(closed)),
+        };
+        app.tabs[1].active_pane = closed;
+        app.tabs.remove(3);
+        app.active_tab = 1;
+        app.active_terminal = 3;
+        app.active_terminal_presented = true;
+
+        assert!(!app.close_pane(closed));
+
+        // The logical focus already names the successor; the presentation waits.
+        assert_eq!(app.terminals.len(), 3);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.tabs[1].active_pane, pending);
+        assert_eq!(app.active_terminal, 1);
+        assert!(!app.active_terminal_presented);
+        assert_eq!(
+            app.terminals[1].presentation_intent,
+            TerminalPresentationIntent::ActivateWhenReady
+        );
+        app.debug_assert_invariants();
+
+        crate::platform::lock_recover(&app.terminals[1].grid).mark_presentation_ready();
+        assert!(app.process_terminal_presentation_intents());
+
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        assert_eq!(
+            app.terminals[1].presentation_intent,
+            TerminalPresentationIntent::None
+        );
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn natural_exit_removes_only_its_pane() {
+        let mut app = App::new();
+        let exiting = app.issue_pane_id();
+        let orphan = Terminal::spawn(
+            None,
+            1,
+            TerminalLaunchSpec {
+                shell: None,
+                working_directory: None,
+                inherited_directory: None,
+                command: vec![std::ffi::OsString::from("/bin/true")],
+                hold: false,
+                bridge_launch_id: None,
+            },
+            terminal_palette(&crate::config::AppConfig::default()),
+            exiting,
+        );
+        let kept = app.issue_pane_id();
+        let (mut app, exiting, kept) = two_pane_app(app, orphan, test_shell(2, kept));
+        app.tabs[0].active_pane = kept;
+        app.active_terminal = 1;
+        app.active_terminal_presented = true;
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while app.terminals.len() > 1 {
+            assert!(!app.remove_closed_terminals());
+            assert!(
+                Instant::now() < deadline,
+                "the exited pane did not close on its own"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), kept);
+        assert!(
+            app.terminals[0].has_process(),
+            "the neighbour's shell must stay alive"
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert!(matches!(app.tabs[0].layout, SplitNode::Leaf(pane) if pane == kept));
+        assert_eq!(app.tabs[0].active_pane, kept);
+        assert_eq!(app.active_terminal, 0);
+        let _ = exiting;
+        app.debug_assert_invariants();
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn closing_active_tile_focuses_next_tile() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        app.active_terminal = 1;
+        app.active_tab = 1;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1, 2]));
+        let closed = app.terminals[1].pane_id();
+
+        assert!(!app.close_pane(closed));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    /// Two terminals with one pane id pass the leaf count; the strip keeps a
+    /// second, distinct leaf, so the per-terminal counts still say one leaf
+    /// each. Only the duplicate-id check can see the split.
+    #[test]
+    #[should_panic(expected = "two terminals share pane id")]
+    fn debug_assert_invariants_rejects_duplicate_pane_ids() {
+        let mut app = App::new();
+        let shared = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, shared));
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, shared));
+        let unowned = app.issue_pane_id();
+        app.tabs[1].layout = SplitNode::Leaf(unowned);
+        app.tabs[1].active_pane = unowned;
+        app.active_terminal = 0;
+        app.active_tab = 0;
+
+        app.debug_assert_invariants();
+    }
+
+    #[test]
     fn active_tab_bell_in_focused_window_sets_nothing() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
-        app.terminals.push(Terminal::new_for_test(8, 2, 2));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 2, pane));
         assert!(app.focused);
         app.terminals[0].ring_bell_for_test();
 
@@ -6118,7 +8969,8 @@ mod tests {
         // Without a window runtime no compositor request can be sent, so the
         // once-per-period flag must stay clear for the next bell to retry.
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(8, 2, 1, pane));
         app.focused = false;
 
         app.terminals[0].ring_bell_for_test();
@@ -6132,9 +8984,10 @@ mod tests {
     fn tab_focus_transition_reports_out_then_in_only_when_focused() {
         let mut app = App::new();
         for display_number in [1, 2] {
-            let terminal = Terminal::new_for_test(8, 2, display_number);
+            let pane = app.issue_pane_id();
+            let terminal = Terminal::new_for_test(8, 2, display_number, pane);
             enable_focus_reporting_for_test(&terminal);
-            app.terminals.push(terminal);
+            push_test_terminal(&mut app, terminal);
         }
         app.focused = false;
         app.send_terminal_focus_transition(Some(0), Some(1));
@@ -6558,7 +9411,8 @@ mod tests {
         }
 
         let mut app = App::from_config(AppConfig::default());
-        app.terminals.push(Terminal::new_for_test(40, 3, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(40, 3, 1, pane));
 
         app.settings_color_input.set_text("#12ABCF");
         assert!(app.apply_settings_color_draft(SettingsColorField::Foreground));
@@ -6900,7 +9754,11 @@ mod tests {
     #[test]
     fn settings_open_and_focus_loss_clear_tracked_physical_mouse_buttons() {
         let mut settings_app = App::new();
-        settings_app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let settings_pane = settings_app.issue_pane_id();
+        push_test_terminal(
+            &mut settings_app,
+            Terminal::new_for_test(8, 2, 1, settings_pane),
+        );
         settings_app.active_terminal_presented = true;
         settings_app
             .interaction
@@ -6909,7 +9767,8 @@ mod tests {
         assert_eq!(settings_app.interaction.pressed_mouse_buttons_for_test(), 0);
 
         let mut focus_app = App::new();
-        focus_app.terminals.push(Terminal::new_for_test(8, 2, 1));
+        let focus_pane = focus_app.issue_pane_id();
+        push_test_terminal(&mut focus_app, Terminal::new_for_test(8, 2, 1, focus_pane));
         focus_app.active_terminal_presented = true;
         focus_app.interaction.set_pressed_mouse_buttons_for_test(1);
         focus_app.on_focus_changed(false);
@@ -6921,7 +9780,8 @@ mod tests {
         use crate::renderer::TerminalUiLayout;
 
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 30, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 30, 1, pane));
         feed_batch(&app.terminals[0], "\x1b[30;1Hsee https://example.com/x");
         app.interaction.update_layout(TerminalUiLayout {
             body: crate::search::Rect {
@@ -7040,7 +9900,8 @@ mod tests {
     #[test]
     fn active_terminal_selection_clear_helper_removes_manual_selection() {
         let mut app = App::new();
-        app.terminals.push(Terminal::new_for_test(80, 30, 1));
+        let pane = app.issue_pane_id();
+        push_test_terminal(&mut app, Terminal::new_for_test(80, 30, 1, pane));
         crate::platform::lock_recover(&app.terminals[0].grid).set_selection(Some((1, 2, 5, 2)));
 
         assert!(app.clear_active_terminal_text_selection());
@@ -7078,7 +9939,16 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("    pub(crate) fn on_pointer_leave").next())
             .expect("cursor moved routing must remain present");
-        assert!(moved.contains("!self.interaction.terminal_selection_active()"));
+        // The tab strip check must yield to a live UI capture, so a scrollbar
+        // drag or a search-input selection keeps its motion over the strip.
+        let strip = moved
+            .find("terminal_tab_strip_layout")
+            .expect("tab strip motion routing must remain present");
+        let guard = moved[..strip]
+            .rfind("if ")
+            .expect("the tab strip check must stay guarded");
+        assert!(moved[guard..strip]
+            .contains("self.interaction.pointer_capture == crate::input::PointerCapture::None"));
         let left = production
             .split("    pub(crate) fn on_pointer_leave")
             .nth(1)
@@ -7105,6 +9975,83 @@ mod tests {
     }
 
     #[test]
+    fn tab_strip_shows_one_label_per_tab_with_active_pane_title() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t6-tab-labels",
+                2,
+            );
+        // A second pane in tab 1 must not add a third strip label.
+        let second_pane = attach_test_pane(&mut app, 1, 3);
+        app.activate_pane(second_pane, false);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        assert_eq!(app.tab_labels.len(), 2);
+        assert_eq!(app.tab_labels.len(), app.tabs.len());
+        let tab = &app.tabs[1];
+        let label = &app.tab_labels[1];
+        assert_eq!(label.id, tab.id);
+        assert_eq!(label.number, tab.title_number);
+        assert_eq!(label.leaf_count, 2);
+        // The title comes from the active pane of the tab, not from its founding terminal.
+        assert_eq!(app.terminals[label.title_terminal].pane_id(), second_pane);
+
+        // The renderer keeps one hitbox per tab: the third terminal has none.
+        let renderer = app.runtime.as_ref().expect("headless runtime").renderer();
+        assert!(renderer.terminal_tab_body(0).is_some());
+        assert!(renderer.terminal_tab_body(1).is_some());
+        assert!(renderer.terminal_tab_body(2).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tab_hit_test_and_drag_use_tab_indices() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t6-tab-drag",
+                2,
+            );
+        let moved_tab = app.tabs[1].id;
+        let founding_pane = app.tabs[1].active_pane;
+        let attached_pane = attach_test_pane(&mut app, 1, 3);
+        let terminal_count = app.terminals.len();
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // Two tabs but three terminals: the second tab's hitbox carries tab index 1.
+        let second = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .renderer()
+            .terminal_tab_body(1)
+            .expect("second tab body");
+        let (x, y) = (second[0] + second[2] * 0.5, second[1] + second[3] * 0.5);
+        let hit = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .terminal_tab_hit_test(x, y);
+        assert_eq!(hit, TerminalTabHit::Body(1));
+
+        app.on_pointer_motion(PointerPosition { x, y });
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_tab, 1);
+        // Drag the second tab left of the first tab's centre.
+        app.on_pointer_motion(PointerPosition { x: 0.0, y });
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+
+        assert_eq!(app.tabs[0].id, moved_tab);
+        assert!(split_contains_pane(&app.tabs[0].layout, founding_pane));
+        assert!(split_contains_pane(&app.tabs[0].layout, attached_pane));
+        assert_eq!(leaf_count(&app.tabs[0].layout), 2);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.terminals.len(), terminal_count);
+        assert_eq!(app.on_frame(), Ok(true));
+        assert_eq!(app.panels.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn tab_drag_threshold_scales_without_quantizing_pointer_motion() {
         assert!(!drag_threshold_passed(100.0, 104.9, 1.0));
         assert!(drag_threshold_passed(100.0, 105.1, 1.0));
@@ -7122,5 +10069,1391 @@ mod tests {
             tab_wheel_delta(ScrollDelta::Pixel { x: 0.0, y: -12.5 }, 1.0,),
             12.5
         );
+    }
+
+    /// Tab 0 split side by side (left: the founding terminal, right: a test
+    /// pane), one rendered frame, so `panels` and `panel_layouts` describe it.
+    fn split_pointer_app(tag: &str) -> (App, PathBuf) {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(tag, 1);
+        attach_test_pane(&mut app, 0, 2);
+        assert_eq!(app.on_frame(), Ok(true));
+        (app, root)
+    }
+
+    /// Splits `pane` of tab 0 along `axis` with a fresh test terminal, without
+    /// spawning. `attach_test_pane` always splits the active pane side by side;
+    /// nested layouts need the pane and the axis chosen.
+    fn attach_test_pane_at(
+        app: &mut App,
+        pane: PaneId,
+        axis: SplitAxis,
+        display_number: u64,
+    ) -> PaneId {
+        let new_pane = app.issue_pane_id();
+        let terminal = Terminal::new_for_test(80, 24, display_number, new_pane);
+        crate::platform::lock_recover(&terminal.grid).mark_presentation_ready();
+        app.terminals.push(terminal);
+        assert!(
+            split_leaf_at(&mut app.tabs[0].layout, pane, axis, new_pane),
+            "pane is not a leaf of tab 0"
+        );
+        app.bump_layout_generation();
+        new_pane
+    }
+
+    /// Centre of panel `index` in global window coordinates.
+    fn panel_body_point(app: &App, index: usize) -> (f32, f32) {
+        let rect = app.panels[index].body;
+        (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5)
+    }
+
+    /// Point in the gap between the two bodies of a side-by-side split.
+    fn split_divider_point(app: &App) -> (f32, f32) {
+        let first = app.panels[0].body;
+        let second = app.panels[1].body;
+        (
+            (first.x + first.w + second.x) * 0.5,
+            first.y + first.h * 0.5,
+        )
+    }
+
+    fn split_pointer_move(app: &mut App, x: f32, y: f32) {
+        app.on_pointer_motion(PointerPosition { x, y });
+    }
+
+    /// Extent along `axis` of the body of `panels[index]`.
+    fn split_body_extent(app: &App, index: usize, axis: SplitAxis) -> f32 {
+        let body = app.panels[index].body;
+        match axis {
+            SplitAxis::SideBySide => body.w,
+            SplitAxis::Stacked => body.h,
+        }
+    }
+
+    /// Presses the divider between `panels[first]` and `panels[second]` at
+    /// `grab_fraction` across the gap, drags the pointer by `delta` along
+    /// `axis`, renders one frame and returns how far the first body moved.
+    fn drag_split_divider(
+        app: &mut App,
+        axis: SplitAxis,
+        first: usize,
+        second: usize,
+        grab_fraction: f32,
+        delta: f32,
+    ) -> f32 {
+        let first_rect = app.panels[first].body;
+        let second_rect = app.panels[second].body;
+        let (press, target, before) = match axis {
+            SplitAxis::SideBySide => {
+                let edge = first_rect.x + first_rect.w;
+                let y = first_rect.y + first_rect.h * 0.5;
+                let x = edge + (second_rect.x - edge) * grab_fraction;
+                ((x, y), (x + delta, y), first_rect.w)
+            }
+            SplitAxis::Stacked => {
+                let edge = first_rect.y + first_rect.h;
+                let x = first_rect.x + first_rect.w * 0.5;
+                let y = edge + (second_rect.y - edge) * grab_fraction;
+                ((x, y), (x, y + delta), first_rect.h)
+            }
+        };
+        split_pointer_move(app, press.0, press.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(
+            app.divider_drag.is_some(),
+            "the press must start a divider drag"
+        );
+        split_pointer_move(app, target.0, target.1);
+        assert_eq!(app.on_frame(), Ok(true));
+        let moved = split_body_extent(app, first, axis) - before;
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        moved
+    }
+
+    /// Saved ratio of the root split of `tab`; panics when the tab is a leaf.
+    fn split_root_ratio(app: &App, tab: usize) -> f32 {
+        match crate::split::node_at_path(&app.tabs[tab].layout, &[]) {
+            Some(SplitNode::Split { ratio, .. }) => *ratio,
+            _ => panic!("tab {tab} is not split"),
+        }
+    }
+
+    /// Legacy X10 press of the left button at a global point, from the panel's
+    /// own layout: the same formula the grid tests use.
+    fn expected_x10_press(layout: TerminalUiLayout, (x, y): (f32, f32)) -> Vec<u8> {
+        let col = ((x - layout.text_x) / layout.char_w).floor() as usize + 1;
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - y
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows - rows_from_bottom;
+        let mut expected = b"\x1b[M".to_vec();
+        expected.extend_from_slice(&[32, col as u8 + 32, row as u8 + 32]);
+        expected
+    }
+
+    #[test]
+    fn click_on_second_pane_focuses_it_and_delivers_press() {
+        let (mut app, root) = split_pointer_app("t7-click-second");
+        // Fractional scale: global coordinates and a `text_x` that already holds
+        // `body.x` must still reach the right pane.
+        app.on_scale_changed(1.25, 640, 400);
+        assert_eq!(app.on_frame(), Ok(true));
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        let point = panel_body_point(&app, 1);
+        let layout = app.panel_layouts[1];
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.interaction.layout.body, layout.body);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(
+            app.terminals[1].input_bytes_for_test(),
+            expected_x10_press(layout, point)
+        );
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        // The paired release is delivered to the same pane, not lost to a mark.
+        let pressed_len = app.terminals[1].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn click_on_nested_bottom_right_pane_delivers_press_and_release() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-click-nested-bottom-right",
+                1,
+            );
+        // Split down, then split both branches right. Terminals keep creation
+        // order, so the bottom-right pane is terminal 2 in panel 3: the panel
+        // index and the terminal index deliberately disagree.
+        let top_left = app.tabs[0].active_pane;
+        let bottom_left = attach_test_pane_at(&mut app, top_left, SplitAxis::Stacked, 2);
+        let bottom_right = attach_test_pane_at(&mut app, bottom_left, SplitAxis::SideBySide, 3);
+        attach_test_pane_at(&mut app, top_left, SplitAxis::SideBySide, 4);
+        app.on_scale_changed(1.333, 800, 600);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        assert_eq!(app.panels.len(), 4);
+        let index = app
+            .panels
+            .iter()
+            .position(|panel| panel.terminal == 2)
+            .expect("the bottom-right pane has a panel");
+        assert_eq!(index, 3);
+        assert_ne!(index, app.panels[index].terminal);
+        // The clicked panel is laid out below the top-right pane and right of
+        // the bottom-left one, so it is the bottom-right pane.
+        let body = app.panels[index].body;
+        assert!(body.x > app.panels[2].body.x);
+        assert!(body.y > app.panels[1].body.y);
+
+        for terminal in &app.terminals {
+            grid_pointer_enable_tracking(terminal);
+        }
+        let point = panel_body_point(&app, index);
+        let layout = app.panel_layouts[index];
+        assert_eq!(layout.body, body);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 2);
+        assert_eq!(app.tabs[0].active_pane, bottom_right);
+        assert_eq!(app.interaction.layout.body, layout.body);
+        assert!(app.divider_drag.is_none());
+        // The expected press comes from the panel's own layout, not from the
+        // bytes the handler wrote.
+        assert_eq!(
+            app.terminals[2].input_bytes_for_test(),
+            expected_x10_press(layout, point)
+        );
+        // Terminal 3 owns the top-right pane; a handler that used the panel
+        // index as the terminal index would send it the press.
+        for other in [0, 1, 3] {
+            assert!(
+                app.terminals[other].input_bytes_for_test().is_empty(),
+                "terminal {other} must not receive the press"
+            );
+        }
+
+        // The paired release stays with the clicked pane, not with a suppression
+        // mark, and focus does not move.
+        let pressed_len = app.terminals[2].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        assert!(app.terminals[2].input_bytes_for_test().len() > pressed_len);
+        assert_eq!(app.active_terminal, 2);
+        for other in [0, 1, 3] {
+            assert!(
+                app.terminals[other].input_bytes_for_test().is_empty(),
+                "terminal {other} must not receive the release"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn click_in_gap_starts_divider_drag_and_changes_no_focus() {
+        let (mut app, root) = split_pointer_app("t7-click-gap");
+        let start = split_divider_point(&app);
+        let original = split_root_ratio(&app, 0);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.divider_drag.is_some());
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        split_pointer_move(&mut app, start.0 + 24.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_keeps_the_grab_offset_to_the_first_branch_edge() {
+        let (mut app, root) = split_pointer_app("t7-drag-offset");
+        // A stationary event after the press leaves the saved ratio alone.
+        let start = split_divider_point(&app);
+        let original = split_root_ratio(&app, 0);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0, start.1);
+        assert_eq!(split_root_ratio(&app, 0), original);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+
+        // Gap centre and near the first edge: one motion, one distance.
+        for fraction in [0.5, 0.9] {
+            let moved = drag_split_divider(&mut app, SplitAxis::SideBySide, 0, 1, fraction, 40.0);
+            assert!(
+                (moved - 40.0).abs() <= 1.0,
+                "grab {fraction} moved the divider by {moved} px for a 40 px motion"
+            );
+        }
+
+        // A fractional scale keeps whole-pixel gaps and the same offset rule.
+        app.on_scale_changed(1.25, 640, 400);
+        assert_eq!(app.on_frame(), Ok(true));
+        let moved = drag_split_divider(&mut app, SplitAxis::SideBySide, 0, 1, 0.5, 24.0);
+        assert!(
+            (moved - 24.0).abs() <= 1.0,
+            "scaled grab moved the divider by {moved} px for a 24 px motion"
+        );
+
+        // Nested horizontal divider: the offset applies at any tree depth.
+        let pane = app.terminals[1].pane_id();
+        attach_test_pane_at(&mut app, pane, SplitAxis::Stacked, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        let moved = drag_split_divider(&mut app, SplitAxis::Stacked, 1, 2, 0.9, 20.0);
+        assert!(
+            (moved - 20.0).abs() <= 1.0,
+            "nested grab moved the divider by {moved} px for a 20 px motion"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Stacked root: the same rule along y.
+        let (mut stacked, stacked_root) = {
+            let (mut app, _receiver, _profile, root) =
+                crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                    "t7-drag-offset-stacked",
+                    1,
+                );
+            let pane = app.tabs[0].active_pane;
+            attach_test_pane_at(&mut app, pane, SplitAxis::Stacked, 2);
+            assert_eq!(app.on_frame(), Ok(true));
+            (app, root)
+        };
+        let moved = drag_split_divider(&mut stacked, SplitAxis::Stacked, 0, 1, 0.5, 32.0);
+        assert!(
+            (moved - 32.0).abs() <= 1.0,
+            "stacked grab moved the divider by {moved} px for a 32 px motion"
+        );
+        let _ = std::fs::remove_dir_all(&stacked_root);
+    }
+
+    #[test]
+    fn click_near_border_starts_drag_when_node_narrower_than_gap() {
+        let (mut app, root) = split_pointer_app("t7-narrow-node");
+        // The body is narrower than the 6 px gap: the branches touch and the
+        // divider band lies over both bodies at the seam.
+        let current = app.grid_metrics;
+        app.set_grid_metrics(GridMetrics {
+            width: 4.0,
+            ..current
+        });
+        assert_eq!(app.on_frame(), Ok(true));
+        let first = app.panels[0].body;
+        let seam = (first.x + first.w, first.y + first.h * 0.5);
+        assert!(app.panels[1].body.contains(seam.0, seam.1));
+
+        split_pointer_move(&mut app, seam.0, seam.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+
+        assert!(app.divider_drag.is_some());
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_finishes_on_release_and_motion_does_not_move_it() {
+        let (mut app, root) = split_pointer_app("t7-drag-finish");
+        let start = split_divider_point(&app);
+        let original = split_root_ratio(&app, 0);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 30.0, start.1);
+        let moved = split_root_ratio(&app, 0);
+        assert!(moved > original);
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.divider_drag.is_none());
+        assert!(!app.suppressed_release.contains(&PointerButton::Left));
+        split_pointer_move(&mut app, start.0 - 30.0, start.1);
+        assert_eq!(split_root_ratio(&app, 0), moved);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lost_release_does_not_leave_drag_active() {
+        let (mut app, root) = split_pointer_app("t7-lost-release");
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 40.0, start.1);
+        let moved = split_root_ratio(&app, 0);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // The same button is pressed with the first release still lost: the old
+        // drag finishes with its recorded ratio and the press starts a new one.
+        // The pointer already sits on the divider the last motion left behind.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(
+            app.divider_drag.as_ref().map(|drag| drag.ratio_at_start),
+            Some(moved)
+        );
+        assert_eq!(split_root_ratio(&app, 0), moved);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_button_press_does_not_replace_drag_owner() {
+        for (name, second) in [
+            ("t7-second-button-8", PointerButton::Other(8)),
+            ("t7-second-button-9", PointerButton::Other(9)),
+        ] {
+            let (mut app, root) = split_pointer_app(name);
+            grid_pointer_enable_tracking(&app.terminals[0]);
+            grid_pointer_enable_tracking(&app.terminals[1]);
+            let start = split_divider_point(&app);
+            split_pointer_move(&mut app, start.0, start.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            let point = panel_body_point(&app, 1);
+            split_pointer_move(&mut app, point.0, point.1);
+            app.on_pointer_button(KeyState::Pressed, second);
+
+            // The live drag keeps its owner; the second press is swallowed.
+            assert_eq!(
+                app.divider_drag.as_ref().map(|drag| drag.button),
+                Some(PointerButton::Left)
+            );
+            assert!(app.suppressed_release.contains(&second));
+            assert!(app.terminals[0].input_bytes_for_test().is_empty());
+            assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+            // Owner release first, then the second button's suppressed release.
+            app.on_pointer_button(KeyState::Released, PointerButton::Left);
+            assert!(app.divider_drag.is_none());
+            app.on_pointer_button(KeyState::Released, second);
+            assert!(!app.suppressed_release.contains(&second));
+            assert!(app.terminals[0].input_bytes_for_test().is_empty());
+            assert!(app.terminals[1].input_bytes_for_test().is_empty());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // The opposite release order: the second button's release arrives first.
+        let (mut app, root) = split_pointer_app("t7-second-button-reverse");
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Other(8));
+        app.on_pointer_button(KeyState::Released, PointerButton::Other(8));
+        assert!(app.divider_drag.is_some());
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.divider_drag.is_none());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_drag_then_normal_click_reaches_terminal() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-cancel-click",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(app.divider_drag.is_some());
+
+        app.select_terminal_tab_from_user(1);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(app.active_tab, 1);
+        app.select_terminal_tab_from_user(0);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // The mark left by the cancelled drag must not swallow this press.
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_resizes_ratio_and_both_ptys() {
+        let (mut app, root) = split_pointer_app("t7-drag-ptys");
+        let before = app.panel_layouts.clone();
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 48.0, start.1);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert_eq!(app.on_frame(), Ok(true));
+
+        assert!(split_root_ratio(&app, 0) > original);
+        assert!(app.panel_layouts[0].cols > before[0].cols);
+        assert!(app.panel_layouts[1].cols < before[1].cols);
+        let left_cols = crate::platform::lock_recover(&app.terminals[0].grid).cols();
+        let right_cols = crate::platform::lock_recover(&app.terminals[1].grid).cols();
+        assert_eq!(left_cols, app.panel_layouts[0].cols);
+        assert_eq!(right_cols, app.panel_layouts[1].cols);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_layout_generation_only_selects_pane_and_suppresses_release() {
+        let (mut app, root) = split_pointer_app("t7-stale");
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        app.bump_layout_generation();
+        assert_ne!(app.panel_layouts_generation, app.layout_generation);
+
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 1);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drag_cancelled_by_tab_switch_restores_ratio() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-ratio-restore",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 50.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+
+        app.select_terminal_tab_from_user(1);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(split_root_ratio(&app, 0), original);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_cancelled_by_focus_loss_restores_ratio() {
+        let (mut app, root) = split_pointer_app("t7-cancel-focus");
+        for terminal in &app.terminals {
+            grid_pointer_enable_tracking(terminal);
+        }
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 50.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+
+        app.on_focus_changed(false);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(split_root_ratio(&app, 0), original);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+
+        // The lost release cannot resume the drag: motion leaves the ratio
+        // alone and the release never reaches a terminal.
+        split_pointer_move(&mut app, start.0 + 90.0, start.1);
+        assert_eq!(split_root_ratio(&app, 0), original);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.suppressed_release.is_empty());
+        for terminal in &app.terminals {
+            assert!(terminal.input_bytes_for_test().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_cancelled_by_settings_restores_ratio() {
+        let (mut app, root) = split_pointer_app("t7-cancel-settings");
+        let original = split_root_ratio(&app, 0);
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0 + 50.0, start.1);
+        assert!(split_root_ratio(&app, 0) > original);
+
+        app.toggle_settings();
+        assert!(app.settings_open);
+        assert!(app.divider_drag.is_none());
+        assert_eq!(split_root_ratio(&app, 0), original);
+
+        // Motion under the open modal never pulls the divider.
+        split_pointer_move(&mut app, start.0 + 100.0, start.1);
+        assert_eq!(split_root_ratio(&app, 0), original);
+        assert!(app.suppressed_release.contains(&PointerButton::Left));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wheel_and_motion_follow_panel_under_pointer() {
+        let (mut app, root) = split_pointer_app("t7-pointer-follow");
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        // Any-motion reporting, so a motion into the inactive pane is visible.
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+
+        assert_eq!(app.active_terminal, 0);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        let before_scroll = app.terminals[1].scroll_y.target;
+        // Motion reporting would consume the wheel as a mouse event; the wheel
+        // of an app without tracking scrolls the scrollback.
+        feed_batch(&app.terminals[1], "\x1b[?1003l");
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+        assert_eq!(app.active_terminal, 0);
+        assert_ne!(app.terminals[1].scroll_y.target, before_scroll);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mouse_motion_and_release_stay_with_pressed_pane() {
+        let (mut app, root) = split_pointer_app("t7-pressed-pane");
+        // Any-motion reporting on both panes, so a stray motion into the right
+        // pane would show up in its bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 0);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // Motion over the right pane stays with the pane that received the press.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let motion_len = app.terminals[0].input_bytes_for_test().len();
+
+        // The paired release reaches the same pane and focus stays where it was.
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > motion_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.active_terminal, 0);
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_over_scrollbar_reaches_pointer_owner() {
+        let (mut app, root) = split_pointer_app("t7-release-scrollbar");
+        // Scrollback makes the pressed pane draw its own scrollbar.
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[0], "\x1b[?1000h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pressed pane draws a scrollbar");
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // The release lands on the pane's own scrollbar. The protocol-area gate
+        // must not drop it, or the terminal app keeps the button held.
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before_release = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert!(bytes.len() > before_release);
+        // X10 release: ESC [ M then the button code 3 (`3 + 32`).
+        assert_eq!(bytes[before_release], 0x1b);
+        assert_eq!(bytes[before_release + 3], 35);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn motion_over_tab_strip_reaches_pointer_owner() {
+        let (mut app, root) = split_pointer_app("t7-motion-tab-strip");
+        // Any-motion reporting, so a delivered motion shows up in the bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let strip = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .terminal_tab_strip_layout()
+            .rect;
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // The tab strip draws over the panes; the pressed pane keeps the motion.
+        split_pointer_move(&mut app, strip.x + strip.w * 0.5, strip.y + strip.h * 0.5);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scrollbar_drag_keeps_motion_over_tab_strip_in_grid_and_split() {
+        // Split tab: the scrollbar drag of the left pane survives the strip.
+        {
+            let (mut app, root) = split_pointer_app("n3-scrollbar-split");
+            feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+            assert_eq!(app.on_frame(), Ok(true));
+            let scrollbar = app.panel_layouts[0]
+                .scrollbar
+                .expect("the dragged pane draws a scrollbar");
+            let grab = (
+                scrollbar.track.x + scrollbar.track.w * 0.5,
+                scrollbar.track.y + scrollbar.track.h * 0.5,
+            );
+            split_pointer_move(&mut app, grab.0, grab.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            let before = app.terminals[0].scroll_y.target;
+
+            let strip = tab_strip_point(&app);
+            split_pointer_move(&mut app, strip.0, strip.1);
+
+            assert_ne!(app.terminals[0].scroll_y.target, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // Grid: the captured tile keeps the drag over the strip too.
+        {
+            let (mut app, _receiver, _profile, root) =
+                crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                    "n3-scrollbar-grid",
+                    2,
+                );
+            app.terminals[0].set_claude_foreground_for_test(true);
+            app.terminals[1].set_claude_foreground_for_test(true);
+            feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+            app.toggle_claude_grid(Instant::now());
+            assert_eq!(app.on_frame(), Ok(true));
+            let scrollbar = app.panel_layouts[0]
+                .scrollbar
+                .expect("the captured tile draws a scrollbar");
+            let grab = (
+                scrollbar.track.x + scrollbar.track.w * 0.5,
+                scrollbar.track.y + scrollbar.track.h * 0.5,
+            );
+            grid_pointer_move(&mut app, grab);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            let before = app.terminals[0].scroll_y.target;
+
+            let strip = tab_strip_point(&app);
+            grid_pointer_move(&mut app, strip);
+
+            assert_ne!(app.terminals[0].scroll_y.target, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn search_input_selection_keeps_motion_over_tab_strip_in_grid_and_split() {
+        // Split tab: the text cursor of the search input follows the drag.
+        {
+            let (mut app, root) = split_pointer_app("n3-search-split");
+            app.interaction.open_search(&mut app.terminals[0]);
+            app.interaction.search.insert_text("abcdef");
+            assert_eq!(app.on_frame(), Ok(true));
+            let input = app
+                .interaction
+                .layout
+                .search
+                .expect("the active pane draws the search overlay")
+                .input;
+            // Press at the text start: the strip lies far to the right of it, so
+            // a delivered motion moves the caret; a swallowed one leaves it.
+            let start = (input.x + 1.0, input.y + input.h * 0.5);
+            split_pointer_move(&mut app, start.0, start.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            let before = app.interaction.search.cursor;
+
+            let strip = tab_strip_point(&app);
+            split_pointer_move(&mut app, strip.0, strip.1);
+
+            assert_ne!(app.interaction.search.cursor, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // Grid: the same selection continues over the strip.
+        {
+            let (mut app, _receiver, _profile, root) =
+                crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                    "n3-search-grid",
+                    2,
+                );
+            app.terminals[0].set_claude_foreground_for_test(true);
+            app.terminals[1].set_claude_foreground_for_test(true);
+            app.toggle_claude_grid(Instant::now());
+            app.interaction.open_search(&mut app.terminals[0]);
+            app.interaction.search.insert_text("abcdef");
+            assert_eq!(app.on_frame(), Ok(true));
+            let input = app
+                .interaction
+                .layout
+                .search
+                .expect("the active tile draws the search overlay")
+                .input;
+            // Press at the text start: the strip lies far to the right of it, so
+            // a delivered motion moves the caret; a swallowed one leaves it.
+            let start = (input.x + 1.0, input.y + input.h * 0.5);
+            grid_pointer_move(&mut app, start);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            let before = app.interaction.search.cursor;
+
+            let strip = tab_strip_point(&app);
+            grid_pointer_move(&mut app, strip);
+
+            assert_ne!(app.interaction.search.cursor, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn wheel_over_other_pane_works_while_pointer_owned() {
+        let (mut app, root) = split_pointer_app("t7-wheel-other-pane");
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[0], "\x1b[?1000h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        // The pointer leaves the pressed pane: the wheel goes to the pane under
+        // it, and focus stays with the pressed one.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let before_scroll = app.terminals[1].scroll_y.target;
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+        assert_ne!(app.terminals[1].scroll_y.target, before_scroll);
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pointer_owner_uses_real_coordinates() {
+        let (mut app, root) = split_pointer_app("t7-owner-real-coords");
+        // SGR any-motion reports, so the encoded motion cell is readable.
+        feed_batch(&app.terminals[0], "\x1b[?1003h\x1b[?1006h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let layout = app.panel_layouts[0];
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // Past the pane's right border, over the neighbouring pane: the owner
+        // encodes the real pointer position with its own layout formula.
+        let x = layout.body.x + layout.body.w + 40.0;
+        let y = left.1;
+        split_pointer_move(&mut app, x, y);
+        let col = (((x - layout.text_x).max(0.0) / layout.char_w).floor() as usize + 1)
+            .clamp(1, layout.cols);
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - y
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows - rows_from_bottom;
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes[pressed_len..]),
+            format!("\x1b[<32;{col};{row}M")
+        );
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn motion_without_press_follows_pane_under_pointer() {
+        let (mut app, root) = split_pointer_app("t7-motion-follow");
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let point = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, point.0, point.1);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignored_press_does_not_leak_a_held_button_to_the_neighbour() {
+        let (mut app, root) = split_pointer_app("t7-ignored-press-isolation");
+        // The right pane reports button motion only while a button is held, so
+        // a pressed-bit left behind by the left pane would surface as a drag.
+        feed_batch(&app.terminals[1], "\x1b[?1002h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        // The left shell does not track the mouse, so its terminal ignores the
+        // right press: the button must not stay held for anybody else.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert_eq!(app.interaction.pressed_mouse_buttons(), 0);
+        assert!(app.split_pointer_owner.is_none());
+        assert!(app.suppressed_release.contains(&PointerButton::Right));
+
+        // Motion over the pane that does track the mouse is not a drag report.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        // The ignored press never reached an application, so its release goes
+        // nowhere either.
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.suppressed_release.is_empty());
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_button_press_while_owned_goes_to_owner() {
+        let (mut app, root) = split_pointer_app("t7-second-press-owner");
+        // Press reporting on both panes, so a stray hit test into the other
+        // pane would leave bytes there.
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        grid_pointer_enable_tracking(&app.terminals[1]);
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert_eq!(app.active_terminal, 0);
+
+        // A second button over the other pane stays with the owner: the focus
+        // does not move, the owner does not change and the other pane sees
+        // nothing.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // Both releases go to the owner; the ownership ends with the last one.
+        let second_press_len = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(app.terminals[0].input_bytes_for_test().len() > second_press_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let second_release_len = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.split_pointer_owner.is_none());
+        assert!(app.terminals[0].input_bytes_for_test().len() > second_release_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_cleared_by_split_and_close() {
+        // A split moves the tree under the held pointer.
+        let (mut app, root) = split_pointer_app("t7-owner-split");
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        app.split_active_pane(SplitAxis::SideBySide);
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Closing another pane ends the gesture of the owner that is still
+        // alive: the release reaches its application once, on the claimed path,
+        // and the physical release adds nothing.
+        let (mut app, root) = split_pointer_app("t7-owner-close");
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        let other = app.terminals[1].pane_id();
+        assert!(!app.close_pane(other));
+        assert!(app.split_pointer_owner.is_none());
+
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert_eq!(bytes.len(), pressed_len + 6, "one X10 release report");
+        // Legacy release: ESC [ M then the button code 3 (`3 + 32`).
+        assert_eq!(bytes[pressed_len], 0x1b);
+        assert_eq!(bytes[pressed_len + 1], b'[');
+        assert_eq!(bytes[pressed_len + 2], b'M');
+        assert_eq!(bytes[pressed_len + 3], 35, "release button code");
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), pressed_len + 6);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_cleared_by_grid_and_tab_switch() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-owner-grid-tab",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        app.focused = true;
+        app.terminals[0].set_claude_foreground_for_test(true);
+        grid_pointer_enable_tracking(&app.terminals[0]);
+
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        // Entering grid mode ends the split pointer ownership.
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        assert!(app.split_pointer_owner.is_none());
+        app.toggle_claude_grid(Instant::now());
+        assert!(!app.grid_open());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // A fresh press owns the pointer again; switching tabs ends it.
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        app.select_terminal_tab_from_user(1);
+        assert_eq!(app.active_tab, 1);
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_not_used_for_grid_motion() {
+        let (mut app, root) = split_pointer_app("t7-owner-grid-motion");
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.focused = true;
+        app.toggle_claude_grid(Instant::now());
+        assert!(app.grid_open());
+        assert_eq!(app.on_frame(), Ok(true));
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        // A stale owner must not take the motion: grid rules route it.
+        app.split_pointer_owner = Some(0);
+
+        let second = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, second);
+        assert_eq!(app.hovered_panel_terminal, Some(1));
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_layout_generation_motion_reaches_no_terminal() {
+        let (mut app, root) = split_pointer_app("t7-stale-motion");
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        app.bump_layout_generation();
+        assert_ne!(app.panel_layouts_generation, app.layout_generation);
+
+        // Neither the pane under the pointer nor the active pane gets motion
+        // encoded against geometry from before the rebuild.
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_survives_idle_main_loop_pass() {
+        let (mut app, root) = split_pointer_app("t7-owner-idle-pass");
+        // Any-motion reporting, so a delivered motion shows up in the bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // The main-loop pass runs `remove_closed_terminals`; with nothing
+        // closed it must leave the pressed pointer with its owner.
+        let _ = app.on_about_to_wait();
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let motion_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(motion_len > pressed_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > motion_len);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.split_pointer_owner.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_reset_suppresses_live_release_for_new_tab() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "t7-owner-reset-tab",
+                2,
+            );
+        attach_test_pane(&mut app, 0, 3);
+        feed_batch(&app.terminals[0], "\x1b[?1000h");
+        feed_batch(&app.terminals[1], "\x1b[?1000h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+
+        // Switching tabs resets the owner while the button is still held.
+        app.select_terminal_tab_from_user(1);
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // The frame rebuilt the actual layout of the new tab. Its terminal must
+        // not receive the release the reset owner still owes.
+        let point = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, point.0, point.1);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // The suppressed release must not poison the next ordinary click.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        let pressed_len = app.terminals[1].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn press_over_protocol_area_does_not_claim_owner() {
+        let (mut app, root) = split_pointer_app("t7-protocol-press");
+        // Scrollback makes the pane draw a scrollbar; tracking makes a
+        // delivered press visible in the terminal bytes.
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before = app.terminals[0].input_bytes_for_test().len();
+        // The protocol-area gate drops this press, so the terminal never saw it
+        // and the pointer must not be claimed for its release.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
+
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_survives_refused_close_cleanup() {
+        let (mut app, root) = split_pointer_app("t7-owner-refused-close");
+        // Only a live process hand-off can be refused, so the closing pane is
+        // replaced by a spawned shell while the gesture stays in the test pane.
+        let other_pane = app.terminals[1].pane_id();
+        app.terminals[1] = test_shell(2, other_pane);
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+
+        // A stopped worker refuses every cleanup request: the pane stays, so
+        // the live gesture must stay with its owner and keep receiving.
+        app.terminal_cleanup.shutdown_and_join();
+        assert!(!app.close_pane(other_pane));
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.split_pointer_owner, Some(0));
+
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        let motion_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(motion_len > pressed_len);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[0].input_bytes_for_test().len() > motion_len);
+        assert!(app.split_pointer_owner.is_none());
+
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_assigned_after_rejected_press_of_other_button() {
+        let (mut app, root) = split_pointer_app("t7-owner-other-button");
+        // Any-motion reporting makes every delivered motion visible in the bytes.
+        feed_batch(&app.terminals[0], "\x1b[?1003h");
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[1]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before = app.terminals[1].input_bytes_for_test().len();
+        // The rejected right press is not a held button: the terminal never saw
+        // it, so it must not hold the owner and motion must not report it.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.split_pointer_owner.is_none());
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), before);
+        assert_eq!(app.interaction.pressed_mouse_buttons(), 0);
+
+        let body = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, body.0, body.1);
+        let moved_len = app.terminals[1].input_bytes_for_test().len();
+        // One legacy X10 motion report: ESC [ M and three offset bytes. Button
+        // code 3 plus both offsets is 67 for no held button, while a held right
+        // button would encode 66.
+        let motion = &app.terminals[1].input_bytes_for_test()[before..];
+        assert_eq!(motion.len(), 6, "one X10 motion report");
+        assert_eq!(motion[3], 67, "motion must report no held button");
+
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.split_pointer_owner, Some(1));
+        assert!(app.terminals[1].input_bytes_for_test().len() > moved_len);
+
+        // Motion and release in the neighbour pane stay with the claimed pane.
+        let pressed_len = app.terminals[1].input_bytes_for_test().len();
+        let neighbour = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, neighbour.0, neighbour.1);
+        assert!(app.terminals[1].input_bytes_for_test().len() > pressed_len);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        let motion_len = app.terminals[1].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        assert!(app.terminals[1].input_bytes_for_test().len() > motion_len);
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        // No button is held after the left release: the owner is gone and the
+        // next click belongs to the pane under the pointer.
+        assert!(app.split_pointer_owner.is_none());
+        // The rejected right release stays swallowed.
+        let release_len = app.terminals[1].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), release_len);
+        assert_eq!(app.interaction.pressed_mouse_buttons(), 0);
+
+        let neighbour_len = app.terminals[1].input_bytes_for_test().len();
+        split_pointer_move(&mut app, neighbour.0, neighbour.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        assert!(!app.terminals[0].input_bytes_for_test().is_empty());
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), neighbour_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_of_rejected_press_never_reaches_terminal() {
+        let (mut app, root) = split_pointer_app("t7-rejected-release");
+        // Press reporting draws the scrollbar and makes every report visible.
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        let before = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
+
+        // Moving into the body must not turn the withheld press into a lone
+        // release report.
+        let body = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, body.0, body.1);
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), before);
+
+        // The next ordinary right click in the body reaches the terminal whole.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > before);
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejected_press_mark_clears_on_next_press() {
+        let (mut app, root) = split_pointer_app("t7-rejected-mark-clears");
+        feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+        grid_pointer_enable_tracking(&app.terminals[0]);
+        assert_eq!(app.on_frame(), Ok(true));
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("the pane draws a scrollbar");
+        let over = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        split_pointer_move(&mut app, over.0, over.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.suppressed_release.contains(&PointerButton::Right));
+
+        // A new press of the same button clears the stale mark, so its own
+        // press and release both reach the terminal.
+        let body = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, body.0, body.1);
+        let before = app.terminals[0].input_bytes_for_test().len();
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert!(app.suppressed_release.is_empty());
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > before);
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert!(app.terminals[0].input_bytes_for_test().len() > pressed_len);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
