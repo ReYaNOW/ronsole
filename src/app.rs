@@ -580,7 +580,8 @@ struct Tab {
 
 /// A divider drag in flight: the tab and the split node addressed from its
 /// root, the button that owns the drag, the structure generation the geometry
-/// belongs to and the saved ratio to restore when the drag is cancelled.
+/// belongs to, the saved ratio to restore when the drag is cancelled and the
+/// pointer distance to the first branch edge the press grabbed.
 struct DividerDrag {
     tab: TabId,
     path: Vec<u8>,
@@ -588,6 +589,7 @@ struct DividerDrag {
     button: PointerButton,
     structure_generation: u64,
     ratio_at_start: f32,
+    grab_offset: f32,
 }
 
 /// Whether `pane` is one of the leaves of this split subtree.
@@ -1064,10 +1066,12 @@ impl App {
         self.suppress_release(drag.button);
     }
 
-    /// Moves the divider of the live drag to the pointer. The saved ratio comes
-    /// from the node geometry of the current frame, clamped to the minimums of
-    /// both branches. A structure change since the press ends the drag without
-    /// a rollback: the node may no longer exist and its current ratio stands.
+    /// Moves the divider of the live drag to the pointer, keeping the distance
+    /// the press grabbed to the first branch edge so the divider does not jump.
+    /// The saved ratio comes from the node geometry of the current frame,
+    /// clamped to the minimums of both branches. A structure change since the
+    /// press ends the drag without a rollback: the node may no longer exist and
+    /// its current ratio stands.
     fn update_divider_drag(&mut self, x: f32, y: f32) {
         let Some(drag) = self.divider_drag.take() else {
             return;
@@ -1085,8 +1089,8 @@ impl App {
         let axis = drag.axis;
         let gap = (GRID_TILE_GAP * metrics.scale).round();
         let coord = match axis {
-            SplitAxis::SideBySide => x,
-            SplitAxis::Stacked => y,
+            SplitAxis::SideBySide => x - drag.grab_offset,
+            SplitAxis::Stacked => y - drag.grab_offset,
         };
         let ratio = {
             let layout = &self.tabs[tab_index].layout;
@@ -1100,25 +1104,31 @@ impl App {
             );
             let node = node_at_path(layout, &drag.path);
             match (rect, node) {
-                (Some(rect), Some(SplitNode::Split { ratio, first, second, .. })) => {
+                (Some(rect), Some(SplitNode::Split { ratio: saved, first, second, .. })) => {
                     let first_min =
                         min_extent(first, axis, metrics.char_w, metrics.char_h, metrics.scale);
                     let second_min =
                         min_extent(second, axis, metrics.char_w, metrics.char_h, metrics.scale);
-                    Some(dragged_ratio(
-                        rect, axis, *ratio, gap, first_min, second_min, coord,
-                    ))
+                    let ratio =
+                        dragged_ratio(rect, axis, *saved, gap, first_min, second_min, coord);
+                    // A motion that leaves the cut on the same pixel keeps the
+                    // saved ratio instead of rewriting its float representation.
+                    let (before, _) =
+                        split_child_rects(rect, axis, *saved, gap, first_min, second_min);
+                    let (after, _) =
+                        split_child_rects(rect, axis, ratio, gap, first_min, second_min);
+                    Some((ratio, before != after))
                 }
                 _ => None,
             }
         };
-        let Some(ratio) = ratio else {
+        let Some((ratio, pixel_changed)) = ratio else {
             self.suppress_release(drag.button);
             return;
         };
-        if let Some(SplitNode::Split { ratio: saved, .. }) =
-            node_at_path_mut(&mut self.tabs[tab_index].layout, &drag.path)
-            && *saved != ratio
+        if pixel_changed
+            && let Some(SplitNode::Split { ratio: saved, .. }) =
+                node_at_path_mut(&mut self.tabs[tab_index].layout, &drag.path)
         {
             *saved = ratio;
             self.bump_layout_generation();
@@ -3239,16 +3249,23 @@ impl App {
     fn build_tab_labels(&mut self) {
         self.tab_labels.clear();
         for tab in &self.tabs {
-            let title_terminal = self
-                .terminals
-                .iter()
-                .position(|terminal| terminal.pane_id() == tab.active_pane)
-                .unwrap_or(usize::MAX);
+            let mut title_terminal = usize::MAX;
+            let mut bell_pending = false;
+            for (index, terminal) in self.terminals.iter().enumerate() {
+                if !split_contains_pane(&tab.layout, terminal.pane_id()) {
+                    continue;
+                }
+                if terminal.pane_id() == tab.active_pane {
+                    title_terminal = index;
+                }
+                bell_pending |= terminal.bell_pending();
+            }
             self.tab_labels.push(TabLabelIndex {
                 id: tab.id,
                 title_terminal,
                 number: tab.title_number,
                 leaf_count: leaf_count(&tab.layout),
+                bell_pending,
             });
         }
     }
@@ -4083,7 +4100,8 @@ impl App {
     }
 
     /// Drag that a press at the pointer starts when it lands on a split
-    /// divider: the node path, its axis and its saved ratio.
+    /// divider: the node path, its axis, its saved ratio and the pointer
+    /// distance to the first branch edge.
     fn divider_drag_at(&self, button: PointerButton) -> Option<DividerDrag> {
         let tab = self.tabs.get(self.active_tab)?;
         let metrics = self.grid_metrics;
@@ -4101,6 +4119,10 @@ impl App {
             Some(SplitNode::Split { ratio, .. }) => *ratio,
             _ => return None,
         };
+        let coord = match hit.axis {
+            SplitAxis::SideBySide => self.pointer_x,
+            SplitAxis::Stacked => self.pointer_y,
+        };
         Some(DividerDrag {
             tab: tab.id,
             path: hit.path,
@@ -4108,6 +4130,7 @@ impl App {
             button,
             structure_generation: self.structure_generation,
             ratio_at_start,
+            grab_offset: coord - hit.first_edge,
         })
     }
 
@@ -7757,6 +7780,38 @@ mod tests {
     }
 
     #[test]
+    fn split_tab_bell_from_inactive_pane_marks_the_tab() {
+        let mut app = App::new();
+        for display_number in [1, 2] {
+            let pane = app.issue_pane_id();
+            push_test_terminal(&mut app, Terminal::new_for_test(8, 2, display_number, pane));
+        }
+        // Tab 1 stays in the background; its active pane keeps the founding terminal.
+        let bell_pane = attach_test_pane(&mut app, 1, 3);
+        let bell_terminal = app
+            .terminal_index_of_pane(bell_pane)
+            .expect("the new pane has a terminal");
+        assert_ne!(app.tabs[1].active_pane, bell_pane);
+
+        app.terminals[bell_terminal].ring_bell_for_test();
+        app.drain_terminal_host_events();
+        assert!(app.terminals[bell_terminal].bell_pending());
+        app.build_tab_labels();
+        assert!(
+            app.tab_labels[1].bell_pending,
+            "an inactive pane of a background tab must mark its tab"
+        );
+        assert!(!app.tab_labels[0].bell_pending, "the other tab stays unmarked");
+
+        // Activating the source pane clears its own mark; the other tab is untouched.
+        app.activate_pane(bell_pane, false);
+        assert!(!app.terminals[bell_terminal].bell_pending());
+        app.build_tab_labels();
+        assert!(!app.tab_labels[1].bell_pending);
+        assert!(!app.tab_labels[0].bell_pending);
+    }
+
+    #[test]
     fn spawn_creates_one_tab_per_terminal_with_unique_pane_ids() {
         let (app, _receiver, _profile, root) =
             crate::app::headless_run::test_support::started_headless_with_test_terminals(
@@ -9930,6 +9985,55 @@ mod tests {
         app.on_pointer_motion(PointerPosition { x, y });
     }
 
+    /// Extent along `axis` of the body of `panels[index]`.
+    fn split_body_extent(app: &App, index: usize, axis: SplitAxis) -> f32 {
+        let body = app.panels[index].body;
+        match axis {
+            SplitAxis::SideBySide => body.w,
+            SplitAxis::Stacked => body.h,
+        }
+    }
+
+    /// Presses the divider between `panels[first]` and `panels[second]` at
+    /// `grab_fraction` across the gap, drags the pointer by `delta` along
+    /// `axis`, renders one frame and returns how far the first body moved.
+    fn drag_split_divider(
+        app: &mut App,
+        axis: SplitAxis,
+        first: usize,
+        second: usize,
+        grab_fraction: f32,
+        delta: f32,
+    ) -> f32 {
+        let first_rect = app.panels[first].body;
+        let second_rect = app.panels[second].body;
+        let (press, target, before) = match axis {
+            SplitAxis::SideBySide => {
+                let edge = first_rect.x + first_rect.w;
+                let y = first_rect.y + first_rect.h * 0.5;
+                let x = edge + (second_rect.x - edge) * grab_fraction;
+                ((x, y), (x + delta, y), first_rect.w)
+            }
+            SplitAxis::Stacked => {
+                let edge = first_rect.y + first_rect.h;
+                let x = first_rect.x + first_rect.w * 0.5;
+                let y = edge + (second_rect.y - edge) * grab_fraction;
+                ((x, y), (x, y + delta), first_rect.h)
+            }
+        };
+        split_pointer_move(app, press.0, press.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(
+            app.divider_drag.is_some(),
+            "the press must start a divider drag"
+        );
+        split_pointer_move(app, target.0, target.1);
+        assert_eq!(app.on_frame(), Ok(true));
+        let moved = split_body_extent(app, first, axis) - before;
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        moved
+    }
+
     /// Saved ratio of the root split of `tab`; panics when the tab is a leaf.
     fn split_root_ratio(app: &App, tab: usize) -> f32 {
         match crate::split::node_at_path(&app.tabs[tab].layout, &[]) {
@@ -10078,6 +10182,67 @@ mod tests {
         assert_eq!(app.active_terminal, 0);
         assert!(app.terminals[0].input_bytes_for_test().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_keeps_the_grab_offset_to_the_first_branch_edge() {
+        let (mut app, root) = split_pointer_app("t7-drag-offset");
+        // A stationary event after the press leaves the saved ratio alone.
+        let start = split_divider_point(&app);
+        let original = split_root_ratio(&app, 0);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        split_pointer_move(&mut app, start.0, start.1);
+        assert_eq!(split_root_ratio(&app, 0), original);
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+
+        // Gap centre and near the first edge: one motion, one distance.
+        for fraction in [0.5, 0.9] {
+            let moved = drag_split_divider(&mut app, SplitAxis::SideBySide, 0, 1, fraction, 40.0);
+            assert!(
+                (moved - 40.0).abs() <= 1.0,
+                "grab {fraction} moved the divider by {moved} px for a 40 px motion"
+            );
+        }
+
+        // A fractional scale keeps whole-pixel gaps and the same offset rule.
+        app.on_scale_changed(1.25, 640, 400);
+        assert_eq!(app.on_frame(), Ok(true));
+        let moved = drag_split_divider(&mut app, SplitAxis::SideBySide, 0, 1, 0.5, 24.0);
+        assert!(
+            (moved - 24.0).abs() <= 1.0,
+            "scaled grab moved the divider by {moved} px for a 24 px motion"
+        );
+
+        // Nested horizontal divider: the offset applies at any tree depth.
+        let pane = app.terminals[1].pane_id();
+        attach_test_pane_at(&mut app, pane, SplitAxis::Stacked, 3);
+        assert_eq!(app.on_frame(), Ok(true));
+        let moved = drag_split_divider(&mut app, SplitAxis::Stacked, 1, 2, 0.9, 20.0);
+        assert!(
+            (moved - 20.0).abs() <= 1.0,
+            "nested grab moved the divider by {moved} px for a 20 px motion"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Stacked root: the same rule along y.
+        let (mut stacked, stacked_root) = {
+            let (mut app, _receiver, _profile, root) =
+                crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                    "t7-drag-offset-stacked",
+                    1,
+                );
+            let pane = app.tabs[0].active_pane;
+            attach_test_pane_at(&mut app, pane, SplitAxis::Stacked, 2);
+            assert_eq!(app.on_frame(), Ok(true));
+            (app, root)
+        };
+        let moved = drag_split_divider(&mut stacked, SplitAxis::Stacked, 0, 1, 0.5, 32.0);
+        assert!(
+            (moved - 32.0).abs() <= 1.0,
+            "stacked grab moved the divider by {moved} px for a 32 px motion"
+        );
+        let _ = std::fs::remove_dir_all(&stacked_root);
     }
 
     #[test]

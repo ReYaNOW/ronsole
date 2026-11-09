@@ -493,6 +493,9 @@ fn center_distance_sq(a: Rect, b: Rect) -> f32 {
 pub(crate) struct DividerHit {
     pub path: Vec<u8>,
     pub axis: SplitAxis,
+    /// Edge of the first branch along `axis` in window coordinates. A drag
+    /// keeps the pointer's distance to it instead of jumping on the first move.
+    pub first_edge: f32,
 }
 
 /// Divider under the point `(x, y)`. Every split node is laid out exactly as
@@ -584,6 +587,7 @@ impl DividerProbe {
                     DividerHit {
                         path: self.path.clone(),
                         axis: *axis,
+                        first_edge,
                     },
                 ));
             }

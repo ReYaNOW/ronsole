@@ -2734,6 +2734,8 @@ pub(crate) struct TabLabelIndex {
     pub number: usize,
     /// Leaves in the tab's split tree; more than one shows the pane focus border.
     pub leaf_count: usize,
+    /// Any pane of the tab rang its bell; the strip marks the tab, not the pane.
+    pub bell_pending: bool,
 }
 
 pub(crate) struct TerminalRenderParams<'a> {

@@ -2651,11 +2651,7 @@ impl Renderer {
             let title_max_w = (tab_w - if can_show_close { 56.0 * s } else { 32.0 * s })
                 .max(0.0);
             let title_max_x = title_x + title_max_w;
-            if tabs
-                .get(idx)
-                .and_then(|label| terminals.get(label.title_terminal))
-                .is_some_and(Terminal::bell_pending)
-            {
+            if tabs.get(idx).is_some_and(|label| label.bell_pending) {
                 let dot = (TERMINAL_TAB_BELL_DOT * s).round().max(1.0);
                 let dot_y = (strip.y + (strip.h - dot) * 0.5).round();
                 self.push_rounded_rect(title_x, dot_y, dot, dot, dot * 0.5, self.palette.accent);
