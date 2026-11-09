@@ -106,7 +106,7 @@ still runs. Coordinates of `mouse_move` are physical framebuffer pixels.
 | `wait <ms>` | `ok frames=<n>` | Real time, ≤ 60000. Use only for negative checks. |
 | `wake <ms>` | `ok cause=<c> frame=<bool> flow=<f> deadline_ms=<n\|none>` | Loop-model timing, spec §3.3. |
 | `idle <ms>` | `ok frames=<n> redraws=<n> polls=<n> wakes=<n> deadlines=<n> flow=<f> deadline_ms=<n\|none>` | Loop-model counters, spec §3.3. |
-| `bench <frames> [csv=<path>] [none\|wheel dx dy\|key <combo>\|type <text>]` | `ok <json>` | Summary JSON with `csv`. |
+| `bench <frames> [csv=<path>] [none\|wheel dx dy\|key <combo>\|type <text>\|drag\|focus]` | `ok <json>` | Summary JSON with `csv`. |
 | `info` | `ok <json>` | GL strings, profile, budget, `hz`. |
 | `quit` | `ok` | EOF does the same. |
 
@@ -152,8 +152,12 @@ stacks, `key ctrl+shift+w` closes the focused pane, and
 `bench <frames> [csv=<path>] [action]` draws exactly `frames` forced frames and
 applies the action before each one, as events with no frame in between: `none`
 (default), `wheel <dx> <dy>` (line delta), `key <combo>` (press and release,
-with the combo's modifiers that `mods` does not hold) or `type <text>`. One CSV
-row per frame, columns in this order (RRiter's, without `root_*`/`chrome_*`):
+with the combo's modifiers that `mods` does not hold), `type <text>`, `drag`
+(moves the root split divider 24 px forward and back along its axis each frame)
+or `focus` (moves the pane focus with `Alt+Left`/`Alt+Right`, alternating each
+frame). `drag` and `focus` split the active tab side by side first when it has
+one pane; that preparation draws no frame and is outside the measured frames.
+One CSV row per frame, columns in this order (RRiter's, without `root_*`/`chrome_*`):
 
 | Column | Meaning |
 |---|---|

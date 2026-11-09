@@ -1490,6 +1490,71 @@ impl App {
         true
     }
 
+    /// Ensures the active tab has two panes for a bench action. A tab that is
+    /// already split is left alone; otherwise the active pane is split side by
+    /// side. Returns the refusal of `split_active_pane` as an error.
+    pub(crate) fn bench_prepare_split(&mut self) -> Result<(), String> {
+        if self.active_tab_split() {
+            return Ok(());
+        }
+        if self.split_active_pane(SplitAxis::SideBySide) {
+            Ok(())
+        } else {
+            Err("bench action could not split the active pane".to_string())
+        }
+    }
+
+    /// Starts the divider drag of a bench action: ensures the active tab is
+    /// split, seeds the drag on the centre of the root divider and returns the
+    /// drag axis with the pressed point. No frame is drawn, so the panels of
+    /// the last rendered frame may still predate the split; the drag is seeded
+    /// directly instead of through the generation-checked press route.
+    pub(crate) fn bench_begin_divider_drag(&mut self) -> Result<(SplitAxis, f32, f32), String> {
+        self.bench_prepare_split()?;
+        let tab = self
+            .tabs
+            .get(self.active_tab)
+            .ok_or("bench action has no active tab")?;
+        let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let Some(rect) = split_node_rect(
+            &tab.layout,
+            body,
+            &[],
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+        ) else {
+            return Err("bench action needs a split active tab".to_string());
+        };
+        let (axis, ratio, first, second) = match &tab.layout {
+            SplitNode::Split { axis, ratio, first, second } => (*axis, *ratio, first, second),
+            SplitNode::Leaf(_) => return Err("bench action needs a split active tab".to_string()),
+        };
+        let gap = node_gap(metrics.scale);
+        let first_min = min_extent(first, axis, metrics.char_w, metrics.char_h, metrics.scale);
+        let second_min = min_extent(second, axis, metrics.char_w, metrics.char_h, metrics.scale);
+        let (first_rect, second_rect) =
+            split_child_rects(rect, axis, ratio, gap, first_min, second_min);
+        let (x, y) = match axis {
+            SplitAxis::SideBySide => (
+                second_rect.x - (second_rect.x - first_rect.x - first_rect.w) * 0.5,
+                rect.y + rect.h * 0.5,
+            ),
+            SplitAxis::Stacked => (
+                rect.x + rect.w * 0.5,
+                second_rect.y - (second_rect.y - first_rect.y - first_rect.h) * 0.5,
+            ),
+        };
+        self.on_pointer_motion(PointerPosition { x, y });
+        let Some(drag) = self.divider_drag_at(PointerButton::Left) else {
+            return Err("bench action could not start a divider drag".to_string());
+        };
+        self.divider_drag = Some(drag);
+        self.suppress_release(PointerButton::Left);
+        Ok((axis, x, y))
+    }
+
     /// Palette a tab created now starts with: the configured background, with
     /// the renderer's default foreground, ANSI colours and cursor.
     fn new_terminal_palette(&self) -> TermPalette {
@@ -10798,6 +10863,50 @@ mod tests {
         assert_eq!(left_cols, app.panel_layouts[0].cols);
         assert_eq!(right_cols, app.panel_layouts[1].cols);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_past_window_edges_keeps_open_ratio_and_pane_minimums() {
+        // A plain root split and a root whose right child is a nested split, so
+        // the second minimum is the subtree minimum, not one pane's minimum.
+        for (tag, nested) in [("t7-drag-clamp", false), ("t7-drag-clamp-nested", true)] {
+            let (mut app, root) = split_pointer_app(tag);
+            if nested {
+                let second = match crate::split::node_at_path(&app.tabs[0].layout, &[1]) {
+                    Some(SplitNode::Leaf(pane)) => *pane,
+                    other => panic!("{tag}: the root's second child is a leaf: {other:?}"),
+                };
+                attach_test_pane_at(&mut app, second, SplitAxis::SideBySide, 3);
+                assert_eq!(app.on_frame(), Ok(true));
+            }
+            let metrics = app.grid_metrics;
+            let (min_w, min_h) = pane_min(metrics.char_w, metrics.char_h, metrics.scale);
+            let start = split_divider_point(&app);
+            split_pointer_move(&mut app, start.0, start.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert!(app.divider_drag.is_some(), "{tag}: the press grabs the divider");
+
+            // Far past either window edge: the drag clamps at each side's
+            // minimum and never reaches a closed ratio.
+            for x in [-10_000.0, metrics.width + 10_000.0] {
+                split_pointer_move(&mut app, x, start.1);
+                assert_eq!(app.on_frame(), Ok(true));
+                let ratio = split_root_ratio(&app, 0);
+                assert!(
+                    ratio > 0.0 && ratio < 1.0,
+                    "{tag}: ratio {ratio} at x {x} stays inside (0, 1)"
+                );
+                for panel in &app.panels {
+                    assert!(
+                        panel.body.w >= min_w && panel.body.h >= min_h,
+                        "{tag}: panel {:?} is smaller than pane_min ({min_w}, {min_h})",
+                        panel.body
+                    );
+                }
+            }
+            app.on_pointer_button(KeyState::Released, PointerButton::Left);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

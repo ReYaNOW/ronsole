@@ -51,6 +51,8 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
     let mut csv_out = BufWriter::new(file);
     writeln!(csv_out, "{CSV_HEADER}").map_err(|error| format!("csv: {error}"))?;
 
+    // Actions that need a split tab prepare it once, outside the measured frames.
+    session.prepare_bench(action)?;
     let system_before = system_snapshot();
     let mut rows = Vec::with_capacity(frames as usize);
     for frame in 0..frames {
@@ -59,7 +61,7 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
             .app_mut()
             .runtime()
             .and_then(|runtime| runtime.renderer().begin_gpu_timer());
-        let stepped = session.bench_frame(action);
+        let stepped = session.bench_frame(action, frame);
         // Ends the query even when the step failed, so no timer query is left open.
         let gpu_ms = gpu_query.and_then(|query| {
             session
@@ -103,6 +105,7 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
         rows.push(row);
     }
     csv_out.flush().map_err(|error| format!("csv: {error}"))?;
+    session.finish_bench(action);
     let system_after = system_snapshot();
     let process_cpu = system_after.process_cpu_ms - system_before.process_cpu_ms;
 
@@ -332,6 +335,31 @@ mod tests {
     #[test]
     fn bench_wheel_action_draws_one_frame_per_bench_frame() {
         assert_exact_frames("wheel", 3, "wheel 0 1");
+    }
+
+    #[test]
+    fn bench_split_actions_draw_one_frame_per_bench_frame() {
+        assert_exact_frames("drag", 5, "drag");
+        assert_exact_frames("focus", 5, "focus");
+    }
+
+    #[test]
+    fn bench_split_actions_prepare_two_panes() {
+        for (tag, action) in [("drag-panes", "drag"), ("focus-panes", "focus")] {
+            let mut session = session_for_test(800, 600);
+            let csv = scratch_dir(tag).join("b.csv");
+            let summary = bench_summary(
+                &mut session,
+                &format!("bench 4 csv={} {action}", csv.display()),
+            );
+            assert_eq!(summary["frames"], 4, "{action} summary");
+            let state = dump(&mut session);
+            assert_eq!(
+                state["panels"].as_array().map(Vec::len),
+                Some(2),
+                "{action} leaves the active tab split"
+            );
+        }
     }
 
     #[test]
