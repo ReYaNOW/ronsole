@@ -717,7 +717,7 @@ pub struct App {
     panel_layouts_grid_generation: u64,
     /// Hint shown on the tab strip until its deadline.
     grid_hint: Option<(GridHint, Instant)>,
-    /// Scratch for the tab indices of the current composition; swapped with `ClaudeGrid::members`.
+    /// Scratch for the terminal indices of the current composition; swapped with `ClaudeGrid::members`.
     grid_members_scratch: Vec<usize>,
     /// Scratch for the tile rectangles `rebuild_panels` gets from `grid_tiles`.
     grid_tile_rects: Vec<(Rect, Rect)>,
@@ -2062,6 +2062,15 @@ impl App {
             .terminals
             .get(self.active_terminal)
             .map(Terminal::pane_id);
+        // The grid neighbours of the focused tile are read before the first
+        // removal, while the previous tile order still exists, and they are
+        // kept by pane identity: the removals shift terminal indices, and only
+        // a tile that survives them may take the focus.
+        let grid_candidates = if self.claude_grid.is_some() && was_active_tab {
+            focused_pane.map_or_else(Vec::new, |pane| self.grid_successors_after_tile(pane))
+        } else {
+            Vec::new()
+        };
         let mut tree_successor = None;
         for pane in panes {
             let Some(index) = self.terminal_index_of_pane(pane) else {
@@ -2105,7 +2114,9 @@ impl App {
             && was_active_tab
             && focused_pane.is_none_or(|pane| self.terminal_index_of_pane(pane).is_none())
         {
-            self.grid_successor_after_focused_removal()
+            grid_candidates
+                .into_iter()
+                .find_map(|pane| self.terminal_index_of_pane(pane))
         } else {
             None
         };
@@ -3414,9 +3425,9 @@ impl App {
             })
     }
 
-    /// Tile that takes focus after `removed` terminals disappear: the next grid
-    /// member after the focused tile in grid order, skipping every removed
-    /// index, else the previous one. Returns the terminal index after the
+    /// Tile that takes focus after `removed` terminals disappear: the first
+    /// surviving grid member after the focused tile's position, else the last
+    /// surviving member before it. Returns the terminal index after the
     /// removals, and `None` outside grid mode or when no tile survives.
     fn grid_successor_after_removal(&self, removed: &[usize]) -> Option<usize> {
         let grid = self.claude_grid.as_ref()?;
@@ -3424,42 +3435,63 @@ impl App {
             return None;
         }
         let live = |member: &usize| !removed.contains(member);
-        let pivot = self.active_terminal;
-        let target = grid
+        // Members follow the tab strip and the split trees, so the neighbour
+        // is taken by position in that order, not by terminal index.
+        let pos = grid
             .members
             .iter()
+            .position(|&member| member == self.active_terminal)?;
+        let target = grid.members[pos + 1..]
+            .iter()
             .copied()
-            .filter(live)
-            .find(|&member| member > pivot)
-            .or_else(|| {
-                grid.members
-                    .iter()
-                    .rev()
-                    .copied()
-                    .filter(live)
-                    .find(|&member| member < pivot)
-            })?;
+            .find(live)
+            .or_else(|| grid.members[..pos].iter().rev().copied().find(live))?;
         Some(target - removed.iter().filter(|&&index| index < target).count())
     }
 
-    /// Tile that takes the focus once the focused tile has left while the grid
-    /// is open: the first surviving member at or after the slot the tile
-    /// occupied, else the last member before it (§6.4). `remove_terminal_at`
-    /// leaves `active_terminal` on that slot, so it is the pivot of the search.
-    fn grid_successor_after_focused_removal(&mut self) -> Option<usize> {
-        self.collect_claude_members();
-        let slot = self.active_terminal;
-        self.grid_members_scratch
+    /// Tiles that may take the focus when the tile of `pivot` leaves with its
+    /// tab, in grid order: the members after its position, then the members
+    /// before it in reverse. The caller keeps the first tile that survives the
+    /// removals, so a refused cleanup still leaves the focus on a live tile
+    /// (§6.4). The tile order is the tab strip and the split trees, so it is
+    /// not the terminal index order.
+    fn grid_successors_after_tile(&self, pivot: PaneId) -> Vec<PaneId> {
+        let Some(grid) = self.claude_grid.as_ref() else {
+            return Vec::new();
+        };
+        let Some(pos) = self
+            .terminal_index_of_pane(pivot)
+            .and_then(|index| grid.members.iter().position(|&member| member == index))
+        else {
+            return Vec::new();
+        };
+        grid.members[pos + 1..]
+            .iter()
+            .chain(grid.members[..pos].iter().rev())
+            .filter_map(|&member| self.terminals.get(member).map(Terminal::pane_id))
+            .collect()
+    }
+
+    /// Tile that takes the focus when the focused tile loses its Claude flag:
+    /// the next tile of the current member order that still has the flag, else
+    /// the previous one. Members follow the tab strip and the split trees, so
+    /// their terminal indices are not in ascending order.
+    fn grid_neighbour_by_tile_position(&self) -> Option<usize> {
+        let grid = self.claude_grid.as_ref()?;
+        let pos = grid
+            .members
+            .iter()
+            .position(|&member| member == self.active_terminal)?;
+        let live = |member: &usize| {
+            self.terminals
+                .get(*member)
+                .is_some_and(|terminal| terminal.claude_foreground())
+        };
+        grid.members[pos + 1..]
             .iter()
             .copied()
-            .find(|&member| member >= slot)
-            .or_else(|| {
-                self.grid_members_scratch
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|&member| member < slot)
-            })
+            .find(live)
+            .or_else(|| grid.members[..pos].iter().rev().copied().find(live))
     }
 
     /// Whether the current members fit the window body at the current metrics (Q9).
@@ -3536,6 +3568,19 @@ impl App {
         if self.claude_grid.is_none() {
             return;
         }
+        // The focused tile may lose its Claude flag between syncs. Its
+        // neighbour is taken from the tile position in the previous
+        // composition, before the members are rebuilt.
+        let active = self.active_terminal;
+        let previous_neighbour = if self
+            .terminals
+            .get(active)
+            .is_some_and(|terminal| !terminal.claude_foreground())
+        {
+            self.grid_neighbour_by_tile_position()
+        } else {
+            None
+        };
         self.collect_claude_members();
         let members_changed = self
             .claude_grid
@@ -3553,16 +3598,18 @@ impl App {
             self.exit_claude_grid(None);
             return;
         }
-        let active = self.active_terminal;
         if !self.grid_contains(active) {
-            // Members are tab indices in ascending order: the next one after the
-            // focused tab, else the last one (all of them lie before it).
-            let target = grid
-                .members
-                .iter()
-                .copied()
-                .find(|&index| index > active)
-                .or_else(|| grid.members.last().copied());
+            // Tile order is the tab strip and the split trees, so the next
+            // tile is the next member in that order, else the previous one.
+            // A focused terminal that was not a tile has no position there
+            // and falls back to the first tile after its index.
+            let target = previous_neighbour.or_else(|| {
+                grid.members
+                    .iter()
+                    .copied()
+                    .find(|&index| index > active)
+                    .or_else(|| grid.members.last().copied())
+            });
             if let Some(target) = target {
                 self.cancel_terminal_presentation_intents();
                 self.activate_ready_terminal(target, false);
@@ -7948,6 +7995,52 @@ mod tests {
     }
 
     #[test]
+    fn grid_members_follow_split_tree_order_inside_one_tab() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        let second = app.issue_pane_id();
+        let third = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(1, first));
+        push_test_terminal(&mut app, presentation_ready_terminal(2, second));
+        push_test_terminal(&mut app, presentation_ready_terminal(3, third));
+        // One tab owns all three panes, with `third` inserted between `first`
+        // and `second` in tree order: the tree order [first, third, second]
+        // differs from the terminal order [first, second, third].
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Split {
+                axis: SplitAxis::Stacked,
+                ratio: 0.5,
+                first: Box::new(SplitNode::Leaf(first)),
+                second: Box::new(SplitNode::Leaf(third)),
+            }),
+            second: Box::new(SplitNode::Leaf(second)),
+        };
+        app.tabs[0].active_pane = first;
+        app.tabs.remove(2);
+        app.tabs.remove(1);
+        app.active_tab = 0;
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        // Claude flags on the new middle pane (terminal 2) and on the last
+        // tree leaf (terminal 1).
+        app.terminals[2].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.grid_metrics = GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+
+        app.toggle_claude_grid(Instant::now());
+
+        assert_eq!(grid_mode_members(&app), Some(vec![2, 1]));
+    }
+
+    #[test]
     fn grid_frame_idle_settles_without_frames() {
         let (mut app, _receiver, _profile, root) =
             crate::app::headless_run::test_support::started_headless_with_test_terminals(
@@ -9352,6 +9445,76 @@ mod tests {
         assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
         assert_eq!(app.active_terminal, 1);
         assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn grid_successor_after_pane_close_follows_tile_position() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        // Tabs [0, 1, 2] become [1, 0, 2], so the tile order is [1, 0, 2]:
+        // terminal 0 is the middle tile and terminal 2 is the next one.
+        app.reorder_terminal_tab(0, 1);
+        app.active_tab = 1;
+        app.active_terminal = 0;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 0, 2]));
+        let next = app.terminals[2].pane_id();
+        let closed = app.terminals[0].pane_id();
+
+        assert!(!app.close_pane(closed));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.terminals[1].pane_id(), next);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn grid_successor_after_last_tile_close_falls_back_to_previous_tile() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        // Tabs [0, 1, 2] become [1, 2, 0], so the tile order is [1, 2, 0]:
+        // terminal 0 is the last tile and terminal 2 the previous one.
+        app.reorder_terminal_tab(0, 2);
+        app.active_tab = 2;
+        app.active_terminal = 0;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 2, 0]));
+        let previous = app.terminals[2].pane_id();
+        let closed = app.terminals[0].pane_id();
+
+        assert!(!app.close_pane(closed));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.terminals[1].pane_id(), previous);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn grid_successor_after_tab_close_follows_tile_position() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        // Tile order [1, 0, 2]: closing the middle tile's tab hands the focus
+        // to terminal 2, not to the numerically next terminal 1.
+        app.reorder_terminal_tab(0, 1);
+        app.active_tab = 1;
+        app.active_terminal = 0;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 0, 2]));
+        let next = app.terminals[2].pane_id();
+        let tab = app.tabs[1].id;
+
+        assert!(!app.close_tab(tab));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.terminals[1].pane_id(), next);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
         app.debug_assert_invariants();
     }
 
