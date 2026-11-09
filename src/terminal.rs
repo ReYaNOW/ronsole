@@ -1007,6 +1007,99 @@ mod tests {
     }
 
     #[test]
+    fn dev_channel_rejects_generation_changed_during_lookup() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        terminal.set_dev_process_group_for_test(Some(1000));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let grid = terminal.grid.clone();
+        let mut scratch = String::new();
+
+        // New output lands while the lookup runs: the scanned generation is
+        // stale by the time Enter would be written.
+        let pass = terminal.observe_dev_channel(now, &mut scratch, true, |pgrp| {
+            assert_eq!(pgrp, Some(1000));
+            let mut grid = crate::platform::lock_recover(&grid);
+            feed(&mut grid, DEV_WARNING_SCREEN.as_bytes());
+            grid.mark_changed();
+            Some(DEV_CLAUDE)
+        });
+
+        assert!(!pass.sent);
+        assert!(terminal.input_bytes_for_test().is_empty());
+        assert!(terminal.dev_channel_verified.is_none());
+        assert_eq!(terminal.dev_warning.confirmed, None);
+        assert_eq!(terminal.dev_warning.enter_at, None);
+
+        // The stale answer is not reused: a fresh pass over the settled
+        // screen verifies again and sends the Enter.
+        assert!(
+            terminal
+                .observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE))
+                .sent
+        );
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+    }
+
+    #[test]
+    fn dev_channel_rejects_group_changed_during_lookup() {
+        // The scan reads 1000; the recheck before Enter reads `changed`.
+        for changed in [Some(2000), None] {
+            let now = Instant::now();
+            let mut terminal = test_terminal(120, 8, 1);
+            terminal.set_dev_process_group_sequence_for_test(&[Some(1000), changed]);
+            feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+            let mut scratch = String::new();
+
+            let pass = terminal.observe_dev_channel(now, &mut scratch, true, |pgrp| {
+                assert_eq!(pgrp, Some(1000));
+                Some(DEV_CLAUDE)
+            });
+
+            assert!(!pass.sent, "{changed:?}");
+            assert!(terminal.input_bytes_for_test().is_empty());
+            assert!(terminal.dev_channel_verified.is_none());
+            assert_eq!(terminal.dev_warning.confirmed, None);
+            assert_eq!(terminal.dev_warning.enter_at, None);
+
+            // A readable settled group gets its own answer and the Enter; an
+            // unreadable one stays unknown and sends nothing.
+            let sent = terminal
+                .observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE))
+                .sent;
+            if changed.is_some() {
+                assert!(sent);
+                assert_eq!(terminal.input_bytes_for_test(), b"\r");
+            } else {
+                assert!(!sent);
+                assert!(terminal.input_bytes_for_test().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn dev_channel_stable_state_sends_one_enter() {
+        let now = Instant::now();
+        let mut terminal = test_terminal(120, 8, 1);
+        terminal.set_dev_process_group_for_test(Some(1000));
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        let mut scratch = String::new();
+
+        let pass = terminal.observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE));
+        assert!(pass.sent);
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+
+        // The warning is still on screen but its Enter is already sent: a
+        // second pass writes nothing more.
+        assert!(
+            !terminal
+                .observe_dev_channel(now, &mut scratch, true, |_| Some(DEV_CLAUDE))
+                .sent
+        );
+        assert_eq!(terminal.input_bytes_for_test(), b"\r");
+    }
+
+    #[test]
     fn dev_channel_group_change_without_content_change_unverifies() {
         let now = Instant::now();
         let mut terminal = test_terminal(120, 8, 1);
@@ -2260,11 +2353,13 @@ pub struct Terminal {
     /// unknown answer clears the whole entry.
     dev_channel_verified: Option<(u64, Option<u32>)>,
     /// Test override of the process and its foreground group for the
-    /// development-channels check: `Some(group)` makes the terminal look like
-    /// it has a process, and a `None` group makes that process's group
-    /// unreadable. Not set means the real `process`/`tcgetpgrp` answer.
+    /// development-channels check: a queue makes the terminal look like it has
+    /// a process, and each read answers the next group (the last one sticks);
+    /// a `None` group makes that process's group unreadable. Not set means the
+    /// real `process`/`tcgetpgrp` answer.
     #[cfg(test)]
-    dev_process_group_for_test: Option<Option<u32>>,
+    dev_process_group_for_test:
+        Option<std::sync::Mutex<std::collections::VecDeque<Option<u32>>>>,
     /// Test override of the PTY foreground process group: when set, the
     /// terminal answers `process_group_leader` with this group even though it
     /// has no process. Not set means the real `process`/`tcgetpgrp` answer.
@@ -2919,6 +3014,27 @@ impl Terminal {
             };
             (Some(pgrp), answer)
         };
+        let entering = warning_visible
+            && answer.is_some()
+            && self.dev_warning.enter_at.is_none()
+            && self.dev_warning.confirmed != answer;
+        if entering
+            && (self.dev_process_group_leader() != verified_group
+                || crate::platform::lock_recover(&self.grid).content_generation() != generation)
+        {
+            // The screen or the foreground group changed between the scan and
+            // the lookup: the verified answer no longer describes what Enter
+            // would reach.
+            self.dev_channel_verified = None;
+            self.dev_claude_cache = None;
+            pass.reverified = self.dev_channel_verified != previous;
+            // Nothing was sent and the content stays hidden: rouse the loop so
+            // a fresh event pass rescans the settled state and may send Enter.
+            if let Some(wake) = self.wake.as_ref() {
+                wake.wake_timer();
+            }
+            return pass;
+        }
         pass.sent = warning_visible && self.enter_dev_warning(now, answer);
         self.apply_dev_channel_banner(generation, answer.is_some());
         self.dev_channel_verified = Some((generation, verified_group));
@@ -3140,8 +3256,14 @@ impl Terminal {
     /// "no process" from "unreadable group"; `dev_has_process` does.
     fn dev_process_group_leader(&self) -> Option<u32> {
         #[cfg(test)]
-        if let Some(group) = self.dev_process_group_for_test {
-            return group;
+        if let Some(groups) = self.dev_process_group_for_test.as_ref() {
+            let mut groups = crate::platform::lock_recover(groups);
+            // Successive reads answer the next group and the last one
+            // sticks, so a scan and the pre-send recheck can disagree.
+            if groups.len() > 1 {
+                return groups.pop_front().flatten();
+            }
+            return groups.front().copied().flatten();
         }
         self.process_group_leader()
     }
@@ -3161,7 +3283,19 @@ impl Terminal {
     /// (`tcgetpgrp` failure).
     #[cfg(test)]
     pub(crate) fn set_dev_process_group_for_test(&mut self, group: Option<u32>) {
-        self.dev_process_group_for_test = Some(group);
+        self.dev_process_group_for_test = Some(std::sync::Mutex::new(
+            std::iter::once(group).collect(),
+        ));
+    }
+
+    /// Makes the foreground group move during a development-channels pass:
+    /// successive reads answer the next group in `groups`, and the last one
+    /// sticks. A `None` group is a process whose group cannot be read.
+    #[cfg(test)]
+    pub(crate) fn set_dev_process_group_sequence_for_test(&mut self, groups: &[Option<u32>]) {
+        self.dev_process_group_for_test = Some(std::sync::Mutex::new(
+            groups.iter().copied().collect(),
+        ));
     }
 
     /// Foreground job name when a job other than the shell is running in this tab.
