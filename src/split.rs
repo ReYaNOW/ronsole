@@ -56,7 +56,7 @@ fn axis_extent(rect: Rect, axis: SplitAxis) -> f32 {
 
 /// Gap between siblings in pixels, snapped to whole pixels for this scale.
 #[inline]
-fn node_gap(scale: f32) -> f32 {
+pub(crate) fn node_gap(scale: f32) -> f32 {
     (GRID_TILE_GAP * scale).round()
 }
 
@@ -260,6 +260,109 @@ fn find_path_in(node: &SplitNode, pane: PaneId, path: &mut Vec<u8>) -> bool {
             path.pop();
             false
         }
+    }
+}
+
+/// Whether `pane` is one of the leaves of `root`. Walks without allocating:
+/// the BEL and pane-to-tab lookups call it on the output path.
+pub(crate) fn split_contains_pane(root: &SplitNode, pane: PaneId) -> bool {
+    match root {
+        SplitNode::Leaf(id) => *id == pane,
+        SplitNode::Split { first, second, .. } => {
+            split_contains_pane(first, pane) || split_contains_pane(second, pane)
+        }
+    }
+}
+
+/// Collects the leaf panes of `node` in tree order. Allocates the caller's
+/// vector; used only by the close path, never in a frame.
+pub(crate) fn collect_split_panes(node: &SplitNode, panes: &mut Vec<PaneId>) {
+    match node {
+        SplitNode::Leaf(pane) => panes.push(*pane),
+        SplitNode::Split { first, second, .. } => {
+            collect_split_panes(first, panes);
+            collect_split_panes(second, panes);
+        }
+    }
+}
+
+/// Absolute rect of the split node addressed by `path` in a tab body, walked
+/// through the same [`child_rects`] call the layout uses. `None` when the
+/// path leaves the tree or ends on a leaf.
+pub(crate) fn split_node_rect(
+    root: &SplitNode,
+    body: Rect,
+    path: &[u8],
+    scale: f32,
+    char_w: f32,
+    char_h: f32,
+) -> Option<Rect> {
+    let mut node = root;
+    let mut rect = body;
+    for step in path {
+        let SplitNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return None;
+        };
+        let (first_rect, second_rect) =
+            child_rects(rect, *axis, *ratio, first, second, scale, char_w, char_h);
+        match step {
+            0 => {
+                node = first;
+                rect = first_rect;
+            }
+            1 => {
+                node = second;
+                rect = second_rect;
+            }
+            _ => return None,
+        }
+    }
+    matches!(node, SplitNode::Split { .. }).then_some(rect)
+}
+
+/// Ratio that puts the divider of `node_rect` at `coord` along `axis`. The
+/// first branch keeps its minimum and the second keeps its own, judged on the
+/// same `available` span [`split_child_rects`] uses. When the minimums do not
+/// fit or an input is not finite, the saved ratio is returned unchanged, and
+/// otherwise the result stays strictly inside (0, 1).
+pub(crate) fn dragged_ratio(
+    node_rect: Rect,
+    axis: SplitAxis,
+    saved_ratio: f32,
+    gap: f32,
+    first_min: f32,
+    second_min: f32,
+    coord: f32,
+) -> f32 {
+    let (extent, start) = match axis {
+        SplitAxis::SideBySide => (node_rect.w, node_rect.x),
+        SplitAxis::Stacked => (node_rect.h, node_rect.y),
+    };
+    if ![extent, start, gap, first_min, second_min, coord]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return saved_ratio;
+    }
+    let span_gap = if extent < gap { 0.0 } else { gap };
+    let available = (extent - span_gap).max(0.0);
+    let first_floor = first_min.ceil();
+    let second_floor = second_min.ceil();
+    if available <= 0.0 || available < first_floor + second_floor {
+        return saved_ratio;
+    }
+    let first_extent = (coord - start).clamp(first_floor, available - second_floor);
+    let ratio = first_extent / available;
+    if ratio > 0.0 && ratio < 1.0 {
+        ratio
+    } else {
+        saved_ratio
     }
 }
 
@@ -1180,5 +1283,49 @@ mod tests {
         let root_only = divider_at(&nested, body, scale, char_w, char_h, 800.0, 900.0)
             .expect("the root gap is a divider");
         assert!(root_only.path.is_empty());
+    }
+
+    #[test]
+    fn dragged_ratio_keeps_saved_ratio_when_minimums_do_not_fit() {
+        // 100 px span minus a 10 px gap leaves 90 px; 50 + 50 minimums need 100.
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 40.0,
+        };
+        let ratio = dragged_ratio(rect, SplitAxis::SideBySide, 0.4, 10.0, 50.0, 50.0, 30.0);
+        assert_eq!(ratio, 0.4);
+    }
+
+    #[test]
+    fn dragged_ratio_clamps_pointer_past_either_edge_to_the_minimums() {
+        // 400 px span minus a 10 px gap leaves 390 px for minimums 50 and 60.
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 40.0,
+        };
+        let far_left = dragged_ratio(rect, SplitAxis::SideBySide, 0.5, 10.0, 50.0, 60.0, -1e4);
+        assert_eq!(far_left, 50.0 / 390.0);
+        let far_right = dragged_ratio(rect, SplitAxis::SideBySide, 0.5, 10.0, 50.0, 60.0, 1e4);
+        assert_eq!(far_right, 330.0 / 390.0);
+        assert!(far_left > 0.0 && far_left < 1.0);
+        assert!(far_right > 0.0 && far_right < 1.0);
+    }
+
+    #[test]
+    fn dragged_ratio_ignores_non_finite_pointer() {
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 40.0,
+        };
+        for coord in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let ratio = dragged_ratio(rect, SplitAxis::SideBySide, 0.25, 10.0, 50.0, 60.0, coord);
+            assert_eq!(ratio, 0.25);
+        }
     }
 }

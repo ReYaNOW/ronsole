@@ -51,15 +51,18 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
     let mut csv_out = BufWriter::new(file);
     writeln!(csv_out, "{CSV_HEADER}").map_err(|error| format!("csv: {error}"))?;
 
+    // Actions that need a split tab prepare it once, outside the measured frames.
+    session.prepare_bench(action)?;
     let system_before = system_snapshot();
     let mut rows = Vec::with_capacity(frames as usize);
+    let mut first_error = None;
     for frame in 0..frames {
         let start = Instant::now();
         let gpu_query = session
             .app_mut()
             .runtime()
             .and_then(|runtime| runtime.renderer().begin_gpu_timer());
-        let stepped = session.bench_frame(action);
+        let stepped = session.bench_frame(action, frame);
         // Ends the query even when the step failed, so no timer query is left open.
         let gpu_ms = gpu_query.and_then(|query| {
             session
@@ -67,7 +70,13 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
                 .runtime()
                 .map(|runtime| runtime.renderer().end_gpu_timer(query))
         });
-        let (update, draw) = stepped?;
+        let (update, draw) = match stepped {
+            Ok(timings) => timings,
+            Err(error) => {
+                first_error = Some(error);
+                break;
+            }
+        };
         let total_ms = ms(start.elapsed());
         let app = session.app_mut();
         let (flush_calls, vertices) = app
@@ -87,7 +96,7 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
             vertices,
             scroll_y,
         };
-        writeln!(
+        if let Err(error) = writeln!(
             csv_out,
             "{},{:.3},{:.3},{},{:.3},{},{},{}",
             row.frame,
@@ -98,11 +107,22 @@ fn run(session: &mut HeadlessSession, frames: u32, csv: Option<PathBuf>, action:
             row.flush_calls,
             row.vertices,
             row.scroll_y
-        )
-        .map_err(|error| format!("csv: {error}"))?;
+        ) {
+            first_error = Some(format!("csv: {error}"));
+            break;
+        }
         rows.push(row);
     }
-    csv_out.flush().map_err(|error| format!("csv: {error}"))?;
+    let flush_error = csv_out.flush().err().map(|error| format!("csv: {error}"));
+    // Releases a pressed drag even when a frame failed, so the session is not
+    // left with a pressed pointer.
+    session.finish_bench(action);
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if let Some(error) = flush_error {
+        return Err(error);
+    }
     let system_after = system_snapshot();
     let process_cpu = system_after.process_cpu_ms - system_before.process_cpu_ms;
 
@@ -247,6 +267,7 @@ fn summary_json(
 #[cfg(test)]
 mod tests {
     use super::CSV_HEADER;
+    use super::super::protocol::BenchAction;
     use super::super::session::HeadlessSession;
     use super::super::tests::{dump, run_script, session_for_test, wait_until};
     use serde_json::Value;
@@ -332,6 +353,64 @@ mod tests {
     #[test]
     fn bench_wheel_action_draws_one_frame_per_bench_frame() {
         assert_exact_frames("wheel", 3, "wheel 0 1");
+    }
+
+    #[test]
+    fn bench_split_actions_draw_one_frame_per_bench_frame() {
+        assert_exact_frames("drag", 5, "drag");
+        assert_exact_frames("focus", 5, "focus");
+    }
+
+    #[test]
+    fn bench_split_actions_prepare_two_panes() {
+        for (tag, action) in [("drag-panes", "drag"), ("focus-panes", "focus")] {
+            let mut session = session_for_test(800, 600);
+            let csv = scratch_dir(tag).join("b.csv");
+            let summary = bench_summary(
+                &mut session,
+                &format!("bench 4 csv={} {action}", csv.display()),
+            );
+            assert_eq!(summary["frames"], 4, "{action} summary");
+            let state = dump(&mut session);
+            assert_eq!(
+                state["panels"].as_array().map(Vec::len),
+                Some(2),
+                "{action} leaves the active tab split"
+            );
+        }
+    }
+
+    /// Splits a fresh session for a focus bench (`stacked` splits it down
+    /// first), runs `frames` focus frames and returns the focused pane of each.
+    fn focus_sequence(stacked: bool, frames: u32) -> Vec<u64> {
+        let mut session = session_for_test(800, 600);
+        if stacked {
+            run_script(&mut session, b"key ctrl+shift+e\n");
+            wait_until(&mut session, 5000, "a stacked two-pane split", |dump| {
+                dump["panels"].as_array().map(Vec::len) == Some(2)
+            });
+        }
+        let action = BenchAction::PaneFocus;
+        session.prepare_bench(&action).expect("focus bench preparation");
+        (0..frames)
+            .map(|frame| {
+                session.bench_frame(&action, frame).expect("focus bench frame");
+                session.app_mut().active_pane_raw().expect("active pane")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bench_focus_action_switches_panes_on_the_root_axis() {
+        for stacked in [false, true] {
+            let seen = focus_sequence(stacked, 4);
+            for pair in seen.windows(2) {
+                assert_ne!(
+                    pair[0], pair[1],
+                    "focus moves on every frame (pre-stacked: {stacked}): {seen:?}"
+                );
+            }
+        }
     }
 
     #[test]

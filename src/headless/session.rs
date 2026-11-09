@@ -5,7 +5,7 @@ use super::Profile;
 use super::backend::HeadlessCounters;
 use super::bench;
 use super::dump;
-use super::keys::{key_input, modifier_key_input};
+use super::keys::{key_input, key_spec, modifier_key_input};
 use super::protocol::{
     BenchAction, ClickPhase, Command, KeyCombo, MouseButtonArg, Response, WheelUnit, parse_line,
 };
@@ -13,6 +13,7 @@ use crate::app::{App, HeadlessRunError, LoopFlow, LoopStep, StepReport};
 use crate::input_types::{KeyInput, KeyState, Modifiers, PointerButton, PointerPosition, ScrollDelta};
 use crate::launch::TerminalLaunchSpec;
 use crate::runtime::WindowRuntime;
+use crate::split::SplitAxis;
 use crate::terminal_process::TERMINAL_OUTPUT_BATCH_IDLE;
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Write};
@@ -24,6 +25,8 @@ use std::time::{Duration, Instant};
 const START_SETTLE_MS: u64 = 500;
 /// Longest single poll wait used by the counting commands, so their clock checks stay fine-grained.
 const POLL_SLICE_MS: u64 = 2;
+/// Distance the bench divider drag moves the pointer on each frame, in physical pixels.
+const BENCH_DRAG_STEP_PX: f32 = 24.0;
 
 /// Where the session's profile directory lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,12 @@ pub(crate) struct HeadlessSession {
     size: (u32, u32),
     scale: f32,
     budget: FrameBudget,
+    /// Axis and pressed point of the divider drag a bench action oscillates
+    /// around; `None` until `prepare_bench` starts it.
+    bench_drag: Option<(SplitAxis, f32, f32)>,
+    /// Axis of the active tab's root split for a bench focus action; `None`
+    /// until `prepare_bench` reads it and when the tab has one pane.
+    bench_focus_axis: Option<SplitAxis>,
     last_report: Option<StepReport>,
     exited: bool,
 }
@@ -142,6 +151,8 @@ impl HeadlessSession {
             size: options.size,
             scale: options.scale,
             budget: options.budget,
+            bench_drag: None,
+            bench_focus_axis: None,
             last_report: None,
             exited: false,
         };
@@ -636,10 +647,40 @@ impl HeadlessSession {
         self.budget
     }
 
+    /// Prepares the tab a bench action needs, before the measured frames: two
+    /// panes for `focus`, and a pressed divider drag for `drag`. Draws no frame.
+    pub(super) fn prepare_bench(&mut self, action: &BenchAction) -> Result<(), String> {
+        match action {
+            BenchAction::SplitDrag => {
+                let (axis, x, y) = self.app.bench_begin_divider_drag()?;
+                self.bench_drag = Some((axis, x, y));
+            }
+            BenchAction::PaneFocus => {
+                self.app.bench_prepare_split()?;
+                self.bench_focus_axis = self.app.bench_split_axis();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Releases the divider drag a bench action started, so later commands see
+    /// no pressed pointer. Draws no frame.
+    pub(super) fn finish_bench(&mut self, action: &BenchAction) {
+        if matches!(action, BenchAction::SplitDrag) && self.bench_drag.take().is_some() {
+            self.app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        }
+    }
+
     /// Applies one bench action as events only, then draws one forced frame, so each call
-    /// draws exactly one frame. Returns the time of the action plus `about_to_wait`
-    /// (`update_ms`) and the time of the frame (`draw_cpu_ms`).
-    pub(super) fn bench_frame(&mut self, action: &BenchAction) -> Result<(Duration, Duration), String> {
+    /// draws exactly one frame. `frame` is the zero-based index within the bench run.
+    /// Returns the time of the action plus `about_to_wait` (`update_ms`) and the time of
+    /// the frame (`draw_cpu_ms`).
+    pub(super) fn bench_frame(
+        &mut self,
+        action: &BenchAction,
+        frame: u32,
+    ) -> Result<(Duration, Duration), String> {
         let start = Instant::now();
         let exit = match action {
             BenchAction::None => false,
@@ -655,6 +696,46 @@ impl HeadlessSession {
                 false
             }
             BenchAction::Key(combo) => self.press_release_events(*combo, 0, false)?,
+            BenchAction::SplitDrag => {
+                let Some((axis, x, y)) = self.bench_drag else {
+                    return Err("bench divider drag was not started".to_string());
+                };
+                let step = if frame % 2 == 0 {
+                    BENCH_DRAG_STEP_PX
+                } else {
+                    -BENCH_DRAG_STEP_PX
+                };
+                let position = match axis {
+                    SplitAxis::SideBySide => PointerPosition { x: x + step, y },
+                    SplitAxis::Stacked => PointerPosition { x, y: y + step },
+                };
+                self.pointer = position;
+                self.app.on_pointer_motion(position);
+                false
+            }
+            BenchAction::PaneFocus => {
+                let axis = self
+                    .bench_focus_axis
+                    .ok_or("bench focus action has no split axis")?;
+                // Neighbour keys run along the root split: focus moves across
+                // the root divider, not along it.
+                let name = match (axis, frame % 2) {
+                    (SplitAxis::SideBySide, 0) => "left",
+                    (SplitAxis::SideBySide, _) => "right",
+                    (SplitAxis::Stacked, 0) => "up",
+                    (SplitAxis::Stacked, _) => "down",
+                };
+                let key = key_spec(name)
+                    .ok_or_else(|| format!("bench focus action has no {name} key"))?;
+                self.press_release_events(
+                    KeyCombo {
+                        key,
+                        mods: Modifiers::ALT,
+                    },
+                    0,
+                    false,
+                )?
+            }
         };
         if exit {
             return Err("app exited during bench".to_string());

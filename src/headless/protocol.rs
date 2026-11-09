@@ -51,6 +51,10 @@ pub(crate) enum BenchAction {
     Wheel { dx: f64, dy: f64 },
     Key(KeyCombo),
     Type(String),
+    /// Moves the root split divider forward and backward along its axis every frame.
+    SplitDrag,
+    /// Focuses the neighbour pane in one direction, alternating every frame.
+    PaneFocus,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -331,7 +335,7 @@ fn parse_key(args: &mut Args) -> Result<Command, String> {
     Ok(Command::Key { combo, repeats: repeats.unwrap_or(0) })
 }
 
-/// `bench <frames> [csv=<path>] [none | wheel <dx> <dy> | key <combo> | type <text>]`.
+/// `bench <frames> [csv=<path>] [none | wheel <dx> <dy> | key <combo> | type <text> | drag | focus]`.
 fn parse_bench(args: &mut Args) -> Result<Command, String> {
     let frames = parse_frames(args.required("frame count")?, MAX_BENCH_FRAMES)?;
     let mut csv = None;
@@ -357,6 +361,8 @@ fn parse_action(args: &mut Args) -> Result<BenchAction, String> {
         }
         Some("key") => BenchAction::Key(parse_combo(args.required("key combo")?)?),
         Some("type") => return Ok(BenchAction::Type(unescape_text(args.remainder()))),
+        Some("drag") => BenchAction::SplitDrag,
+        Some("focus") => BenchAction::PaneFocus,
         Some(t) => return Err(format!("unknown action '{}'", clip(t))),
     };
     args.finish()?;
@@ -616,6 +622,24 @@ mod tests {
             cmd("bench 5 wheel 0 2"),
             Command::Bench { frames: 5, csv: None, action: BenchAction::Wheel { dx: 0.0, dy: 2.0 } }
         );
+    }
+
+    #[test]
+    fn bench_split_actions_parse() {
+        assert_eq!(
+            cmd("bench 30 drag"),
+            Command::Bench { frames: 30, csv: None, action: BenchAction::SplitDrag }
+        );
+        assert_eq!(
+            cmd("bench 30 focus"),
+            Command::Bench { frames: 30, csv: None, action: BenchAction::PaneFocus }
+        );
+    }
+
+    #[test]
+    fn bench_rejects_unknown_action() {
+        assert_eq!(err("bench 5 spin"), "unknown action 'spin'");
+        assert_eq!(err("bench 5 drag extra"), "unexpected argument 'extra'");
     }
 
     #[test]

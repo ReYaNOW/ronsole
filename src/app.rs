@@ -11,7 +11,7 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::panels::{GRID_TILE_GAP, Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
+use crate::panels::{Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
 use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
@@ -26,9 +26,10 @@ use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
 use crate::split::{
-    PaneDirection, PaneId, SplitAxis, SplitNode, divider_at, layout_panes, leaf_count, min_extent,
-    node_at_path, node_at_path_mut, pane_in_direction, pane_min, remove_leaf, split_child_rects,
-    split_leaf_at, successor,
+    PaneDirection, PaneId, SplitAxis, SplitNode, collect_split_panes, divider_at, dragged_ratio,
+    layout_panes, leaf_count, min_extent, node_at_path, node_at_path_mut, node_gap,
+    pane_in_direction, pane_min, remove_leaf, split_child_rects, split_contains_pane,
+    split_leaf_at, split_node_rect, successor,
 };
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
@@ -224,11 +225,12 @@ struct SettingsBackgroundKeyOutcome {
 /// Tab rows listed by the close confirmation before the "and N more" line.
 const CLOSE_CONFIRM_MAX_ROWS: usize = 8;
 
-/// What a confirmed close does: the whole window or one tab.
+/// What a confirmed close does: the whole window, one tab or one pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseTarget {
     Window,
     Tab(usize),
+    Pane(PaneId),
 }
 
 /// Open close confirmation. Its text is built once when the dialog opens.
@@ -262,6 +264,7 @@ impl CloseConfirm {
         let title = match target {
             CloseTarget::Window => "Закрыть окно?",
             CloseTarget::Tab(_) => "Закрыть вкладку?",
+            CloseTarget::Pane(_) => "Закрыть панель?",
         };
         Some(Self {
             target,
@@ -529,7 +532,7 @@ struct GridMetrics {
     char_h: f32,
 }
 
-/// Grid mode state: the tabs shown as tiles. `members` holds tab indices in tab order.
+/// Grid mode state. `members` holds terminal indices, listed in tab order.
 #[derive(Default)]
 struct ClaudeGrid {
     members: Vec<usize>,
@@ -592,16 +595,6 @@ struct DividerDrag {
     grab_offset: f32,
 }
 
-/// Whether `pane` is one of the leaves of this split subtree.
-fn split_contains_pane(node: &SplitNode, pane: PaneId) -> bool {
-    match node {
-        SplitNode::Leaf(id) => *id == pane,
-        SplitNode::Split { first, second, .. } => {
-            split_contains_pane(first, pane) || split_contains_pane(second, pane)
-        }
-    }
-}
-
 /// Number of leaves in the subtree, optionally only those for `pane`.
 #[cfg(any(debug_assertions, test))]
 fn split_leaf_count(node: &SplitNode, pane: Option<PaneId>) -> usize {
@@ -613,90 +606,23 @@ fn split_leaf_count(node: &SplitNode, pane: Option<PaneId>) -> usize {
     }
 }
 
-/// Collects the leaf panes of `node` in tree order. Allocates the caller's
-/// vector; used only by the close path, never in a frame.
-fn collect_split_panes(node: &SplitNode, panes: &mut Vec<PaneId>) {
+/// Pushes the indices of the Claude Code terminals among the leaves of `node`
+/// onto `out`, in split-tree order. Used by the grid member collection only.
+fn push_claude_leaves(node: &SplitNode, terminals: &[Terminal], out: &mut Vec<usize>) {
     match node {
-        SplitNode::Leaf(pane) => panes.push(*pane),
+        SplitNode::Leaf(pane) => {
+            let found = terminals
+                .iter()
+                .position(|terminal| terminal.pane_id() == *pane);
+            if let Some(index) = found.filter(|&index| terminals[index].claude_foreground()) {
+                out.push(index);
+            }
+        }
         SplitNode::Split { first, second, .. } => {
-            collect_split_panes(first, panes);
-            collect_split_panes(second, panes);
+            push_claude_leaves(first, terminals, out);
+            push_claude_leaves(second, terminals, out);
         }
     }
-}
-
-/// Absolute rect of the split node addressed by `path` in a tab body, walked
-/// through the same `split_child_rects` call the layout uses. `None` when the
-/// path leaves the tree or ends on a leaf.
-fn split_node_rect(
-    root: &SplitNode,
-    body: Rect,
-    path: &[u8],
-    scale: f32,
-    char_w: f32,
-    char_h: f32,
-) -> Option<Rect> {
-    let gap = (GRID_TILE_GAP * scale).round();
-    let mut node = root;
-    let mut rect = body;
-    for step in path {
-        let SplitNode::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } = node
-        else {
-            return None;
-        };
-        let first_min = min_extent(first, *axis, char_w, char_h, scale);
-        let second_min = min_extent(second, *axis, char_w, char_h, scale);
-        let (first_rect, second_rect) =
-            split_child_rects(rect, *axis, *ratio, gap, first_min, second_min);
-        match step {
-            0 => {
-                node = first;
-                rect = first_rect;
-            }
-            1 => {
-                node = second;
-                rect = second_rect;
-            }
-            _ => return None,
-        }
-    }
-    matches!(node, SplitNode::Split { .. }).then_some(rect)
-}
-
-/// Ratio that puts the divider of `node_rect` at `coord` along `axis`. The
-/// first branch keeps its minimum and the second keeps its own, judged on the
-/// same `available` span [`split_child_rects`] uses; a node too small for both
-/// minimums follows the pointer unclamped.
-fn dragged_ratio(
-    node_rect: Rect,
-    axis: SplitAxis,
-    saved_ratio: f32,
-    gap: f32,
-    first_min: f32,
-    second_min: f32,
-    coord: f32,
-) -> f32 {
-    let (extent, start) = match axis {
-        SplitAxis::SideBySide => (node_rect.w, node_rect.x),
-        SplitAxis::Stacked => (node_rect.h, node_rect.y),
-    };
-    let node_gap = if extent < gap { 0.0 } else { gap };
-    let available = (extent - node_gap).max(0.0);
-    if available <= 0.0 {
-        return saved_ratio;
-    }
-    let first_floor = first_min.ceil();
-    let second_floor = second_min.ceil();
-    let mut first_extent = (coord - start).clamp(0.0, available);
-    if available >= first_floor + second_floor {
-        first_extent = first_extent.clamp(first_floor, available - second_floor);
-    }
-    first_extent / available
 }
 
 pub struct App {
@@ -791,7 +717,7 @@ pub struct App {
     panel_layouts_grid_generation: u64,
     /// Hint shown on the tab strip until its deadline.
     grid_hint: Option<(GridHint, Instant)>,
-    /// Scratch for the tab indices of the current composition; swapped with `ClaudeGrid::members`.
+    /// Scratch for the terminal indices of the current composition; swapped with `ClaudeGrid::members`.
     grid_members_scratch: Vec<usize>,
     /// Scratch for the tile rectangles `rebuild_panels` gets from `grid_tiles`.
     grid_tile_rects: Vec<(Rect, Rect)>,
@@ -1088,7 +1014,7 @@ impl App {
         let metrics = self.grid_metrics;
         let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
         let axis = drag.axis;
-        let gap = (GRID_TILE_GAP * metrics.scale).round();
+        let gap = node_gap(metrics.scale);
         let coord = match axis {
             SplitAxis::SideBySide => x - drag.grab_offset,
             SplitAxis::Stacked => y - drag.grab_offset,
@@ -1240,7 +1166,7 @@ impl App {
             self.active_tab = tab_index;
             self.bump_structure_generation();
         }
-        self.tabs[tab_index].active_pane = pane;
+        self.set_tab_active_pane(tab_index, pane);
         if index == self.active_terminal && self.active_terminal_presented {
             self.pending_tab_reveal = Some(reveal_tail);
             self.mark_dirty();
@@ -1275,8 +1201,14 @@ impl App {
             return;
         };
         if split_contains_pane(&self.tabs[index].layout, pane) {
-            self.tabs[index].active_pane = pane;
+            self.set_tab_active_pane(index, pane);
         }
+    }
+
+    /// Sets the active pane of the tab at `tab_index`. Every change of
+    /// `Tab.active_pane` in the app goes through here.
+    fn set_tab_active_pane(&mut self, tab_index: usize, pane: PaneId) {
+        self.tabs[tab_index].active_pane = pane;
     }
 
     /// Thin adapter over the pane identity: existing callers keep their index.
@@ -1315,7 +1247,7 @@ impl App {
         );
         let mut leaves = 0;
         for tab in &self.tabs {
-            leaves += split_leaf_count(&tab.layout, None);
+            leaves += leaf_count(&tab.layout);
             assert!(tab.title_number > 0, "a tab must carry its title number");
             assert!(
                 split_contains_pane(&tab.layout, tab.active_pane),
@@ -1545,7 +1477,8 @@ impl App {
             self.set_grid_hint(GridHint::SpawnFailed, Instant::now());
             return false;
         }
-        self.cancel_terminal_presentation_intents();
+        // A split of the active tab leaves a pending activation of another tab
+        // untouched; only explicit navigation cancels it.
         let applied = split_leaf_at(&mut self.tabs[tab_index].layout, active_pane, axis, pane_id);
         debug_assert!(applied, "the preview split already succeeded");
         if !applied {
@@ -1555,6 +1488,80 @@ impl App {
         self.bump_structure_generation();
         self.request_frame();
         true
+    }
+
+    /// Ensures the active tab has two panes for a bench action. A tab that is
+    /// already split is left alone; otherwise the active pane is split side by
+    /// side. Returns the refusal of `split_active_pane` as an error.
+    pub(crate) fn bench_prepare_split(&mut self) -> Result<(), String> {
+        if self.active_tab_split() {
+            return Ok(());
+        }
+        if self.split_active_pane(SplitAxis::SideBySide) {
+            Ok(())
+        } else {
+            Err("bench action could not split the active pane".to_string())
+        }
+    }
+
+    /// Axis of the active tab's root split, or `None` when the tab has one pane.
+    /// A bench focus action picks its key pair by this axis.
+    pub(crate) fn bench_split_axis(&self) -> Option<SplitAxis> {
+        match &self.tabs.get(self.active_tab)?.layout {
+            SplitNode::Split { axis, .. } => Some(*axis),
+            SplitNode::Leaf(_) => None,
+        }
+    }
+
+    /// Starts the divider drag of a bench action: ensures the active tab is
+    /// split, seeds the drag on the centre of the root divider and returns the
+    /// drag axis with the pressed point. No frame is drawn, so the panels of
+    /// the last rendered frame may still predate the split; the drag is seeded
+    /// directly instead of through the generation-checked press route.
+    pub(crate) fn bench_begin_divider_drag(&mut self) -> Result<(SplitAxis, f32, f32), String> {
+        self.bench_prepare_split()?;
+        let tab = self
+            .tabs
+            .get(self.active_tab)
+            .ok_or("bench action has no active tab")?;
+        let metrics = self.grid_metrics;
+        let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
+        let Some(rect) = split_node_rect(
+            &tab.layout,
+            body,
+            &[],
+            metrics.scale,
+            metrics.char_w,
+            metrics.char_h,
+        ) else {
+            return Err("bench action needs a split active tab".to_string());
+        };
+        let (axis, ratio, first, second) = match &tab.layout {
+            SplitNode::Split { axis, ratio, first, second } => (*axis, *ratio, first, second),
+            SplitNode::Leaf(_) => return Err("bench action needs a split active tab".to_string()),
+        };
+        let gap = node_gap(metrics.scale);
+        let first_min = min_extent(first, axis, metrics.char_w, metrics.char_h, metrics.scale);
+        let second_min = min_extent(second, axis, metrics.char_w, metrics.char_h, metrics.scale);
+        let (first_rect, second_rect) =
+            split_child_rects(rect, axis, ratio, gap, first_min, second_min);
+        let (x, y) = match axis {
+            SplitAxis::SideBySide => (
+                second_rect.x - (second_rect.x - first_rect.x - first_rect.w) * 0.5,
+                rect.y + rect.h * 0.5,
+            ),
+            SplitAxis::Stacked => (
+                rect.x + rect.w * 0.5,
+                second_rect.y - (second_rect.y - first_rect.y - first_rect.h) * 0.5,
+            ),
+        };
+        self.on_pointer_motion(PointerPosition { x, y });
+        let Some(drag) = self.divider_drag_at(PointerButton::Left) else {
+            return Err("bench action could not start a divider drag".to_string());
+        };
+        self.divider_drag = Some(drag);
+        self.suppress_release(PointerButton::Left);
+        Ok((axis, x, y))
     }
 
     /// Palette a tab created now starts with: the configured background, with
@@ -1888,6 +1895,7 @@ impl App {
                 true
             }
             CloseTarget::Tab(index) => self.close_terminal_tab_at(index),
+            CloseTarget::Pane(pane) => self.close_pane(pane),
         }
     }
 
@@ -1898,7 +1906,7 @@ impl App {
         // A tab target lists every pane of that tab. Its index names one of the
         // tab's terminals; the tab itself comes from the split tree.
         let tab_filter = match target {
-            CloseTarget::Window => None,
+            CloseTarget::Window | CloseTarget::Pane(_) => None,
             CloseTarget::Tab(index) => {
                 let Some(terminal) = self.terminals.get(index) else {
                     return Vec::new();
@@ -1909,8 +1917,18 @@ impl App {
                 Some(tab)
             }
         };
+        // A pane target lists only its own terminal.
+        let pane_filter = match target {
+            CloseTarget::Pane(pane) => Some(pane),
+            CloseTarget::Window | CloseTarget::Tab(_) => None,
+        };
         let mut busy = Vec::new();
         for terminal in &self.terminals {
+            if let Some(pane) = pane_filter
+                && terminal.pane_id() != pane
+            {
+                continue;
+            }
             if let Some(tab) = tab_filter
                 && self.tab_index_of_pane(terminal.pane_id()) != Some(tab)
             {
@@ -1955,6 +1973,10 @@ impl App {
         };
         let tab = self.tabs[tab_index].id;
         let was_active_tab = tab_index == self.active_tab;
+        // Identity of the active tab before the close: a close reveals the
+        // tail of the tab it moves focus to, not of the tab it leaves alone.
+        let active_tab_id = self.tabs.get(self.active_tab).map(|entry| entry.id);
+        let pending_tab_reveal = self.pending_tab_reveal;
         let last_pane_of_tab = leaf_count(&self.tabs[tab_index].layout) == 1;
         // The last pane of the last tab is shut down synchronously instead of
         // waiting for the cleanup worker; that branch cannot refuse.
@@ -1974,10 +1996,19 @@ impl App {
         // The cleanup is accepted (or no process needs it): the terminal really
         // leaves storage. Only now end the live pointer gesture, because a
         // refused cleanup keeps both the pane and its owner.
-        // The drag node may be the leaf being closed: restore before the tree moves.
-        // The removed terminal shifts the indices the pointer owner holds.
-        self.cancel_divider_drag();
-        self.reset_split_pointer_owner();
+        // A divider drag belongs to the active tab only: a pane of a background
+        // tab leaves it alone and it is carried to the new structure generation
+        // below. The pointer owner does not: in grid mode `panels` keeps the
+        // pre-removal tile composition, so the owner must end before the
+        // removal shifts its terminal index.
+        if was_active_tab {
+            // The drag node may be the leaf being closed: restore before the
+            // tree moves.
+            self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
+        } else if self.claude_grid.is_some() {
+            self.reset_split_pointer_owner();
+        }
         let tree_successor = if last_pane_of_tab {
             self.remove_last_pane_of_tab(tab);
             None
@@ -1987,12 +2018,26 @@ impl App {
         if let Some(next) = tree_successor
             && let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab)
         {
-            self.tabs[tab_index].active_pane = next;
+            self.set_tab_active_pane(tab_index, next);
         }
         self.terminal_tab_drag = None;
         self.cancel_close_dialog();
-        self.pending_tab_reveal = Some(false);
         self.focus_after_removal(tab, was_active_tab, tree_successor, grid_successor);
+        // The dragged tab's tree and body did not change, so only the global
+        // generation grew: carry the drag over without a rollback.
+        if !was_active_tab
+            && self.claude_grid.is_none()
+            && let Some(drag) = self.divider_drag.as_mut()
+        {
+            drag.structure_generation = self.structure_generation;
+        }
+        // Only a close that changed or removed the active tab sets the reveal;
+        // a close that keeps it keeps the reveal seen before the close.
+        if self.tabs.get(self.active_tab).map(|entry| entry.id) != active_tab_id {
+            self.pending_tab_reveal = Some(false);
+        } else {
+            self.pending_tab_reveal = pending_tab_reveal;
+        }
         self.request_frame();
         self.sync_claude_grid(Instant::now());
         self.terminals.is_empty()
@@ -2007,6 +2052,8 @@ impl App {
             return false;
         };
         let was_active_tab = tab_index == self.active_tab;
+        // Identity of the active tab before the close; see `close_pane`.
+        let active_tab_id = self.tabs.get(self.active_tab).map(|entry| entry.id);
         let mut panes = Vec::new();
         collect_split_panes(&self.tabs[tab_index].layout, &mut panes);
         // The tile that holds the focus now: §6.4 keeps the focus on it when a
@@ -2015,6 +2062,15 @@ impl App {
             .terminals
             .get(self.active_terminal)
             .map(Terminal::pane_id);
+        // The grid neighbours of the focused tile are read before the first
+        // removal, while the previous tile order still exists, and they are
+        // kept by pane identity: the removals shift terminal indices, and only
+        // a tile that survives them may take the focus.
+        let grid_candidates = if self.claude_grid.is_some() && was_active_tab {
+            focused_pane.map_or_else(Vec::new, |pane| self.grid_successors_after_tile(pane))
+        } else {
+            Vec::new()
+        };
         let mut tree_successor = None;
         for pane in panes {
             let Some(index) = self.terminal_index_of_pane(pane) else {
@@ -2047,7 +2103,7 @@ impl App {
             if let Some(next) = self.remove_terminal_at(index) {
                 tree_successor = Some(next);
                 if let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) {
-                    self.tabs[tab_index].active_pane = next;
+                    self.set_tab_active_pane(tab_index, next);
                 }
             }
         }
@@ -2058,14 +2114,19 @@ impl App {
             && was_active_tab
             && focused_pane.is_none_or(|pane| self.terminal_index_of_pane(pane).is_none())
         {
-            self.grid_successor_after_focused_removal()
+            grid_candidates
+                .into_iter()
+                .find_map(|pane| self.terminal_index_of_pane(pane))
         } else {
             None
         };
         self.terminal_tab_drag = None;
         self.cancel_close_dialog();
-        self.pending_tab_reveal = Some(false);
         self.focus_after_removal(tab, was_active_tab, tree_successor, grid_successor);
+        // Only a close that changed or removed the active tab sets the reveal.
+        if self.tabs.get(self.active_tab).map(|entry| entry.id) != active_tab_id {
+            self.pending_tab_reveal = Some(false);
+        }
         self.request_frame();
         self.sync_claude_grid(Instant::now());
         self.terminals.is_empty()
@@ -2119,6 +2180,12 @@ impl App {
             self.active_terminal_presented = false;
         }
         self.terminals.remove(index);
+        // The pointer owner holds a terminal index too: it follows its terminal.
+        match self.split_pointer_owner {
+            Some(owner) if owner == index => self.split_pointer_owner = None,
+            Some(owner) if owner > index => self.split_pointer_owner = Some(owner - 1),
+            _ => {}
+        }
         if index < self.active_terminal {
             self.active_terminal -= 1;
         } else if index == self.active_terminal {
@@ -2249,7 +2316,7 @@ impl App {
                 self.active_tab = tab_index;
                 self.bump_structure_generation();
             }
-            self.tabs[tab_index].active_pane = pane;
+            self.set_tab_active_pane(tab_index, pane);
         }
         self.active_terminal = index;
         self.active_terminal_presented = false;
@@ -3061,7 +3128,7 @@ impl App {
             GlobalShortcut::FocusPane(direction) => self.focus_pane_in_direction(direction),
             GlobalShortcut::ClosePane => {
                 if let Some(pane) = self.tabs.get(self.active_tab).map(|tab| tab.active_pane)
-                    && self.close_pane(pane)
+                    && self.request_terminal_close(CloseTarget::Pane(pane))
                 {
                     return true;
                 }
@@ -3321,13 +3388,13 @@ impl App {
         }
     }
 
-    /// Fills `grid_members_scratch` with the tabs whose foreground is Claude Code.
+    /// Fills `grid_members_scratch` with the terminals whose foreground is Claude
+    /// Code: tab strip order first, split-tree order inside each tab. Every
+    /// terminal is a leaf of exactly one tab tree (§4 invariant).
     fn collect_claude_members(&mut self) {
         self.grid_members_scratch.clear();
-        for (index, terminal) in self.terminals.iter().enumerate() {
-            if terminal.claude_foreground() {
-                self.grid_members_scratch.push(index);
-            }
+        for tab in &self.tabs {
+            push_claude_leaves(&tab.layout, &self.terminals, &mut self.grid_members_scratch);
         }
     }
 
@@ -3358,9 +3425,9 @@ impl App {
             })
     }
 
-    /// Tile that takes focus after `removed` terminals disappear: the next grid
-    /// member after the focused tile in grid order, skipping every removed
-    /// index, else the previous one. Returns the terminal index after the
+    /// Tile that takes focus after `removed` terminals disappear: the first
+    /// surviving grid member after the focused tile's position, else the last
+    /// surviving member before it. Returns the terminal index after the
     /// removals, and `None` outside grid mode or when no tile survives.
     fn grid_successor_after_removal(&self, removed: &[usize]) -> Option<usize> {
         let grid = self.claude_grid.as_ref()?;
@@ -3368,42 +3435,63 @@ impl App {
             return None;
         }
         let live = |member: &usize| !removed.contains(member);
-        let pivot = self.active_terminal;
-        let target = grid
+        // Members follow the tab strip and the split trees, so the neighbour
+        // is taken by position in that order, not by terminal index.
+        let pos = grid
             .members
             .iter()
+            .position(|&member| member == self.active_terminal)?;
+        let target = grid.members[pos + 1..]
+            .iter()
             .copied()
-            .filter(live)
-            .find(|&member| member > pivot)
-            .or_else(|| {
-                grid.members
-                    .iter()
-                    .rev()
-                    .copied()
-                    .filter(live)
-                    .find(|&member| member < pivot)
-            })?;
+            .find(live)
+            .or_else(|| grid.members[..pos].iter().rev().copied().find(live))?;
         Some(target - removed.iter().filter(|&&index| index < target).count())
     }
 
-    /// Tile that takes the focus once the focused tile has left while the grid
-    /// is open: the first surviving member at or after the slot the tile
-    /// occupied, else the last member before it (§6.4). `remove_terminal_at`
-    /// leaves `active_terminal` on that slot, so it is the pivot of the search.
-    fn grid_successor_after_focused_removal(&mut self) -> Option<usize> {
-        self.collect_claude_members();
-        let slot = self.active_terminal;
-        self.grid_members_scratch
+    /// Tiles that may take the focus when the tile of `pivot` leaves with its
+    /// tab, in grid order: the members after its position, then the members
+    /// before it in reverse. The caller keeps the first tile that survives the
+    /// removals, so a refused cleanup still leaves the focus on a live tile
+    /// (§6.4). The tile order is the tab strip and the split trees, so it is
+    /// not the terminal index order.
+    fn grid_successors_after_tile(&self, pivot: PaneId) -> Vec<PaneId> {
+        let Some(grid) = self.claude_grid.as_ref() else {
+            return Vec::new();
+        };
+        let Some(pos) = self
+            .terminal_index_of_pane(pivot)
+            .and_then(|index| grid.members.iter().position(|&member| member == index))
+        else {
+            return Vec::new();
+        };
+        grid.members[pos + 1..]
+            .iter()
+            .chain(grid.members[..pos].iter().rev())
+            .filter_map(|&member| self.terminals.get(member).map(Terminal::pane_id))
+            .collect()
+    }
+
+    /// Tile that takes the focus when the focused tile loses its Claude flag:
+    /// the next tile of the current member order that still has the flag, else
+    /// the previous one. Members follow the tab strip and the split trees, so
+    /// their terminal indices are not in ascending order.
+    fn grid_neighbour_by_tile_position(&self) -> Option<usize> {
+        let grid = self.claude_grid.as_ref()?;
+        let pos = grid
+            .members
+            .iter()
+            .position(|&member| member == self.active_terminal)?;
+        let live = |member: &usize| {
+            self.terminals
+                .get(*member)
+                .is_some_and(|terminal| terminal.claude_foreground())
+        };
+        grid.members[pos + 1..]
             .iter()
             .copied()
-            .find(|&member| member >= slot)
-            .or_else(|| {
-                self.grid_members_scratch
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|&member| member < slot)
-            })
+            .find(live)
+            .or_else(|| grid.members[..pos].iter().rev().copied().find(live))
     }
 
     /// Whether the current members fit the window body at the current metrics (Q9).
@@ -3480,6 +3568,19 @@ impl App {
         if self.claude_grid.is_none() {
             return;
         }
+        // The focused tile may lose its Claude flag between syncs. Its
+        // neighbour is taken from the tile position in the previous
+        // composition, before the members are rebuilt.
+        let active = self.active_terminal;
+        let previous_neighbour = if self
+            .terminals
+            .get(active)
+            .is_some_and(|terminal| !terminal.claude_foreground())
+        {
+            self.grid_neighbour_by_tile_position()
+        } else {
+            None
+        };
         self.collect_claude_members();
         let members_changed = self
             .claude_grid
@@ -3497,16 +3598,18 @@ impl App {
             self.exit_claude_grid(None);
             return;
         }
-        let active = self.active_terminal;
         if !self.grid_contains(active) {
-            // Members are tab indices in ascending order: the next one after the
-            // focused tab, else the last one (all of them lie before it).
-            let target = grid
-                .members
-                .iter()
-                .copied()
-                .find(|&index| index > active)
-                .or_else(|| grid.members.last().copied());
+            // Tile order is the tab strip and the split trees, so the next
+            // tile is the next member in that order, else the previous one.
+            // A focused terminal that was not a tile has no position there
+            // and falls back to the first tile after its index.
+            let target = previous_neighbour.or_else(|| {
+                grid.members
+                    .iter()
+                    .copied()
+                    .find(|&index| index > active)
+                    .or_else(|| grid.members.last().copied())
+            });
             if let Some(target) = target {
                 self.cancel_terminal_presentation_intents();
                 self.activate_ready_terminal(target, false);
@@ -4501,6 +4604,13 @@ impl App {
         let grid_mode = self.grid_open() || self.active_tab_split();
         // Read before the loop: `tab_visible` cannot be called while `terminals` is borrowed.
         let grid_members = self.claude_grid.as_ref().map(|grid| grid.members.as_slice());
+        // Without a grid, the panes of the active tab are the ones on screen.
+        // Both are read from the state, not from `panels`: a grid toggled since
+        // the last frame has not rebuilt the panels yet.
+        let visible_layout = match grid_members {
+            Some(_) => None,
+            None => self.tabs.get(self.active_tab).map(|tab| &tab.layout),
+        };
         let panels = &self.panels;
         let mut bell_rang = false;
         let mut dev_redraw = false;
@@ -4509,10 +4619,13 @@ impl App {
             // the published deadline is read from the same pending state.
             if terminal.apply_host_events(&mut self.interaction) {
                 bell_rang = true;
-                // Tiles of an open grid and the active tab are on screen; only
-                // other tabs get a mark.
-                let on_grid_tile = grid_members.is_some_and(|members| members.contains(&index));
-                if !on_grid_tile && index != active {
+                // Grid tiles and the visible panes of the active tab are on
+                // screen, and so is the active terminal; only other terminals
+                // get a mark.
+                let pane = terminal.pane_id();
+                let on_screen_tile = grid_members.is_some_and(|members| members.contains(&index))
+                    || visible_layout.is_some_and(|layout| split_contains_pane(layout, pane));
+                if !on_screen_tile && index != active {
                     terminal.mark_bell_pending();
                 }
             }
@@ -7843,18 +7956,88 @@ mod tests {
         let generation = app.grid_generation;
         let layout_generation = app.layout_generation;
 
-        // Tiles are panes, not tabs: moving a tab in the strip leaves the grid
-        // composition alone, so its generation and its tile order stay put.
+        // Tiles follow the tab strip, not the storage order: moving tab 0 behind
+        // tab 1 makes terminal 1 tile 0 and bumps the grid generation.
         app.reorder_terminal_tab(0, 1);
-        assert_eq!(app.grid_generation, generation);
+        app.sync_claude_grid(Instant::now());
+        assert_ne!(app.grid_generation, generation);
         assert!(app.layout_generation > layout_generation);
-        // The inactive history tile keeps its scroll target: index 1 still names it.
+        assert_eq!(
+            app.claude_grid.as_ref().map(|grid| grid.members.clone()),
+            Some(vec![1, 0])
+        );
+        // The inactive history terminal keeps its scroll target across the reorder.
         app.terminals[1].scroll_y.target = 20.0;
         app.terminals[1].scroll_y.current = 20.0;
 
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert_eq!(app.terminals[1].scroll_y.target, 20.0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_members_follow_tab_order_not_terminal_storage() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-tab-order-members",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Storage stays [0, 1]; moving tab 0 to the end puts terminal 1 first.
+        app.reorder_terminal_tab(0, 1);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(
+            app.claude_grid.as_ref().map(|grid| grid.members.clone()),
+            Some(vec![1, 0])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_members_follow_split_tree_order_inside_one_tab() {
+        let mut app = App::new();
+        let first = app.issue_pane_id();
+        let second = app.issue_pane_id();
+        let third = app.issue_pane_id();
+        push_test_terminal(&mut app, presentation_ready_terminal(1, first));
+        push_test_terminal(&mut app, presentation_ready_terminal(2, second));
+        push_test_terminal(&mut app, presentation_ready_terminal(3, third));
+        // One tab owns all three panes, with `third` inserted between `first`
+        // and `second` in tree order: the tree order [first, third, second]
+        // differs from the terminal order [first, second, third].
+        app.tabs[0].layout = SplitNode::Split {
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            first: Box::new(SplitNode::Split {
+                axis: SplitAxis::Stacked,
+                ratio: 0.5,
+                first: Box::new(SplitNode::Leaf(first)),
+                second: Box::new(SplitNode::Leaf(third)),
+            }),
+            second: Box::new(SplitNode::Leaf(second)),
+        };
+        app.tabs[0].active_pane = first;
+        app.tabs.remove(2);
+        app.tabs.remove(1);
+        app.active_tab = 0;
+        app.active_terminal = 0;
+        app.active_terminal_presented = true;
+        // Claude flags on the new middle pane (terminal 2) and on the last
+        // tree leaf (terminal 1).
+        app.terminals[2].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.grid_metrics = GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        };
+
+        app.toggle_claude_grid(Instant::now());
+
+        assert_eq!(grid_mode_members(&app), Some(vec![2, 1]));
     }
 
     #[test]
@@ -7937,6 +8120,236 @@ mod tests {
         app.build_tab_labels();
         assert!(!app.tab_labels[1].bell_pending);
         assert!(!app.tab_labels[0].bell_pending);
+    }
+
+    /// Tab 0 holds a background split (two panes, the lower terminal indices);
+    /// tab 1 is active with its right pane focused and holds a split as well.
+    fn background_and_active_split_app(tag: &str) -> (App, PathBuf, PaneId, PaneId) {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(tag, 2);
+        assert_eq!(app.tabs.len(), 2);
+        let bg_pane = attach_test_pane(&mut app, 0, 3);
+        let active_right = attach_test_pane(&mut app, 1, 4);
+        app.activate_pane(active_right, false);
+        assert_eq!(app.active_tab, 1);
+        app.set_grid_metrics(GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        assert_eq!(app.on_frame(), Ok(true));
+        (app, root, bg_pane, active_right)
+    }
+
+    /// A divider drag of the root split of the active tab, seeded without
+    /// pointer events.
+    fn seeded_divider_drag(app: &App) -> DividerDrag {
+        DividerDrag {
+            tab: app.tabs[app.active_tab].id,
+            path: Vec::new(),
+            axis: SplitAxis::SideBySide,
+            button: PointerButton::Left,
+            structure_generation: 0,
+            ratio_at_start: 0.5,
+            grab_offset: 0.0,
+        }
+    }
+
+    #[test]
+    fn split_bell_from_visible_inactive_pane_does_not_mark_the_tab() {
+        let (mut app, left, right, root) = focused_right_split_app("bell-visible-pane");
+        assert_eq!(app.tabs[0].active_pane, right);
+        let left_terminal = app
+            .terminal_index_of_pane(left)
+            .expect("the left pane has a terminal");
+
+        // The left pane is visible in the active tab: its bell is not marked.
+        app.terminals[left_terminal].ring_bell_for_test();
+        app.drain_terminal_host_events();
+        app.build_tab_labels();
+        assert!(!app.terminals[left_terminal].bell_pending());
+        assert!(
+            !app.tab_labels[0].bell_pending,
+            "a visible pane must not mark the active tab"
+        );
+
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn background_pane_close_keeps_divider_drag_and_follows_owner() {
+        let (mut app, root, bg_pane, active_right) =
+            background_and_active_split_app("drag-bg-close");
+        let owner = app
+            .terminal_index_of_pane(active_right)
+            .expect("the active right pane has a terminal");
+        let bg_index = app
+            .terminal_index_of_pane(bg_pane)
+            .expect("the background pane has a terminal");
+        assert!(bg_index < owner, "the closed terminal must precede the owner");
+        // A real press on the divider of the active tab seeds the drag with the
+        // current structure generation.
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(app.divider_drag.is_some());
+        app.split_pointer_owner = Some(owner);
+        let ratio_before = split_root_ratio(&app, app.active_tab);
+
+        assert!(!app.close_pane(bg_pane));
+
+        assert!(app.terminal_index_of_pane(bg_pane).is_none());
+        let drag = app
+            .divider_drag
+            .as_ref()
+            .expect("a pane of a background tab leaves the divider drag alone");
+        assert_eq!(
+            drag.structure_generation, app.structure_generation,
+            "the drag is carried to the new structure generation"
+        );
+        assert_eq!(
+            app.split_pointer_owner,
+            app.terminal_index_of_pane(active_right),
+            "the pointer owner must follow its terminal after the index shift"
+        );
+
+        // The divider still follows the pointer after the background close.
+        split_pointer_move(&mut app, start.0 + 24.0, start.1);
+        assert!(app.divider_drag.is_some(), "the drag must survive the motion");
+        let ratio_after = split_root_ratio(&app, app.active_tab);
+        assert!(
+            ratio_after > ratio_before,
+            "the drag must still resize the active tab's divider: {ratio_before} -> {ratio_after}"
+        );
+
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_open_background_pane_close_resets_split_pointer_owner() {
+        let mut app = grid_mode_app(&[true, true, false]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        assert_eq!(app.active_terminal, 0);
+        // The pointer was pressed on the second tile.
+        app.split_pointer_owner = Some(1);
+        let background_pane = app.tabs[2].active_pane;
+
+        assert!(!app.close_pane(background_pane));
+
+        assert!(app.terminal_index_of_pane(background_pane).is_none());
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.grid_open());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        assert!(
+            app.split_pointer_owner.is_none(),
+            "a close in grid mode ends the pointer ownership before the tiles go stale"
+        );
+    }
+
+    #[test]
+    fn active_tab_pane_close_cancels_divider_drag_and_owner() {
+        let (mut app, root, _bg_pane, active_right) =
+            background_and_active_split_app("drag-own-close");
+        let owner = app
+            .terminal_index_of_pane(active_right)
+            .expect("the active right pane has a terminal");
+        app.divider_drag = Some(seeded_divider_drag(&app));
+        app.split_pointer_owner = Some(owner);
+
+        app.close_pane(active_right);
+
+        assert!(app.divider_drag.is_none());
+        assert!(app.split_pointer_owner.is_none());
+
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_keeps_pending_activation_of_another_tab() {
+        let (mut app, _receiver, _profile, root) =
+            headless_split_app("split-keeps-intent", 2);
+        let other_pane = app.tabs[1].active_pane;
+        let other = app
+            .terminal_index_of_pane(other_pane)
+            .expect("the other tab has a terminal");
+        app.terminals[other].presentation_intent = TerminalPresentationIntent::ActivateWhenReady;
+
+        press_ctrl_shift(&mut app, KeyCode::KeyD);
+
+        assert_eq!(leaf_count(&app.tabs[0].layout), 2, "the active tab was split");
+        let other = app
+            .terminal_index_of_pane(other_pane)
+            .expect("the other tab keeps its terminal");
+        assert!(matches!(
+            app.terminals[other].presentation_intent,
+            TerminalPresentationIntent::ActivateWhenReady
+        ));
+
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_inactive_pane_of_active_tab_keeps_pending_reveal() {
+        let (mut app, left, _right, root) = focused_right_split_app("reveal-visible-close");
+        app.pending_tab_reveal = Some(true);
+
+        app.close_pane(left);
+
+        assert_eq!(app.pending_tab_reveal, Some(true));
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_active_pane_of_active_tab_keeps_pending_reveal() {
+        let (mut app, left, right, root) = focused_right_split_app("reveal-active-pane-close");
+        app.pending_tab_reveal = None;
+
+        app.close_pane(right);
+
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert_eq!(
+            app.pending_tab_reveal, None,
+            "a close that keeps the active tab keeps the reveal"
+        );
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_pane_of_background_tab_keeps_pending_reveal() {
+        let (mut app, root, bg_pane, _active_right) =
+            background_and_active_split_app("reveal-bg-close");
+        app.pending_tab_reveal = Some(true);
+
+        app.close_pane(bg_pane);
+
+        assert_eq!(app.pending_tab_reveal, Some(true));
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_last_pane_of_active_tab_sets_reveal_false() {
+        let (mut app, _receiver, _profile, root) =
+            headless_split_app("reveal-last-pane", 2);
+        assert_eq!(app.active_tab, 0);
+        let pane = app.tabs[0].active_pane;
+        app.pending_tab_reveal = Some(true);
+
+        app.close_pane(pane);
+
+        assert_eq!(app.tabs.len(), 1, "the closed tab is gone");
+        assert_eq!(app.pending_tab_reveal, Some(false));
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -8258,6 +8671,8 @@ mod tests {
 
         let _ = press_ctrl_shift(&mut app, KeyCode::KeyW);
 
+        // The right pane runs no job, so its close skips the dialog.
+        assert!(app.close_confirm.is_none());
         assert!(app.terminal_index_of_pane(right).is_none());
         assert_eq!(app.terminals.len(), 1);
         assert_eq!(app.terminals[0].pane_id(), left);
@@ -8265,6 +8680,109 @@ mod tests {
         assert_eq!(app.tabs[0].active_pane, left);
         assert_eq!(app.active_terminal, 0);
         app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Replaces the terminal of `pane` with a real shell running `sleep 30` in
+    /// the foreground, and waits until the pane reports that job as busy.
+    fn make_pane_busy(app: &mut App, label: &str, pane: PaneId) {
+        let index = app
+            .terminal_index_of_pane(pane)
+            .expect("the pane has a terminal");
+        app.terminals[index] = spawn_shell_tab(label, pane);
+        app.terminals[index].write_input(b"sleep 30\r").unwrap();
+        wait_for_test_condition("foreground sleep job in the pane", || {
+            !app.busy_close_targets(CloseTarget::Pane(pane)).is_empty()
+        });
+    }
+
+    #[test]
+    fn ctrl_shift_w_on_busy_pane_asks_then_closes_only_that_pane() {
+        let (mut app, left, right, root) = focused_right_split_app("close-pane-confirm");
+        make_pane_busy(&mut app, "close-pane-confirm", right);
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyW));
+        let confirm = app
+            .close_confirm
+            .as_ref()
+            .expect("a busy pane opens the dialog");
+        assert_eq!(confirm.target, CloseTarget::Pane(right));
+        assert_eq!(confirm.title, "Закрыть панель?");
+        assert!(app.terminal_index_of_pane(right).is_some());
+        assert_eq!(app.terminals.len(), 2);
+
+        assert!(!app.confirm_close_dialog());
+        assert!(app.close_confirm.is_none());
+        assert!(app.terminal_index_of_pane(right).is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), left);
+        assert_eq!(app.tabs[0].active_pane, left);
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_pane_close_keeps_the_busy_pane() {
+        let (mut app, left, right, root) = focused_right_split_app("close-pane-cancel");
+        make_pane_busy(&mut app, "close-pane-cancel", right);
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyW));
+        assert!(app.close_confirm.is_some());
+        app.cancel_close_dialog();
+
+        assert!(app.close_confirm.is_none());
+        assert!(app.terminal_index_of_pane(right).is_some());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.tabs[0].active_pane, right);
+        assert!(app.terminal_index_of_pane(left).is_some());
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn free_pane_next_to_busy_sibling_closes_without_dialog() {
+        let (mut app, left, right, root) = focused_right_split_app("close-free-pane");
+        make_pane_busy(&mut app, "close-free-pane", right);
+        // The free pane takes the focus; its busy sibling stays in the tab.
+        app.activate_pane(left, false);
+        app.rebuild_panels();
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyW));
+
+        assert!(
+            app.close_confirm.is_none(),
+            "a free pane closes without a dialog next to a busy sibling"
+        );
+        assert!(app.terminal_index_of_pane(left).is_none());
+        assert!(
+            app.terminal_index_of_pane(right).is_some(),
+            "the busy sibling must not be closed with the free pane"
+        );
+        assert_eq!(app.tabs[0].active_pane, right);
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn confirm_after_pane_vanished_does_nothing() {
+        let (mut app, left, right, root) = focused_right_split_app("close-pane-vanished");
+        // The pane leaves on its own before the dialog is confirmed. Its close
+        // also cancels any open dialog, so the stale dialog is set again here.
+        assert!(!app.close_pane(right));
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Pane(right),
+            title: "Закрыть панель?",
+            rows: vec!["tab — sleep".to_string()],
+            more: None,
+            hovered: CloseConfirmHit::None,
+        });
+
+        assert!(!app.confirm_close_dialog());
+        assert!(app.close_confirm.is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), left);
+        assert_eq!(app.tabs[0].active_pane, left);
+        app.shutdown_all();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8709,7 +9227,8 @@ mod tests {
             char_h: 16.0,
         };
         app.toggle_claude_grid(Instant::now());
-        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        // Tiles follow the tab strip: tab 0 (with `focused`) comes before tab 1.
+        assert_eq!(grid_mode_members(&app), Some(vec![2, 1]));
         assert_eq!(app.active_terminal, 2);
         app.terminal_cleanup.shutdown_and_join();
         let tab = app.tabs[0].id;
@@ -8728,7 +9247,7 @@ mod tests {
             app.terminals[0].has_process(),
             "the refused shell keeps its process"
         );
-        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        assert_eq!(grid_mode_members(&app), Some(vec![2, 1]));
         app.debug_assert_invariants();
         app.shutdown_all();
     }
@@ -8926,6 +9445,76 @@ mod tests {
         assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
         assert_eq!(app.active_terminal, 1);
         assert!(app.active_terminal_presented);
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn grid_successor_after_pane_close_follows_tile_position() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        // Tabs [0, 1, 2] become [1, 0, 2], so the tile order is [1, 0, 2]:
+        // terminal 0 is the middle tile and terminal 2 is the next one.
+        app.reorder_terminal_tab(0, 1);
+        app.active_tab = 1;
+        app.active_terminal = 0;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 0, 2]));
+        let next = app.terminals[2].pane_id();
+        let closed = app.terminals[0].pane_id();
+
+        assert!(!app.close_pane(closed));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.terminals[1].pane_id(), next);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn grid_successor_after_last_tile_close_falls_back_to_previous_tile() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        // Tabs [0, 1, 2] become [1, 2, 0], so the tile order is [1, 2, 0]:
+        // terminal 0 is the last tile and terminal 2 the previous one.
+        app.reorder_terminal_tab(0, 2);
+        app.active_tab = 2;
+        app.active_terminal = 0;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 2, 0]));
+        let previous = app.terminals[2].pane_id();
+        let closed = app.terminals[0].pane_id();
+
+        assert!(!app.close_pane(closed));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.terminals[1].pane_id(), previous);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        app.debug_assert_invariants();
+    }
+
+    #[test]
+    fn grid_successor_after_tab_close_follows_tile_position() {
+        let mut app = grid_mode_app(&[true, true, true]);
+        // Tile order [1, 0, 2]: closing the middle tile's tab hands the focus
+        // to terminal 2, not to the numerically next terminal 1.
+        app.reorder_terminal_tab(0, 1);
+        app.active_tab = 1;
+        app.active_terminal = 0;
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![1, 0, 2]));
+        let next = app.terminals[2].pane_id();
+        let tab = app.tabs[1].id;
+
+        assert!(!app.close_tab(tab));
+
+        assert!(app.grid_open());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.active_terminal, 1);
+        assert_eq!(app.terminals[1].pane_id(), next);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
         app.debug_assert_invariants();
     }
 
@@ -10553,6 +11142,50 @@ mod tests {
         assert_eq!(left_cols, app.panel_layouts[0].cols);
         assert_eq!(right_cols, app.panel_layouts[1].cols);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn divider_drag_past_window_edges_keeps_open_ratio_and_pane_minimums() {
+        // A plain root split and a root whose right child is a nested split, so
+        // the second minimum is the subtree minimum, not one pane's minimum.
+        for (tag, nested) in [("t7-drag-clamp", false), ("t7-drag-clamp-nested", true)] {
+            let (mut app, root) = split_pointer_app(tag);
+            if nested {
+                let second = match crate::split::node_at_path(&app.tabs[0].layout, &[1]) {
+                    Some(SplitNode::Leaf(pane)) => *pane,
+                    other => panic!("{tag}: the root's second child is a leaf: {other:?}"),
+                };
+                attach_test_pane_at(&mut app, second, SplitAxis::SideBySide, 3);
+                assert_eq!(app.on_frame(), Ok(true));
+            }
+            let metrics = app.grid_metrics;
+            let (min_w, min_h) = pane_min(metrics.char_w, metrics.char_h, metrics.scale);
+            let start = split_divider_point(&app);
+            split_pointer_move(&mut app, start.0, start.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert!(app.divider_drag.is_some(), "{tag}: the press grabs the divider");
+
+            // Far past either window edge: the drag clamps at each side's
+            // minimum and never reaches a closed ratio.
+            for x in [-10_000.0, metrics.width + 10_000.0] {
+                split_pointer_move(&mut app, x, start.1);
+                assert_eq!(app.on_frame(), Ok(true));
+                let ratio = split_root_ratio(&app, 0);
+                assert!(
+                    ratio > 0.0 && ratio < 1.0,
+                    "{tag}: ratio {ratio} at x {x} stays inside (0, 1)"
+                );
+                for panel in &app.panels {
+                    assert!(
+                        panel.body.w >= min_w && panel.body.h >= min_h,
+                        "{tag}: panel {:?} is smaller than pane_min ({min_w}, {min_h})",
+                        panel.body
+                    );
+                }
+            }
+            app.on_pointer_button(KeyState::Released, PointerButton::Left);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

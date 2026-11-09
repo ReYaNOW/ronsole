@@ -4,15 +4,59 @@
 //! Expected geometry comes from the split rules of the design (§8.2): whole
 //! pixels separated by `GRID_TILE_GAP` scaled by the dump `scale`.
 
-use super::session::HeadlessSession;
-use super::tests::{run_script, session_with_shell, wait_until};
+use super::session::{FrameBudget, HeadlessSession, HzSource, ProfileChoice, SessionOptions};
+use super::tests::{TEST_BACKGROUND, run_script, wait_until};
 use crate::panels::GRID_TILE_GAP;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Directory the acceptance screenshots go to (plan Task 10).
-const SHOTS_DIR: &str = "/tmp/ronsole-split-shots";
+/// Physical framebuffer of the acceptance screenshots (plan Task 10).
+const ACCEPTANCE_SIZE: (u32, u32) = (2560, 1440);
+/// UI scale of the acceptance screenshots (plan Task 10).
+const ACCEPTANCE_SCALE: f32 = 1.333;
+
+/// Gives each test its own profile and screenshot directories within the process.
+static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+
+/// Fresh directory unique to this process and `tag`.
+fn fresh_dir(tag: &str) -> PathBuf {
+    let index = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "ronsole-split-{}-{tag}-{index}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("test directory");
+    dir
+}
+
+/// Session at the acceptance size and scale, running `/bin/sh`.
+fn acceptance_session() -> HeadlessSession {
+    crate::prefer_egl_vendor();
+    let dir = fresh_dir("profile");
+    let [red, green, blue] = TEST_BACKGROUND;
+    fs::write(
+        dir.join("config"),
+        format!("terminal_background=#{red:02X}{green:02X}{blue:02X}\n"),
+    )
+    .expect("test profile config");
+    let options = SessionOptions {
+        size: ACCEPTANCE_SIZE,
+        scale: ACCEPTANCE_SCALE,
+        profile: ProfileChoice::Dir(dir),
+        shell: Some(PathBuf::from("/bin/sh")),
+        budget: FrameBudget {
+            budget_ms: 1000.0 / 240.0,
+            hz: 240.0,
+            source: HzSource::Default,
+        },
+    };
+    let mut session = HeadlessSession::start(options).expect("acceptance session starts");
+    session.remove_profile_on_drop();
+    session
+}
 
 /// Runs `script` and panics if any response is an `err`; returns the responses.
 fn run_ok(session: &mut HeadlessSession, script: &[u8]) -> Vec<String> {
@@ -87,15 +131,16 @@ fn assert_single_tab(dump: &Value) {
     assert!(tabs[0]["title"].is_string(), "tab title is a string");
 }
 
-/// Runs `settle 500`, takes `screenshot` of `name` into `SHOTS_DIR`, and
+/// Runs `settle 500`, takes `screenshot` of `name` into `shots`, and
 /// asserts the reply and the PNG file describe the whole framebuffer.
 fn take_screenshot(
     session: &mut HeadlessSession,
+    shots: &Path,
     name: &str,
     size: (u32, u32),
 ) -> PathBuf {
     run_ok(session, b"settle 500\n");
-    let path = PathBuf::from(SHOTS_DIR).join(name);
+    let path = shots.join(name);
     let _ = fs::remove_file(&path);
     let lines = run_ok(
         session,
@@ -123,12 +168,27 @@ fn take_screenshot(
 
 #[test]
 fn headless_split_panes_screenshot_and_dump() {
-    let mut session = session_with_shell(800, 600, Some(PathBuf::from("/bin/sh")));
+    let shots = fresh_dir("shots");
+    let mut session = acceptance_session();
 
     // Start from one pane: the dump reports the tab, its single number and the
-    // active pane of the tab's tree.
+    // active pane of the tab's tree. The acceptance framebuffer and scale come
+    // from the plan, not from the implementation.
     let single = wait_for_panels(&mut session, 1, "one pane before any split");
     assert_single_tab(&single);
+    assert_eq!(
+        single["size"][0].as_u64(),
+        Some(u64::from(ACCEPTANCE_SIZE.0))
+    );
+    assert_eq!(
+        single["size"][1].as_u64(),
+        Some(u64::from(ACCEPTANCE_SIZE.1))
+    );
+    let scale = single["scale"].as_f64().expect("dump scale is a number");
+    assert!(
+        (scale - f64::from(ACCEPTANCE_SCALE)).abs() < 1e-6,
+        "acceptance scale is {scale}"
+    );
     let first_pane = pane_id(&single["panels"][0]);
     assert_eq!(single["active_pane"].as_u64(), Some(first_pane));
     assert_eq!(single["panels"][0]["content_hidden"], false);
@@ -140,7 +200,11 @@ fn headless_split_panes_screenshot_and_dump() {
     let panels = side_by_side["panels"].as_array().expect("panels");
     assert_no_overlap(panels);
     let gap = expected_gap(&side_by_side);
-    assert_eq!(gap, 6.0, "scale 1.0 and GRID_TILE_GAP 6 px");
+    assert_eq!(
+        gap,
+        (f64::from(GRID_TILE_GAP) * f64::from(ACCEPTANCE_SCALE)).round(),
+        "the divider gap follows the acceptance scale"
+    );
     let (left_x, left_y, left_w, left_h) = panel_rect(&panels[0]);
     let (right_x, right_y, _right_w, right_h) = panel_rect(&panels[1]);
     assert_eq!(left_y, right_y, "side-by-side panes share a top edge");
@@ -155,7 +219,7 @@ fn headless_split_panes_screenshot_and_dump() {
         side_by_side["active_pane"].as_u64().expect("active pane"),
         "the new pane takes the focus"
     );
-    take_screenshot(&mut session, "split-2-side-by-side.png", (800, 600));
+    take_screenshot(&mut session, &shots, "split-2-side-by-side.png", ACCEPTANCE_SIZE);
 
     // Ctrl+Shift+E splits the focused pane into a stacked column (3 panes).
     run_ok(&mut session, b"key ctrl+shift+e\n");
@@ -190,7 +254,7 @@ fn headless_split_panes_screenshot_and_dump() {
         nested["active_pane"].as_u64().expect("active pane"),
         "the newest pane takes the focus"
     );
-    take_screenshot(&mut session, "split-3-nested.png", (800, 600));
+    take_screenshot(&mut session, &shots, "split-3-nested.png", ACCEPTANCE_SIZE);
 
     // Ctrl+Shift+W closes the focused pane and gives focus to its neighbour.
     run_ok(&mut session, b"key ctrl+shift+w\n");
