@@ -805,8 +805,9 @@ pub struct App {
     last_header_press: Option<(Instant, usize)>,
     hovered_panel_terminal: Option<usize>,
     /// Terminal that received the press of a pointer drag begun in a split
-    /// pane, while `pointer_capture` is `None`. Motion and the paired release
-    /// go to it with its pane's layout even after the pointer leaves its body.
+    /// pane or a grid tile, while `pointer_capture` is `None`. Motion and the
+    /// paired release go to it with its own layout even after the pointer
+    /// leaves its body. Ownership lasts only while a button is still held.
     split_pointer_owner: Option<usize>,
     /// Earliest end of the banner hiding among grid tiles that the last grid
     /// frame drew with `content_hidden`; grid mode only.
@@ -1177,9 +1178,9 @@ impl App {
         Some((terminal, layout))
     }
 
-    /// Terminal and layout of the split pane that owns the pressed pointer.
-    /// The press stays with that terminal while any button is held, even after
-    /// the pointer leaves the pane's body.
+    /// Terminal and layout of the split pane or grid tile that owns the
+    /// pressed pointer. The press stays with that terminal while any button is
+    /// held, even after the pointer leaves the pane's body.
     fn split_pointer_target(&self) -> Option<(usize, TerminalUiLayout)> {
         let owner = self.split_pointer_owner?;
         let index = self
@@ -2304,14 +2305,15 @@ impl App {
         self.mark_dirty();
     }
 
-    /// Ends the split pointer ownership before a structural change or a mode
-    /// switch. The terminal indices behind the owner may shift and the pressed
-    /// pane may disappear, so a later physical release must not reach another
-    /// terminal: every button the owner still holds gets its release swallowed
-    /// and its press state cancelled. The owner's application did see those
-    /// presses, so the gesture ends for it first with a protocol release on the
-    /// claimed path; otherwise a change in a neighbouring pane leaves it
-    /// dragging. The layout stays actual for ordinary input.
+    /// Ends the pressed-pointer ownership of a split pane or grid tile before
+    /// a structural change or a mode switch. The terminal indices behind the
+    /// owner may shift and the pressed pane may disappear, so a later physical
+    /// release must not reach another terminal: every button the owner still
+    /// holds gets its release swallowed and its press state cancelled. The
+    /// owner's application did see those presses, so the gesture ends for it
+    /// first with a protocol release on the claimed path; otherwise a change in
+    /// a neighbouring pane leaves it dragging. The layout stays actual for
+    /// ordinary input.
     fn reset_split_pointer_owner(&mut self) {
         let owner_target = self.split_pointer_target();
         let Some(owner) = self.split_pointer_owner.take() else {
@@ -3309,6 +3311,9 @@ impl App {
     /// a tile whose geometry has moved. A composition change is structural: the
     /// panels, their layouts and the saved layout all move with it.
     fn bump_grid_generation(&mut self) {
+        // The owner's tile belongs to geometry the new generation replaces: end
+        // its gesture on the claimed path before the held bits are reset.
+        self.reset_split_pointer_owner();
         self.grid_generation = self.grid_generation.wrapping_add(1);
         self.bump_structure_generation();
         if let Some(terminal) = self.terminals.get_mut(self.active_terminal) {
@@ -3713,13 +3718,14 @@ impl App {
             self.request_frame();
             return;
         }
-        // The pane that owns the pressed pointer takes the motion with the real
-        // pointer coordinates, before the tab strip and the pane hit tests: a
-        // drag over the scrollbar, past the pane's edge or over the strip keeps
-        // reporting to its terminal.
-        if self.active_tab_split()
-            && !self.grid_open()
+        // The pane or tile that owns the pressed pointer takes the motion with
+        // the real pointer coordinates, before the tab strip and the pane hit
+        // tests: a drag over the scrollbar, past the pane's edge or over the
+        // strip keeps reporting to its terminal. Without a held button the
+        // gesture is over and motion follows the hit test again.
+        if (self.active_tab_split() || self.grid_open())
             && self.interaction.pointer_capture == crate::input::PointerCapture::None
+            && self.interaction.mouse_buttons_pressed()
             && let Some((terminal, layout)) = self.split_pointer_target()
         {
             let saved_layout = self.interaction.layout;
@@ -3820,9 +3826,9 @@ impl App {
     }
 
     pub(crate) fn on_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
-        // A split pane that received the press owns every button until all of
-        // them are released. Grid mode never reads the split owner.
-        let split_pointer_owned = !self.grid_open() && self.split_pointer_owner.is_some();
+        // A split pane or grid tile that received the press owns every button
+        // until all of them are released.
+        let pointer_owned = self.split_pointer_owner.is_some();
         if state == KeyState::Pressed {
             if self
                 .divider_drag
@@ -3908,7 +3914,7 @@ impl App {
             }
             return false;
         }
-        if button == PointerButton::Left && state == KeyState::Pressed && !split_pointer_owned {
+        if button == PointerButton::Left && state == KeyState::Pressed && !pointer_owned {
             let hit = self
                 .runtime
                 .as_ref()
@@ -3968,30 +3974,29 @@ impl App {
             return false;
         }
         let active = self.active_terminal;
-        // A press claims the split pointer when it is the first one the
-        // terminal actually receives as mouse input: a press swallowed by a
-        // protocol area (search, scrollbar, link) claims nothing and needs no
-        // paired release. Bits of other buttons, including ones the terminal
-        // never received, must not block the claim.
-        let claims_split_pointer = !self.grid_open()
-            && self.active_tab_split()
-            && !split_pointer_owned
+        // A press claims the pointer when it is the first one the terminal
+        // actually receives as mouse input: a press swallowed by a protocol
+        // area (search, scrollbar, link) claims nothing and needs no paired
+        // release. Bits of other buttons, including ones the terminal never
+        // received, must not block the claim.
+        let claims_pointer = (self.grid_open() || self.active_tab_split())
+            && !pointer_owned
             && state == KeyState::Pressed
             && self.interaction.pointer_capture == crate::input::PointerCapture::None;
-        // A split-pane press keeps its release: the terminal that received the
-        // press gets it with its own layout, even when the pointer has left its
+        // The press keeps its release: the terminal that received it gets it
+        // with its own pane or tile layout, even when the pointer has left its
         // body. A live capture stays with the active terminal. Presses that
         // arrive while the pointer is owned go to the owner the same way.
-        let split_owner = if !self.grid_open()
+        let pointer_target = if (self.grid_open() || self.active_tab_split())
             && self.interaction.pointer_capture == crate::input::PointerCapture::None
-            && (state == KeyState::Released || split_pointer_owned)
+            && (state == KeyState::Released || pointer_owned)
         {
             self.split_pointer_target()
         } else {
             None
         };
         let (target_terminal, target_layout) =
-            split_owner.unwrap_or((active, self.interaction.layout));
+            pointer_target.unwrap_or((active, self.interaction.layout));
         let saved_layout = self.interaction.layout;
         self.interaction.layout = target_layout;
         let mut press_delivered = false;
@@ -4007,7 +4012,7 @@ impl App {
                 button,
                 terminal,
                 |text, x, scroll| runtime.terminal_search_cursor_from_x(text, x, scroll),
-                split_owner.is_some(),
+                pointer_target.is_some(),
             );
             press_delivered = outcome.delivered();
             press_rejected = outcome.rejected();
@@ -4022,7 +4027,7 @@ impl App {
             // not reach the application as an unpaired report.
             self.suppress_release(button);
         }
-        if claims_split_pointer && press_delivered {
+        if claims_pointer && press_delivered {
             self.split_pointer_owner = Some(target_terminal);
         }
         // The owner lives only while some button is still held.
@@ -4140,6 +4145,12 @@ impl App {
     /// panels first.
     fn route_grid_pointer_button(&mut self, state: KeyState, button: PointerButton) -> bool {
         if state == KeyState::Released {
+            return true;
+        }
+        if self.split_pointer_owner.is_some() {
+            // The pressed pointer is owned until every button is released: no
+            // tile hit test, no focus change and no new owner. The claimed path
+            // of the caller delivers the event with the real coordinates.
             return true;
         }
         if self.interaction.pointer_capture != crate::input::PointerCapture::None {
@@ -7299,6 +7310,74 @@ mod tests {
         grid_pointer_move(&mut app, point);
         assert_eq!(app.terminals[1].input_bytes_for_test().len(), stale);
         assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_pressed_tile_keeps_motion_and_release_over_another_tile() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-owner",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Button-motion reporting with SGR coordinates on both tiles: a held bit
+        // left behind by one tile would surface in the other as a drag report.
+        for terminal in &app.terminals {
+            feed_batch(terminal, "\x1b[?1002h\x1b[?1006h");
+        }
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // A press in tile 0 claims the pointer for its terminal.
+        let first = grid_pointer_point(&app, 0, false);
+        grid_pointer_move(&mut app, first);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(app.active_terminal, 0);
+        assert_eq!(app.split_pointer_owner, Some(0));
+        let pressed_len = app.terminals[0].input_bytes_for_test().len();
+        assert!(pressed_len > 0);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+
+        // Motion over tile 1 stays with the pressed tile, encoded with its own
+        // layout at the real pointer position.
+        let layout = app.panel_layouts[0];
+        let second = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, second);
+        let col = (((second.0 - layout.text_x).max(0.0) / layout.char_w).floor() as usize + 1)
+            .clamp(1, layout.cols);
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - second.1
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows - rows_from_bottom;
+        let motion = app.terminals[0].input_bytes_for_test();
+        assert_eq!(
+            String::from_utf8_lossy(&motion[pressed_len..]),
+            format!("\x1b[<32;{col};{row}M")
+        );
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.active_terminal, 0);
+
+        // Exactly one release over tile 1 reaches the owner; tile 1 sees none.
+        let motion_len = motion.len();
+        app.on_pointer_button(KeyState::Released, PointerButton::Left);
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes[motion_len..]),
+            format!("\x1b[<0;{col};{row}m")
+        );
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.split_pointer_owner.is_none());
+
+        // Without the owner, motion follows the hit test again: tile 1 reports
+        // it as any motion and the pressed tile stays silent.
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+        let after_release = app.terminals[0].input_bytes_for_test().len();
+        grid_pointer_move(&mut app, second);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), after_release);
         let _ = std::fs::remove_dir_all(&root);
     }
 
