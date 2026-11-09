@@ -1967,6 +1967,7 @@ impl App {
         // Identity of the active tab before the close: a close reveals the
         // tail of the tab it moves focus to, not of the tab it leaves alone.
         let active_tab_id = self.tabs.get(self.active_tab).map(|entry| entry.id);
+        let pending_tab_reveal = self.pending_tab_reveal;
         let last_pane_of_tab = leaf_count(&self.tabs[tab_index].layout) == 1;
         // The last pane of the last tab is shut down synchronously instead of
         // waiting for the cleanup worker; that branch cannot refuse.
@@ -1986,12 +1987,17 @@ impl App {
         // The cleanup is accepted (or no process needs it): the terminal really
         // leaves storage. Only now end the live pointer gesture, because a
         // refused cleanup keeps both the pane and its owner.
-        // A divider drag and the pointer owner belong to the active tab only. A
-        // pane of a background tab leaves them alone; `remove_terminal_at`
-        // still shifts the owner's terminal index.
-        // The drag node may be the leaf being closed: restore before the tree moves.
+        // A divider drag belongs to the active tab only: a pane of a background
+        // tab leaves it alone and it is carried to the new structure generation
+        // below. The pointer owner does not: in grid mode `panels` keeps the
+        // pre-removal tile composition, so the owner must end before the
+        // removal shifts its terminal index.
         if was_active_tab {
+            // The drag node may be the leaf being closed: restore before the
+            // tree moves.
             self.cancel_divider_drag();
+            self.reset_split_pointer_owner();
+        } else if self.claude_grid.is_some() {
             self.reset_split_pointer_owner();
         }
         let tree_successor = if last_pane_of_tab {
@@ -2008,9 +2014,20 @@ impl App {
         self.terminal_tab_drag = None;
         self.cancel_close_dialog();
         self.focus_after_removal(tab, was_active_tab, tree_successor, grid_successor);
-        // Only a close that changed or removed the active tab sets the reveal.
+        // The dragged tab's tree and body did not change, so only the global
+        // generation grew: carry the drag over without a rollback.
+        if !was_active_tab
+            && self.claude_grid.is_none()
+            && let Some(drag) = self.divider_drag.as_mut()
+        {
+            drag.structure_generation = self.structure_generation;
+        }
+        // Only a close that changed or removed the active tab sets the reveal;
+        // a close that keeps it keeps the reveal seen before the close.
         if self.tabs.get(self.active_tab).map(|entry| entry.id) != active_tab_id {
             self.pending_tab_reveal = Some(false);
+        } else {
+            self.pending_tab_reveal = pending_tab_reveal;
         }
         self.request_frame();
         self.sync_claude_grid(Instant::now());
@@ -8013,6 +8030,14 @@ mod tests {
         let active_right = attach_test_pane(&mut app, 1, 4);
         app.activate_pane(active_right, false);
         assert_eq!(app.active_tab, 1);
+        app.set_grid_metrics(GridMetrics {
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            char_w: 8.0,
+            char_h: 16.0,
+        });
+        assert_eq!(app.on_frame(), Ok(true));
         (app, root, bg_pane, active_right)
     }
 
@@ -8063,15 +8088,25 @@ mod tests {
             .terminal_index_of_pane(bg_pane)
             .expect("the background pane has a terminal");
         assert!(bg_index < owner, "the closed terminal must precede the owner");
-        app.divider_drag = Some(seeded_divider_drag(&app));
+        // A real press on the divider of the active tab seeds the drag with the
+        // current structure generation.
+        let start = split_divider_point(&app);
+        split_pointer_move(&mut app, start.0, start.1);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert!(app.divider_drag.is_some());
         app.split_pointer_owner = Some(owner);
+        let ratio_before = split_root_ratio(&app, app.active_tab);
 
         assert!(!app.close_pane(bg_pane));
 
         assert!(app.terminal_index_of_pane(bg_pane).is_none());
-        assert!(
-            app.divider_drag.is_some(),
-            "a pane of a background tab leaves the divider drag alone"
+        let drag = app
+            .divider_drag
+            .as_ref()
+            .expect("a pane of a background tab leaves the divider drag alone");
+        assert_eq!(
+            drag.structure_generation, app.structure_generation,
+            "the drag is carried to the new structure generation"
         );
         assert_eq!(
             app.split_pointer_owner,
@@ -8079,8 +8114,39 @@ mod tests {
             "the pointer owner must follow its terminal after the index shift"
         );
 
+        // The divider still follows the pointer after the background close.
+        split_pointer_move(&mut app, start.0 + 24.0, start.1);
+        assert!(app.divider_drag.is_some(), "the drag must survive the motion");
+        let ratio_after = split_root_ratio(&app, app.active_tab);
+        assert!(
+            ratio_after > ratio_before,
+            "the drag must still resize the active tab's divider: {ratio_before} -> {ratio_after}"
+        );
+
         app.shutdown_all();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_open_background_pane_close_resets_split_pointer_owner() {
+        let mut app = grid_mode_app(&[true, true, false]);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        assert_eq!(app.active_terminal, 0);
+        // The pointer was pressed on the second tile.
+        app.split_pointer_owner = Some(1);
+        let background_pane = app.tabs[2].active_pane;
+
+        assert!(!app.close_pane(background_pane));
+
+        assert!(app.terminal_index_of_pane(background_pane).is_none());
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.grid_open());
+        assert_eq!(grid_mode_members(&app), Some(vec![0, 1]));
+        assert!(
+            app.split_pointer_owner.is_none(),
+            "a close in grid mode ends the pointer ownership before the tiles go stale"
+        );
     }
 
     #[test]
@@ -8135,6 +8201,22 @@ mod tests {
         app.close_pane(left);
 
         assert_eq!(app.pending_tab_reveal, Some(true));
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_active_pane_of_active_tab_keeps_pending_reveal() {
+        let (mut app, left, right, root) = focused_right_split_app("reveal-active-pane-close");
+        app.pending_tab_reveal = None;
+
+        app.close_pane(right);
+
+        assert_eq!(app.tabs[0].active_pane, left);
+        assert_eq!(
+            app.pending_tab_reveal, None,
+            "a close that keeps the active tab keeps the reveal"
+        );
         app.shutdown_all();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8556,6 +8638,30 @@ mod tests {
     }
 
     #[test]
+    fn free_pane_next_to_busy_sibling_closes_without_dialog() {
+        let (mut app, left, right, root) = focused_right_split_app("close-free-pane");
+        make_pane_busy(&mut app, "close-free-pane", right);
+        // The free pane takes the focus; its busy sibling stays in the tab.
+        app.activate_pane(left, false);
+        app.rebuild_panels();
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyW));
+
+        assert!(
+            app.close_confirm.is_none(),
+            "a free pane closes without a dialog next to a busy sibling"
+        );
+        assert!(app.terminal_index_of_pane(left).is_none());
+        assert!(
+            app.terminal_index_of_pane(right).is_some(),
+            "the busy sibling must not be closed with the free pane"
+        );
+        assert_eq!(app.tabs[0].active_pane, right);
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn confirm_after_pane_vanished_does_nothing() {
         let (mut app, left, right, root) = focused_right_split_app("close-pane-vanished");
         // The pane leaves on its own before the dialog is confirmed. Its close
@@ -8574,6 +8680,7 @@ mod tests {
         assert_eq!(app.terminals.len(), 1);
         assert_eq!(app.terminals[0].pane_id(), left);
         assert_eq!(app.tabs[0].active_pane, left);
+        app.shutdown_all();
         let _ = std::fs::remove_dir_all(&root);
     }
 
