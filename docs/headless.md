@@ -154,9 +154,11 @@ applies the action before each one, as events with no frame in between: `none`
 (default), `wheel <dx> <dy>` (line delta), `key <combo>` (press and release,
 with the combo's modifiers that `mods` does not hold), `type <text>`, `drag`
 (moves the root split divider 24 px forward and back along its axis each frame)
-or `focus` (moves the pane focus with `Alt+Left`/`Alt+Right`, alternating each
-frame). `drag` and `focus` split the active tab side by side first when it has
-one pane; that preparation draws no frame and is outside the measured frames.
+or `focus` (moves the pane focus with the two keys across the root split, so
+`Alt+Left`/`Alt+Right` for a side-by-side root and `Alt+Up`/`Alt+Down` for a
+stacked one, alternating each frame). `drag` and `focus` split the active tab
+side by side first when it has one pane; that preparation draws no frame and
+is outside the measured frames.
 One CSV row per frame, columns in this order (RRiter's, without `root_*`/`chrome_*`):
 
 | Column | Meaning |
