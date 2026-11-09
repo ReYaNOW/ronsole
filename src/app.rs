@@ -3287,22 +3287,12 @@ impl App {
     }
 
     /// Fills `grid_members_scratch` with the terminals whose foreground is Claude
-    /// Code: tab strip order first, split-tree order inside each tab. A terminal
-    /// that no tab's tree owns follows them in storage order.
+    /// Code: tab strip order first, split-tree order inside each tab. Every
+    /// terminal is a leaf of exactly one tab tree (§4 invariant).
     fn collect_claude_members(&mut self) {
         self.grid_members_scratch.clear();
         for tab in &self.tabs {
             push_claude_leaves(&tab.layout, &self.terminals, &mut self.grid_members_scratch);
-        }
-        for (index, terminal) in self.terminals.iter().enumerate() {
-            if terminal.claude_foreground()
-                && !self
-                    .tabs
-                    .iter()
-                    .any(|tab| split_contains_pane(&tab.layout, terminal.pane_id()))
-            {
-                self.grid_members_scratch.push(index);
-            }
         }
     }
 
@@ -8963,7 +8953,8 @@ mod tests {
             char_h: 16.0,
         };
         app.toggle_claude_grid(Instant::now());
-        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        // Tiles follow the tab strip: tab 0 (with `focused`) comes before tab 1.
+        assert_eq!(grid_mode_members(&app), Some(vec![2, 1]));
         assert_eq!(app.active_terminal, 2);
         app.terminal_cleanup.shutdown_and_join();
         let tab = app.tabs[0].id;
@@ -8982,7 +8973,7 @@ mod tests {
             app.terminals[0].has_process(),
             "the refused shell keeps its process"
         );
-        assert_eq!(grid_mode_members(&app), Some(vec![1, 2]));
+        assert_eq!(grid_mode_members(&app), Some(vec![2, 1]));
         app.debug_assert_invariants();
         app.shutdown_all();
     }

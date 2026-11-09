@@ -263,9 +263,15 @@ fn find_path_in(node: &SplitNode, pane: PaneId, path: &mut Vec<u8>) -> bool {
     }
 }
 
-/// Whether `pane` is one of the leaves of `root`.
+/// Whether `pane` is one of the leaves of `root`. Walks without allocating:
+/// the BEL and pane-to-tab lookups call it on the output path.
 pub(crate) fn split_contains_pane(root: &SplitNode, pane: PaneId) -> bool {
-    find_path(root, pane).is_some()
+    match root {
+        SplitNode::Leaf(id) => *id == pane,
+        SplitNode::Split { first, second, .. } => {
+            split_contains_pane(first, pane) || split_contains_pane(second, pane)
+        }
+    }
 }
 
 /// Collects the leaf panes of `node` in tree order. Allocates the caller's
