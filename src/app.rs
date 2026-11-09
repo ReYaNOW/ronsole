@@ -224,11 +224,12 @@ struct SettingsBackgroundKeyOutcome {
 /// Tab rows listed by the close confirmation before the "and N more" line.
 const CLOSE_CONFIRM_MAX_ROWS: usize = 8;
 
-/// What a confirmed close does: the whole window or one tab.
+/// What a confirmed close does: the whole window, one tab or one pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseTarget {
     Window,
     Tab(usize),
+    Pane(PaneId),
 }
 
 /// Open close confirmation. Its text is built once when the dialog opens.
@@ -262,6 +263,7 @@ impl CloseConfirm {
         let title = match target {
             CloseTarget::Window => "Закрыть окно?",
             CloseTarget::Tab(_) => "Закрыть вкладку?",
+            CloseTarget::Pane(_) => "Закрыть панель?",
         };
         Some(Self {
             target,
@@ -1240,7 +1242,7 @@ impl App {
             self.active_tab = tab_index;
             self.bump_structure_generation();
         }
-        self.tabs[tab_index].active_pane = pane;
+        self.set_tab_active_pane(tab_index, pane);
         if index == self.active_terminal && self.active_terminal_presented {
             self.pending_tab_reveal = Some(reveal_tail);
             self.mark_dirty();
@@ -1275,8 +1277,14 @@ impl App {
             return;
         };
         if split_contains_pane(&self.tabs[index].layout, pane) {
-            self.tabs[index].active_pane = pane;
+            self.set_tab_active_pane(index, pane);
         }
+    }
+
+    /// Sets the active pane of the tab at `tab_index`. Every change of
+    /// `Tab.active_pane` in the app goes through here.
+    fn set_tab_active_pane(&mut self, tab_index: usize, pane: PaneId) {
+        self.tabs[tab_index].active_pane = pane;
     }
 
     /// Thin adapter over the pane identity: existing callers keep their index.
@@ -1888,6 +1896,7 @@ impl App {
                 true
             }
             CloseTarget::Tab(index) => self.close_terminal_tab_at(index),
+            CloseTarget::Pane(pane) => self.close_pane(pane),
         }
     }
 
@@ -1898,7 +1907,7 @@ impl App {
         // A tab target lists every pane of that tab. Its index names one of the
         // tab's terminals; the tab itself comes from the split tree.
         let tab_filter = match target {
-            CloseTarget::Window => None,
+            CloseTarget::Window | CloseTarget::Pane(_) => None,
             CloseTarget::Tab(index) => {
                 let Some(terminal) = self.terminals.get(index) else {
                     return Vec::new();
@@ -1909,8 +1918,18 @@ impl App {
                 Some(tab)
             }
         };
+        // A pane target lists only its own terminal.
+        let pane_filter = match target {
+            CloseTarget::Pane(pane) => Some(pane),
+            CloseTarget::Window | CloseTarget::Tab(_) => None,
+        };
         let mut busy = Vec::new();
         for terminal in &self.terminals {
+            if let Some(pane) = pane_filter
+                && terminal.pane_id() != pane
+            {
+                continue;
+            }
             if let Some(tab) = tab_filter
                 && self.tab_index_of_pane(terminal.pane_id()) != Some(tab)
             {
@@ -1987,7 +2006,7 @@ impl App {
         if let Some(next) = tree_successor
             && let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab)
         {
-            self.tabs[tab_index].active_pane = next;
+            self.set_tab_active_pane(tab_index, next);
         }
         self.terminal_tab_drag = None;
         self.cancel_close_dialog();
@@ -2047,7 +2066,7 @@ impl App {
             if let Some(next) = self.remove_terminal_at(index) {
                 tree_successor = Some(next);
                 if let Some(tab_index) = self.tabs.iter().position(|entry| entry.id == tab) {
-                    self.tabs[tab_index].active_pane = next;
+                    self.set_tab_active_pane(tab_index, next);
                 }
             }
         }
@@ -2249,7 +2268,7 @@ impl App {
                 self.active_tab = tab_index;
                 self.bump_structure_generation();
             }
-            self.tabs[tab_index].active_pane = pane;
+            self.set_tab_active_pane(tab_index, pane);
         }
         self.active_terminal = index;
         self.active_terminal_presented = false;
@@ -3061,7 +3080,7 @@ impl App {
             GlobalShortcut::FocusPane(direction) => self.focus_pane_in_direction(direction),
             GlobalShortcut::ClosePane => {
                 if let Some(pane) = self.tabs.get(self.active_tab).map(|tab| tab.active_pane)
-                    && self.close_pane(pane)
+                    && self.request_terminal_close(CloseTarget::Pane(pane))
                 {
                     return true;
                 }
@@ -8258,6 +8277,8 @@ mod tests {
 
         let _ = press_ctrl_shift(&mut app, KeyCode::KeyW);
 
+        // The right pane runs no job, so its close skips the dialog.
+        assert!(app.close_confirm.is_none());
         assert!(app.terminal_index_of_pane(right).is_none());
         assert_eq!(app.terminals.len(), 1);
         assert_eq!(app.terminals[0].pane_id(), left);
@@ -8265,6 +8286,84 @@ mod tests {
         assert_eq!(app.tabs[0].active_pane, left);
         assert_eq!(app.active_terminal, 0);
         app.debug_assert_invariants();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Replaces the terminal of `pane` with a real shell running `sleep 30` in
+    /// the foreground, and waits until the pane reports that job as busy.
+    fn make_pane_busy(app: &mut App, label: &str, pane: PaneId) {
+        let index = app
+            .terminal_index_of_pane(pane)
+            .expect("the pane has a terminal");
+        app.terminals[index] = spawn_shell_tab(label, pane);
+        app.terminals[index].write_input(b"sleep 30\r").unwrap();
+        wait_for_test_condition("foreground sleep job in the pane", || {
+            !app.busy_close_targets(CloseTarget::Pane(pane)).is_empty()
+        });
+    }
+
+    #[test]
+    fn ctrl_shift_w_on_busy_pane_asks_then_closes_only_that_pane() {
+        let (mut app, left, right, root) = focused_right_split_app("close-pane-confirm");
+        make_pane_busy(&mut app, "close-pane-confirm", right);
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyW));
+        let confirm = app
+            .close_confirm
+            .as_ref()
+            .expect("a busy pane opens the dialog");
+        assert_eq!(confirm.target, CloseTarget::Pane(right));
+        assert_eq!(confirm.title, "Закрыть панель?");
+        assert!(app.terminal_index_of_pane(right).is_some());
+        assert_eq!(app.terminals.len(), 2);
+
+        assert!(!app.confirm_close_dialog());
+        assert!(app.close_confirm.is_none());
+        assert!(app.terminal_index_of_pane(right).is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), left);
+        assert_eq!(app.tabs[0].active_pane, left);
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_pane_close_keeps_the_busy_pane() {
+        let (mut app, left, right, root) = focused_right_split_app("close-pane-cancel");
+        make_pane_busy(&mut app, "close-pane-cancel", right);
+
+        assert!(!press_ctrl_shift(&mut app, KeyCode::KeyW));
+        assert!(app.close_confirm.is_some());
+        app.cancel_close_dialog();
+
+        assert!(app.close_confirm.is_none());
+        assert!(app.terminal_index_of_pane(right).is_some());
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(app.tabs[0].active_pane, right);
+        assert!(app.terminal_index_of_pane(left).is_some());
+        app.shutdown_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn confirm_after_pane_vanished_does_nothing() {
+        let (mut app, left, right, root) = focused_right_split_app("close-pane-vanished");
+        // The pane leaves on its own before the dialog is confirmed. Its close
+        // also cancels any open dialog, so the stale dialog is set again here.
+        assert!(!app.close_pane(right));
+        app.close_confirm = Some(CloseConfirm {
+            target: CloseTarget::Pane(right),
+            title: "Закрыть панель?",
+            rows: vec!["tab — sleep".to_string()],
+            more: None,
+            hovered: CloseConfirmHit::None,
+        });
+
+        assert!(!app.confirm_close_dialog());
+        assert!(app.close_confirm.is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].pane_id(), left);
+        assert_eq!(app.tabs[0].active_pane, left);
         let _ = std::fs::remove_dir_all(&root);
     }
 
