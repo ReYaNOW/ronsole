@@ -1659,6 +1659,16 @@ pub(crate) fn terminal_scrollbar_layout(
         w: 8.0 * s,
         h: (body.h - 8.0 * s).max(1.0),
     };
+    // The scrollbar is drawn after the body scissor is lifted, so a track that
+    // does not fit wholly inside `body` would spill into the gap and the
+    // neighbouring pane of a narrow split.
+    if track.x < body.x
+        || track.y < body.y
+        || track.x + track.w > body.x + body.w
+        || track.y + track.h > body.y + body.h
+    {
+        return None;
+    }
     let max_scroll = terminal_max_scroll(total_lines, char_h, body.h, s);
     if max_scroll <= 0.0 {
         return None;
@@ -4429,6 +4439,44 @@ mod tests {
         assert_eq!(terminal_anchored_scroll_offset(3.4, 0, 20.0, 100.0, false), 3.0);
         // The alternate screen draws no scrollback offset.
         assert_eq!(terminal_anchored_scroll_offset(10.0, 2, 20.0, 0.0, true), 0.0);
+    }
+
+    #[test]
+    fn scrollbar_layout_is_absent_when_the_track_does_not_fit_inside_the_body() {
+        // A split pane can shrink below the fixed scrollbar inset; the scrollbar
+        // draws outside the body scissor, so an overflowing track is skipped.
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for (w, h) in [(4.0_f32, 40.0_f32), (11.0, 40.0), (800.0, 2.0), (0.0, 0.0)] {
+                let body = Rect { x: 10.0, y: 20.0, w, h };
+                assert!(
+                    terminal_scrollbar_layout(body, scale, 20.0, 100, 0.0).is_none(),
+                    "w {w} h {h} scale {scale}"
+                );
+            }
+            for w in [12.0_f32, 13.0, 40.0, 800.0] {
+                for h in [4.0 * scale + 1.0, 8.0 * scale, 40.0 * scale, 600.0] {
+                    let body = Rect { x: 10.0, y: 20.0, w, h };
+                    let layout = terminal_scrollbar_layout(body, scale, 20.0, 100, 0.0);
+                    if let Some(layout) = layout {
+                        for rect in [layout.track, layout.thumb] {
+                            assert!(rect.x >= body.x, "w {w} h {h} scale {scale}");
+                            assert!(rect.y >= body.y, "w {w} h {h} scale {scale}");
+                            assert!(
+                                rect.x + rect.w <= body.x + body.w,
+                                "w {w} h {h} scale {scale}"
+                            );
+                            assert!(
+                                rect.y + rect.h <= body.y + body.h,
+                                "w {w} h {h} scale {scale}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // An ordinary body keeps its scrollbar.
+        let body = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+        assert!(terminal_scrollbar_layout(body, 1.0, 20.0, 100, 0.0).is_some());
     }
 
     #[test]
