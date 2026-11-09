@@ -3747,7 +3747,10 @@ impl App {
             self.interaction.layout = saved_layout;
             return;
         }
-        if !self.interaction.terminal_selection_active()
+        // The tab strip swallows hover only while no UI capture owns the
+        // pointer: a scrollbar drag or a search-input selection that crosses
+        // the strip keeps its motion, as the capture path below delivers it.
+        if self.interaction.pointer_capture == crate::input::PointerCapture::None
             && self.runtime.as_ref().is_some_and(|runtime| {
                 runtime
                     .terminal_tab_strip_layout()
@@ -6892,6 +6895,17 @@ mod tests {
         feed_batch(terminal, "\x1b[?1000h");
     }
 
+    /// Centre of the tab strip drawn by the headless runtime, above every body.
+    fn tab_strip_point(app: &App) -> (f32, f32) {
+        let strip = app
+            .runtime
+            .as_ref()
+            .expect("headless runtime")
+            .terminal_tab_strip_layout()
+            .rect;
+        (strip.x + strip.w * 0.5, strip.y + strip.h * 0.5)
+    }
+
     #[test]
     fn grid_pointer_click_in_inactive_tile_focuses_it_and_routes_press() {
         let (mut app, _receiver, _profile, root) =
@@ -7390,20 +7404,55 @@ mod tests {
             );
         app.terminals[0].set_claude_foreground_for_test(true);
         app.terminals[1].set_claude_foreground_for_test(true);
-        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        // Both tiles need scrollback: the captured tile draws the scrollbar that
+        // starts the capture, and the tile under the pointer must stay still.
+        // Button-motion SGR reports make the captured tile's protocol wheel
+        // visible in its bytes.
+        for terminal in &app.terminals {
+            feed_batch(terminal, &"history line\r\n".repeat(200));
+            feed_batch(terminal, "\x1b[?1002h\x1b[?1006h");
+        }
         app.toggle_claude_grid(Instant::now());
         assert_eq!(app.on_frame(), Ok(true));
 
-        // A capturing tile keeps the wheel: the tile under the pointer does not
-        // scroll while another tile owns the pointer.
-        let point = grid_pointer_point(&app, 1, false);
-        app.pointer_x = point.0;
-        app.pointer_y = point.1;
-        app.interaction.pointer_capture = crate::input::PointerCapture::TerminalScrollbar;
+        // A real capture: the press lands on tile 0's own scrollbar.
+        let scrollbar = app.panel_layouts[0]
+            .scrollbar
+            .expect("tile 0 draws a scrollbar");
+        let grab = (
+            scrollbar.track.x + scrollbar.track.w * 0.5,
+            scrollbar.track.y + scrollbar.track.h * 0.5,
+        );
+        grid_pointer_move(&mut app, grab);
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+        assert_eq!(
+            app.interaction.pointer_capture,
+            crate::input::PointerCapture::TerminalScrollbar
+        );
+        let captured_len = app.terminals[0].input_bytes_for_test().len();
+
+        // The pointer leaves the captured tile for tile 1: the wheel stays with
+        // tile 0 and is encoded with tile 0's layout at the real pointer
+        // position, while tile 1 and the focus are untouched.
+        let second = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, second);
         let before = app.terminals[1].scroll_y.target;
-        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+        app.on_scroll(ScrollDelta::Pixel { x: 0.0, y: 1.0 });
 
         assert_eq!(app.terminals[1].scroll_y.target, before);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        let layout = app.panel_layouts[0];
+        let col = (((second.0 - layout.text_x).max(0.0) / layout.char_w).floor() as usize + 1)
+            .clamp(1, layout.cols);
+        let rows_from_bottom = ((layout.body.y + layout.body.h - layout.bottom_pad - second.1
+            + layout.scroll_offset)
+            / layout.char_h)
+            .floor() as usize;
+        let row = layout.visible_rows.saturating_sub(rows_from_bottom);
+        assert_eq!(
+            String::from_utf8_lossy(&app.terminals[0].input_bytes_for_test()[captured_len..]),
+            format!("\x1b[<64;{col};{row}M")
+        );
         assert_eq!(app.active_terminal, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -9890,7 +9939,16 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("    pub(crate) fn on_pointer_leave").next())
             .expect("cursor moved routing must remain present");
-        assert!(moved.contains("!self.interaction.terminal_selection_active()"));
+        // The tab strip check must yield to a live UI capture, so a scrollbar
+        // drag or a search-input selection keeps its motion over the strip.
+        let strip = moved
+            .find("terminal_tab_strip_layout")
+            .expect("tab strip motion routing must remain present");
+        let guard = moved[..strip]
+            .rfind("if ")
+            .expect("the tab strip check must stay guarded");
+        assert!(moved[guard..strip]
+            .contains("self.interaction.pointer_capture == crate::input::PointerCapture::None"));
         let left = production
             .split("    pub(crate) fn on_pointer_leave")
             .nth(1)
@@ -10710,6 +10768,158 @@ mod tests {
         assert!(app.terminals[1].input_bytes_for_test().is_empty());
         assert_eq!(app.split_pointer_owner, Some(0));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scrollbar_drag_keeps_motion_over_tab_strip_in_grid_and_split() {
+        // Split tab: the scrollbar drag of the left pane survives the strip.
+        {
+            let (mut app, root) = split_pointer_app("n3-scrollbar-split");
+            feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+            assert_eq!(app.on_frame(), Ok(true));
+            let scrollbar = app.panel_layouts[0]
+                .scrollbar
+                .expect("the dragged pane draws a scrollbar");
+            let grab = (
+                scrollbar.track.x + scrollbar.track.w * 0.5,
+                scrollbar.track.y + scrollbar.track.h * 0.5,
+            );
+            split_pointer_move(&mut app, grab.0, grab.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            let before = app.terminals[0].scroll_y.target;
+
+            let strip = tab_strip_point(&app);
+            split_pointer_move(&mut app, strip.0, strip.1);
+
+            assert_ne!(app.terminals[0].scroll_y.target, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // Grid: the captured tile keeps the drag over the strip too.
+        {
+            let (mut app, _receiver, _profile, root) =
+                crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                    "n3-scrollbar-grid",
+                    2,
+                );
+            app.terminals[0].set_claude_foreground_for_test(true);
+            app.terminals[1].set_claude_foreground_for_test(true);
+            feed_batch(&app.terminals[0], &"history line\r\n".repeat(200));
+            app.toggle_claude_grid(Instant::now());
+            assert_eq!(app.on_frame(), Ok(true));
+            let scrollbar = app.panel_layouts[0]
+                .scrollbar
+                .expect("the captured tile draws a scrollbar");
+            let grab = (
+                scrollbar.track.x + scrollbar.track.w * 0.5,
+                scrollbar.track.y + scrollbar.track.h * 0.5,
+            );
+            grid_pointer_move(&mut app, grab);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            let before = app.terminals[0].scroll_y.target;
+
+            let strip = tab_strip_point(&app);
+            grid_pointer_move(&mut app, strip);
+
+            assert_ne!(app.terminals[0].scroll_y.target, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::TerminalScrollbar
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn search_input_selection_keeps_motion_over_tab_strip_in_grid_and_split() {
+        // Split tab: the text cursor of the search input follows the drag.
+        {
+            let (mut app, root) = split_pointer_app("n3-search-split");
+            app.interaction.open_search(&mut app.terminals[0]);
+            app.interaction.search.insert_text("abcdef");
+            assert_eq!(app.on_frame(), Ok(true));
+            let input = app
+                .interaction
+                .layout
+                .search
+                .expect("the active pane draws the search overlay")
+                .input;
+            // Press at the text start: the strip lies far to the right of it, so
+            // a delivered motion moves the caret; a swallowed one leaves it.
+            let start = (input.x + 1.0, input.y + input.h * 0.5);
+            split_pointer_move(&mut app, start.0, start.1);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            let before = app.interaction.search.cursor;
+
+            let strip = tab_strip_point(&app);
+            split_pointer_move(&mut app, strip.0, strip.1);
+
+            assert_ne!(app.interaction.search.cursor, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // Grid: the same selection continues over the strip.
+        {
+            let (mut app, _receiver, _profile, root) =
+                crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                    "n3-search-grid",
+                    2,
+                );
+            app.terminals[0].set_claude_foreground_for_test(true);
+            app.terminals[1].set_claude_foreground_for_test(true);
+            app.toggle_claude_grid(Instant::now());
+            app.interaction.open_search(&mut app.terminals[0]);
+            app.interaction.search.insert_text("abcdef");
+            assert_eq!(app.on_frame(), Ok(true));
+            let input = app
+                .interaction
+                .layout
+                .search
+                .expect("the active tile draws the search overlay")
+                .input;
+            // Press at the text start: the strip lies far to the right of it, so
+            // a delivered motion moves the caret; a swallowed one leaves it.
+            let start = (input.x + 1.0, input.y + input.h * 0.5);
+            grid_pointer_move(&mut app, start);
+            app.on_pointer_button(KeyState::Pressed, PointerButton::Left);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            let before = app.interaction.search.cursor;
+
+            let strip = tab_strip_point(&app);
+            grid_pointer_move(&mut app, strip);
+
+            assert_ne!(app.interaction.search.cursor, before);
+            assert_eq!(
+                app.interaction.pointer_capture,
+                crate::input::PointerCapture::SearchInput
+            );
+            assert_eq!(app.active_terminal, 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

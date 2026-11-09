@@ -331,6 +331,8 @@ impl TerminalInteraction {
         had_selection
     }
 
+    /// Test-only: production routes by the whole capture state, not by one kind.
+    #[cfg(test)]
     pub(crate) fn terminal_selection_active(&self) -> bool {
         self.pointer_capture == PointerCapture::TerminalSelection
     }
@@ -1109,7 +1111,11 @@ impl TerminalInteraction {
         terminal: &mut Terminal,
         layout: TerminalUiLayout,
     ) -> bool {
-        if !layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
+        // A live UI capture owns the wheel past the captured terminal's body:
+        // the drag keeps scrolling its terminal. Without one, the wheel belongs
+        // only to the body under the pointer.
+        let claimed = self.pointer_capture != PointerCapture::None;
+        if !claimed && !layout.body.contains(self.mouse_x, self.mouse_y) { return false; }
         let dy = terminal_wheel_delta(delta, layout.char_h, self.scroll_sensitivity);
         let grid = crate::platform::lock_recover(&terminal.grid);
         let is_alt = grid.is_alt_screen();
@@ -1125,6 +1131,7 @@ impl TerminalInteraction {
                 self.mouse_x,
                 self.mouse_y,
                 dy,
+                claimed,
             ) {
                 let _ = terminal.write_input(&input);
             }
@@ -1672,6 +1679,9 @@ fn terminal_mouse_motion_report(
     mouse_report(tracking, sgr, kind, cell_x - 1, cell_y - 1)
 }
 
+/// `claimed` means a UI capture owns the pressed pointer: the wheel is encoded
+/// at the real pointer position, clamped to the grid, even past the pane body
+/// or over its protocol areas.
 fn terminal_mouse_wheel_sequence(
     layout: TerminalUiLayout,
     tracking: MouseTrackingMode,
@@ -1679,8 +1689,13 @@ fn terminal_mouse_wheel_sequence(
     x: f32,
     y: f32,
     dy: f32,
+    claimed: bool,
 ) -> Option<Vec<u8>> {
-    let (cell_x, cell_y) = terminal_mouse_protocol_cell(layout, x, y)?;
+    let (cell_x, cell_y) = if claimed {
+        terminal_mouse_protocol_cell_at(layout, x, y)?
+    } else {
+        terminal_mouse_protocol_cell(layout, x, y)?
+    };
     let steps = (dy.abs() / 20.0).max(1.0) as usize;
     let kind = if dy > 0.0 {
         MouseEventKind::WheelUp
@@ -3807,6 +3822,7 @@ mod tests {
                 x,
                 y,
                 40.0,
+                false,
             )
             .is_none());
         }
@@ -3829,6 +3845,7 @@ mod tests {
             body_x,
             body_y,
             40.0,
+            false,
         )
         .is_some());
 
@@ -3843,6 +3860,26 @@ mod tests {
             formerly_covered.1,
         )
         .is_some());
+    }
+
+    #[test]
+    fn captured_wheel_scrolls_its_terminal_outside_the_body() {
+        let mut interaction = TerminalInteraction::default();
+        // A scrollbar drag owns the pointer past the pane's body.
+        interaction.pointer_capture = PointerCapture::TerminalScrollbar;
+        interaction.mouse_x = 900.0;
+        interaction.mouse_y = 400.0;
+        let mut terminal = selection_test_terminal();
+        let mut layout = mouse_test_layout(0.0);
+        layout.max_scroll = 100.0;
+        assert!(!layout.body.contains(interaction.mouse_x, interaction.mouse_y));
+
+        assert!(interaction.mouse_wheel(
+            ScrollDelta::Pixel { x: 0.0, y: 1.0 },
+            &mut terminal,
+            layout,
+        ));
+        assert!(terminal.scroll_y.target > 0.0);
     }
 
     #[test]
