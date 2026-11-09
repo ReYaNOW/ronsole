@@ -151,9 +151,9 @@ pub(crate) enum MouseInputOutcome {
     Consumed,
     /// A mouse-reporting sequence was written to the terminal application.
     Delivered,
-    /// A press the application can report was withheld by one of the pane's
-    /// protocol areas. The application never saw the press, so its release must
-    /// not reach the application alone.
+    /// A press that never reached the terminal application: a protocol area of
+    /// the pane withheld it, or the terminal took no mouse input at all. Its
+    /// release must not reach the application alone.
     Rejected,
 }
 
@@ -901,7 +901,16 @@ impl TerminalInteraction {
         search_cursor_from_x: impl FnOnce(&str, f32, f32) -> usize,
         claimed: bool,
     ) -> MouseInputOutcome {
-        self.mouse_button_event(state, button, terminal, search_cursor_from_x, claimed)
+        let outcome =
+            self.mouse_button_event(state, button, terminal, search_cursor_from_x, claimed);
+        if outcome == MouseInputOutcome::Ignored && state == KeyState::Pressed {
+            // The terminal did not take this press, so it must not stay held
+            // for the motion reports of another pane, and its release must not
+            // reach an application that never saw the press.
+            self.cancel_pointer_press(button);
+            return MouseInputOutcome::Rejected;
+        }
+        outcome
     }
 
     fn mouse_button_event(

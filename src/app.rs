@@ -1147,6 +1147,26 @@ impl App {
         Some((terminal, layout))
     }
 
+    /// Terminal and layout of the grid tile under the pointer. A live pointer
+    /// capture keeps its terminal, so the motion follows it. `None` when the
+    /// rendered geometry is stale or no tile body is under the pointer: nothing
+    /// receives motion for an old layout.
+    fn grid_tile_under_pointer(&self) -> Option<(usize, TerminalUiLayout)> {
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            return Some((self.active_terminal, self.interaction.layout));
+        }
+        if self.panel_layouts_grid_generation != self.grid_generation {
+            return None;
+        }
+        let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
+        else {
+            return None;
+        };
+        let terminal = self.panels.get(index)?.terminal;
+        let layout = *self.panel_layouts.get(index)?;
+        Some((terminal, layout))
+    }
+
     /// Terminal and layout of the split pane that owns the pressed pointer.
     /// The press stays with that terminal while any button is held, even after
     /// the pointer leaves the pane's body.
@@ -2276,14 +2296,40 @@ impl App {
 
     /// Ends the split pointer ownership before a structural change or a mode
     /// switch. The terminal indices behind the owner may shift and the pressed
-    /// pane may disappear, so a later release must not reach another terminal:
-    /// every button the owner still holds gets its release swallowed and its
-    /// press state cancelled. The layout stays actual for ordinary input.
+    /// pane may disappear, so a later physical release must not reach another
+    /// terminal: every button the owner still holds gets its release swallowed
+    /// and its press state cancelled. The owner's application did see those
+    /// presses, so the gesture ends for it first with a protocol release on the
+    /// claimed path; otherwise a change in a neighbouring pane leaves it
+    /// dragging. The layout stays actual for ordinary input.
     fn reset_split_pointer_owner(&mut self) {
+        let owner_target = self.split_pointer_target();
         let Some(owner) = self.split_pointer_owner.take() else {
             return;
         };
         let pressed = self.interaction.pressed_mouse_buttons();
+        if let Some((target, layout)) = owner_target {
+            let saved_layout = self.interaction.layout;
+            self.interaction.layout = layout;
+            if let Some(terminal) = self.terminals.get_mut(target) {
+                for button in [
+                    PointerButton::Left,
+                    PointerButton::Middle,
+                    PointerButton::Right,
+                ] {
+                    if pressed & mouse_button_bit(button) != 0 {
+                        let _ = self.interaction.mouse_input_outcome(
+                            KeyState::Released,
+                            button,
+                            terminal,
+                            |_, _, _| 0,
+                            true,
+                        );
+                    }
+                }
+            }
+            self.interaction.layout = saved_layout;
+        }
         for button in [
             PointerButton::Left,
             PointerButton::Middle,
@@ -3690,21 +3736,31 @@ impl App {
             return;
         }
         let active = self.active_terminal;
-        let (target_terminal, target_layout) =
-            if self.active_tab_split() && !self.grid_open() {
-                if let Some((terminal, layout)) = self.split_panel_under_pointer() {
-                    // The pane under the pointer takes the motion with its own
-                    // layout; focus does not change. A captured pointer keeps
-                    // its terminal.
-                    (terminal, layout)
-                } else {
-                    // The rendered geometry is stale or no pane body is under
-                    // the pointer: nothing receives motion for the old layout.
-                    return;
-                }
+        let (target_terminal, target_layout) = if self.grid_open() {
+            if let Some((terminal, layout)) = self.grid_tile_under_pointer() {
+                // The tile under the pointer takes the motion with its own
+                // layout; focus does not change. A captured pointer keeps its
+                // terminal.
+                (terminal, layout)
             } else {
-                (active, self.interaction.layout)
-            };
+                // The rendered geometry is stale or no tile body is under the
+                // pointer: nothing receives motion for the old layout.
+                return;
+            }
+        } else if self.active_tab_split() {
+            if let Some((terminal, layout)) = self.split_panel_under_pointer() {
+                // The pane under the pointer takes the motion with its own
+                // layout; focus does not change. A captured pointer keeps
+                // its terminal.
+                (terminal, layout)
+            } else {
+                // The rendered geometry is stale or no pane body is under
+                // the pointer: nothing receives motion for the old layout.
+                return;
+            }
+        } else {
+            (active, self.interaction.layout)
+        };
         let saved_layout = self.interaction.layout;
         self.interaction.layout = target_layout;
         if let (Some(runtime), Some(terminal)) =
@@ -4144,6 +4200,20 @@ impl App {
             }
             return;
         }
+        // A captured pointer keeps the wheel: neither the tab strip nor the
+        // tile under the pointer may take it from the capturing terminal.
+        if self.interaction.pointer_capture != crate::input::PointerCapture::None {
+            let active = self.active_terminal;
+            if let Some(terminal) = self.terminals.get_mut(active)
+                && self
+                    .interaction
+                    .mouse_wheel(delta, terminal, self.interaction.layout)
+            {
+                self.sync_animation_state();
+                self.request_frame();
+            }
+            return;
+        }
         if let Some(runtime) = self.runtime.as_ref() {
             let strip = runtime.terminal_tab_strip_layout();
             if strip.rect.contains(self.pointer_x, self.pointer_y) {
@@ -4158,18 +4228,10 @@ impl App {
         if self.grid_open() {
             // The wheel scrolls the tile under the pointer and never moves focus.
             self.rebuild_panels();
-            if self.panel_layouts_grid_generation != self.grid_generation {
-                return;
-            }
-            let Some(PanelHit::Body(index)) = panel_hit(&self.panels, self.pointer_x, self.pointer_y)
-            else {
+            let Some((target, layout)) = self.grid_tile_under_pointer() else {
                 return;
             };
-            let (Some(panel), Some(layout)) = (self.panels.get(index), self.panel_layouts.get(index).copied())
-            else {
-                return;
-            };
-            let Some(terminal) = self.terminals.get_mut(panel.terminal) else {
+            let Some(terminal) = self.terminals.get_mut(target) else {
                 return;
             };
             if self.interaction.mouse_wheel(delta, terminal, layout) {
@@ -7183,6 +7245,64 @@ mod tests {
 
         assert_eq!(app.active_terminal, 0);
         assert_eq!(app.terminals[1].scroll_y.target, before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_motion_follows_the_tile_under_the_pointer() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-motion",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+        // Any-motion reporting makes the receiving tile visible in its bytes.
+        feed_batch(&app.terminals[1], "\x1b[?1003h");
+
+        // The inactive tile under the pointer receives the motion; the active
+        // tile next to it and the focus stay untouched.
+        let point = grid_pointer_point(&app, 1, false);
+        grid_pointer_move(&mut app, point);
+        assert!(!app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert_eq!(app.active_terminal, 0);
+
+        // The frame's tile geometry is stale: it must not encode the motion.
+        app.bump_grid_generation();
+        let stale = app.terminals[1].input_bytes_for_test().len();
+        grid_pointer_move(&mut app, point);
+        assert_eq!(app.terminals[1].input_bytes_for_test().len(), stale);
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_wheel_with_pointer_capture_ignores_the_tile_under_the_pointer() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-pointer-wheel-capture",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        feed_batch(&app.terminals[1], &"history line\r\n".repeat(200));
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(app.on_frame(), Ok(true));
+
+        // A capturing tile keeps the wheel: the tile under the pointer does not
+        // scroll while another tile owns the pointer.
+        let point = grid_pointer_point(&app, 1, false);
+        app.pointer_x = point.0;
+        app.pointer_y = point.1;
+        app.interaction.pointer_capture = crate::input::PointerCapture::TerminalScrollbar;
+        let before = app.terminals[1].scroll_y.target;
+        app.on_scroll(ScrollDelta::Line { x: 0.0, y: 1.0 });
+
+        assert_eq!(app.terminals[1].scroll_y.target, before);
+        assert_eq!(app.active_terminal, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -10422,6 +10542,39 @@ mod tests {
     }
 
     #[test]
+    fn ignored_press_does_not_leak_a_held_button_to_the_neighbour() {
+        let (mut app, root) = split_pointer_app("t7-ignored-press-isolation");
+        // The right pane reports button motion only while a button is held, so
+        // a pressed-bit left behind by the left pane would surface as a drag.
+        feed_batch(&app.terminals[1], "\x1b[?1002h");
+        assert_eq!(app.on_frame(), Ok(true));
+
+        let left = panel_body_point(&app, 0);
+        split_pointer_move(&mut app, left.0, left.1);
+        // The left shell does not track the mouse, so its terminal ignores the
+        // right press: the button must not stay held for anybody else.
+        app.on_pointer_button(KeyState::Pressed, PointerButton::Right);
+        assert_eq!(app.interaction.pressed_mouse_buttons(), 0);
+        assert!(app.split_pointer_owner.is_none());
+        assert!(app.suppressed_release.contains(&PointerButton::Right));
+
+        // Motion over the pane that does track the mouse is not a drag report.
+        let right = panel_body_point(&app, 1);
+        split_pointer_move(&mut app, right.0, right.1);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+
+        // The ignored press never reached an application, so its release goes
+        // nowhere either.
+        app.on_pointer_button(KeyState::Released, PointerButton::Right);
+        assert!(app.terminals[1].input_bytes_for_test().is_empty());
+        assert!(app.terminals[0].input_bytes_for_test().is_empty());
+        assert!(app.suppressed_release.is_empty());
+        assert_eq!(app.active_terminal, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn second_button_press_while_owned_goes_to_owner() {
         let (mut app, root) = split_pointer_app("t7-second-press-owner");
         // Press reporting on both panes, so a stray hit test into the other
@@ -10474,8 +10627,9 @@ mod tests {
         assert!(app.split_pointer_owner.is_none());
         let _ = std::fs::remove_dir_all(&root);
 
-        // Closing another pane removes the terminal whose index the owner
-        // held; the release of the lost press must reach nobody.
+        // Closing another pane ends the gesture of the owner that is still
+        // alive: the release reaches its application once, on the claimed path,
+        // and the physical release adds nothing.
         let (mut app, root) = split_pointer_app("t7-owner-close");
         grid_pointer_enable_tracking(&app.terminals[0]);
         let point = panel_body_point(&app, 0);
@@ -10487,9 +10641,17 @@ mod tests {
         assert!(!app.close_pane(other));
         assert!(app.split_pointer_owner.is_none());
 
+        let bytes = app.terminals[0].input_bytes_for_test();
+        assert_eq!(bytes.len(), pressed_len + 6, "one X10 release report");
+        // Legacy release: ESC [ M then the button code 3 (`3 + 32`).
+        assert_eq!(bytes[pressed_len], 0x1b);
+        assert_eq!(bytes[pressed_len + 1], b'[');
+        assert_eq!(bytes[pressed_len + 2], b'M');
+        assert_eq!(bytes[pressed_len + 3], 35, "release button code");
+
         app.on_pointer_button(KeyState::Released, PointerButton::Left);
         assert_eq!(app.terminals.len(), 1);
-        assert_eq!(app.terminals[0].input_bytes_for_test().len(), pressed_len);
+        assert_eq!(app.terminals[0].input_bytes_for_test().len(), pressed_len + 6);
         let _ = std::fs::remove_dir_all(&root);
     }
 
