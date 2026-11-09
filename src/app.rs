@@ -11,7 +11,7 @@ use crate::input_types::{
     PointerPosition, ScrollDelta,
 };
 use crate::launch::TerminalLaunchSpec;
-use crate::panels::{GRID_TILE_GAP, Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
+use crate::panels::{Panel, PanelHit, grid_fits, grid_tiles, panel_hit};
 use crate::platform::{
     KdeActivationWorker, OpenSink, kde_session_active, open_uri_allowed, open_uri_with,
 };
@@ -26,9 +26,10 @@ use crate::scroll::ScrollState;
 use crate::search::{Rect, TerminalSearchHit};
 use crate::single_line_input::SingleLineInput;
 use crate::split::{
-    PaneDirection, PaneId, SplitAxis, SplitNode, divider_at, layout_panes, leaf_count, min_extent,
-    node_at_path, node_at_path_mut, pane_in_direction, pane_min, remove_leaf, split_child_rects,
-    split_leaf_at, successor,
+    PaneDirection, PaneId, SplitAxis, SplitNode, collect_split_panes, divider_at, dragged_ratio,
+    layout_panes, leaf_count, min_extent, node_at_path, node_at_path_mut, node_gap,
+    pane_in_direction, pane_min, remove_leaf, split_child_rects, split_contains_pane,
+    split_leaf_at, split_node_rect, successor,
 };
 use crate::tabs::{
     DRAG_AUTOSCROLL_EDGE_PX, TabDragState, active_index_after_move, active_index_after_remove,
@@ -529,7 +530,7 @@ struct GridMetrics {
     char_h: f32,
 }
 
-/// Grid mode state: the tabs shown as tiles. `members` holds tab indices in tab order.
+/// Grid mode state. `members` holds terminal indices, listed in tab order.
 #[derive(Default)]
 struct ClaudeGrid {
     members: Vec<usize>,
@@ -592,16 +593,6 @@ struct DividerDrag {
     grab_offset: f32,
 }
 
-/// Whether `pane` is one of the leaves of this split subtree.
-fn split_contains_pane(node: &SplitNode, pane: PaneId) -> bool {
-    match node {
-        SplitNode::Leaf(id) => *id == pane,
-        SplitNode::Split { first, second, .. } => {
-            split_contains_pane(first, pane) || split_contains_pane(second, pane)
-        }
-    }
-}
-
 /// Number of leaves in the subtree, optionally only those for `pane`.
 #[cfg(any(debug_assertions, test))]
 fn split_leaf_count(node: &SplitNode, pane: Option<PaneId>) -> usize {
@@ -613,90 +604,23 @@ fn split_leaf_count(node: &SplitNode, pane: Option<PaneId>) -> usize {
     }
 }
 
-/// Collects the leaf panes of `node` in tree order. Allocates the caller's
-/// vector; used only by the close path, never in a frame.
-fn collect_split_panes(node: &SplitNode, panes: &mut Vec<PaneId>) {
+/// Pushes the indices of the Claude Code terminals among the leaves of `node`
+/// onto `out`, in split-tree order. Used by the grid member collection only.
+fn push_claude_leaves(node: &SplitNode, terminals: &[Terminal], out: &mut Vec<usize>) {
     match node {
-        SplitNode::Leaf(pane) => panes.push(*pane),
+        SplitNode::Leaf(pane) => {
+            let found = terminals
+                .iter()
+                .position(|terminal| terminal.pane_id() == *pane);
+            if let Some(index) = found.filter(|&index| terminals[index].claude_foreground()) {
+                out.push(index);
+            }
+        }
         SplitNode::Split { first, second, .. } => {
-            collect_split_panes(first, panes);
-            collect_split_panes(second, panes);
+            push_claude_leaves(first, terminals, out);
+            push_claude_leaves(second, terminals, out);
         }
     }
-}
-
-/// Absolute rect of the split node addressed by `path` in a tab body, walked
-/// through the same `split_child_rects` call the layout uses. `None` when the
-/// path leaves the tree or ends on a leaf.
-fn split_node_rect(
-    root: &SplitNode,
-    body: Rect,
-    path: &[u8],
-    scale: f32,
-    char_w: f32,
-    char_h: f32,
-) -> Option<Rect> {
-    let gap = (GRID_TILE_GAP * scale).round();
-    let mut node = root;
-    let mut rect = body;
-    for step in path {
-        let SplitNode::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } = node
-        else {
-            return None;
-        };
-        let first_min = min_extent(first, *axis, char_w, char_h, scale);
-        let second_min = min_extent(second, *axis, char_w, char_h, scale);
-        let (first_rect, second_rect) =
-            split_child_rects(rect, *axis, *ratio, gap, first_min, second_min);
-        match step {
-            0 => {
-                node = first;
-                rect = first_rect;
-            }
-            1 => {
-                node = second;
-                rect = second_rect;
-            }
-            _ => return None,
-        }
-    }
-    matches!(node, SplitNode::Split { .. }).then_some(rect)
-}
-
-/// Ratio that puts the divider of `node_rect` at `coord` along `axis`. The
-/// first branch keeps its minimum and the second keeps its own, judged on the
-/// same `available` span [`split_child_rects`] uses; a node too small for both
-/// minimums follows the pointer unclamped.
-fn dragged_ratio(
-    node_rect: Rect,
-    axis: SplitAxis,
-    saved_ratio: f32,
-    gap: f32,
-    first_min: f32,
-    second_min: f32,
-    coord: f32,
-) -> f32 {
-    let (extent, start) = match axis {
-        SplitAxis::SideBySide => (node_rect.w, node_rect.x),
-        SplitAxis::Stacked => (node_rect.h, node_rect.y),
-    };
-    let node_gap = if extent < gap { 0.0 } else { gap };
-    let available = (extent - node_gap).max(0.0);
-    if available <= 0.0 {
-        return saved_ratio;
-    }
-    let first_floor = first_min.ceil();
-    let second_floor = second_min.ceil();
-    let mut first_extent = (coord - start).clamp(0.0, available);
-    if available >= first_floor + second_floor {
-        first_extent = first_extent.clamp(first_floor, available - second_floor);
-    }
-    first_extent / available
 }
 
 pub struct App {
@@ -1088,7 +1012,7 @@ impl App {
         let metrics = self.grid_metrics;
         let body = terminal_body_rect(metrics.width, metrics.height, metrics.scale);
         let axis = drag.axis;
-        let gap = (GRID_TILE_GAP * metrics.scale).round();
+        let gap = node_gap(metrics.scale);
         let coord = match axis {
             SplitAxis::SideBySide => x - drag.grab_offset,
             SplitAxis::Stacked => y - drag.grab_offset,
@@ -1315,7 +1239,7 @@ impl App {
         );
         let mut leaves = 0;
         for tab in &self.tabs {
-            leaves += split_leaf_count(&tab.layout, None);
+            leaves += leaf_count(&tab.layout);
             assert!(tab.title_number > 0, "a tab must carry its title number");
             assert!(
                 split_contains_pane(&tab.layout, tab.active_pane),
@@ -3321,11 +3245,21 @@ impl App {
         }
     }
 
-    /// Fills `grid_members_scratch` with the tabs whose foreground is Claude Code.
+    /// Fills `grid_members_scratch` with the terminals whose foreground is Claude
+    /// Code: tab strip order first, split-tree order inside each tab. A terminal
+    /// that no tab's tree owns follows them in storage order.
     fn collect_claude_members(&mut self) {
         self.grid_members_scratch.clear();
+        for tab in &self.tabs {
+            push_claude_leaves(&tab.layout, &self.terminals, &mut self.grid_members_scratch);
+        }
         for (index, terminal) in self.terminals.iter().enumerate() {
-            if terminal.claude_foreground() {
+            if terminal.claude_foreground()
+                && !self
+                    .tabs
+                    .iter()
+                    .any(|tab| split_contains_pane(&tab.layout, terminal.pane_id()))
+            {
                 self.grid_members_scratch.push(index);
             }
         }
@@ -7843,17 +7777,41 @@ mod tests {
         let generation = app.grid_generation;
         let layout_generation = app.layout_generation;
 
-        // Tiles are panes, not tabs: moving a tab in the strip leaves the grid
-        // composition alone, so its generation and its tile order stay put.
+        // Tiles follow the tab strip, not the storage order: moving tab 0 behind
+        // tab 1 makes terminal 1 tile 0 and bumps the grid generation.
         app.reorder_terminal_tab(0, 1);
-        assert_eq!(app.grid_generation, generation);
+        app.sync_claude_grid(Instant::now());
+        assert_ne!(app.grid_generation, generation);
         assert!(app.layout_generation > layout_generation);
-        // The inactive history tile keeps its scroll target: index 1 still names it.
+        assert_eq!(
+            app.claude_grid.as_ref().map(|grid| grid.members.clone()),
+            Some(vec![1, 0])
+        );
+        // The inactive history terminal keeps its scroll target across the reorder.
         app.terminals[1].scroll_y.target = 20.0;
         app.terminals[1].scroll_y.current = 20.0;
 
         assert_eq!(grid_frame_step(&mut app), Ok(true));
         assert_eq!(app.terminals[1].scroll_y.target, 20.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grid_members_follow_tab_order_not_terminal_storage() {
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "grid-tab-order-members",
+                2,
+            );
+        app.terminals[0].set_claude_foreground_for_test(true);
+        app.terminals[1].set_claude_foreground_for_test(true);
+        // Storage stays [0, 1]; moving tab 0 to the end puts terminal 1 first.
+        app.reorder_terminal_tab(0, 1);
+        app.toggle_claude_grid(Instant::now());
+        assert_eq!(
+            app.claude_grid.as_ref().map(|grid| grid.members.clone()),
+            Some(vec![1, 0])
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
