@@ -120,6 +120,9 @@ pub(crate) struct HeadlessSession {
     /// Axis and pressed point of the divider drag a bench action oscillates
     /// around; `None` until `prepare_bench` starts it.
     bench_drag: Option<(SplitAxis, f32, f32)>,
+    /// Axis of the active tab's root split for a bench focus action; `None`
+    /// until `prepare_bench` reads it and when the tab has one pane.
+    bench_focus_axis: Option<SplitAxis>,
     last_report: Option<StepReport>,
     exited: bool,
 }
@@ -149,6 +152,7 @@ impl HeadlessSession {
             scale: options.scale,
             budget: options.budget,
             bench_drag: None,
+            bench_focus_axis: None,
             last_report: None,
             exited: false,
         };
@@ -651,7 +655,10 @@ impl HeadlessSession {
                 let (axis, x, y) = self.app.bench_begin_divider_drag()?;
                 self.bench_drag = Some((axis, x, y));
             }
-            BenchAction::PaneFocus => self.app.bench_prepare_split()?,
+            BenchAction::PaneFocus => {
+                self.app.bench_prepare_split()?;
+                self.bench_focus_axis = self.app.bench_split_axis();
+            }
             _ => {}
         }
         Ok(())
@@ -707,7 +714,17 @@ impl HeadlessSession {
                 false
             }
             BenchAction::PaneFocus => {
-                let name = if frame % 2 == 0 { "left" } else { "right" };
+                let axis = self
+                    .bench_focus_axis
+                    .ok_or("bench focus action has no split axis")?;
+                // Neighbour keys run along the root split: focus moves across
+                // the root divider, not along it.
+                let name = match (axis, frame % 2) {
+                    (SplitAxis::SideBySide, 0) => "left",
+                    (SplitAxis::SideBySide, _) => "right",
+                    (SplitAxis::Stacked, 0) => "up",
+                    (SplitAxis::Stacked, _) => "down",
+                };
                 let key = key_spec(name)
                     .ok_or_else(|| format!("bench focus action has no {name} key"))?;
                 self.press_release_events(

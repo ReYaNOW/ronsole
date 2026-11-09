@@ -1504,6 +1504,15 @@ impl App {
         }
     }
 
+    /// Axis of the active tab's root split, or `None` when the tab has one pane.
+    /// A bench focus action picks its key pair by this axis.
+    pub(crate) fn bench_split_axis(&self) -> Option<SplitAxis> {
+        match &self.tabs.get(self.active_tab)?.layout {
+            SplitNode::Split { axis, .. } => Some(*axis),
+            SplitNode::Leaf(_) => None,
+        }
+    }
+
     /// Starts the divider drag of a bench action: ensures the active tab is
     /// split, seeds the drag on the centre of the root divider and returns the
     /// drag axis with the pressed point. No frame is drawn, so the panels of
