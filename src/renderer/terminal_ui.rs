@@ -83,6 +83,19 @@ const TERMINAL_TAB_BELL_DOT: f32 = 6.0;
 /// Space between the bell dot and the tab title.
 const TERMINAL_TAB_BELL_GAP: f32 = 6.0;
 const TERMINAL_ADD_SIZE: f32 = 20.0;
+
+/// Tab width from its title: the natural chrome, plus the bell dot and its
+/// gap so the dot does not push the title out of the tab.
+fn terminal_tab_width(text_width: f32, bell_pending: bool, s: f32) -> f32 {
+    let bell = if bell_pending {
+        (TERMINAL_TAB_BELL_DOT * s).round().max(1.0) + TERMINAL_TAB_BELL_GAP * s
+    } else {
+        0.0
+    };
+    (text_width + TERMINAL_TAB_NATURAL_CHROME * s + bell)
+        .round()
+        .max(72.0 * s)
+}
 const TAB_STRIP_EDGE_FADE_ALPHA: f32 = 0.4;
 const TAB_STRIP_EDGE_FADE_WIDTH: f32 = 40.0;
 const SEARCH_MATCH: [f32; 4] = [0.60, 0.60, 0.60, 0.35];
@@ -2580,12 +2593,12 @@ impl Renderer {
         let mut widths = std::mem::take(&mut self.terminal_tab_widths);
         widths.clear();
         widths.reserve(tabs.len());
-        for title in &titles {
-            widths.push(
-                (self.terminal_ui_text_width(title, 1.0) + TERMINAL_TAB_NATURAL_CHROME * s)
-                    .round()
-                    .max(72.0 * s),
-            );
+        for (label, title) in tabs.iter().zip(titles.iter()) {
+            widths.push(terminal_tab_width(
+                self.terminal_ui_text_width(title, 1.0),
+                label.bell_pending,
+                s,
+            ));
         }
         let max_scroll = terminal_tab_max_scroll(&widths, strip.w, s);
         let scroll_x = scroll_x.clamp(0.0, max_scroll);
@@ -4473,6 +4486,17 @@ mod tests {
         // An ordinary body keeps its scrollbar.
         let body = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
         assert!(terminal_scrollbar_layout(body, 1.0, 20.0, 100, 0.0).is_some());
+    }
+
+    #[test]
+    fn tab_width_leaves_room_for_the_bell_dot() {
+        for s in [1.0_f32, 1.25, 1.333, 2.0] {
+            let plain = terminal_tab_width(100.0, false, s);
+            let bell = terminal_tab_width(100.0, true, s);
+            let extra = (TERMINAL_TAB_BELL_DOT * s).round().max(1.0) + TERMINAL_TAB_BELL_GAP * s;
+            assert!((bell - plain - extra).abs() <= 1.0, "scale {s}");
+            assert_eq!(terminal_tab_width(0.0, false, s), 72.0 * s);
+        }
     }
 
     #[test]
