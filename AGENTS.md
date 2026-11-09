@@ -272,6 +272,7 @@ Do not hand-edit generated map contents. Fix the generator or source and regener
 - Inspect status before editing and preserve unrelated tracked/untracked files.
 - Never discard changes with `git reset --hard`, `git checkout --`, or similar destructive commands.
 - Commit with explicit paths (`git add <file>…`, never `-A`/`.`); substantial work goes on a branch. Push only from the main session, once the task is finished and `make codex_test` is green.
+- A finished PR with a green `make codex_test` is squash-merged by the main session (`gh pr merge <n> --squash`, without `--delete-branch`), without asking; a stack goes one squash per PR, bottom up.
 - Do not edit `.git/` or generated `.code-review-graph/` data.
 - Never run `cargo clean`.
 
