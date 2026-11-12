@@ -371,10 +371,10 @@ impl TerminalInteraction {
         if delta == 0.0 || self.layout.max_scroll <= 0.0 {
             return false;
         }
-        let old_target = terminal.scroll_y.target.clamp(0.0, self.layout.max_scroll);
+        let max = terminal_input_scroll_max(&self.layout);
+        let old_target = terminal.scroll_y.target.clamp(0.0, max);
         let speed = crate::scroll::drag_autoscroll_speed(delta, delta < 0.0);
-        let new_target =
-            (old_target - delta.signum() * speed * dt).clamp(0.0, self.layout.max_scroll);
+        let new_target = (old_target - delta.signum() * speed * dt).clamp(0.0, max);
         if new_target == old_target {
             return false;
         }
@@ -1152,7 +1152,7 @@ impl TerminalInteraction {
         }
         terminal.scroll_y.anim_speed = 7.0;
         terminal.scroll_y.scroll_by(dy);
-        terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
+        terminal.scroll_y.clamp_target(0.0, terminal_input_scroll_max(&layout));
         true
     }
 }
@@ -1519,6 +1519,15 @@ fn search_key_falls_through_to_terminal(
         PhysicalKey::Code(KeyCode::KeyT) => ctrl && !shift && !alt && !super_key,
         _ => false,
     }
+}
+
+/// Upper bound for input that moves `scroll_y`. While the redraw after a
+/// history clear is in progress the layout limit is the short content before
+/// the reprint, so input leaves the offset unclamped and the next frame's
+/// `Terminal::anchor_scroll` clamps it once the redraw is over.
+#[inline]
+fn terminal_input_scroll_max(layout: &TerminalUiLayout) -> f32 {
+    if layout.anchor_redrawing { f32::MAX } else { layout.max_scroll }
 }
 
 #[inline]
@@ -3880,6 +3889,46 @@ mod tests {
             layout,
         ));
         assert!(terminal.scroll_y.target > 0.0);
+    }
+
+    /// While the redraw after a history clear is in progress the layout limit
+    /// is the short content before the reprint; input must not clamp to it.
+    #[test]
+    fn redraw_window_wheel_keeps_the_offset_above_the_short_content() {
+        let mut interaction = TerminalInteraction::default();
+        interaction.mouse_x = 100.0;
+        interaction.mouse_y = 400.0;
+        let mut terminal = selection_test_terminal();
+        terminal.scroll_y.current = 500.0;
+        terminal.scroll_y.target = 500.0;
+        let mut layout = mouse_test_layout(0.0);
+        layout.max_scroll = 100.0;
+        layout.anchor_redrawing = true;
+
+        assert!(interaction.mouse_wheel(
+            ScrollDelta::Pixel { x: 0.0, y: 1.0 },
+            &mut terminal,
+            layout,
+        ));
+        assert!(terminal.scroll_y.target > 500.0);
+    }
+
+    #[test]
+    fn redraw_window_selection_autoscroll_keeps_the_offset_above_the_short_content() {
+        let mut interaction = TerminalInteraction::default();
+        let mut terminal = selection_test_terminal();
+        interaction.layout = mouse_test_layout(0.0);
+        interaction.layout.max_scroll = 100.0;
+        interaction.layout.anchor_redrawing = true;
+        interaction.pointer_capture = PointerCapture::TerminalSelection;
+        interaction.terminal_selection_anchor = Some((10, 15));
+        interaction.mouse_x = 100.0;
+        interaction.mouse_y = 50.0;
+        terminal.scroll_y.current = 500.0;
+        terminal.scroll_y.target = 500.0;
+
+        assert!(interaction.update_selection_autoscroll(0.016, &mut terminal));
+        assert!(terminal.scroll_y.target > 500.0);
     }
 
     #[test]

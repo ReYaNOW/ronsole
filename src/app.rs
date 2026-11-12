@@ -4532,6 +4532,7 @@ impl App {
                     more: confirm.more.as_deref(),
                     hovered: confirm.hovered,
                 }),
+                now,
             }))
         } else {
             None
@@ -4861,6 +4862,7 @@ mod tests {
                 settings_color_editing: None,
                 settings_color_input: &color_input,
                 close_confirm: None,
+                now: Instant::now(),
             })
             .expect("panel render");
         panel_layouts

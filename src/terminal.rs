@@ -93,7 +93,12 @@ mod tests {
 
     /// One frame of the app's scroll step: anchor, then clamp to the limit.
     fn anchor_frame(terminal: &mut Terminal) {
-        if let Some(max) = terminal.anchor_scroll(ANCHOR_CHAR_H, ANCHOR_BODY_H, 1.0, anchor_now()) {
+        anchor_frame_at(terminal, anchor_now());
+    }
+
+    /// One frame of the app's scroll step at `now`.
+    fn anchor_frame_at(terminal: &mut Terminal, now: Instant) {
+        if let Some(max) = terminal.anchor_scroll(ANCHOR_CHAR_H, ANCHOR_BODY_H, 1.0, now) {
             terminal.scroll_y.clamp_target(0.0, max);
             terminal.scroll_y.clamp_current(0.0, max);
         }
@@ -180,7 +185,10 @@ mod tests {
 
         feed(&mut crate::platform::lock_recover(&terminal.grid), b"\x1b[2J\x1b[3J\x1b[H");
         // A render before the next step must not clamp the offset either.
-        assert!(terminal.scroll_anchor_redrawing(&crate::platform::lock_recover(&terminal.grid)));
+        assert!(terminal.scroll_anchor_redrawing(
+            &crate::platform::lock_recover(&terminal.grid),
+            anchor_now()
+        ));
         anchor_frame(&mut terminal);
         // The first part of the reprint scrolls fewer lines than the offset.
         feed_numbered(&terminal, 0, 7);
@@ -188,10 +196,60 @@ mod tests {
         feed_numbered(&terminal, 7, 33);
         anchor_frame(&mut terminal);
         // Output went quiet: the redraw is over.
-        anchor_frame(&mut terminal);
+        let quiet = anchor_now() + Duration::from_secs(1);
+        assert!(!terminal.scroll_anchor_redrawing(
+            &crate::platform::lock_recover(&terminal.grid),
+            quiet
+        ));
+        anchor_frame_at(&mut terminal, quiet);
 
         assert_eq!(terminal.scroll_y.target, 5.0 * ANCHOR_CHAR_H);
         assert_eq!(terminal.scroll_y.current, 5.0 * ANCHOR_CHAR_H);
+        assert_eq!(bottom_line_in_view(&terminal), before);
+    }
+
+    /// No frame comes after a redraw until genuine output arrives much
+    /// later; the view must move with that output.
+    #[test]
+    fn redraw_window_lets_output_after_an_idle_gap_move_the_view() {
+        let mut terminal = test_terminal(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
+        let start = anchor_now();
+        anchor_frame_at(&mut terminal, start);
+        let before = bottom_line_in_view(&terminal);
+
+        feed(&mut crate::platform::lock_recover(&terminal.grid), b"\x1b[2J\x1b[3J\x1b[H");
+        feed_numbered(&terminal, 0, 40);
+        anchor_frame_at(&mut terminal, start);
+        feed_numbered(&terminal, 40, 6);
+        anchor_frame_at(&mut terminal, start + Duration::from_secs(10));
+
+        assert_eq!(terminal.scroll_y.target, 11.0 * ANCHOR_CHAR_H);
+        assert_eq!(bottom_line_in_view(&terminal), before);
+    }
+
+    /// A frame in a pause of the reprint must not clamp the offset to the
+    /// part reprinted so far.
+    #[test]
+    fn redraw_window_keeps_the_offset_over_a_pause_in_the_reprint() {
+        let mut terminal = test_terminal(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 30.0 * ANCHOR_CHAR_H);
+        let start = anchor_now();
+        anchor_frame_at(&mut terminal, start);
+        let before = bottom_line_in_view(&terminal);
+
+        feed(&mut crate::platform::lock_recover(&terminal.grid), b"\x1b[2J\x1b[3J\x1b[H");
+        feed_numbered(&terminal, 0, 10);
+        anchor_frame_at(&mut terminal, start);
+        anchor_frame_at(&mut terminal, start + Duration::from_millis(10));
+        feed_numbered(&terminal, 10, 30);
+        anchor_frame_at(&mut terminal, start + Duration::from_millis(20));
+        // Output went quiet: the redraw is over and the clamp applies again.
+        anchor_frame_at(&mut terminal, start + Duration::from_secs(1));
+
+        assert_eq!(terminal.scroll_y.target, 30.0 * ANCHOR_CHAR_H);
         assert_eq!(bottom_line_in_view(&terminal), before);
     }
 
@@ -276,7 +334,7 @@ mod tests {
         feed_numbered(&terminal, 40, 7);
         let pending = {
             let grid = crate::platform::lock_recover(&terminal.grid);
-            terminal.scroll_anchor_pending(&grid)
+            terminal.scroll_anchor_pending(&grid, anchor_now())
         };
         assert_eq!(pending, 7);
         let drawn = terminal.scroll_y.current + pending as f32 * ANCHOR_CHAR_H;
@@ -287,7 +345,7 @@ mod tests {
         assert_eq!(terminal.scroll_y.current, drawn);
         let pending_after = {
             let grid = crate::platform::lock_recover(&terminal.grid);
-            terminal.scroll_anchor_pending(&grid)
+            terminal.scroll_anchor_pending(&grid, anchor_now())
         };
         assert_eq!(pending_after, 0);
     }
@@ -3179,7 +3237,8 @@ impl Terminal {
         let (scrolled, total_lines, is_alt, redrawing) = {
             let grid = crate::platform::lock_recover(&self.grid);
             let scrolled = self.scroll_anchor.hold(&grid, now);
-            (scrolled, grid.total_rows(), grid.is_alt_screen(), self.scroll_anchor.redrawing(&grid))
+            let redrawing = self.scroll_anchor.redrawing(&grid, now);
+            (scrolled, grid.total_rows(), grid.is_alt_screen(), redrawing)
         };
         if scrolled > 0 {
             let delta = scrolled as f32 * char_h;
@@ -3196,19 +3255,20 @@ impl Terminal {
     /// read under the grid lock the caller already holds. A render adds them
     /// to `scroll_y` so it draws the offset the next `anchor_scroll` applies.
     /// 0 once the view is back at the bottom (the next step releases the anchor).
-    pub(crate) fn scroll_anchor_pending(&self, grid: &Term) -> usize {
+    /// `now` is the frame instant passed to `anchor_scroll`.
+    pub(crate) fn scroll_anchor_pending(&self, grid: &Term, now: Instant) -> usize {
         if !(self.scroll_y.target > 0.0) {
             return 0;
         }
-        self.scroll_anchor.pending(grid)
+        self.scroll_anchor.pending(grid, now)
     }
 
-    /// Whether a scrolled-up view waits for the redraw after a scrollback
-    /// clear, read under the grid lock the caller already holds. A render
-    /// clamps only what it draws then; its layout limit must not clamp
-    /// `scroll_y`, which still holds the offset for the reprinted content.
-    pub(crate) fn scroll_anchor_redrawing(&self, grid: &Term) -> bool {
-        self.scroll_y.target > 0.0 && self.scroll_anchor.redrawing(grid)
+    /// Whether a scrolled-up view waits at `now` for the redraw after a
+    /// scrollback clear, read under the grid lock the caller already holds.
+    /// A render clamps only what it draws then; its layout limit must not
+    /// clamp `scroll_y`, which still holds the offset for the reprinted content.
+    pub(crate) fn scroll_anchor_redrawing(&self, grid: &Term, now: Instant) -> bool {
+        self.scroll_y.target > 0.0 && self.scroll_anchor.redrawing(grid, now)
     }
 
     pub(crate) fn manually_confirm_bridge(

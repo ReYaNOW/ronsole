@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 /// synchronized-output hold reaches the screen in parts anyway.
 const REDRAW_WINDOW: Duration = SYNC_TIMEOUT;
 
+/// Output pause that ends a redraw: lines after it are new output, not the
+/// rest of the reprint.
+pub(crate) const REDRAW_QUIET: Duration = Duration::from_millis(50);
+
 /// Anchor of a viewport scrolled up into the scrollback.
 ///
 /// Hosts measure their scroll offset from the bottom of the content, so every
@@ -26,24 +30,37 @@ const REDRAW_WINDOW: Duration = SYNC_TIMEOUT;
 /// whole transcript (for example on a focus report); counting the reprint
 /// would move the viewport by the whole history. A clear therefore opens a
 /// redraw window: lines pushed while it is open do not grow the offset, and
-/// the host keeps its offset unclamped ([`Self::redrawing`]) because the
-/// content is still short of the reprint. The window closes at the first
-/// `hold` that sees no new lines and no new clear after the reprint pushed
-/// lines in an earlier `hold` of the window, at `REDRAW_WINDOW` after
-/// the `hold` that saw the clear, or on `release`; the host then clamps the
-/// offset to the reprinted content as usual.
+/// the host keeps its offset unclamped while [`Self::redrawing`] holds,
+/// because the content is still short of the reprint. The window closes once
+/// output has paused for `REDRAW_QUIET` (timed from the last `hold` that saw
+/// the clear or reprinted lines), at `REDRAW_WINDOW` after the `hold` that saw
+/// the clear, or on `release`. The window is timed by the `now` the host
+/// passes, so it closes even when no `hold` runs; the first `hold` after it
+/// closed counts its lines as new output, and the host clamps the offset to
+/// the reprinted content as usual.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScrollbackAnchor {
     /// `Term::output_scrolled_lines` at the last `hold`; `None` while released.
     seen_scrolled: Option<u64>,
     /// `Term::history_clears` at the last `hold`.
     seen_clears: u64,
-    /// When the `hold` that saw the latest clear ran, while its redraw
-    /// window is open.
-    redraw_since: Option<Instant>,
-    /// The open redraw window has seen the reprint push lines; only then a
-    /// quiet `hold` means the reprint is over.
-    redraw_pushed: bool,
+    /// The redraw window of the latest clear, until a `hold` closes it.
+    redraw: Option<RedrawWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RedrawWindow {
+    /// When the `hold` that saw the clear ran.
+    opened: Instant,
+    /// When the last `hold` that saw the clear or reprinted lines ran.
+    active: Instant,
+}
+
+impl RedrawWindow {
+    fn open_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.active) < REDRAW_QUIET
+            && now.saturating_duration_since(self.opened) < REDRAW_WINDOW
+    }
 }
 
 impl ScrollbackAnchor {
@@ -51,8 +68,7 @@ impl ScrollbackAnchor {
         Self {
             seen_scrolled: None,
             seen_clears: 0,
-            redraw_since: None,
-            redraw_pushed: false,
+            redraw: None,
         }
     }
 
@@ -65,25 +81,25 @@ impl ScrollbackAnchor {
         let scrolled = term.output_scrolled_lines();
         let lines = match self.seen_scrolled {
             None => 0,
-            Some(seen) if term.history_clears != self.seen_clears => {
-                self.redraw_since = Some(now);
-                // Lines in the window of the clear are most likely its reprint.
-                self.redraw_pushed = scrolled != seen;
+            Some(_) if term.history_clears != self.seen_clears => {
+                // Lines pushed before the clear in this frame are erased by it.
+                self.redraw = Some(RedrawWindow { opened: now, active: now });
                 0
             }
             Some(seen) => {
                 let pushed = scrolled.wrapping_sub(seen);
-                match self.redraw_since {
-                    Some(since) => {
-                        // Lines up to the closing `hold` still belong to the redraw.
-                        let quiet = pushed == 0 && self.redraw_pushed;
-                        self.redraw_pushed |= pushed != 0;
-                        if quiet || now.saturating_duration_since(since) >= REDRAW_WINDOW {
-                            self.redraw_since = None;
+                match self.redraw.as_mut() {
+                    Some(window) if window.open_at(now) => {
+                        // Lines in the window are most likely the reprint.
+                        if pushed != 0 {
+                            window.active = now;
                         }
                         0
                     }
-                    None => usize::try_from(pushed).unwrap_or(usize::MAX),
+                    _ => {
+                        self.redraw = None;
+                        usize::try_from(pushed).unwrap_or(usize::MAX)
+                    }
                 }
             }
         };
@@ -92,31 +108,31 @@ impl ScrollbackAnchor {
         lines
     }
 
-    /// The lines that the next `hold` would return, without consuming them.
-    /// Renders use it to draw the offset that the next `hold` will apply.
-    /// 0 while released or redrawing.
-    pub fn pending(&self, term: &Term) -> usize {
+    /// The lines that the next `hold` at `now` would return, without
+    /// consuming them. Renders use it to draw the offset that the next `hold`
+    /// will apply. 0 while released or redrawing.
+    pub fn pending(&self, term: &Term, now: Instant) -> usize {
         let Some(seen) = self.seen_scrolled else {
             return 0;
         };
-        if self.redrawing(term) {
+        if self.redrawing(term, now) {
             return 0;
         }
         usize::try_from(term.output_scrolled_lines().wrapping_sub(seen)).unwrap_or(usize::MAX)
     }
 
-    /// Whether a scrollback clear's redraw window is open, or a clear since
-    /// the last `hold` is about to open one. The content is short of the
-    /// reprint then, so the host must not clamp its offset to it.
-    pub fn redrawing(&self, term: &Term) -> bool {
+    /// Whether a scrollback clear's redraw window is open at `now`, or a
+    /// clear since the last `hold` is about to open one. The content is short
+    /// of the reprint then, so the host must not clamp its offset to it.
+    pub fn redrawing(&self, term: &Term, now: Instant) -> bool {
         self.seen_scrolled.is_some()
-            && (self.redraw_since.is_some() || term.history_clears != self.seen_clears)
+            && (term.history_clears != self.seen_clears
+                || self.redraw.is_some_and(|window| window.open_at(now)))
     }
 
     /// The viewport is at the bottom and follows output again.
     pub fn release(&mut self) {
         self.seen_scrolled = None;
-        self.redraw_since = None;
-        self.redraw_pushed = false;
+        self.redraw = None;
     }
 }

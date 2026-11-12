@@ -1,5 +1,5 @@
 use super::support::{RecordingSink, feed, test_config};
-use crate::scroll_anchor::ScrollbackAnchor;
+use crate::scroll_anchor::{REDRAW_QUIET, ScrollbackAnchor};
 use crate::term::{Term, TermConfig};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -9,6 +9,12 @@ use std::time::{Duration, Instant};
 fn now() -> Instant {
     static NOW: OnceLock<Instant> = OnceLock::new();
     *NOW.get_or_init(Instant::now)
+}
+
+/// The first instant at which a redraw window opened or active at `now()`
+/// has gone quiet.
+fn quiet() -> Instant {
+    now() + REDRAW_QUIET
 }
 
 fn lines(count: usize) -> Vec<u8> {
@@ -83,7 +89,7 @@ fn resize_round_trip_is_not_output() {
     term.resize(10, 3);
 
     assert_eq!(anchor.hold(&term, now()), 0);
-    assert_eq!(anchor.pending(&term), 0);
+    assert_eq!(anchor.pending(&term, now()), 0);
 }
 
 #[test]
@@ -95,10 +101,10 @@ fn pending_reports_lines_without_consuming_them() {
     anchor.hold(&term, now());
 
     feed(&mut term, &mut sink, &lines(4));
-    assert_eq!(anchor.pending(&term), 4);
-    assert_eq!(anchor.pending(&term), 4);
+    assert_eq!(anchor.pending(&term, now()), 4);
+    assert_eq!(anchor.pending(&term, now()), 4);
     assert_eq!(anchor.hold(&term, now()), 4);
-    assert_eq!(anchor.pending(&term), 0);
+    assert_eq!(anchor.pending(&term, now()), 0);
 }
 
 /// An Ink-style full redraw: clear the screen and the history, reprint all.
@@ -117,14 +123,14 @@ fn history_clear_and_reprint_does_not_grow_the_offset() {
     anchor.hold(&term, now());
 
     feed(&mut term, &mut sink, &full_redraw(20));
-    assert_eq!(anchor.pending(&term), 0);
+    assert_eq!(anchor.pending(&term, now()), 0);
     assert_eq!(anchor.hold(&term, now()), 0);
     // Output went quiet: the redraw window closes.
-    assert_eq!(anchor.hold(&term, now()), 0);
+    assert_eq!(anchor.hold(&term, quiet()), 0);
 
     // Output after the redraw moves the view again.
     feed(&mut term, &mut sink, &lines(3));
-    assert_eq!(anchor.hold(&term, now()), 3);
+    assert_eq!(anchor.hold(&term, quiet()), 3);
 }
 
 /// Offset growth over a redraw of `reprint` lines whose stream a frame cuts
@@ -140,7 +146,7 @@ fn redraw_growth(split: usize, reprint: usize) -> usize {
     let mut grown = anchor.hold(&term, now());
     feed(&mut term, &mut sink, &lines(reprint - split));
     grown += anchor.hold(&term, now());
-    grown + anchor.hold(&term, now())
+    grown + anchor.hold(&term, quiet())
 }
 
 #[test]
@@ -163,7 +169,7 @@ fn quiet_frame_before_the_reprint_keeps_the_redraw_window_open() {
     assert_eq!(anchor.hold(&term, now()), 0);
     // A frame lands before the reprint reaches the terminal.
     assert_eq!(anchor.hold(&term, now()), 0);
-    assert!(anchor.redrawing(&term));
+    assert!(anchor.redrawing(&term, now()));
     feed(&mut term, &mut sink, &lines(22));
     assert_eq!(anchor.hold(&term, now()), 0);
 }
@@ -178,11 +184,11 @@ fn shell_history_before_a_redraw_does_not_absorb_later_output() {
     anchor.hold(&term, now());
     feed(&mut term, &mut sink, &full_redraw(5));
     assert_eq!(anchor.hold(&term, now()), 0);
-    assert_eq!(anchor.hold(&term, now()), 0);
+    assert_eq!(anchor.hold(&term, quiet()), 0);
 
     feed(&mut term, &mut sink, &lines(4));
-    assert_eq!(anchor.pending(&term), 4);
-    assert_eq!(anchor.hold(&term, now()), 4);
+    assert_eq!(anchor.pending(&term, quiet()), 4);
+    assert_eq!(anchor.hold(&term, quiet()), 4);
 }
 
 #[test]
@@ -201,12 +207,12 @@ fn split_reprint_beyond_the_scrollback_limit_does_not_grow_the_offset() {
     assert_eq!(anchor.hold(&term, now()), 0);
     // The rest of the reprint evicts lines from the full scrollback.
     feed(&mut term, &mut sink, &lines(12));
-    assert_eq!(anchor.pending(&term), 0);
+    assert_eq!(anchor.pending(&term, now()), 0);
     assert_eq!(anchor.hold(&term, now()), 0);
-    assert_eq!(anchor.hold(&term, now()), 0);
+    assert_eq!(anchor.hold(&term, quiet()), 0);
 
     feed(&mut term, &mut sink, &lines(2));
-    assert_eq!(anchor.hold(&term, now()), 2);
+    assert_eq!(anchor.hold(&term, quiet()), 2);
 }
 
 #[test]
@@ -218,10 +224,10 @@ fn release_closes_the_redraw_window() {
     anchor.hold(&term, now());
     feed(&mut term, &mut sink, b"\x1b[3J");
     anchor.hold(&term, now());
-    assert!(anchor.redrawing(&term));
+    assert!(anchor.redrawing(&term, now()));
 
     anchor.release();
-    assert!(!anchor.redrawing(&term));
+    assert!(!anchor.redrawing(&term, now()));
     anchor.hold(&term, now());
     feed(&mut term, &mut sink, &lines(4));
     assert_eq!(anchor.hold(&term, now()), 4);
@@ -234,21 +240,24 @@ fn redraw_window_closes_at_its_deadline_under_steady_output() {
     feed(&mut term, &mut sink, &lines(20));
     let mut anchor = ScrollbackAnchor::new();
     let start = now();
+    let at = |ms| start + Duration::from_millis(ms);
     anchor.hold(&term, start);
 
     feed(&mut term, &mut sink, &full_redraw(5));
     assert_eq!(anchor.hold(&term, start), 0);
+    // Output keeps coming without a pause long enough to end the redraw.
+    for ms in [40, 80, 120] {
+        feed(&mut term, &mut sink, &lines(5));
+        assert_eq!(anchor.hold(&term, at(ms)), 0);
+        assert!(anchor.redrawing(&term, at(ms)));
+    }
+    // Past the deadline the window closes and output counts again.
+    assert!(!anchor.redrawing(&term, at(160)));
     feed(&mut term, &mut sink, &lines(5));
-    assert_eq!(anchor.hold(&term, start + Duration::from_millis(100)), 0);
-    assert!(anchor.redrawing(&term));
-    // The hold past the deadline still takes the lines before it.
-    feed(&mut term, &mut sink, &lines(5));
-    assert_eq!(anchor.hold(&term, start + Duration::from_millis(200)), 0);
-    assert!(!anchor.redrawing(&term));
-
+    assert_eq!(anchor.pending(&term, at(160)), 5);
+    assert_eq!(anchor.hold(&term, at(160)), 5);
     feed(&mut term, &mut sink, &lines(3));
-    assert_eq!(anchor.pending(&term), 3);
-    assert_eq!(anchor.hold(&term, start + Duration::from_millis(210)), 3);
+    assert_eq!(anchor.hold(&term, at(170)), 3);
 }
 
 #[test]
@@ -259,17 +268,75 @@ fn clear_since_the_last_hold_counts_as_redrawing() {
     let mut anchor = ScrollbackAnchor::new();
     feed(&mut term, &mut sink, b"\x1b[3J");
     // A released anchor has no offset to keep.
-    assert!(!anchor.redrawing(&term));
+    assert!(!anchor.redrawing(&term, now()));
     anchor.hold(&term, now());
-    assert!(!anchor.redrawing(&term));
+    assert!(!anchor.redrawing(&term, now()));
 
     feed(&mut term, &mut sink, &full_redraw(8));
-    assert!(anchor.redrawing(&term));
-    assert_eq!(anchor.pending(&term), 0);
+    assert!(anchor.redrawing(&term, now()));
+    assert_eq!(anchor.pending(&term, now()), 0);
     assert_eq!(anchor.hold(&term, now()), 0);
-    assert!(anchor.redrawing(&term));
-    assert_eq!(anchor.hold(&term, now()), 0);
-    assert!(!anchor.redrawing(&term));
+    assert!(anchor.redrawing(&term, now()));
+    // A quiet window stops redrawing without waiting for the next hold.
+    assert!(!anchor.redrawing(&term, quiet()));
+    assert_eq!(anchor.hold(&term, quiet()), 0);
+    assert!(!anchor.redrawing(&term, quiet()));
+}
+
+#[test]
+fn redraw_window_counts_output_after_an_idle_gap() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, &lines(20));
+    let mut anchor = ScrollbackAnchor::new();
+    let start = now();
+    anchor.hold(&term, start);
+
+    feed(&mut term, &mut sink, &full_redraw(20));
+    assert_eq!(anchor.hold(&term, start), 0);
+    // No frame comes after the reprint; genuine output arrives much later.
+    feed(&mut term, &mut sink, &lines(6));
+    let later = start + Duration::from_secs(10);
+    assert!(!anchor.redrawing(&term, later));
+    assert_eq!(anchor.pending(&term, later), 6);
+    assert_eq!(anchor.hold(&term, later), 6);
+}
+
+#[test]
+fn redraw_window_stays_open_over_a_pause_between_reprint_chunks() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, &lines(40));
+    let mut anchor = ScrollbackAnchor::new();
+    let start = now();
+    anchor.hold(&term, start);
+
+    feed(&mut term, &mut sink, &full_redraw(10));
+    assert_eq!(anchor.hold(&term, start), 0);
+    // A frame lands in a short pause of the reprint.
+    assert_eq!(anchor.hold(&term, start + Duration::from_millis(10)), 0);
+    assert!(anchor.redrawing(&term, start + Duration::from_millis(10)));
+    feed(&mut term, &mut sink, &lines(30));
+    assert_eq!(anchor.hold(&term, start + Duration::from_millis(20)), 0);
+}
+
+#[test]
+fn redraw_window_output_before_the_clear_does_not_start_the_reprint() {
+    let mut term = Term::new(test_config(10, 3));
+    let mut sink = RecordingSink::new();
+    feed(&mut term, &mut sink, &lines(20));
+    let mut anchor = ScrollbackAnchor::new();
+    let start = now();
+    anchor.hold(&term, start);
+
+    // Lines that the clear erases arrive in the same frame as the clear.
+    feed(&mut term, &mut sink, &lines(3));
+    feed(&mut term, &mut sink, &full_redraw(0));
+    assert_eq!(anchor.hold(&term, start), 0);
+    // A frame lands before the reprint reaches the terminal.
+    assert_eq!(anchor.hold(&term, start + Duration::from_millis(10)), 0);
+    feed(&mut term, &mut sink, &lines(22));
+    assert_eq!(anchor.hold(&term, start + Duration::from_millis(20)), 0);
 }
 
 #[test]
@@ -281,5 +348,5 @@ fn pending_is_zero_while_released() {
     feed(&mut term, &mut sink, &lines(3));
 
     anchor.release();
-    assert_eq!(anchor.pending(&term), 0);
+    assert_eq!(anchor.pending(&term, now()), 0);
 }

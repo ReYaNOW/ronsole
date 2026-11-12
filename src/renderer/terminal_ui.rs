@@ -3677,6 +3677,7 @@ impl Renderer {
         settings_color_editing: Option<SettingsColorField>,
         settings_color_input: &SingleLineInput,
         close_confirm: Option<CloseConfirmView<'_>>,
+        now: Instant,
     ) -> TerminalUiLayout {
         self.frame_flushes = 0;
         self.frame_vertices = 0;
@@ -3760,6 +3761,7 @@ impl Renderer {
                     focused,
                     pointer_x,
                     pointer_y,
+                    now,
                 )
             };
             if let (Some(header), true) = (panel.header, is_active) {
@@ -3861,6 +3863,7 @@ impl Renderer {
         window_focused: bool,
         pointer_x: f32,
         pointer_y: f32,
+        now: Instant,
     ) -> TerminalUiLayout {
         let palette = self.palette;
         let s = self.scale_factor;
@@ -3895,8 +3898,8 @@ impl Renderer {
         let total_lines = grid.total_rows();
         let max_scroll = if is_alt { 0.0 } else { terminal_max_scroll(total_lines, char_h, body.h, s) };
         // Read under the lock taken above, so the offset matches the lines drawn from this grid.
-        let pending = terminal.scroll_anchor_pending(&grid);
-        let anchor_redrawing = terminal.scroll_anchor_redrawing(&grid);
+        let pending = terminal.scroll_anchor_pending(&grid, now);
+        let anchor_redrawing = terminal.scroll_anchor_redrawing(&grid, now);
         let scroll_offset = terminal_anchored_scroll_offset(
             terminal.scroll_y.current,
             pending,
