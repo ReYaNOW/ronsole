@@ -466,9 +466,7 @@ impl Perform for Performer<'_> {
                         }
                     }
                     3 => {
-                        self.term.scrollback.clear();
-                        self.term.scrollback_meta.clear();
-                        self.term.scrollback_storage_cols = self.term.cols;
+                        self.term.clear_scrollback();
                         self.term.selection = None;
                     }
                     _ => {}

@@ -103,6 +103,10 @@ pub struct Term {
     /// Lines that output scrolled off the top of the full-screen normal
     /// screen; monotonic, not moved by resize or reflow.
     pub(crate) output_scrolled_lines: u64,
+    /// Scrollback clears (`ED 3`, `RIS`) so far (wrapping); `ScrollbackAnchor`
+    /// compares it to notice a clear since its last `hold` and open the
+    /// redraw window in which the reprint does not move the viewport.
+    pub(crate) history_clears: u64,
     pub(crate) pool: Vec<Vec<Cell>>,
     pub(crate) scrollback_limit: usize,
     pub(crate) identity: TermIdentity,
@@ -195,6 +199,7 @@ impl Term {
             scrollback_storage_cols: cols,
             scrollback_pushed: 0,
             output_scrolled_lines: 0,
+            history_clears: 0,
             pool: Vec::with_capacity(128),
             scrollback_limit: scrollback_lines,
             identity,

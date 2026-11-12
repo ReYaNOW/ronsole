@@ -501,6 +501,16 @@ impl Term {
         self.presentation_ready && self.presentation_layout_ready
     }
 
+    /// Empties the scrollback (`ED 3`, `RIS`) and records the clear for
+    /// `ScrollbackAnchor`: apps that redraw by clearing the history and
+    /// reprinting it must not move a scrolled-up viewport by the reprint.
+    pub(crate) fn clear_scrollback(&mut self) {
+        self.history_clears = self.history_clears.wrapping_add(1);
+        self.scrollback.clear();
+        self.scrollback_meta.clear();
+        self.scrollback_storage_cols = self.cols;
+    }
+
     pub(crate) fn push_scrollback_row(&mut self, line: Vec<Cell>, state: LineMeta) {
         self.scrollback_storage_cols = self.scrollback_storage_cols.max(line.len());
         self.scrollback_pushed = self.scrollback_pushed.wrapping_add(1);
@@ -1058,9 +1068,7 @@ impl Term {
             *state = LineMeta::default();
         }
 
-        self.scrollback.clear();
-        self.scrollback_meta.clear();
-        self.scrollback_storage_cols = self.cols;
+        self.clear_scrollback();
         self.selection = None;
         self.tab_stops = default_tab_stops(self.cols);
         self.reset_terminal_modes();

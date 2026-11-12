@@ -2764,6 +2764,8 @@ pub(crate) struct TerminalRenderParams<'a> {
     pub settings_color_editing: Option<crate::renderer::SettingsColorField>,
     pub settings_color_input: &'a crate::single_line_input::SingleLineInput,
     pub close_confirm: Option<crate::renderer::CloseConfirmView<'a>>,
+    /// Frame instant passed to `Terminal::anchor_scroll` in the same frame.
+    pub now: Instant,
 }
 
 /// Field order is destruction order: the renderer goes first while its GL target is
@@ -3129,6 +3131,7 @@ impl WindowRuntime {
             params.settings_color_editing,
             params.settings_color_input,
             params.close_confirm,
+            params.now,
         );
         match (&mut self.target, &self.backend) {
             (GlTarget::Window { context, surface, .. }, RuntimeBackend::Wayland(_)) => {
@@ -4056,6 +4059,7 @@ mod tests {
             settings_color_editing: None,
             settings_color_input: &color_input,
             close_confirm: None,
+            now: Instant::now(),
         });
         assert!(result.is_ok(), "render failed: {:?}", result.err());
     }

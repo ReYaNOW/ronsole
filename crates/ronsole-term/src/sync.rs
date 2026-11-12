@@ -8,7 +8,7 @@ use vte::Parser;
 /// Reset sequence; its end is the replay boundary.
 const SYNC_RESET: &[u8] = b"\x1b[?2026l";
 /// How long a set may hold the grid before the buffer is replayed.
-const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+pub(crate) const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// Held bytes that force a replay even without a reset.
 const SYNC_BUF_LIMIT: usize = 2 * 1024 * 1024;
 /// Buffer capacity kept between synchronized updates.
