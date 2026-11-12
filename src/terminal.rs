@@ -140,6 +140,26 @@ mod tests {
         assert_eq!(terminal.scroll_y.target, 12.0 * ANCHOR_CHAR_H);
     }
 
+    /// An Ink app (Claude Code) answers the focus reports of a tab switch by
+    /// clearing the screen and the history and reprinting the transcript; the
+    /// scrolled-up view must stay where it was instead of jumping to the top.
+    #[test]
+    fn scrolled_up_view_stays_put_across_a_clear_and_reprint_redraw() {
+        let mut terminal = test_terminal(20, 4, 1);
+        feed_numbered(&terminal, 0, 40);
+        scroll_to(&mut terminal, 5.0 * ANCHOR_CHAR_H);
+        anchor_frame(&mut terminal);
+        let before = bottom_line_in_view(&terminal);
+
+        feed(&mut crate::platform::lock_recover(&terminal.grid), b"\x1b[2J\x1b[3J\x1b[H");
+        feed_numbered(&terminal, 0, 40);
+        anchor_frame(&mut terminal);
+
+        assert_eq!(bottom_line_in_view(&terminal), before);
+        assert_eq!(terminal.scroll_y.current, 5.0 * ANCHOR_CHAR_H);
+        assert_eq!(terminal.scroll_y.target, 5.0 * ANCHOR_CHAR_H);
+    }
+
     #[test]
     fn view_at_bottom_follows_output() {
         let mut terminal = test_terminal(20, 4, 1);
