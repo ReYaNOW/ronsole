@@ -4445,7 +4445,7 @@ impl App {
             let limit = if active_content_hidden {
                 None
             } else {
-                terminal.anchor_scroll(layout.char_h, layout.body.h, layout.scale)
+                terminal.anchor_scroll(layout.char_h, layout.body.h, layout.scale, now)
             };
             terminal.scroll_y.update(dt);
             if let Some(max) = limit {
@@ -4479,7 +4479,7 @@ impl App {
                 terminal.scroll_y.update(dt);
                 continue;
             };
-            let limit = terminal.anchor_scroll(layout.char_h, layout.body.h, layout.scale);
+            let limit = terminal.anchor_scroll(layout.char_h, layout.body.h, layout.scale, now);
             terminal.scroll_y.update(dt);
             if let Some(max) = limit {
                 terminal.scroll_y.clamp_target(0.0, max);
@@ -4546,7 +4546,12 @@ impl App {
                     .panels
                     .iter()
                     .any(|panel| panel.terminal == active && panel.content_hidden);
-                if !active_content_hidden && let Some(terminal) = self.terminals.get_mut(active) {
+                // A view waiting for a redraw after a history clear keeps its
+                // offset; the render clamped only what it drew.
+                if !active_content_hidden
+                    && !layout.anchor_redrawing
+                    && let Some(terminal) = self.terminals.get_mut(active)
+                {
                     terminal.scroll_y.clamp_target(0.0, layout.max_scroll);
                     terminal.scroll_y.clamp_current(0.0, layout.max_scroll);
                 }
@@ -4555,7 +4560,11 @@ impl App {
                     if panel.terminal == active || panel.content_hidden {
                         continue;
                     }
-                    let Some(max) = self.panel_layouts.get(index).map(|layout| layout.max_scroll)
+                    let Some(max) = self
+                        .panel_layouts
+                        .get(index)
+                        .filter(|layout| !layout.anchor_redrawing)
+                        .map(|layout| layout.max_scroll)
                     else {
                         continue;
                     };

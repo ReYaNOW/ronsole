@@ -506,8 +506,6 @@ impl Term {
     /// reprinting it must not move a scrolled-up viewport by the reprint.
     pub(crate) fn clear_scrollback(&mut self) {
         self.history_clears = self.history_clears.wrapping_add(1);
-        self.scrolled_at_history_clear = self.output_scrolled_lines;
-        self.history_cleared_lines = self.scrollback.len() as u64;
         self.scrollback.clear();
         self.scrollback_meta.clear();
         self.scrollback_storage_cols = self.cols;

@@ -104,12 +104,9 @@ pub struct Term {
     /// screen; monotonic, not moved by resize or reflow.
     pub(crate) output_scrolled_lines: u64,
     /// Scrollback clears (`ED 3`, `RIS`) so far (wrapping); `ScrollbackAnchor`
-    /// compares it to notice a clear since its last `hold`.
+    /// compares it to notice a clear since its last `hold` and open the
+    /// redraw window in which the reprint does not move the viewport.
     pub(crate) history_clears: u64,
-    /// `output_scrolled_lines` at the latest scrollback clear.
-    pub(crate) scrolled_at_history_clear: u64,
-    /// Scrollback rows the latest clear removed.
-    pub(crate) history_cleared_lines: u64,
     pub(crate) pool: Vec<Vec<Cell>>,
     pub(crate) scrollback_limit: usize,
     pub(crate) identity: TermIdentity,
@@ -203,8 +200,6 @@ impl Term {
             scrollback_pushed: 0,
             output_scrolled_lines: 0,
             history_clears: 0,
-            scrolled_at_history_clear: 0,
-            history_cleared_lines: 0,
             pool: Vec::with_capacity(128),
             scrollback_limit: scrollback_lines,
             identity,

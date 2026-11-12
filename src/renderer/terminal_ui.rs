@@ -182,6 +182,10 @@ pub(crate) struct TerminalUiLayout {
     /// Set when this layout was written for a tile whose content was hidden at
     /// render time. Its `max_scroll` is not a real content limit, so clamps must skip it.
     pub content_hidden: bool,
+    /// Set when the scrolled-up view waits for the redraw after a history clear
+    /// (`Terminal::scroll_anchor_redrawing`); its `max_scroll` is the short
+    /// content before the reprint, so clamps must skip it.
+    pub anchor_redrawing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3892,6 +3896,7 @@ impl Renderer {
         let max_scroll = if is_alt { 0.0 } else { terminal_max_scroll(total_lines, char_h, body.h, s) };
         // Read under the lock taken above, so the offset matches the lines drawn from this grid.
         let pending = terminal.scroll_anchor_pending(&grid);
+        let anchor_redrawing = terminal.scroll_anchor_redrawing(&grid);
         let scroll_offset = terminal_anchored_scroll_offset(
             terminal.scroll_y.current,
             pending,
@@ -4184,6 +4189,7 @@ impl Renderer {
             scrollbar,
             search: search_geometry,
             content_hidden: false,
+            anchor_redrawing,
         }
     }
 }
