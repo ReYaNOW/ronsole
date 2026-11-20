@@ -738,6 +738,10 @@ pub struct App {
     /// Earliest end of the banner hiding among grid tiles that the last grid
     /// frame drew with `content_hidden`; grid mode only.
     withheld_until: Option<Instant>,
+    /// Test hook run by `on_frame` after the frame-start development-channels
+    /// passes and before the render: stands in for PTY output landing there.
+    #[cfg(test)]
+    frame_race_hook: Option<Box<dyn FnOnce(&[Terminal])>>,
 }
 
 impl App {
@@ -840,6 +844,8 @@ impl App {
             hovered_panel_terminal: None,
             split_pointer_owner: None,
             withheld_until: None,
+            #[cfg(test)]
+            frame_race_hook: None,
         }
     }
 
@@ -4497,6 +4503,10 @@ impl App {
         if self.grid_open() || self.active_tab_split() {
             self.observe_grid_dev_warnings(now);
         }
+        #[cfg(test)]
+        if let Some(hook) = self.frame_race_hook.take() {
+            hook(&self.terminals);
+        }
         self.build_tab_labels();
         let tab_strip_hint = self.tab_strip_hint(now);
         let render_result = if let Some(runtime) = self.runtime.as_mut() {
@@ -4963,6 +4973,46 @@ mod tests {
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         grid.advance(bytes.as_bytes(), Instant::now(), &mut sink);
         grid.mark_changed();
+    }
+
+    /// Renders one frame of the headless app and returns its RGBA pixels.
+    fn frame_pixels(app: &mut App) -> Vec<u8> {
+        app.dirty = true;
+        assert_eq!(app.on_frame(), Ok(true));
+        let runtime = app.runtime.as_ref().expect("headless runtime");
+        runtime.read_pixels().expect("frame pixels").2
+    }
+
+    #[test]
+    fn dev_channel_output_landing_after_frame_pass_is_drawn() {
+        // Hidden cursor, so only the text differs between the frames.
+        const TEXT: &str = "\x1b[?25l\x1b[2J\x1b[Hordinary output of the frame race\r\nsecond line";
+        let (mut app, _receiver, _profile, root) =
+            crate::app::headless_run::test_support::started_headless_with_test_terminals(
+                "dev-channel-frame-race",
+                1,
+            );
+        feed_batch(&app.terminals[0], "\x1b[?25l\x1b[2J\x1b[H");
+        let empty = frame_pixels(&mut app);
+        feed_batch(&app.terminals[0], TEXT);
+        let drawn = frame_pixels(&mut app);
+        // The same text written again after the frame-start development-channels
+        // pass: a newer generation that pass did not verify.
+        app.frame_race_hook = Some(Box::new(|terminals: &[Terminal]| {
+            feed_batch(&terminals[0], TEXT);
+        }));
+        let raced = frame_pixels(&mut app);
+        assert!(app.frame_race_hook.is_none());
+
+        let differing = |a: &[u8], b: &[u8]| {
+            a.chunks(4).zip(b.chunks(4)).filter(|(left, right)| left != right).count()
+        };
+        let text_pixels = differing(&empty, &drawn);
+        assert!(text_pixels > 0);
+        // The raced frame shows the text, not an empty body.
+        let missing = differing(&raced, &drawn);
+        assert!(missing * 4 < text_pixels, "missing {missing} of {text_pixels} text pixels");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

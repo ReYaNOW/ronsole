@@ -3875,8 +3875,9 @@ impl Renderer {
         let mut grid = crate::platform::lock_recover(&terminal.grid);
         // The renderer resizes the grid to the body geometry below, and a resize
         // bumps the content generation without new output. The development-channels
-        // verdict belongs to the content that was verified, so capture its
-        // generation before that resize.
+        // verdict belongs to the content that was verified, so keep this generation
+        // for it, taken before that resize. The verdict itself is taken after the
+        // resize, where the grid is the one drawn (`Terminal::dev_channel_render_verified`).
         let verified_generation = grid.content_generation();
         let resized =
             prepare_terminal_grid_for_render(&mut grid, search.as_deref_mut(), new_cols, new_rows);
@@ -3929,11 +3930,17 @@ impl Renderer {
         let hovered_link = terminal.hovered_link();
         let content_generation = grid.content_generation();
         // The frame decided to draw this panel from the generation it scanned,
-        // but output may have landed since. The development-channels check
-        // verifies one generation only, so a newer grid draws no body here
+        // but output may have landed since: the verdict covers the generation
+        // locked above, for the foreground group as it is now. Output parsed
+        // during `resize_pty` is not checked, so that grid draws no body here
         // (the background and the chrome stay).
-        let content_verified = terminal.dev_channel_generation_verified(verified_generation)
-            && content_generation == resized_generation;
+        let content_verified = content_generation == resized_generation
+            && terminal.dev_channel_render_verified(
+                &grid,
+                verified_generation,
+                resized,
+                &mut self.dev_channel_scratch,
+            );
         if presentation_visible && content_clip.is_some() && content_verified {
             let visible_range = visible_row_range(total_lines, visible_rows, scroll_offset, char_h);
             for layer in TERMINAL_BODY_LAYERS {
