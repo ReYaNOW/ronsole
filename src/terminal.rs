@@ -1079,11 +1079,22 @@ mod tests {
     }
 
     /// The renderer's verdict under the grid lock, as `render_terminal_body`
-    /// takes it.
+    /// takes it for a frame that did not resize the grid.
     fn render_verified(terminal: &Terminal) -> bool {
+        render_verified_at(terminal, false)
+    }
+
+    /// The renderer's verdict under the grid lock for a frame that resized
+    /// the grid (`resized`) or did not.
+    fn render_verified_at(terminal: &Terminal, resized: bool) -> bool {
         let grid = crate::platform::lock_recover(&terminal.grid);
         let mut scratch = String::new();
-        terminal.dev_channel_render_verified(&grid, grid.content_generation(), &mut scratch)
+        terminal.dev_channel_render_verified(
+            &grid,
+            grid.content_generation(),
+            resized,
+            &mut scratch,
+        )
     }
 
     /// A terminal with a foreground group whose plain screen went through a
@@ -1142,6 +1153,18 @@ mod tests {
         // The banner drawn again: its new cells are drawn, a candidate.
         feed_dev_screen(&terminal, &screen);
         assert!(!render_verified(&terminal));
+    }
+
+    /// The candidate check reads the visible rows only, so a warning pushed
+    /// into the scrollback passes it. A frame that grows the grid moves that
+    /// warning back on screen, so the same check must not verify that frame.
+    #[test]
+    fn dev_channel_resize_frame_does_not_trust_candidate_check() {
+        let terminal = render_race_terminal(120, 8);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        feed_dev_screen(&terminal, &"\r\nline".repeat(10));
+        assert!(render_verified_at(&terminal, false));
+        assert!(!render_verified_at(&terminal, true));
     }
 
     #[test]
@@ -1581,6 +1604,42 @@ mod tests {
             assert_eq!(line[81].ch(), 'p');
             assert!(!line[81].is_hidden(), "panel row {row}");
         }
+    }
+
+    /// A hidden banner beside the side panel is no candidate: the panel text
+    /// right of the divider is not part of the banner, so it must not count
+    /// as a drawn banner cell and bring the candidate back.
+    #[test]
+    fn dev_hidden_banner_beside_side_panel_is_not_a_candidate() {
+        let now = Instant::now();
+        let mut terminal = render_race_terminal(143, 8);
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let split = 77;
+        let first_head: String = first.chars().take(split).collect();
+        let first_tail: String = first.chars().skip(split).collect();
+        let screen = format!(
+            "\x1b[2J\x1b[H▎ {first_head}\x1b[80G│ panel alpha\x1b[2;1H▎ {first_tail}\x1b[80G│ panel beta\x1b[3;1H▎ {}\x1b[80G│ panel gamma",
+            DEV_CHANNEL_BANNER_LINES[1]
+        );
+        feed_dev_screen(&terminal, &screen);
+        assert!(!render_verified(&terminal));
+
+        terminal.observe_dev_channel(now, &mut String::new(), true, |_| Some(DEV_CLAUDE));
+        {
+            let grid = crate::platform::lock_recover(&terminal.grid);
+            for row in 0..3 {
+                let line = grid.visible_row(row).expect("screen row");
+                assert!(line[..79]
+                    .iter()
+                    .filter(|cell| cell.ch() != ' ')
+                    .all(|cell| cell.is_hidden()), "banner row {row}");
+            }
+        }
+
+        // Output in another row after the hiding: the generation is unverified,
+        // so only the candidate check can accept the content.
+        feed_dev_screen(&terminal, "\x1b[8;1Hmore output");
+        assert!(render_verified(&terminal));
     }
 
     /// Claude Code wraps the banner at a word of its chat column, so blanks
@@ -2304,6 +2363,24 @@ fn match_banner_row<'a>(
     end.map(|end| (end, divider))
 }
 
+/// End column of the banner text on a block row: `cells` cut at `cols`, up to
+/// the side panel divider. A divider in the first cell is the banner's own
+/// bar and is skipped. `BannerRows::walk_blocks` and `DevBannerState::apply`
+/// both use this range, so a cell counts as drawn exactly when `apply` hides
+/// it.
+fn banner_hide_end(cells: &[Cell], cols: usize) -> usize {
+    let end = cells.len().min(cols);
+    let from =
+        usize::from(cells.first().is_some_and(|cell| cell.ch() == DEV_CHANNEL_PANE_DIVIDER));
+    cells
+        .iter()
+        .take(end)
+        .enumerate()
+        .skip(from)
+        .find(|(_, cell)| cell.ch() == DEV_CHANNEL_PANE_DIVIDER)
+        .map_or(end, |(x, _)| x)
+}
+
 /// Rows scanned for banner blocks: the last `history` scrollback rows (none
 /// on the alternate screen), then the screen rows, as one sequence.
 #[derive(Clone, Copy)]
@@ -2430,9 +2507,14 @@ impl<'a> BannerRows<'a> {
                 row += 1;
                 continue;
             };
-            drawn |= self
-                .cells(row, len)
-                .any(|cell| cell.ch() != ' ' && !cell.is_hidden());
+            drawn |= (row..row + len).any(|index| {
+                self.row(index).is_some_and(|(cells, _)| {
+                    cells
+                        .iter()
+                        .take(banner_hide_end(cells, self.grid.cols()))
+                        .any(|cell| cell.ch() != ' ' && !cell.is_hidden())
+                })
+            });
             on_block(row, len);
             row += len;
         }
@@ -2548,13 +2630,7 @@ impl DevBannerState {
             }
             // Only drawn cells before the side panel divider are hidden; a
             // divider glyph in the first cell is the banner's own bar.
-            let end = line.len().min(cols);
-            let from =
-                usize::from(line.first().is_some_and(|cell| cell.ch() == DEV_CHANNEL_PANE_DIVIDER));
-            let stop = line[from.min(end)..end]
-                .iter()
-                .position(|cell| cell.ch() == DEV_CHANNEL_PANE_DIVIDER)
-                .map_or(end, |x| from + x);
+            let stop = banner_hide_end(line, cols);
             // `line` ends its borrow here, so each cell is re-read through a
             // short borrow before the mutable `set_host_hidden` call.
             for x in 0..stop {
@@ -3355,19 +3431,24 @@ impl Terminal {
     }
 
     /// Render-path verdict for `grid` (this terminal's grid, locked by the
-    /// caller) at content `generation`: the generation was verified by an
-    /// event pass, or output landed after that pass but the content has no
-    /// candidate, which the event pass would verify without `/proc`. A
-    /// candidate or an unknown answer keeps the content hidden. Changes no
-    /// development-channels state and sends nothing.
+    /// caller) at content `generation`, taken after the frame has resized the
+    /// grid when `resized`: the generation was verified by an event pass for
+    /// the foreground group now, or output landed after that pass and the
+    /// content has no candidate, which the event pass would verify without
+    /// `/proc`. The candidate check reads the grid as it is now, so it only
+    /// stands when the frame did not resize the grid: a resize moves
+    /// scrollback rows onto the screen. A candidate or an unknown answer keeps
+    /// the content hidden. Changes no development-channels state and sends
+    /// nothing.
     pub(crate) fn dev_channel_render_verified(
         &self,
         grid: &Term,
         generation: u64,
+        resized: bool,
         scratch: &mut String,
     ) -> bool {
         self.dev_channel_generation_verified(generation)
-            || self.dev_channel_candidate_in(grid, scratch) == Some(false)
+            || (!resized && self.dev_channel_candidate_in(grid, scratch) == Some(false))
     }
 
     /// Whether the grid's current content may be drawn (see
