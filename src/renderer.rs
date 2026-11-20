@@ -627,6 +627,9 @@ pub struct Renderer {
     tile_titles: Vec<terminal_ui::TileTitleCache>,
     /// Reused buffer for the raw display title of a tile before the cache check.
     tile_title_scratch: String,
+    /// Reused buffer for the render-path development-channels warning check;
+    /// see `Terminal::dev_channel_render_verified`.
+    dev_channel_scratch: String,
     terminal_tab_actual_xs: Vec<f32>,
     terminal_tab_order: Vec<usize>,
     terminal_tab_render_order: Vec<usize>,
@@ -767,6 +770,7 @@ impl Renderer {
             terminal_tab_widths: Vec::with_capacity(8),
             tile_titles: Vec::with_capacity(8),
             tile_title_scratch: String::with_capacity(96),
+            dev_channel_scratch: String::new(),
             terminal_tab_actual_xs: Vec::with_capacity(8),
             terminal_tab_order: Vec::with_capacity(8),
             terminal_tab_render_order: Vec::with_capacity(8),

@@ -1078,22 +1078,133 @@ mod tests {
         assert!(terminal.dev_channel_content_verified());
     }
 
-    #[test]
-    fn dev_channel_change_between_frame_decision_and_render_hides_content() {
-        let now = Instant::now();
-        let mut terminal = test_terminal(120, 8, 1);
-        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ ready");
+    /// The renderer's verdict under the grid lock, as `render_terminal_body`
+    /// takes it.
+    fn render_verified(terminal: &Terminal) -> bool {
+        let grid = crate::platform::lock_recover(&terminal.grid);
         let mut scratch = String::new();
-        terminal.observe_dev_channel_cached(now, &mut scratch);
-        let decided = dev_generation(&terminal);
-        assert!(terminal.dev_channel_generation_verified(decided));
+        terminal.dev_channel_render_verified(&grid, grid.content_generation(), &mut scratch)
+    }
 
-        // Output lands after the frame decided: the renderer's final check
-        // under the grid lock, done on the generation it locked, must reject it.
+    /// A terminal with a foreground group whose plain screen went through a
+    /// frame-path pass, so the next output lands after that pass.
+    fn render_race_terminal(cols: usize, rows: usize) -> Terminal {
+        let mut terminal = test_terminal(cols, rows, 1);
+        terminal.set_dev_process_group_for_test(Some(1000));
+        feed_dev_screen(&terminal, "\x1b[2J\x1b[H$ ready");
+        terminal.observe_dev_channel_cached(Instant::now(), &mut String::new());
+        assert!(terminal.dev_channel_generation_verified(dev_generation(&terminal)));
+        terminal
+    }
+
+    #[test]
+    fn dev_channel_change_between_frame_decision_and_render_draws_ordinary_output() {
+        let terminal = render_race_terminal(120, 8);
+        let decided = dev_generation(&terminal);
+
+        // Ordinary output lands after the frame decided: it has no candidate,
+        // so the renderer draws it, and the verification state is left to the
+        // next event pass.
         feed_dev_screen(&terminal, "more output");
         let rendered = dev_generation(&terminal);
         assert_ne!(rendered, decided);
+        assert!(render_verified(&terminal));
         assert!(!terminal.dev_channel_generation_verified(rendered));
+    }
+
+    #[test]
+    fn dev_channel_candidate_landing_before_render_hides_content() {
+        // The warning screen.
+        let terminal = render_race_terminal(120, 8);
+        feed_dev_screen(&terminal, DEV_WARNING_SCREEN);
+        assert!(!render_verified(&terminal));
+
+        // A banner with drawn cells.
+        let terminal = render_race_terminal(200, 8);
+        let (screen, _) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
+        feed_dev_screen(&terminal, &screen);
+        assert!(!render_verified(&terminal));
+    }
+
+    #[test]
+    fn dev_channel_hidden_banner_with_new_output_is_drawn_until_rewritten() {
+        let now = Instant::now();
+        let mut terminal = render_race_terminal(200, 8);
+        let (screen, rows) = banner_screen(DEV_CHANNEL_BANNER_LINES, 190);
+        feed_dev_screen(&terminal, &screen);
+        terminal.observe_dev_channel(now, &mut String::new(), true, |_| Some(DEV_CLAUDE));
+        assert_banner_rows(&terminal, rows, true);
+
+        // Output in another row: the banner stays hidden, so no candidate.
+        feed_dev_screen(&terminal, "\x1b[6;1Hmore output");
+        assert!(render_verified(&terminal));
+
+        // The banner drawn again: its new cells are drawn, a candidate.
+        feed_dev_screen(&terminal, &screen);
+        assert!(!render_verified(&terminal));
+    }
+
+    #[test]
+    fn dev_channel_render_check_beyond_scrollback_bound_hides_content() {
+        let terminal = render_race_terminal(40, 12);
+        feed_dev_screen(&terminal, &"\r\nline".repeat(20));
+        assert!(render_verified(&terminal));
+
+        let terminal = render_race_terminal(40, 12);
+        feed_dev_screen(&terminal, &"\r\nline".repeat(DEV_CHANNEL_RENDER_PUSHED_LIMIT + 20));
+        assert!(!render_verified(&terminal));
+    }
+
+    #[test]
+    fn dev_channel_render_check_matches_event_pass_candidate() {
+        let first = DEV_CHANNEL_BANNER_LINES[0];
+        let second = DEV_CHANNEL_BANNER_LINES[1];
+        let changed_first = first.replace("server:cc-tg", "server:cc-tx");
+        let (head, tail) = first.split_at(77);
+        let (flag_head, flag_tail) = first.split_at(first.find("--dangerously").unwrap_or(0));
+        let narrow = banner_screen(DEV_CHANNEL_BANNER_LINES, 38).0;
+        let corpus: Vec<(usize, usize, String)> = vec![
+            (120, 8, "\x1b[2J\x1b[H$ ordinary output".to_owned()),
+            (120, 8, DEV_WARNING_SCREEN.to_owned()),
+            (200, 8, banner_screen(DEV_CHANNEL_BANNER_LINES, 190).0),
+            (200, 8, banner_screen([changed_first.as_str(), second], 190).0),
+            (200, 8, banner_screen([first, "server:cc-tg"], 190).0),
+            (200, 8, banner_screen([second, first], 190).0),
+            (200, 8, format!("\x1b[2J\x1b[Habove\r\n\u{258e} {first}\r\n> {second}")),
+            (200, 8, format!("\x1b[2J\x1b[Habove\r\n  {first}\r\n  {second}")),
+            (40, 12, narrow.clone()),
+            (40, 12, format!("{narrow}{}", "\r\nbelow".repeat(20))),
+            (60, 12, banner_screen(DEV_CHANNEL_BANNER_LINES, 190).0),
+            (40, 12, format!("\x1b[?1049h{narrow}")),
+            (
+                143,
+                8,
+                format!(
+                    "\x1b[2J\x1b[H▎ {head}\x1b[80G│ panel alpha\x1b[2;1H▎ {tail}\x1b[80G│ panel beta\x1b[3;1H▎ {second}\x1b[80G│ panel gamma"
+                ),
+            ),
+            (
+                200,
+                8,
+                format!(
+                    "\x1b[2J\x1b[H▎ {flag_head}\x1b[106Gmine\x1b[110G│ a\x1b[2;1H▎ {flag_tail}\x1b[110G│ b\x1b[3;1H▎ {second}\x1b[110G│ c"
+                ),
+            ),
+            (200, 8, format!("\x1b[2J\x1b[Hleft\x1b[20G│ ▎ {first}\x1b[2;1Hleft\x1b[20G│ ▎ {second}")),
+            (200, 8, format!("\x1b[2J\x1b[Hmy output\x1b[2;1H▎ {second}\x1b[110G│ panel\x1b[3;1H│ {second}")),
+        ];
+        let mut seen = [false; 2];
+        for (cols, rows, screen) in corpus {
+            let mut terminal = render_race_terminal(cols, rows);
+            feed_dev_screen(&terminal, &screen);
+            let drawn = render_verified(&terminal);
+            let mut scratch = String::new();
+            let (_, warning_visible) = terminal.scan_dev_channel_warning(&mut scratch);
+            let (_, banner_drawn) = terminal.scan_dev_channel_banner();
+            assert_eq!(drawn, !(warning_visible || banner_drawn), "{screen:?}");
+            seen[usize::from(drawn)] = true;
+        }
+        assert_eq!(seen, [true, true]);
     }
 
     #[test]
@@ -2300,7 +2411,40 @@ impl<'a> BannerRows<'a> {
             .find_map(|(pos, _)| self.rest_at(0, 0, pos))
             .or_else(|| self.rest_at(0, 1, 0))
     }
+
+    /// Walks the banner blocks of these rows, top to bottom, reading the
+    /// grid only: `on_block` gets each block as (first row, rows). Returns
+    /// whether some block has a drawn (not hidden) cell. Shared by
+    /// `DevBannerState::scan` and the render-path `DevBannerState::drawn_now`.
+    fn walk_blocks(self, mut on_block: impl FnMut(usize, usize)) -> bool {
+        let mut drawn = false;
+        let mut row = 0;
+        while row < self.len() {
+            let block = self.block_at(row);
+            let block = if row == 0 {
+                block.or_else(|| self.cut_block_at_top())
+            } else {
+                block
+            };
+            let Some(len) = block else {
+                row += 1;
+                continue;
+            };
+            drawn |= self
+                .cells(row, len)
+                .any(|cell| cell.ch() != ' ' && !cell.is_hidden());
+            on_block(row, len);
+            row += len;
+        }
+        drawn
+    }
 }
+
+/// Upper bound of the rows that may have entered the scrollback since the
+/// last applied banner scan for the render-path check
+/// (`DevBannerState::drawn_now`) to still walk them; more is "unknown", which
+/// keeps the frame's overscan bounded.
+const DEV_CHANNEL_RENDER_PUSHED_LIMIT: usize = 256;
 
 /// Per-tab state of the development-channels banner hiding.
 #[derive(Debug, Default)]
@@ -2341,6 +2485,18 @@ impl DevBannerState {
     /// scrollback is scanned, since the resize reflowed it. Returns whether
     /// there is a block and whether one has a drawn (not hidden) cell.
     fn scan(&mut self, grid: &Term) -> (bool, bool) {
+        let (pushed, reach) = self.reach(grid);
+        let rows = BannerRows::new(grid, reach);
+        self.window = (rows.history, rows.history.saturating_sub(pushed));
+        self.blocks.clear();
+        let blocks = &mut self.blocks;
+        let drawn = rows.walk_blocks(|row, len| blocks.push((row, len)));
+        (!self.blocks.is_empty(), drawn)
+    }
+
+    /// Rows that entered the scrollback since the last applied scan, and the
+    /// scrollback rows a scan reaches (all of them after a width change).
+    fn reach(&self, grid: &Term) -> (usize, usize) {
         let pushed = usize::try_from(grid.scrollback_pushed().wrapping_sub(self.scanned_pushed))
             .unwrap_or(usize::MAX);
         let reach = if grid.cols() == self.scanned_cols {
@@ -2348,29 +2504,20 @@ impl DevBannerState {
         } else {
             usize::MAX
         };
-        let rows = BannerRows::new(grid, reach);
-        self.window = (rows.history, rows.history.saturating_sub(pushed));
-        self.blocks.clear();
-        let mut drawn = false;
-        let mut row = 0;
-        while row < rows.len() {
-            let block = rows.block_at(row);
-            let block = if row == 0 {
-                block.or_else(|| rows.cut_block_at_top())
-            } else {
-                block
-            };
-            let Some(len) = block else {
-                row += 1;
-                continue;
-            };
-            drawn |= rows
-                .cells(row, len)
-                .any(|cell| cell.ch() != ' ' && !cell.is_hidden());
-            self.blocks.push((row, len));
-            row += len;
+        (pushed, reach)
+    }
+
+    /// The drawn flag `scan` would return for `grid`, recording nothing: for
+    /// the render path, which holds the grid lock and must not change the
+    /// scan state. `None` ("unknown") after a width change or when more than
+    /// `DEV_CHANNEL_RENDER_PUSHED_LIMIT` rows entered the scrollback since the
+    /// last applied scan.
+    fn drawn_now(&self, grid: &Term) -> Option<bool> {
+        let (pushed, reach) = self.reach(grid);
+        if grid.cols() != self.scanned_cols || pushed > DEV_CHANNEL_RENDER_PUSHED_LIMIT {
+            return None;
         }
-        (!self.blocks.is_empty(), drawn)
+        Some(BannerRows::new(grid, reach).walk_blocks(|_, _| {}))
     }
 
     /// Hides the non-blank cells of every block of the last `scan` when
@@ -3190,6 +3337,37 @@ impl Terminal {
             Some((verified, None)) => verified == generation,
             None => false,
         }
+    }
+
+    /// Whether `grid` (this terminal's grid, locked by the caller) has a
+    /// development-channels candidate: the warning screen or a banner block
+    /// with a drawn cell. Uses the event pass detectors (`write_compact_screen`
+    /// with `compact_bridge_warning_visible`, `BannerRows::walk_blocks`) and
+    /// records nothing, so the event pass still scans and verifies this
+    /// generation. `None` when the banner walk would exceed its bound
+    /// (`DevBannerState::drawn_now`).
+    fn dev_channel_candidate_in(&self, grid: &Term, scratch: &mut String) -> Option<bool> {
+        write_compact_screen(grid, scratch);
+        if compact_bridge_warning_visible(scratch) {
+            return Some(true);
+        }
+        self.dev_banner.drawn_now(grid)
+    }
+
+    /// Render-path verdict for `grid` (this terminal's grid, locked by the
+    /// caller) at content `generation`: the generation was verified by an
+    /// event pass, or output landed after that pass but the content has no
+    /// candidate, which the event pass would verify without `/proc`. A
+    /// candidate or an unknown answer keeps the content hidden. Changes no
+    /// development-channels state and sends nothing.
+    pub(crate) fn dev_channel_render_verified(
+        &self,
+        grid: &Term,
+        generation: u64,
+        scratch: &mut String,
+    ) -> bool {
+        self.dev_channel_generation_verified(generation)
+            || self.dev_channel_candidate_in(grid, scratch) == Some(false)
     }
 
     /// Whether the grid's current content may be drawn (see
