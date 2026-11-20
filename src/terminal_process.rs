@@ -1478,6 +1478,9 @@ fn terminal_launch_command(
     command.cwd(cwd.as_os_str());
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    // Claude Code picks synchronized output (mode 2026) from a list of known terminals, and
+    // `claude attach` forwards that guess to a background session instead of querying us.
+    command.env("CLAUDE_CODE_FORCE_SYNC_OUTPUT", "1");
     // Never leak a token inherited from Ronsole's own environment.
     if tab_token.as_str().is_empty() {
         command.env_remove(TERMINAL_TAB_TOKEN_ENV);
@@ -2112,6 +2115,10 @@ mod tests {
         );
         assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
         assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(
+            command.get_env("CLAUDE_CODE_FORCE_SYNC_OUTPUT"),
+            Some(OsStr::new("1"))
+        );
         assert_eq!(title, "example-tool");
         assert_eq!(spawn_target, "terminal command");
     }
